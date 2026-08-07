@@ -230,6 +230,7 @@ pub struct EnginePorts {
 }
 
 pub(crate) struct SharedControlState {
+    render_horizon: AtomicU64,
     fence_sequence: AtomicU64,
     stop_requested: AtomicBool,
     command_overflows: AtomicU64,
@@ -239,11 +240,20 @@ pub(crate) struct SharedControlState {
 impl SharedControlState {
     fn new() -> Self {
         Self {
+            render_horizon: AtomicU64::new(0),
             fence_sequence: AtomicU64::new(0),
             stop_requested: AtomicBool::new(false),
             command_overflows: AtomicU64::new(0),
             failed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn publish_render_horizon(&self, frame: Frame) {
+        self.render_horizon.store(frame, Ordering::Release);
+    }
+
+    fn render_horizon(&self) -> Frame {
+        self.render_horizon.load(Ordering::Acquire)
     }
 
     fn request(&self, fence_sequence: u64) {
@@ -329,6 +339,10 @@ fn audio_channels_with_capacity_values(
 }
 
 impl AudioController {
+    pub fn render_horizon(&self) -> Frame {
+        self.shared.render_horizon()
+    }
+
     pub fn install(
         &mut self,
         pad: PadId,

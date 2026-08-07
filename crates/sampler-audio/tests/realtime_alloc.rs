@@ -220,6 +220,19 @@ fn measure_pure_device_write_adapter() {
     });
 }
 
+fn measure_render_horizon_publication() {
+    let (controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(48_000, ports).unwrap();
+    assert_eq!(controller.render_horizon(), 0);
+
+    COUNTS.reset_and_enable();
+    engine.render_frames(128, |_| {});
+    COUNTS.disable();
+
+    assert_eq!(controller.render_horizon(), 128);
+    assert_eq!((COUNTS.allocations(), COUNTS.deallocations()), (0, 0));
+}
+
 #[test]
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
@@ -230,4 +243,5 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_full_retirement_retry();
     measure_telemetry_full_handling();
     measure_pure_device_write_adapter();
+    measure_render_horizon_publication();
 }

@@ -196,6 +196,10 @@ impl AudioEngine {
     }
 
     pub fn render_frames(&mut self, frame_count: usize, mut write_frame: impl FnMut([f32; 2])) {
+        let frame_count_as_frame = Frame::try_from(frame_count).unwrap_or(Frame::MAX);
+        let horizon = self.rendered_frame.saturating_add(frame_count_as_frame);
+        self.ports.shared.publish_render_horizon(horizon);
+
         self.flush_deferred_retirement();
         self.apply_stop_fence();
         self.drain_commands();
@@ -239,6 +243,11 @@ impl AudioEngine {
 
     pub fn queued_commands(&self) -> usize {
         self.ports.commands.slots()
+    }
+
+    #[cfg(test)]
+    fn set_rendered_frame_for_test(&mut self, frame: Frame) {
+        self.rendered_frame = frame;
     }
 
     #[cfg(test)]
@@ -753,6 +762,29 @@ mod tests {
 
     fn constant_sample(frames: usize, value: f32) -> Arc<SampleBuffer> {
         Arc::new(SampleBuffer::new(48_000, vec![value; frames * 2]).unwrap())
+    }
+
+    #[test]
+    fn render_horizon_is_visible_before_the_first_frame_is_written() {
+        let (controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let mut seen = Vec::new();
+
+        engine.render_frames(257, |_| seen.push(controller.render_horizon()));
+
+        assert_eq!(seen, vec![257; 257]);
+        assert_eq!(controller.render_horizon(), 257);
+    }
+
+    #[test]
+    fn render_horizon_saturates_instead_of_panicking() {
+        let (controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        engine.set_rendered_frame_for_test(u64::MAX - 2);
+
+        engine.render_frames(8, |_| {});
+
+        assert_eq!(controller.render_horizon(), u64::MAX);
     }
 
     #[test]

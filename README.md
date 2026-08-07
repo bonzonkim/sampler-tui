@@ -10,7 +10,7 @@ The project targets macOS and Linux and is implemented as a Rust workspace:
 
 ## Current status
 
-Delivery slice 1 is complete on the feature branch. The core currently provides:
+Delivery slice 1 is complete. The core currently provides:
 
 - ten validated banks with sixteen pads each;
 - gate, one-shot, loop, gain, pan, pitch, and choke-group settings;
@@ -19,7 +19,7 @@ Delivery slice 1 is complete on the feature branch. The core currently provides:
 - reversible quantization and allocation-free pattern scheduling into caller-owned buffers;
 - a versioned TOML project document with portable `audio/` paths and nested validation.
 
-No audio is emitted yet. The executable is a workspace-boundary smoke test until delivery slice 2 connects decoding and a real output device.
+Delivery slice 2 is audible through the system default output device. The audio path decodes WAV, AIFF, FLAC, and MP3, converts samples to the active device rate, schedules one-shot playback on the bounded real-time engine, and reports device or runtime failures without entering terminal raw mode.
 
 ## Build and test
 
@@ -29,10 +29,10 @@ Rust 1.95.0 is selected by `rust-toolchain.toml`.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --release
-cargo run -p sampler-tui
+cargo run -p sampler-tui -- play path/to/sample.wav
 ```
 
-The binary currently prints `sampler-tui: core ready`.
+The diagnostic command prints the active device rate/channel count and decoded duration, plays one clean one-shot, and exits after rendered-frame completion. Run `cargo run -p sampler-tui -- --help` for its usage.
 
 ## Roadmap
 

@@ -498,16 +498,18 @@ impl App {
             return true;
         }
 
-        let view = &mut self.pads[offset];
-        view.label = path
+        let label = path
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy()
             .into_owned();
+        let view = &mut self.pads[offset];
+        view.label = label.clone();
         view.source = Some(path);
         view.sample = Some(loaded.buffer);
         view.preview = loaded.preview;
         view.state = PadLoadState::Ready;
+        self.status = format!("Loaded {}", label.to_uppercase());
         true
     }
 

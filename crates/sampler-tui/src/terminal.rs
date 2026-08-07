@@ -237,7 +237,7 @@ impl EventLoopApp for App {
     }
 }
 
-trait EventLoopWorker {
+pub trait EventLoopWorker {
     fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError>;
     fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendError>;
 }
@@ -256,11 +256,21 @@ trait EventLoopDrawer<A> {
     fn draw(&mut self, app: &A) -> io::Result<()>;
 }
 
-struct TerminalDrawer<'a>(&'a mut ratatui::DefaultTerminal);
+pub trait EventLoopTerminal {
+    fn draw(&mut self, app: &App) -> io::Result<()>;
+}
 
-impl EventLoopDrawer<App> for TerminalDrawer<'_> {
+impl EventLoopTerminal for ratatui::DefaultTerminal {
     fn draw(&mut self, app: &App) -> io::Result<()> {
-        self.0.draw(|frame| ui::render(frame, app)).map(|_| ())
+        self.draw(|frame| ui::render(frame, app)).map(|_| ())
+    }
+}
+
+struct TerminalDrawer<'a, T>(&'a mut T);
+
+impl<T: EventLoopTerminal> EventLoopDrawer<App> for TerminalDrawer<'_, T> {
+    fn draw(&mut self, app: &App) -> io::Result<()> {
+        self.0.draw(app)
     }
 }
 
@@ -364,6 +374,15 @@ pub fn run_event_loop(
     events: &mut impl EventSource,
     worker: &mut WorkerHandle,
 ) -> io::Result<()> {
+    run_event_loop_with(terminal, app, events, worker)
+}
+
+pub fn run_event_loop_with(
+    terminal: &mut impl EventLoopTerminal,
+    app: &mut App,
+    events: &mut impl EventSource,
+    worker: &mut impl EventLoopWorker,
+) -> io::Result<()> {
     let now = Instant::now();
     let mut state = LoopState::new(now.checked_add(TICK_INTERVAL).unwrap_or(now));
     let mut drawer = TerminalDrawer(terminal);
@@ -373,7 +392,7 @@ pub fn run_event_loop(
     Ok(())
 }
 
-trait TerminalLifecycle {
+pub trait TerminalLifecycle {
     type Terminal;
 
     fn initialize(&mut self) -> io::Result<Self::Terminal>;
@@ -426,7 +445,7 @@ impl TerminalLifecycle for RatatuiTerminalLifecycle {
     }
 }
 
-trait ShutdownWorker {
+pub trait ShutdownWorker {
     fn request_shutdown(&mut self);
 }
 
@@ -467,7 +486,7 @@ impl<W: ShutdownWorker> Drop for WorkerShutdownGuard<'_, W> {
     }
 }
 
-fn run_with_runtime_lifecycle<A, O, L, W, F, J, R, T, E>(
+pub fn run_with_runtime_lifecycle<A, O, L, W, F, J, R, T, E>(
     app: &mut A,
     enhancements: O,
     lifecycle: &mut L,
@@ -554,7 +573,7 @@ where
     preserve_primary(primary, cleanup)
 }
 
-trait AudioShutdown {
+pub trait AudioShutdown {
     type Error;
 
     fn shutdown_audio(&mut self) -> Result<(), Self::Error>;

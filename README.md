@@ -21,6 +21,8 @@ Delivery slice 1 is complete. The core currently provides:
 
 Delivery slice 2 is provisional. The default-device path has been exercised programmatically on macOS through rendered-frame completion, but no human hearing or one-shot-cleanliness verification was performed. Hermetic automated decode tests cover WAV, AIFF, FLAC, and MP3. Linux playback, human audibility, and device-disconnect behavior remain unchecked.
 
+Delivery slice 3 is implemented with automated acceptance evidence. The tests cover the real App/worker-result/render path for loading, triggering, releasing, bank switching, telemetry, and status rendering; bounded rapid sixteen-pad input with typed overflow; 79x23 and 80x24 layouts and all overlays; and ordered audio, keyboard, terminal, and worker cleanup for normal, error, and panic outcomes. Interactive terminal and audio acceptance has not been performed for this slice, so hearing, Linux behavior, physical device loss/retry, keyboard-enhancement compatibility, and manual panic restoration remain unchecked. See [`docs/manual-tui-checklist.md`](docs/manual-tui-checklist.md) for the honest acceptance record.
+
 ## Build and test
 
 Rust 1.95.0 is selected by `rust-toolchain.toml`.
@@ -29,15 +31,16 @@ Rust 1.95.0 is selected by `rust-toolchain.toml`.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --release
+cargo run -p sampler-tui
 cargo run -p sampler-tui -- play path/to/sample.wav
 ```
 
-The diagnostic command prints the active device rate/channel count and decoded duration, schedules one one-shot, and exits after rendered-frame completion. A successful exit is programmatic path evidence, not proof that the output was heard or free of audible artifacts. Run `cargo run -p sampler-tui -- --help` for its usage.
+The no-argument command opens the 80x24-minimum performance TUI. The diagnostic `play` command prints the active device rate/channel count and decoded duration, schedules one one-shot, and exits after rendered-frame completion. A successful exit is programmatic path evidence, not proof that the output was heard or free of audible artifacts. Run `cargo run -p sampler-tui -- --help` for its usage.
 
 ## Roadmap
 
 1. Add offline mixing, sample decoding/resampling, real device output, and responsive pad triggering.
-2. Build the 80×24 minimum performance TUI, keyboard mapping, help, command palette, file picker, meters, and terminal restoration.
+2. Harden the implemented 80×24 performance TUI with recorded macOS/Linux interactive and hardware acceptance.
 3. Add waveform sample editing, pattern recording/editing, project save/load, atomic saves, and autosave recovery.
 4. Add audio input, resampling, mixer and choke controls, built-in effects, MIDI, export, and cross-platform release hardening.
 

@@ -73,7 +73,7 @@ fn render_sample(frame: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_pad().min(15);
     let offset = usize::from(u8::from(app.active_bank())) * 16 + selected;
     let pad = &app.pads()[offset];
-    let label = pad_label(pad);
+    let label = selected_sample_label(pad);
     let state = load_state_name(&pad.state);
     let summary = format!(
         " PAD {:02} · {} · {}",
@@ -251,7 +251,7 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
         "no (Shift stops)"
     };
     let rows = [
-        format!("Voices {}", telemetry.active_voices),
+        format!("Voices {:02}", telemetry.active_voices),
         format!("Late {}", telemetry.late_commands),
         format!("Invalid {}", telemetry.invalid_commands),
         format!("Overflow {}", telemetry.command_overflows),
@@ -562,6 +562,24 @@ fn pad_label(pad: &PadView) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "----".to_owned())
+}
+
+fn selected_sample_label(pad: &PadView) -> String {
+    let label = if !pad.label.trim().is_empty() {
+        Path::new(pad.label.trim())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| pad.label.trim().to_owned())
+    } else {
+        pad.source
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "----".to_owned())
+    };
+    label.to_uppercase()
 }
 
 fn load_state_name(state: &PadLoadState) -> &'static str {
@@ -991,7 +1009,13 @@ mod tests {
 
         assert_eq!(app.meter_levels(), (0.0, 1.0));
         let snapshot = render_lines(80, 24, &app).join("\n");
-        for expected in ["Voices 2", "Late 1", "Invalid 2", "Overflow 3", "Frame 512"] {
+        for expected in [
+            "Voices 02",
+            "Late 1",
+            "Invalid 2",
+            "Overflow 3",
+            "Frame 512",
+        ] {
             assert!(snapshot.contains(expected), "missing {expected}");
         }
 

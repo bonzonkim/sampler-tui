@@ -295,7 +295,7 @@ fn run_iteration<A, E, W, D>(
     drawer: &mut D,
     now: Instant,
     state: &mut LoopState,
-) -> io::Result<()>
+) -> io::Result<usize>
 where
     A: EventLoopApp,
     E: EventSource,
@@ -317,6 +317,7 @@ where
         }
     }
 
+    let mut events_applied = 0;
     for event_index in 0..MAX_EVENTS_PER_ITERATION {
         let timeout = if event_index == 0 {
             state.next_tick.saturating_duration_since(now)
@@ -327,6 +328,7 @@ where
             break;
         }
         app.apply_terminal_event(events.read()?);
+        events_applied += 1;
         state.dirty = true;
     }
 
@@ -365,7 +367,25 @@ where
         drawer.draw(app)?;
         state.dirty = false;
     }
-    Ok(())
+    Ok(events_applied)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventLoopIteration {
+    pub events_applied: usize,
+    pub should_quit: bool,
+}
+
+pub trait EventLoopObserver {
+    fn iteration_completed(&mut self, iteration: EventLoopIteration) -> io::Result<()>;
+}
+
+struct IgnoreEventLoopIterations;
+
+impl EventLoopObserver for IgnoreEventLoopIterations {
+    fn iteration_completed(&mut self, _iteration: EventLoopIteration) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn run_event_loop(
@@ -383,11 +403,32 @@ pub fn run_event_loop_with(
     events: &mut impl EventSource,
     worker: &mut impl EventLoopWorker,
 ) -> io::Result<()> {
+    run_event_loop_with_observer(
+        terminal,
+        app,
+        events,
+        worker,
+        &mut IgnoreEventLoopIterations,
+    )
+}
+
+pub fn run_event_loop_with_observer(
+    terminal: &mut impl EventLoopTerminal,
+    app: &mut App,
+    events: &mut impl EventSource,
+    worker: &mut impl EventLoopWorker,
+    observer: &mut impl EventLoopObserver,
+) -> io::Result<()> {
     let now = Instant::now();
     let mut state = LoopState::new(now.checked_add(TICK_INTERVAL).unwrap_or(now));
     let mut drawer = TerminalDrawer(terminal);
     while !app.should_quit() {
-        run_iteration(app, events, worker, &mut drawer, Instant::now(), &mut state)?;
+        let events_applied =
+            run_iteration(app, events, worker, &mut drawer, Instant::now(), &mut state)?;
+        observer.iteration_completed(EventLoopIteration {
+            events_applied,
+            should_quit: app.should_quit(),
+        })?;
     }
     Ok(())
 }
@@ -797,7 +838,7 @@ mod tests {
         drawer: &mut FakeDrawer,
         now: Instant,
         state: &mut LoopState,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         run_iteration(app, events, worker, drawer, now, state)
     }
 

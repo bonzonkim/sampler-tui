@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
@@ -17,18 +16,43 @@ use ratatui::backend::TestBackend;
 use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
 use sampler_core::{BankId, PadId, PadSettings};
 use sampler_tui::terminal::{
-    EventLoopTerminal, EventLoopWorker, KeyboardEnhancementOps, ShutdownWorker, TerminalLifecycle,
-    run_event_loop_with, run_with_runtime_lifecycle,
+    EventLoopIteration, EventLoopObserver, EventLoopTerminal, EventLoopWorker,
+    KeyboardEnhancementOps, ShutdownWorker, TerminalLifecycle, run_event_loop_with,
+    run_event_loop_with_observer, run_with_runtime_lifecycle,
 };
 use sampler_tui::{
     App, AudioPort, DirectoryEntry, DirectoryEntryKind, KeyboardCapabilities, LoadedSample,
-    MAX_EVENTS_PER_ITERATION, PAD_KEYS, PREVIEW_COLUMNS, PreviewColumn, WorkerRequest,
-    WorkerResult, WorkerSendError,
+    PAD_KEYS, PREVIEW_COLUMNS, PreviewColumn, WorkerRequest, WorkerResult, WorkerSendError,
 };
 
 #[derive(Debug, Clone, PartialEq)]
+struct SampleIdentity {
+    sample_rate: u32,
+    frames: usize,
+    channels: u16,
+    first_frame: [f32; 2],
+    signal_sum: f32,
+}
+
+impl SampleIdentity {
+    fn from_buffer(buffer: &SampleBuffer) -> Self {
+        Self {
+            sample_rate: buffer.sample_rate(),
+            frames: buffer.frames(),
+            channels: 2,
+            first_frame: [buffer.data()[0], buffer.data()[1]],
+            signal_sum: buffer.data().iter().sum(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum AudioCall {
-    Install(PadId),
+    Install {
+        pad: PadId,
+        sample: SampleIdentity,
+        settings: PadSettings,
+    },
     Trigger(PadId, Frame, f32),
     Release(PadId, Frame),
     StopPad(PadId),
@@ -36,12 +60,18 @@ enum AudioCall {
     UpdatePad(PadId),
 }
 
+#[derive(Debug, Clone)]
+struct AcceptedAudioCall {
+    id: usize,
+    call: AudioCall,
+}
+
 #[derive(Default)]
 struct AudioState {
-    attempted_calls: usize,
-    accepted_calls: Vec<AudioCall>,
+    accepted_calls: Vec<AcceptedAudioCall>,
+    outstanding_calls: VecDeque<usize>,
+    completed_calls: Vec<usize>,
     typed_overflows: usize,
-    outstanding_calls: usize,
     maintenance_calls: usize,
     telemetry: VecDeque<Telemetry>,
 }
@@ -81,10 +111,10 @@ impl FakeAudio {
 
     fn accept_command(&self, call: AudioCall) -> Result<(), String> {
         let mut state = self.state.borrow_mut();
-        state.attempted_calls = state.attempted_calls.saturating_add(1);
-        if state.outstanding_calls < self.command_capacity {
-            state.outstanding_calls = state.outstanding_calls.saturating_add(1);
-            state.accepted_calls.push(call);
+        if state.outstanding_calls.len() < self.command_capacity {
+            let id = state.accepted_calls.len();
+            state.accepted_calls.push(AcceptedAudioCall { id, call });
+            state.outstanding_calls.push_back(id);
             Ok(())
         } else {
             state.typed_overflows = state.typed_overflows.saturating_add(1);
@@ -117,10 +147,14 @@ impl AudioPort for FakeAudio {
     fn install(
         &mut self,
         pad: PadId,
-        _sample: Arc<SampleBuffer>,
-        _settings: PadSettings,
+        sample: Arc<SampleBuffer>,
+        settings: PadSettings,
     ) -> Result<SampleSlot, String> {
-        self.accept_command(AudioCall::Install(pad))?;
+        self.accept_command(AudioCall::Install {
+            pad,
+            sample: SampleIdentity::from_buffer(&sample),
+            settings,
+        })?;
         SampleSlot::new(0).map_err(|error| error.to_string())
     }
 
@@ -152,8 +186,9 @@ impl AudioPort for FakeAudio {
     fn reclaim_retired(&mut self) -> usize {
         let mut state = self.state.borrow_mut();
         state.maintenance_calls = state.maintenance_calls.saturating_add(1);
-        let reclaimed = state.outstanding_calls;
-        state.outstanding_calls = 0;
+        let reclaimed = state.outstanding_calls.len();
+        let completed = state.outstanding_calls.drain(..).collect::<Vec<_>>();
+        state.completed_calls.extend(completed);
         reclaimed
     }
 
@@ -166,17 +201,44 @@ impl AudioPort for FakeAudio {
     }
 }
 
+#[derive(Clone)]
+struct QueuedEvent {
+    event: Event,
+    user_input: bool,
+}
+
+struct LoadScript {
+    filename: String,
+    buffer: Arc<SampleBuffer>,
+}
+
+struct HarnessWorkerState {
+    script: Option<LoadScript>,
+    results: VecDeque<WorkerResult>,
+    requests_sent: usize,
+    results_delivered: usize,
+    loaded_result_waiting_for_draw: bool,
+    polls_while_loaded_waiting: usize,
+    loaded_result_draws: usize,
+    events: Rc<RefCell<VecDeque<QueuedEvent>>>,
+    post_load_events: Rc<RefCell<VecDeque<QueuedEvent>>>,
+}
+
 struct TuiHarness {
     width: u16,
     height: u16,
     app: App,
     audio: Rc<RefCell<AudioState>>,
-    pending_scan: Option<(u64, PathBuf)>,
-    events: VecDeque<Event>,
+    events: Rc<RefCell<VecDeque<QueuedEvent>>>,
+    post_load_events: Rc<RefCell<VecDeque<QueuedEvent>>>,
+    worker: Rc<RefCell<HarnessWorkerState>>,
+    awaiting_load: bool,
     queued_input_events: usize,
-    read_input_events: usize,
-    draw_calls: usize,
-    rendered_overflows: usize,
+    read_input_events: Rc<Cell<usize>>,
+    events_per_iteration: Rc<RefCell<Vec<usize>>>,
+    draw_calls: Rc<Cell<usize>>,
+    rendered_overflows: Rc<Cell<usize>>,
+    last_screen: Rc<RefCell<Option<String>>>,
 }
 
 impl TuiHarness {
@@ -186,17 +248,34 @@ impl TuiHarness {
         app.set_keyboard_capabilities(KeyboardCapabilities {
             release_events: true,
         });
+        let events = Rc::new(RefCell::new(VecDeque::new()));
+        let post_load_events = Rc::new(RefCell::new(VecDeque::new()));
+        let worker = Rc::new(RefCell::new(HarnessWorkerState {
+            script: None,
+            results: VecDeque::new(),
+            requests_sent: 0,
+            results_delivered: 0,
+            loaded_result_waiting_for_draw: false,
+            polls_while_loaded_waiting: 0,
+            loaded_result_draws: 0,
+            events: Rc::clone(&events),
+            post_load_events: Rc::clone(&post_load_events),
+        }));
         Self {
             width,
             height,
             app,
             audio: audio_state,
-            pending_scan: None,
-            events: VecDeque::new(),
+            events,
+            post_load_events,
+            worker,
+            awaiting_load: false,
             queued_input_events: 0,
-            read_input_events: 0,
-            draw_calls: 0,
-            rendered_overflows: 0,
+            read_input_events: Rc::new(Cell::new(0)),
+            events_per_iteration: Rc::new(RefCell::new(Vec::new())),
+            draw_calls: Rc::new(Cell::new(0)),
+            rendered_overflows: Rc::new(Cell::new(0)),
+            last_screen: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -210,62 +289,15 @@ impl TuiHarness {
 
     fn open_picker_for_selected(&mut self) {
         self.app.open_picker();
-        let requests = self.app.take_worker_requests();
-        let [
-            WorkerRequest::ScanDirectory {
-                request_id, path, ..
-            },
-        ] = requests.as_slice()
-        else {
-            panic!("expected one directory scan request")
-        };
-        self.pending_scan = Some((*request_id, path.clone()));
+        self.awaiting_load = true;
     }
 
     fn deliver_loaded(&mut self, filename: &str, buffer: Arc<SampleBuffer>) {
-        let (request_id, directory) = self
-            .pending_scan
-            .take()
-            .expect("picker scan must be opened first");
-        let path = directory.join(filename);
-        assert!(self.app.apply_worker_result(WorkerResult::Scanned {
-            request_id,
-            path: directory,
-            result: Ok(vec![DirectoryEntry {
-                path: path.clone(),
-                kind: DirectoryEntryKind::File,
-            }]),
-        }));
-        self.app
-            .apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        let requests = self.app.take_worker_requests();
-        let [
-            WorkerRequest::LoadSample {
-                pad,
-                generation,
-                path: requested_path,
-                engine_rate,
-            },
-        ] = requests.as_slice()
-        else {
-            panic!("expected one sample load request")
-        };
-        assert_eq!(*engine_rate, buffer.sample_rate());
-        assert_eq!(requested_path, &path);
-        let frames = buffer.frames();
-        assert!(self.app.apply_worker_result(WorkerResult::Loaded {
-            pad: *pad,
-            generation: *generation,
-            path,
-            result: Ok(LoadedSample {
-                buffer,
-                source_rate: *engine_rate,
-                source_frames: frames,
-                duration: Duration::from_secs_f64(frames as f64 / f64::from(*engine_rate)),
-                preview: [PreviewColumn::default(); PREVIEW_COLUMNS],
-            }),
-        }));
+        assert!(self.awaiting_load, "picker must be opened before loading");
+        self.worker.borrow_mut().script = Some(LoadScript {
+            filename: filename.to_owned(),
+            buffer,
+        });
     }
 
     fn press(&mut self, character: char) {
@@ -277,11 +309,19 @@ impl TuiHarness {
     }
 
     fn key(&mut self, character: char, kind: KeyEventKind) {
-        self.events.push_back(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char(character),
-            KeyModifiers::NONE,
-            kind,
-        )));
+        let event = QueuedEvent {
+            event: Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                kind,
+            )),
+            user_input: true,
+        };
+        if self.awaiting_load {
+            self.post_load_events.borrow_mut().push_back(event);
+        } else {
+            self.events.borrow_mut().push_back(event);
+        }
         self.queued_input_events = self.queued_input_events.saturating_add(1);
     }
 
@@ -291,77 +331,105 @@ impl TuiHarness {
     }
 
     fn draw(&mut self) -> String {
-        self.drive_events(256);
-        render_screen(self.width, self.height, &self.app)
+        self.run_until_idle(256);
+        self.last_screen
+            .borrow()
+            .clone()
+            .expect("event loop must draw the final screen")
     }
 
     fn run_until_idle(&mut self, max_iterations: usize) {
-        self.drive_events(max_iterations);
+        self.try_run_until_idle(max_iterations)
+            .expect("in-memory event loop must complete");
     }
 
-    fn drive_events(&mut self, max_iterations: usize) {
-        let input_event_count = self.events.len();
-        let required_iterations = input_event_count.div_ceil(MAX_EVENTS_PER_ITERATION) + 1;
-        assert!(
-            required_iterations <= max_iterations.max(1),
-            "event burst exceeded harness iteration bound"
-        );
-        self.events.push_back(Event::Key(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::CONTROL,
-        )));
-        let read_calls = Rc::new(Cell::new(0));
-        let draw_calls = Rc::new(Cell::new(0));
-        let rendered_overflows = Rc::new(Cell::new(0));
+    fn try_run_until_idle(&mut self, max_iterations: usize) -> io::Result<()> {
+        let quit = QueuedEvent {
+            event: Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            user_input: false,
+        };
+        if self.awaiting_load {
+            self.post_load_events.borrow_mut().push_back(quit);
+        } else {
+            self.events.borrow_mut().push_back(quit);
+        }
         let mut events = HarnessEvents {
-            events: std::mem::take(&mut self.events),
-            read_calls: Rc::clone(&read_calls),
+            events: Rc::clone(&self.events),
+            user_reads: Rc::clone(&self.read_input_events),
+            worker: Rc::clone(&self.worker),
         };
         let mut terminal = HarnessTerminal {
             width: self.width,
             height: self.height,
-            draw_calls: Rc::clone(&draw_calls),
-            rendered_overflows: Rc::clone(&rendered_overflows),
+            draw_calls: Rc::clone(&self.draw_calls),
+            rendered_overflows: Rc::clone(&self.rendered_overflows),
+            last_screen: Rc::clone(&self.last_screen),
+            worker: Rc::clone(&self.worker),
         };
-        let mut worker = IdleWorker;
-        run_event_loop_with(&mut terminal, &mut self.app, &mut events, &mut worker)
-            .expect("in-memory event loop must complete");
-        assert!(events.events.is_empty(), "event loop left unread input");
-        self.read_input_events = self
-            .read_input_events
-            .saturating_add(read_calls.get().saturating_sub(1));
-        self.draw_calls = self.draw_calls.saturating_add(draw_calls.get());
-        self.rendered_overflows = self
-            .rendered_overflows
-            .saturating_add(rendered_overflows.get());
+        let mut observer = HarnessObserver {
+            events_per_iteration: Rc::clone(&self.events_per_iteration),
+            max_iterations,
+        };
+        let mut worker = HarnessWorker {
+            state: Rc::clone(&self.worker),
+        };
+        let result = run_event_loop_with_observer(
+            &mut terminal,
+            &mut self.app,
+            &mut events,
+            &mut worker,
+            &mut observer,
+        );
+        if result.is_ok() {
+            assert!(
+                self.events.borrow().is_empty(),
+                "event loop left unread input"
+            );
+            assert!(
+                self.post_load_events.borrow().is_empty(),
+                "event loop left post-load input"
+            );
+        }
+        result
     }
 
     fn accepted_audio_calls(&self) -> usize {
         self.audio.borrow().accepted_calls.len()
     }
 
+    fn completed_audio_calls(&self) -> usize {
+        self.audio.borrow().completed_calls.len()
+    }
+
     fn audio_calls(&self) -> Vec<AudioCall> {
-        self.audio.borrow().accepted_calls.clone()
+        self.audio
+            .borrow()
+            .accepted_calls
+            .iter()
+            .map(|accepted| accepted.call.clone())
+            .collect()
     }
 
     fn silent_losses(&self) -> usize {
         let state = self.audio.borrow();
-        let unclassified_audio_calls = state
-            .attempted_calls
-            .saturating_sub(state.accepted_calls.len() + state.typed_overflows);
+        let accepted_not_completed = state
+            .accepted_calls
+            .iter()
+            .filter(|accepted| !state.completed_calls.contains(&accepted.id))
+            .count();
         let unread_input = self
             .queued_input_events
-            .saturating_sub(self.read_input_events);
+            .saturating_sub(self.read_input_events.get());
         let pads_never_accepted = (0..PAD_KEYS.len())
             .filter(|index| !self.app.is_pad_held(*index))
             .count();
-        let missing_draw_progress = usize::from(self.draw_calls == 0);
-        unclassified_audio_calls + unread_input + pads_never_accepted + missing_draw_progress
+        let missing_draw_progress = usize::from(self.draw_calls.get() == 0);
+        accepted_not_completed + unread_input + pads_never_accepted + missing_draw_progress
     }
 
     fn visible_overflows(&self) -> usize {
         if self.audio.borrow().typed_overflows > 0 {
-            self.rendered_overflows
+            self.rendered_overflows.get()
         } else {
             0
         }
@@ -370,25 +438,61 @@ impl TuiHarness {
     fn maintenance_calls(&self) -> usize {
         self.audio.borrow().maintenance_calls
     }
+
+    fn events_per_iteration(&self) -> Vec<usize> {
+        self.events_per_iteration.borrow().clone()
+    }
+
+    fn max_events_per_iteration(&self) -> usize {
+        self.events_per_iteration
+            .borrow()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn worker_delivery(&self) -> (usize, usize) {
+        let worker = self.worker.borrow();
+        (worker.requests_sent, worker.results_delivered)
+    }
+
+    fn worker_result_draws(&self) -> usize {
+        self.worker.borrow().loaded_result_draws
+    }
 }
 
 struct HarnessEvents {
-    events: VecDeque<Event>,
-    read_calls: Rc<Cell<usize>>,
+    events: Rc<RefCell<VecDeque<QueuedEvent>>>,
+    user_reads: Rc<Cell<usize>>,
+    worker: Rc<RefCell<HarnessWorkerState>>,
 }
 
 impl sampler_tui::EventSource for HarnessEvents {
     fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
-        Ok(!self.events.is_empty())
+        let mut worker = self.worker.borrow_mut();
+        if worker.loaded_result_waiting_for_draw {
+            worker.polls_while_loaded_waiting = worker.polls_while_loaded_waiting.saturating_add(1);
+            if worker.polls_while_loaded_waiting > 1 {
+                return Err(io::Error::other(
+                    "loaded worker result was not drawn in its iteration",
+                ));
+            }
+        }
+        drop(worker);
+        Ok(!self.events.borrow().is_empty())
     }
 
     fn read(&mut self) -> io::Result<Event> {
-        let event = self
+        let queued = self
             .events
+            .borrow_mut()
             .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no event"))?;
-        self.read_calls.set(self.read_calls.get().saturating_add(1));
-        Ok(event)
+        if queued.user_input {
+            self.user_reads.set(self.user_reads.get().saturating_add(1));
+        }
+        Ok(queued.event)
     }
 }
 
@@ -397,28 +501,130 @@ struct HarnessTerminal {
     height: u16,
     draw_calls: Rc<Cell<usize>>,
     rendered_overflows: Rc<Cell<usize>>,
+    last_screen: Rc<RefCell<Option<String>>>,
+    worker: Rc<RefCell<HarnessWorkerState>>,
 }
 
 impl EventLoopTerminal for HarnessTerminal {
     fn draw(&mut self, app: &App) -> io::Result<()> {
-        self.draw_calls.set(self.draw_calls.get().saturating_add(1));
+        let draw_calls = self.draw_calls.get().saturating_add(1);
+        self.draw_calls.set(draw_calls);
         let screen = render_screen(self.width, self.height, app);
         if screen.contains("audio command queue full") {
             self.rendered_overflows
                 .set(self.rendered_overflows.get().saturating_add(1));
         }
+        *self.last_screen.borrow_mut() = Some(screen);
+        let mut worker = self.worker.borrow_mut();
+        if worker.loaded_result_waiting_for_draw {
+            worker.loaded_result_waiting_for_draw = false;
+            worker.loaded_result_draws = worker.loaded_result_draws.saturating_add(1);
+            let events = Rc::clone(&worker.events);
+            let post_load_events = Rc::clone(&worker.post_load_events);
+            drop(worker);
+            let released = post_load_events.borrow_mut().drain(..).collect::<Vec<_>>();
+            events.borrow_mut().extend(released);
+        }
         Ok(())
     }
 }
 
-struct IdleWorker;
+struct HarnessObserver {
+    events_per_iteration: Rc<RefCell<Vec<usize>>>,
+    max_iterations: usize,
+}
 
-impl EventLoopWorker for IdleWorker {
+impl EventLoopObserver for HarnessObserver {
+    fn iteration_completed(&mut self, iteration: EventLoopIteration) -> io::Result<()> {
+        let mut events = self.events_per_iteration.borrow_mut();
+        events.push(iteration.events_applied);
+        if events.len() >= self.max_iterations && !iteration.should_quit {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "event loop iteration budget exhausted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct HarnessWorker {
+    state: Rc<RefCell<HarnessWorkerState>>,
+}
+
+impl EventLoopWorker for HarnessWorker {
     fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError> {
-        Err(TryRecvError::Empty)
+        let mut state = self.state.borrow_mut();
+        let Some(result) = state.results.pop_front() else {
+            return Err(TryRecvError::Empty);
+        };
+        state.results_delivered = state.results_delivered.saturating_add(1);
+        if matches!(&result, WorkerResult::Loaded { .. }) {
+            state.loaded_result_waiting_for_draw = true;
+            state.polls_while_loaded_waiting = 0;
+        }
+        Ok(result)
     }
 
-    fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendError> {
+    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendError> {
+        const RESULT_CAPACITY: usize = 8;
+
+        let mut state = self.state.borrow_mut();
+        if state.results.len() >= RESULT_CAPACITY {
+            return Err(WorkerSendError::WorkerBusy);
+        }
+        state.requests_sent = state.requests_sent.saturating_add(1);
+        let script = state
+            .script
+            .as_ref()
+            .expect("worker request requires a configured load script");
+        let filename = script.filename.clone();
+        let buffer = Arc::clone(&script.buffer);
+        match request {
+            WorkerRequest::ScanDirectory {
+                request_id, path, ..
+            } => {
+                let sample_path = path.join(&filename);
+                state.results.push_back(WorkerResult::Scanned {
+                    request_id,
+                    path,
+                    result: Ok(vec![DirectoryEntry {
+                        path: sample_path,
+                        kind: DirectoryEntryKind::File,
+                    }]),
+                });
+                state.events.borrow_mut().push_back(QueuedEvent {
+                    event: Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    user_input: false,
+                });
+            }
+            WorkerRequest::LoadSample {
+                pad,
+                generation,
+                path,
+                engine_rate,
+            } => {
+                assert_eq!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(filename.as_str())
+                );
+                assert_eq!(engine_rate, buffer.sample_rate());
+                let frames = buffer.frames();
+                state.results.push_back(WorkerResult::Loaded {
+                    pad,
+                    generation,
+                    path,
+                    result: Ok(LoadedSample {
+                        buffer,
+                        source_rate: engine_rate,
+                        source_frames: frames,
+                        duration: Duration::from_secs_f64(frames as f64 / f64::from(engine_rate)),
+                        preview: [PreviewColumn::default(); PREVIEW_COLUMNS],
+                    }),
+                });
+            }
+            WorkerRequest::Shutdown => panic!("event loop must not send worker shutdown"),
+        }
         Ok(())
     }
 }
@@ -644,18 +850,22 @@ impl LifecycleHarness {
             );
             outcome
         }));
-        match (self.outcome, result) {
-            (Panic, Err(_)) => {}
+        let original_panic_resumed = match (self.outcome, result) {
+            (Panic, Err(payload)) => {
+                assert_eq!(payload.downcast_ref::<&str>().copied(), Some("draw panic"));
+                calls.borrow_mut().push("resume");
+                true
+            }
             (Panic, Ok(_)) => panic!("panic outcome must resume its panic"),
-            (_, Ok(Ok(()))) if matches!(self.outcome, Quit) => {}
-            (_, Ok(Err(_))) if !matches!(self.outcome, Quit) => {}
+            (_, Ok(Ok(()))) if matches!(self.outcome, Quit) => false,
+            (_, Ok(Err(_))) if !matches!(self.outcome, Quit) => false,
             (_, unexpected) => panic!("unexpected lifecycle outcome: {unexpected:?}"),
-        }
+        };
         LifecycleResult {
             calls: calls.borrow().clone(),
             alive: alive.get(),
             shutdown_requested: shutdown_requested.get(),
-            outcome: self.outcome,
+            original_panic_resumed,
         }
     }
 }
@@ -664,16 +874,12 @@ struct LifecycleResult {
     calls: Vec<&'static str>,
     alive: bool,
     shutdown_requested: bool,
-    outcome: ExitOutcome,
+    original_panic_resumed: bool,
 }
 
 impl LifecycleResult {
     fn cleanup_order(&self) -> Vec<&'static str> {
-        self.calls
-            .iter()
-            .copied()
-            .filter(|call| !matches!(*call, "request-worker" | "report"))
-            .collect()
+        self.calls.clone()
     }
 
     fn worker_is_alive(&self) -> bool {
@@ -690,30 +896,8 @@ impl LifecycleResult {
                 == 1
     }
 
-    fn shutdown_precedes_restore(&self) -> bool {
-        let shutdown = self.calls.iter().position(|call| *call == "request-worker");
-        let restore = self.calls.iter().position(|call| *call == "restore");
-        matches!((shutdown, restore), (Some(shutdown), Some(restore)) if shutdown < restore)
-    }
-
-    fn reported_after_cleanup(&self) -> bool {
-        let reports = self
-            .calls
-            .iter()
-            .enumerate()
-            .filter(|(_, call)| **call == "report")
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if matches!(self.outcome, Panic) {
-            reports.len() == 1
-                && self
-                    .calls
-                    .iter()
-                    .position(|call| *call == "join-worker")
-                    .is_some_and(|join| reports[0] > join)
-        } else {
-            reports.is_empty()
-        }
+    fn original_panic_resumed(&self) -> bool {
+        self.original_panic_resumed
     }
 }
 
@@ -736,12 +920,25 @@ fn loads_plays_releases_switches_banks_and_renders_status() {
     assert_eq!(
         harness.audio_calls(),
         [
-            AudioCall::Install(pad(0, 0)),
+            AudioCall::Install {
+                pad: pad(0, 0),
+                sample: SampleIdentity {
+                    sample_rate: 48_000,
+                    frames: 256,
+                    channels: 2,
+                    first_frame: [0.25, 0.25],
+                    signal_sum: 128.0,
+                },
+                settings: PadSettings::default(),
+            },
             AudioCall::Trigger(pad(0, 0), 64, 1.0),
             AudioCall::Release(pad(0, 0), 64),
             AudioCall::Trigger(pad(1, 4), 64, 1.0),
         ]
     );
+    assert_eq!(harness.worker_delivery(), (2, 2));
+    assert_eq!(harness.worker_result_draws(), 1);
+    assert_eq!(harness.events_per_iteration(), [0, 1, 0, 5]);
 }
 
 #[test]
@@ -756,25 +953,48 @@ fn rapid_sixteen_pad_input_is_bounded_and_loss_is_typed() {
     assert_eq!(harness.silent_losses(), 0);
     assert!(harness.visible_overflows() > 0);
     assert!(harness.maintenance_calls() >= 1);
+    assert_eq!(harness.max_events_per_iteration(), 64);
+    assert_eq!(
+        harness.events_per_iteration(),
+        [vec![64; 16], vec![1]].concat()
+    );
+    assert_eq!(
+        harness.completed_audio_calls(),
+        harness.accepted_audio_calls()
+    );
+}
+
+#[test]
+fn max_iterations_is_an_enforced_execution_bound() {
+    let mut harness = TuiHarness::with_command_capacity(8);
+    for index in 0..65 {
+        harness.press(PAD_KEYS[index % PAD_KEYS.len()]);
+    }
+
+    let error = harness.try_run_until_idle(1).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(harness.events_per_iteration(), [64]);
 }
 
 #[test]
 fn every_exit_path_restores_before_reporting_and_joins_worker() {
     for outcome in [Quit, DrawError, ReadError, AppError, Panic] {
         let result = LifecycleHarness::new(outcome).run();
-        assert_eq!(
-            result.cleanup_order(),
-            [
-                "stop-all",
-                "drop-audio",
-                "pop-keys",
-                "restore",
-                "join-worker"
-            ]
-        );
+        let mut expected = vec![
+            "stop-all",
+            "drop-audio",
+            "pop-keys",
+            "request-worker",
+            "restore",
+            "join-worker",
+        ];
+        if matches!(outcome, Panic) {
+            expected.extend(["report", "resume"]);
+        }
+        assert_eq!(result.cleanup_order(), expected);
         assert!(!result.worker_is_alive());
         assert!(result.shutdown_was_requested());
-        assert!(result.shutdown_precedes_restore());
-        assert!(result.reported_after_cleanup());
+        assert_eq!(result.original_panic_resumed(), matches!(outcome, Panic));
     }
 }

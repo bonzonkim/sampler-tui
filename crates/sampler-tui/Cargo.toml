@@ -6,6 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+crossterm.workspace = true
 sampler-audio = { path = "../sampler-audio" }
 sampler-core = { path = "../sampler-core" }
-

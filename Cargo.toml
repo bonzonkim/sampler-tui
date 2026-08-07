@@ -8,6 +8,7 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+crossterm = "0.29.0"
 cpal = "0.18.1"
 rtrb = "0.3.4"
 rubato = "4.0.0"

@@ -96,6 +96,15 @@ impl<const N: usize> VoiceAllocator<N> {
         self.stop_where(|voice| voice.choke_group == Some(group))
     }
 
+    pub fn stop_slot(&mut self, slot: usize, id: VoiceId) -> Option<Voice> {
+        let voice = self.voices.get_mut(slot)?;
+        if voice.is_some_and(|voice| voice.id == id) {
+            voice.take()
+        } else {
+            None
+        }
+    }
+
     pub fn active_voices(&self) -> usize {
         self.voices.iter().flatten().count()
     }
@@ -130,7 +139,7 @@ impl<const N: usize> VoiceAllocator<N> {
                     .min_by_key(|(_, voice)| voice.started_at)
             })
             .map(|(slot, _)| slot)
-            .expect("non-zero full allocator has a voice")
+            .unwrap_or(0)
     }
 }
 
@@ -198,5 +207,17 @@ mod tests {
         voices.trigger(VoiceRequest::new(pad(1), 12, 1.0, None, false));
         assert_eq!(voices.release_pad(pad(0)), 2);
         assert_eq!(voices.active_voices(), 1);
+    }
+
+    #[test]
+    fn stop_slot_only_removes_the_expected_voice_generation() {
+        let mut voices = VoiceAllocator::<1>::new();
+        let first = voices.trigger(VoiceRequest::new(pad(0), 0, 1.0, None, false));
+        let second = voices.trigger(VoiceRequest::new(pad(1), 1, 1.0, None, false));
+        assert_eq!(voices.stop_slot(first.slot, first.voice.id), None);
+        assert_eq!(
+            voices.stop_slot(second.slot, second.voice.id),
+            Some(second.voice)
+        );
     }
 }

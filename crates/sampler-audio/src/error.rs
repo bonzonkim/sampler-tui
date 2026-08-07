@@ -71,3 +71,9 @@ pub enum ControlError {
     #[error("trigger velocity must be finite and in 0.0..=1.0")]
     InvalidVelocity,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum EngineError {
+    #[error("engine sample rate must be non-zero")]
+    ZeroSampleRate,
+}

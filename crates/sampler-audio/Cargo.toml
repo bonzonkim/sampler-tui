@@ -6,5 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+cpal.workspace = true
+rtrb.workspace = true
+rubato.workspace = true
 sampler-core = { path = "../sampler-core" }
+symphonia.workspace = true
+thiserror.workspace = true
 
+[dev-dependencies]
+hound = "3.5.1"

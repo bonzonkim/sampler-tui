@@ -8,7 +8,10 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+cpal = "0.18.1"
+rtrb = "0.3.4"
+rubato = "4.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
+symphonia = { version = "0.6.0", default-features = false, features = ["wav", "aiff", "flac", "mp3", "pcm"] }
 thiserror = "2.0.19"
 toml = "1.1.4"
-

@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use sampler_audio::SampleBuffer;
+use sampler_audio::{SampleBuffer, Telemetry};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{BankId, PadId, PadSettings};
 
@@ -71,6 +71,7 @@ pub struct App {
     selected_pad: usize,
     pads: [PadView; PAD_VIEW_COUNT],
     audio: Option<Box<dyn AudioPort>>,
+    audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
     overlay: Option<Overlay>,
     palette: LineEditor,
@@ -82,6 +83,9 @@ pub struct App {
     keyboard_capabilities: KeyboardCapabilities,
     status: String,
     audio_unavailable_message: Option<String>,
+    telemetry: Telemetry,
+    meter_left: f32,
+    meter_right: f32,
     should_quit: bool,
 }
 
@@ -97,6 +101,9 @@ impl App {
 
     fn new(audio: Option<Box<dyn AudioPort>>, audio_error: Option<String>) -> Self {
         let overlay = audio_error.clone().map(Overlay::DeviceError);
+        let audio_format = audio
+            .as_ref()
+            .map(|audio| (audio.sample_rate(), audio.channels()));
         let current_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from(std::path::MAIN_SEPARATOR_STR));
         Self {
@@ -104,6 +111,7 @@ impl App {
             selected_pad: 0,
             pads: array::from_fn(|_| PadView::default()),
             audio,
+            audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
             overlay,
             palette: LineEditor::default(),
@@ -115,6 +123,18 @@ impl App {
             keyboard_capabilities: KeyboardCapabilities::default(),
             status: audio_error.clone().unwrap_or_default(),
             audio_unavailable_message: audio_error,
+            telemetry: Telemetry {
+                rendered_frame: 0,
+                last_triggered_frame: None,
+                peak_left: 0.0,
+                peak_right: 0.0,
+                active_voices: 0,
+                late_commands: 0,
+                invalid_commands: 0,
+                command_overflows: 0,
+            },
+            meter_left: 0.0,
+            meter_right: 0.0,
             should_quit: false,
         }
     }
@@ -174,6 +194,45 @@ impl App {
 
     pub fn pads(&self) -> &[PadView; PAD_VIEW_COUNT] {
         &self.pads
+    }
+
+    pub fn audio_format(&self) -> Option<(u32, u16)> {
+        self.audio_format
+    }
+
+    pub fn is_pad_held(&self, index: usize) -> bool {
+        let Some(held) = self.held_pad_by_key.get(index).copied().flatten() else {
+            return false;
+        };
+        held.bank() == self.active_bank && usize::from(held.index()) == index
+    }
+
+    pub fn release_events_available(&self) -> bool {
+        self.keyboard_capabilities.release_events
+    }
+
+    pub fn telemetry(&self) -> Telemetry {
+        self.telemetry
+    }
+
+    pub fn meter_levels(&self) -> (f32, f32) {
+        (self.meter_left, self.meter_right)
+    }
+
+    pub fn tick(&mut self) {
+        const METER_DECAY: f32 = 0.85;
+
+        let next = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.latest_telemetry());
+        self.meter_left = sanitize_peak(self.meter_left * METER_DECAY);
+        self.meter_right = sanitize_peak(self.meter_right * METER_DECAY);
+        if let Some(telemetry) = next {
+            self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
+            self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
+            self.telemetry = telemetry;
+        }
     }
 
     pub fn pad(&self, pad: PadId) -> &PadView {
@@ -707,6 +766,14 @@ fn resolve_picker_directory(current_dir: &Path, directory: PathBuf) -> PathBuf {
         }
     }
     normalized
+}
+
+fn sanitize_peak(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn pad_offset(pad: PadId) -> usize {

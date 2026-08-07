@@ -4,6 +4,7 @@ pub mod file_picker;
 pub mod input;
 pub mod loader;
 pub mod palette;
+pub mod ui;
 
 pub use app::{
     App, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView, PreviewColumn,

@@ -1,4 +1,5 @@
 use std::array;
+use std::f32::consts::PI;
 use std::sync::Arc;
 
 use rtrb::PushError;
@@ -8,7 +9,7 @@ use sampler_core::{
 
 use crate::{
     AudioCommand, CriticalEvent, EngineError, EnginePorts, SAMPLE_SLOT_COUNT, SampleBuffer,
-    SampleSlot,
+    SampleSlot, Telemetry,
 };
 
 const VOICE_COUNT: usize = 32;
@@ -17,6 +18,7 @@ const MAX_COMMANDS_PER_RENDER: usize = 64;
 const PAD_COUNT: usize = 160;
 const PADS_PER_BANK: usize = 16;
 const ATTACK_FRAMES: u8 = 32;
+const RELEASE_FRAMES: u8 = 64;
 
 struct SampleEntry {
     buffer: Option<Arc<SampleBuffer>>,
@@ -33,18 +35,44 @@ struct PadBinding {
 #[derive(Clone, Copy)]
 struct Envelope {
     attack_frame: u8,
+    release_frame: Option<u8>,
+    release_start_gain: f32,
 }
 
 impl Envelope {
     const fn attack() -> Self {
-        Self { attack_frame: 0 }
+        Self {
+            attack_frame: 0,
+            release_frame: None,
+            release_start_gain: 0.0,
+        }
     }
 
-    fn next_gain(&mut self) -> f32 {
+    fn begin_release(&mut self) {
+        if self.release_frame.is_none() {
+            self.release_start_gain = f32::from(self.attack_frame) / f32::from(ATTACK_FRAMES);
+            self.release_frame = Some(0);
+        }
+    }
+
+    fn next_gain(&mut self) -> (f32, bool) {
+        if let Some(release_frame) = self.release_frame {
+            let release_frame = release_frame.saturating_add(1).min(RELEASE_FRAMES);
+            self.release_frame = Some(release_frame);
+            return (
+                self.release_start_gain * f32::from(RELEASE_FRAMES - release_frame)
+                    / f32::from(RELEASE_FRAMES),
+                release_frame == RELEASE_FRAMES,
+            );
+        }
+
         if self.attack_frame < ATTACK_FRAMES {
             self.attack_frame += 1;
         }
-        f32::from(self.attack_frame) / f32::from(ATTACK_FRAMES)
+        (
+            f32::from(self.attack_frame) / f32::from(ATTACK_FRAMES),
+            false,
+        )
     }
 }
 
@@ -56,6 +84,7 @@ struct AudioVoice {
     advance: f64,
     pad: PadId,
     mode: PlaybackMode,
+    choke_group: Option<sampler_core::ChokeGroup>,
     left_gain: f32,
     right_gain: f32,
     envelope: Envelope,
@@ -95,6 +124,9 @@ pub struct AudioEngine {
     rendered_frame: Frame,
     late_commands: u64,
     invalid_commands: u64,
+    telemetry_peak_left: f32,
+    telemetry_peak_right: f32,
+    next_telemetry_frame: Frame,
 }
 
 impl AudioEngine {
@@ -103,6 +135,7 @@ impl AudioEngine {
             return Err(EngineError::ZeroSampleRate);
         }
 
+        let telemetry_interval = telemetry_interval(sample_rate);
         Ok(Self {
             sample_rate,
             ports,
@@ -123,6 +156,9 @@ impl AudioEngine {
             rendered_frame: 0,
             late_commands: 0,
             invalid_commands: 0,
+            telemetry_peak_left: 0.0,
+            telemetry_peak_right: 0.0,
+            next_telemetry_frame: telemetry_interval,
         })
     }
 
@@ -151,9 +187,15 @@ impl AudioEngine {
 
         for _ in 0..frame_count {
             self.execute_due_actions();
-            write_frame(self.render_frame());
+            let frame = self.render_frame();
+            self.telemetry_peak_left = self.telemetry_peak_left.max(frame[0].abs());
+            self.telemetry_peak_right = self.telemetry_peak_right.max(frame[1].abs());
+            write_frame(frame);
             self.rendered_frame = self.rendered_frame.saturating_add(1);
+            self.emit_telemetry_if_due();
         }
+
+        self.retire_unused_samples();
     }
 
     pub fn rendered_frame(&self) -> Frame {
@@ -178,6 +220,15 @@ impl AudioEngine {
 
     pub fn queued_commands(&self) -> usize {
         self.ports.commands.slots()
+    }
+
+    #[cfg(test)]
+    fn voices_for_pad(&self, pad: PadId) -> usize {
+        self.voices
+            .iter()
+            .flatten()
+            .filter(|voice| voice.pad == pad)
+            .count()
     }
 
     fn drain_commands(&mut self) {
@@ -353,6 +404,8 @@ impl AudioEngine {
             ScheduledAction::Release { pad, .. } => {
                 if self.pad_binding(pad).slot.is_none() {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
+                } else {
+                    self.release_gate_voices(pad);
                 }
             }
         }
@@ -373,10 +426,18 @@ impl AudioEngine {
             return;
         }
 
+        if let Some(group) = binding.settings.choke_group {
+            self.release_choke_group(group);
+        }
+
+        let gain = 10.0_f32.powf(binding.settings.gain_db / 20.0) * velocity;
+        let pan_angle = (binding.settings.pan + 1.0) * PI / 4.0;
+
+        let advance = 2.0_f64.powf(f64::from(binding.settings.pitch_semitones) / 12.0_f64);
         let allocation = self.allocator.trigger(VoiceRequest::new(
             pad,
             self.rendered_frame,
-            velocity,
+            gain,
             binding.settings.choke_group,
             false,
         ));
@@ -384,27 +445,42 @@ impl AudioEngine {
             id: allocation.voice.id,
             slot,
             position: 0.0,
-            advance: 1.0,
+            advance,
             pad,
             mode: binding.settings.mode,
-            left_gain: velocity,
-            right_gain: velocity,
+            choke_group: binding.settings.choke_group,
+            left_gain: gain * pan_angle.cos(),
+            right_gain: gain * pan_angle.sin(),
             envelope: Envelope::attack(),
         });
     }
 
     fn stop_pad(&mut self, pad: PadId) {
-        for slot in 0..VOICE_COUNT {
-            if self.voices[slot].is_some_and(|voice| voice.pad == pad) {
-                self.stop_voice(slot);
+        for voice in self.voices.iter_mut().flatten() {
+            if voice.pad == pad {
+                voice.envelope.begin_release();
             }
         }
     }
 
     fn stop_all(&mut self) {
-        for slot in 0..VOICE_COUNT {
-            if self.voices[slot].is_some() {
-                self.stop_voice(slot);
+        for voice in self.voices.iter_mut().flatten() {
+            voice.envelope.begin_release();
+        }
+    }
+
+    fn release_gate_voices(&mut self, pad: PadId) {
+        for voice in self.voices.iter_mut().flatten() {
+            if voice.pad == pad && voice.mode == PlaybackMode::Gate {
+                voice.envelope.begin_release();
+            }
+        }
+    }
+
+    fn release_choke_group(&mut self, group: sampler_core::ChokeGroup) {
+        for voice in self.voices.iter_mut().flatten() {
+            if voice.choke_group == Some(group) {
+                voice.envelope.begin_release();
             }
         }
     }
@@ -425,33 +501,101 @@ impl AudioEngine {
             let sample = self.samples[voice.slot.index()]
                 .buffer
                 .as_ref()
-                .and_then(|buffer| buffer.frame_linear(voice.position));
+                .and_then(|buffer| voice_sample(buffer, voice.position, voice.mode));
             let Some(sample) = sample else {
                 self.invalid_commands = self.invalid_commands.saturating_add(1);
                 self.stop_voice(slot);
                 continue;
             };
 
-            let envelope_gain = voice.envelope.next_gain();
-            output[0] += sample[0] * voice.left_gain * envelope_gain;
-            output[1] += sample[1] * voice.right_gain * envelope_gain;
+            let (envelope_gain, release_finished) = voice.envelope.next_gain();
+            let left = finite_or_zero(
+                sample[0] * voice.left_gain * envelope_gain,
+                &mut self.invalid_commands,
+            );
+            let right = finite_or_zero(
+                sample[1] * voice.right_gain * envelope_gain,
+                &mut self.invalid_commands,
+            );
+            output[0] = finite_or_zero(output[0] + left, &mut self.invalid_commands);
+            output[1] = finite_or_zero(output[1] + right, &mut self.invalid_commands);
             voice.position += voice.advance;
 
             let sample_frames = self.samples[voice.slot.index()]
                 .buffer
                 .as_ref()
                 .map_or(0, |buffer| buffer.frames());
-            let finished = matches!(
-                voice.mode,
-                PlaybackMode::OneShot | PlaybackMode::Gate | PlaybackMode::Loop
-            ) && voice.position >= sample_frames as f64;
+            if voice.mode == PlaybackMode::Loop && voice.position >= sample_frames as f64 {
+                voice.position %= sample_frames as f64;
+            }
+            let finished = release_finished
+                || (voice.mode != PlaybackMode::Loop && voice.position >= sample_frames as f64);
             if finished {
                 self.stop_voice(slot);
             } else {
                 self.voices[slot] = Some(voice);
             }
         }
-        output
+        [
+            soft_limit(output[0], &mut self.invalid_commands),
+            soft_limit(output[1], &mut self.invalid_commands),
+        ]
+    }
+
+    fn emit_telemetry_if_due(&mut self) {
+        if self.rendered_frame < self.next_telemetry_frame {
+            return;
+        }
+
+        let telemetry = Telemetry {
+            rendered_frame: self.rendered_frame,
+            peak_left: self.telemetry_peak_left,
+            peak_right: self.telemetry_peak_right,
+            active_voices: self.allocator.active_voices(),
+            late_commands: self.late_commands,
+            invalid_commands: self.invalid_commands,
+        };
+        let _ = self.ports.telemetry.push(telemetry);
+        self.telemetry_peak_left = 0.0;
+        self.telemetry_peak_right = 0.0;
+        self.next_telemetry_frame = self
+            .next_telemetry_frame
+            .saturating_add(telemetry_interval(self.sample_rate));
+    }
+
+    fn retire_unused_samples(&mut self) {
+        for index in 0..SAMPLE_SLOT_COUNT {
+            let entry = &self.samples[index];
+            if !entry.retiring
+                || entry.pad_references != 0
+                || self
+                    .voices
+                    .iter()
+                    .flatten()
+                    .any(|voice| voice.slot.index() == index)
+                || self.ports.retirements.slots() == 0
+            {
+                continue;
+            }
+
+            let Some(buffer) = self.samples[index].buffer.take() else {
+                self.samples[index].retiring = false;
+                self.invalid_commands = self.invalid_commands.saturating_add(1);
+                continue;
+            };
+            let Ok(slot) = SampleSlot::new(index) else {
+                self.samples[index].buffer = Some(buffer);
+                self.invalid_commands = self.invalid_commands.saturating_add(1);
+                continue;
+            };
+            let event = CriticalEvent::RetiredSample { slot, buffer };
+            match self.ports.retirements.push(event) {
+                Ok(()) => self.samples[index].retiring = false,
+                Err(PushError::Full(CriticalEvent::RetiredSample { buffer, .. })) => {
+                    self.samples[index].buffer = Some(buffer);
+                }
+            }
+        }
     }
 
     fn pad_binding(&self, pad: PadId) -> &PadBinding {
@@ -461,6 +605,44 @@ impl AudioEngine {
     fn pad_binding_mut(&mut self, pad: PadId) -> &mut PadBinding {
         &mut self.pads[pad_index(pad)]
     }
+}
+
+fn finite_or_zero(value: f32, invalid_commands: &mut u64) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        *invalid_commands = invalid_commands.saturating_add(1);
+        0.0
+    }
+}
+
+fn soft_limit(value: f32, invalid_commands: &mut u64) -> f32 {
+    let value = finite_or_zero(value, invalid_commands);
+    finite_or_zero(value / (1.0 + value.abs()), invalid_commands)
+}
+
+fn voice_sample(buffer: &SampleBuffer, position: f64, mode: PlaybackMode) -> Option<[f32; 2]> {
+    if mode != PlaybackMode::Loop {
+        return buffer.frame_linear(position);
+    }
+    if !position.is_finite() || position.is_sign_negative() || position >= buffer.frames() as f64 {
+        return None;
+    }
+
+    let frame = position as usize;
+    let next_frame = (frame + 1) % buffer.frames();
+    let fraction = position - frame as f64;
+    let data = buffer.data();
+    let current = [data[frame * 2], data[frame * 2 + 1]];
+    let next = [data[next_frame * 2], data[next_frame * 2 + 1]];
+    Some([
+        (f64::from(current[0]) * (1.0 - fraction) + f64::from(next[0]) * fraction) as f32,
+        (f64::from(current[1]) * (1.0 - fraction) + f64::from(next[1]) * fraction) as f32,
+    ])
+}
+
+fn telemetry_interval(sample_rate: u32) -> Frame {
+    Frame::from(sample_rate.div_ceil(30).max(1))
 }
 
 fn pad_index(pad: PadId) -> usize {
@@ -478,10 +660,14 @@ fn settings_are_valid(settings: PadSettings) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
 
     use super::*;
-    use crate::{AudioController, PadId, PadSettings, SampleBuffer, audio_channels};
+    use crate::{
+        AudioController, PadId, PadSettings, SampleBuffer, audio_channels,
+        command::audio_channels_with_capacities,
+    };
+    use sampler_core::{BankId, ChokeGroup};
 
     fn harness() -> (AudioController, AudioEngine) {
         let (controller, ports) = audio_channels();
@@ -533,5 +719,352 @@ mod tests {
         }
         assert_eq!(engine.pending_actions(), 128);
         assert_eq!(engine.queued_commands(), 2);
+    }
+
+    #[test]
+    fn gate_release_reaches_silence_after_64_frames() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        controller.release(PadId::first(), 32).unwrap();
+        let mut output = vec![0.0; 2 * 128];
+        engine.render_stereo(&mut output);
+        assert_eq!(&output[2 * 96..], &[0.0; 64]);
+        assert_eq!(engine.active_voices(), 0);
+    }
+
+    #[test]
+    fn release_during_attack_does_not_jump_above_the_current_level() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Gate, 0.0, -1.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        controller.release(PadId::first(), 8).unwrap();
+        let mut output = [0.0; 2 * 9];
+        engine.render_stereo(&mut output);
+        assert!(output[16] <= output[14]);
+    }
+
+    #[test]
+    fn loop_wraps_without_finishing_until_stopped() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(2, 0.5), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut output = [0.0; 20];
+        engine.render_stereo(&mut output);
+        assert_eq!(engine.active_voices(), 1);
+        assert!(output.iter().skip(4).any(|value| *value != 0.0));
+    }
+
+    #[test]
+    fn fractional_loop_pitch_interpolates_from_the_last_frame_to_the_first() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, -12.0, None).unwrap();
+        let ramp = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0, 1.0, 1.0]).unwrap());
+        controller.install(PadId::first(), ramp, settings).unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut output = [0.0; 2 * 36];
+        engine.render_stereo(&mut output);
+        assert!((output[2 * 33] - output[2 * 35]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn octave_up_advances_two_source_frames() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::OneShot, 0.0, -1.0, 12.0, None).unwrap();
+        let ramp = Arc::new(
+            SampleBuffer::new(
+                48_000,
+                vec![0.0, 0.0, 0.2, 0.2, 0.4, 0.4, 0.6, 0.6, 0.8, 0.8, 1.0, 1.0],
+            )
+            .unwrap(),
+        );
+        controller.install(PadId::first(), ramp, settings).unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut output = [0.0; 6];
+        engine.render_stereo(&mut output);
+        assert!(output[2] > output[0]);
+        assert!(output[4] > output[2]);
+    }
+
+    #[test]
+    fn hard_left_equal_power_pan_silences_right_channel() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(8, 1.0), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut output = [0.0; 16];
+        engine.render_stereo(&mut output);
+        assert!(output.chunks_exact(2).all(|frame| frame[1] == 0.0));
+    }
+
+    #[test]
+    fn triggering_a_choke_group_releases_the_prior_pad() {
+        let (mut controller, mut engine) = harness();
+        let group = Some(ChokeGroup::new(1).unwrap());
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, group).unwrap();
+        let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .unwrap();
+        controller
+            .install(second, constant_sample(256, 0.5), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        controller.trigger(second, 32, 1.0).unwrap();
+        let mut output = [0.0; 2 * 128];
+        engine.render_stereo(&mut output);
+        assert_eq!(engine.voices_for_pad(PadId::first()), 0);
+        assert_eq!(engine.voices_for_pad(second), 1);
+    }
+
+    #[test]
+    fn thirty_three_triggers_leave_exactly_thirty_two_voices() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .unwrap();
+        for frame in 0..33 {
+            controller
+                .trigger(PadId::first(), frame, 0.5 + frame as f32 / 100.0)
+                .unwrap();
+        }
+        let mut output = [0.0; 2 * 64];
+        engine.render_stereo(&mut output);
+        assert_eq!(engine.active_voices(), 32);
+    }
+
+    #[test]
+    fn stealing_uses_velocity_times_pad_gain_as_the_audible_level() {
+        let (mut controller, mut engine) = harness();
+        let bank = BankId::new(0).unwrap();
+        let quiet_by_gain = PadId::new(bank, 0).unwrap();
+        let lower_velocity = PadId::new(bank, 1).unwrap();
+        let filler = PadId::new(bank, 2).unwrap();
+        let newcomer = PadId::new(bank, 3).unwrap();
+        let quiet_settings = PadSettings::new(PlaybackMode::Loop, -60.0, 0.0, 0.0, None).unwrap();
+        let normal_settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+
+        for (pad, settings) in [
+            (quiet_by_gain, quiet_settings),
+            (lower_velocity, normal_settings),
+            (filler, normal_settings),
+            (newcomer, normal_settings),
+        ] {
+            controller
+                .install(pad, constant_sample(8, 0.25), settings)
+                .unwrap();
+        }
+        controller.trigger(quiet_by_gain, 0, 1.0).unwrap();
+        controller.trigger(lower_velocity, 0, 0.2).unwrap();
+        for _ in 0..30 {
+            controller.trigger(filler, 0, 1.0).unwrap();
+        }
+        controller.trigger(newcomer, 0, 1.0).unwrap();
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(engine.voices_for_pad(quiet_by_gain), 0);
+        assert_eq!(engine.voices_for_pad(lower_velocity), 1);
+        assert_eq!(engine.voices_for_pad(newcomer), 1);
+    }
+
+    #[test]
+    fn retired_buffer_is_moved_only_after_last_voice_finishes() {
+        let (mut controller, mut engine) = harness();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(128, 1.0),
+                PadSettings::default(),
+            )
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut started = [0.0; 64];
+        engine.render_stereo(&mut started);
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(2, 0.5),
+                PadSettings::default(),
+            )
+            .unwrap();
+        let mut first = [0.0; 64];
+        engine.render_stereo(&mut first);
+        assert_eq!(controller.reclaim_retired(), 0);
+        let mut rest = [0.0; 256];
+        engine.render_stereo(&mut rest);
+        assert_eq!(controller.reclaim_retired(), 1);
+    }
+
+    #[test]
+    fn negative_pad_gain_reduces_the_rendered_level() {
+        let render_peak = |gain_db| {
+            let (mut controller, mut engine) = harness();
+            let settings = PadSettings::new(PlaybackMode::Loop, gain_db, -1.0, 0.0, None).unwrap();
+            controller
+                .install(PadId::first(), constant_sample(64, 0.1), settings)
+                .unwrap();
+            controller.trigger(PadId::first(), 0, 1.0).unwrap();
+            let mut output = [0.0; 64];
+            engine.render_stereo(&mut output);
+            output[62]
+        };
+
+        assert!(render_peak(-6.0) < render_peak(0.0));
+    }
+
+    #[test]
+    fn one_shot_ignores_a_matching_release() {
+        let (mut controller, mut engine) = harness();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(128, 1.0),
+                PadSettings::default(),
+            )
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        controller.release(PadId::first(), 0).unwrap();
+        let mut output = [0.0; 4];
+        engine.render_stereo(&mut output);
+        assert_eq!(engine.active_voices(), 1);
+        assert!(output.iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn stop_pad_releases_instead_of_cutting_the_voice() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut attack = [0.0; 64];
+        engine.render_stereo(&mut attack);
+        controller.stop_pad(PadId::first()).unwrap();
+        let mut release = [0.0; 2 * 63];
+        engine.render_stereo(&mut release);
+        assert_eq!(engine.active_voices(), 1);
+        let mut final_frame = [1.0; 2];
+        engine.render_stereo(&mut final_frame);
+        assert_eq!(final_frame, [0.0; 2]);
+        assert_eq!(engine.active_voices(), 0);
+    }
+
+    #[test]
+    fn telemetry_is_emitted_at_thirty_hertz_with_limited_peaks() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(8, 1.0), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        engine.render_frames(1_599, |_| {});
+        assert_eq!(controller.latest_telemetry(), None);
+        engine.render_frames(1, |_| {});
+        let telemetry = controller.latest_telemetry().unwrap();
+        assert_eq!(telemetry.rendered_frame, 1_600);
+        assert!(telemetry.peak_left > 0.0 && telemetry.peak_left < 1.0);
+        assert_eq!(telemetry.peak_left, telemetry.peak_right);
+        assert_eq!(telemetry.active_voices, 1);
+        engine.render_frames(1_599, |_| {});
+        assert_eq!(controller.latest_telemetry(), None);
+    }
+
+    #[test]
+    fn telemetry_never_exceeds_thirty_events_per_second() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(44_101, ports).unwrap();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        let sample = Arc::new(SampleBuffer::new(44_101, vec![0.25; 16]).unwrap());
+        controller
+            .install(PadId::first(), sample, settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+
+        engine.render_frames(1_470, |_| {});
+        assert_eq!(controller.latest_telemetry(), None);
+        engine.render_frames(1, |_| {});
+        assert_eq!(controller.latest_telemetry().unwrap().rendered_frame, 1_471);
+    }
+
+    #[test]
+    fn full_telemetry_queue_drops_the_new_event_without_retaining_it() {
+        let (mut controller, ports) = audio_channels_with_capacities(8, 1, 1);
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(8, 0.25), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+
+        engine.render_frames(1_600, |_| {});
+        engine.render_frames(1_600, |_| {});
+        assert_eq!(controller.latest_telemetry().unwrap().rendered_frame, 1_600);
+        engine.render_frames(1_600, |_| {});
+        assert_eq!(controller.latest_telemetry().unwrap().rendered_frame, 4_800);
+    }
+
+    #[test]
+    fn non_finite_mix_intermediates_are_silenced_and_counted() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 6.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(8, f32::MAX), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        let mut output = [0.0; 2 * 64];
+        engine.render_stereo(&mut output);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(engine.invalid_commands() > 0);
+    }
+
+    #[test]
+    fn full_retirement_queue_keeps_the_buffer_for_a_later_callback() {
+        let (mut controller, ports) = audio_channels_with_capacities(16, 1, 1);
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let mut retired_weak: [Option<Weak<SampleBuffer>>; 2] = [None, None];
+
+        for (index, weak) in retired_weak.iter_mut().enumerate() {
+            let sample = constant_sample(8, 0.25 + index as f32 * 0.25);
+            *weak = Some(Arc::downgrade(&sample));
+            controller
+                .install(PadId::first(), sample, PadSettings::default())
+                .unwrap();
+            engine.render_stereo(&mut []);
+        }
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(8, 0.75),
+                PadSettings::default(),
+            )
+            .unwrap();
+        engine.render_stereo(&mut []);
+
+        assert!(
+            retired_weak
+                .iter()
+                .all(|weak| weak.as_ref().unwrap().upgrade().is_some())
+        );
+        assert_eq!(controller.reclaim_retired(), 1);
+        assert!(retired_weak[0].as_ref().unwrap().upgrade().is_none());
+        assert!(retired_weak[1].as_ref().unwrap().upgrade().is_some());
+
+        engine.render_stereo(&mut []);
+        assert_eq!(controller.reclaim_retired(), 1);
+        assert!(retired_weak[1].as_ref().unwrap().upgrade().is_none());
     }
 }

@@ -174,7 +174,7 @@ pub fn audio_channels() -> (AudioController, EnginePorts) {
 }
 
 #[cfg(test)]
-fn audio_channels_with_capacities(
+pub(crate) fn audio_channels_with_capacities(
     command_capacity: usize,
     retirement_capacity: usize,
     telemetry_capacity: usize,

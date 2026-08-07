@@ -41,6 +41,7 @@ pub struct PadView {
     pub state: PadLoadState,
     pub sample: Option<Arc<SampleBuffer>>,
     pub preview: [PreviewColumn; PREVIEW_COLUMNS],
+    pub active: bool,
 }
 
 impl Default for PadView {
@@ -53,6 +54,7 @@ impl Default for PadView {
             state: PadLoadState::Empty,
             sample: None,
             preview: [PreviewColumn::default(); PREVIEW_COLUMNS],
+            active: false,
         }
     }
 }
@@ -124,6 +126,7 @@ impl App {
             status: audio_error.clone().unwrap_or_default(),
             audio_unavailable_message: audio_error,
             telemetry: Telemetry {
+                active_pads: [0; 3],
                 rendered_frame: 0,
                 last_triggered_frame: None,
                 peak_left: 0.0,
@@ -232,6 +235,13 @@ impl App {
             self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
             self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
             self.telemetry = telemetry;
+            for bank in 0..BANK_COUNT {
+                let bank = BankId::new(bank).expect("bounded bank is valid");
+                for index in 0..PADS_PER_BANK {
+                    let pad = PadId::new(bank, index).expect("bounded pad is valid");
+                    self.pads[pad_offset(pad)].active = telemetry.is_pad_active(pad);
+                }
+            }
         }
     }
 
@@ -363,7 +373,7 @@ impl App {
             else {
                 unreachable!()
             };
-            if path != self.file_picker.directory() {
+            if self.file_picker.pending_directory() != Some(path.as_path()) {
                 return false;
             }
             let error = result.as_ref().err().cloned();
@@ -621,7 +631,11 @@ impl App {
     }
 
     fn open_picker_parent(&mut self) {
-        let Some(parent) = self.file_picker.directory().parent().map(ToOwned::to_owned) else {
+        let directory = self
+            .file_picker
+            .pending_directory()
+            .unwrap_or_else(|| self.file_picker.directory());
+        let Some(parent) = directory.parent().map(ToOwned::to_owned) else {
             self.status = "already at filesystem root".to_owned();
             return;
         };

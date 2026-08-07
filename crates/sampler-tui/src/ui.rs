@@ -117,10 +117,9 @@ fn render_sample(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
-    let pad_width = if area.width >= 108 { 65 } else { 49 };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(pad_width), Constraint::Min(1)])
+        .constraints([Constraint::Length(49), Constraint::Min(1)])
         .split(area);
     render_pads(frame, columns[0], app);
     render_performance(frame, columns[1], app);
@@ -197,7 +196,7 @@ fn pad_cell(key: char, pad: &PadView, selected: bool, held: bool, width: usize) 
         PadLoadState::Empty => '·',
         PadLoadState::WaitingForDevice => '◇',
         PadLoadState::Loading => '…',
-        PadLoadState::Ready if held => '▶',
+        PadLoadState::Ready if pad.active => '▶',
         PadLoadState::Ready => '●',
         PadLoadState::Error(_) => '×',
     };
@@ -371,9 +370,13 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     if inner.is_empty() {
         return;
     }
-    let input = format!(":{}", app.palette_text());
+    let input = palette_window(
+        app.palette_text(),
+        app.palette_cursor(),
+        usize::from(inner.width),
+    );
     frame.render_widget(
-        Paragraph::new(truncate(&input, usize::from(inner.width))),
+        Paragraph::new(input),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     if let Some(error) = app.palette_error()
@@ -387,6 +390,57 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn palette_window(text: &str, cursor: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let cursor = cursor.min(text.len());
+    let (before, after) = text.split_at(cursor);
+    let before = format!(":{before}");
+    let full = format!("{before}▏{after}");
+    if display_width(&full) <= width {
+        return full;
+    }
+
+    let context_width = width.saturating_sub(1);
+    let mut right = prefix_with_width(after, context_width / 2);
+    let left = suffix_with_width(&before, context_width.saturating_sub(display_width(&right)));
+    let remaining = context_width
+        .saturating_sub(display_width(&left))
+        .saturating_sub(display_width(&right));
+    if remaining > 0 {
+        right = prefix_with_width(after, display_width(&right).saturating_add(remaining));
+    }
+    format!("{left}▏{right}")
+}
+
+fn prefix_with_width(value: &str, width: usize) -> String {
+    let mut result = String::new();
+    for character in value.chars() {
+        let mut candidate = result.clone();
+        candidate.push(character);
+        if display_width(&candidate) > width {
+            break;
+        }
+        result.push(character);
+    }
+    result
+}
+
+fn suffix_with_width(value: &str, width: usize) -> String {
+    let mut result = String::new();
+    for character in value.chars().rev() {
+        let mut candidate = String::with_capacity(character.len_utf8() + result.len());
+        candidate.push(character);
+        candidate.push_str(&result);
+        if display_width(&candidate) > width {
+            break;
+        }
+        result = candidate;
+    }
+    result
+}
+
 fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(area, 72, 19);
     frame.render_widget(Clear, popup);
@@ -398,21 +452,42 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
     let picker = app.file_picker();
     let directory = picker.directory().to_string_lossy();
+    let header = if let Some(pending) = picker.pending_directory() {
+        format!(
+            "Loading {}… · Viewing {directory}",
+            pending.to_string_lossy(),
+        )
+    } else if let (Some(failed), Some(error)) = (picker.failed_directory(), picker.error()) {
+        format!(
+            "× {}: {error} · Viewing {directory}",
+            failed.to_string_lossy(),
+        )
+    } else {
+        format!("Viewing {directory}")
+    };
     frame.render_widget(
-        Paragraph::new(truncate(&directory, usize::from(inner.width))),
+        Paragraph::new(truncate(&header, usize::from(inner.width))),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     let list_height = inner.height.saturating_sub(2);
+    let visible_rows = usize::from(list_height);
+    let offset = picker
+        .cursor()
+        .saturating_add(1)
+        .saturating_sub(visible_rows);
     let items: Vec<ListItem> = if picker.entries().is_empty() {
-        vec![ListItem::new(match picker.error() {
-            Some(error) => format!("× {error}"),
-            None => "… scanning / no matching audio files".to_owned(),
+        vec![ListItem::new(if picker.is_scanning() {
+            "… loading (no committed entries)".to_owned()
+        } else {
+            "(empty directory)".to_owned()
         })]
     } else {
         picker
             .entries()
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(visible_rows)
             .map(|(index, entry)| {
                 let select = if index == picker.cursor() { '>' } else { ' ' };
                 let kind = if entry.is_directory() { '/' } else { ' ' };
@@ -546,6 +621,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::{Modifier, Style};
@@ -555,7 +631,7 @@ mod tests {
     use crate::audio::AudioPort;
     use crate::input::InputAction;
     use crate::loader::{LoadedSample, WorkerResult};
-    use crate::{App, Overlay, PREVIEW_COLUMNS, PreviewColumn};
+    use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
 
     use super::render;
 
@@ -662,7 +738,18 @@ mod tests {
     }
 
     fn populated_app() -> App {
-        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_stop_error("Overflow 3")));
+        populated_app_with_audio(FakeAudio::ready().with_stop_error("Overflow 3"))
+    }
+
+    fn populated_app_with_audio(audio: FakeAudio) -> App {
+        let mut app = loaded_states_app(audio);
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::StopAll);
+        app
+    }
+
+    fn loaded_states_app(audio: FakeAudio) -> App {
+        let mut app = App::with_audio(Box::new(audio));
         let kick = pad(0);
         let path = std::path::PathBuf::from("/samples/KICK.wav");
         let request = app.begin_load(kick, path.clone()).unwrap();
@@ -707,8 +794,6 @@ mod tests {
             path: error_path,
             result: Err("decode failed".to_owned()),
         });
-        app.apply(InputAction::PadPress(0));
-        app.apply(InputAction::StopAll);
         app
     }
 
@@ -733,6 +818,46 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         terminal.backend().buffer()[(x, y)].style()
+    }
+
+    fn render_symbol(width: u16, height: u16, app: &App, x: u16, y: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal.backend().buffer()[(x, y)].symbol().to_owned()
+    }
+
+    fn complete_picker_scan(app: &mut App, count: usize) {
+        let requests = app.take_worker_requests();
+        let [
+            crate::WorkerRequest::ScanDirectory {
+                request_id, path, ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected one picker scan")
+        };
+        let entries = (0..count)
+            .map(|index| DirectoryEntry {
+                path: std::path::PathBuf::from("/samples").join(format!("sample-{index:02}.wav")),
+                kind: DirectoryEntryKind::File,
+            })
+            .collect();
+        assert!(app.apply_worker_result(WorkerResult::Scanned {
+            request_id: *request_id,
+            path: path.clone(),
+            result: Ok(entries),
+        }));
+    }
+
+    fn picker_at(cursor: usize) -> App {
+        let mut app = ready_app();
+        app.open_picker_at("/samples");
+        complete_picker_scan(&mut app, 20);
+        for _ in 0..cursor {
+            app.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app
     }
 
     #[test]
@@ -791,9 +916,43 @@ mod tests {
     }
 
     #[test]
+    fn overlay_rects_are_exactly_centered_and_clear_base_cells() {
+        let mut help = ready_app();
+        help.open_help();
+        let mut palette = ready_app();
+        palette.open_palette();
+        let mut picker = ready_app();
+        picker.open_picker_at("/samples");
+        let mut confirm = ready_app();
+        confirm.open_quit_confirmation();
+        let failed = App::without_audio("device disconnected");
+
+        for (app, rect) in [
+            (help, (21, 7, 58, 15)),
+            (palette, (19, 12, 62, 5)),
+            (picker, (14, 5, 72, 19)),
+            (confirm, (29, 12, 42, 5)),
+            (failed, (19, 11, 62, 7)),
+        ] {
+            let (x, y, width, height) = rect;
+            assert_eq!(render_symbol(100, 30, &app, x, y), "┌");
+            assert_eq!(render_symbol(100, 30, &app, x + width - 1, y), "┐");
+            assert_eq!(render_symbol(100, 30, &app, x, y + height - 1), "└");
+            assert_eq!(
+                render_symbol(100, 30, &app, x + width - 1, y + height - 1),
+                "┘"
+            );
+        }
+
+        let mut palette = ready_app();
+        palette.open_palette();
+        assert_eq!(render_symbol(100, 30, &palette, 49, 14), " ");
+    }
+
+    #[test]
     fn pad_states_have_monochrome_text_markers() {
         let snapshot = render_lines(80, 24, &populated_app()).join("\n");
-        assert!(snapshot.contains("KICK▶!"), "held/active marker missing");
+        assert!(snapshot.contains("KICK●!"), "held marker missing");
         assert!(snapshot.contains("HAT…"), "loading marker missing");
         assert!(snapshot.contains("CLAP×"), "error marker missing");
         assert!(snapshot.contains(">[1"), "selected marker missing");
@@ -816,6 +975,7 @@ mod tests {
     #[test]
     fn tick_clamps_non_finite_meters_and_render_uses_cached_counters() {
         let telemetry = Telemetry {
+            active_pads: [0; 3],
             rendered_frame: 512,
             last_triggered_frame: Some(500),
             peak_left: f32::NAN,
@@ -853,6 +1013,43 @@ mod tests {
     }
 
     #[test]
+    fn active_and_held_are_independent_pad_states() {
+        let telemetry = Telemetry {
+            active_pads: [1, 0, 0],
+            rendered_frame: 64,
+            last_triggered_frame: Some(0),
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 1,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+        };
+        let mut active_only = loaded_states_app(FakeAudio::ready().with_telemetry(telemetry));
+        active_only.apply(InputAction::PadPress(0));
+        active_only.apply(InputAction::PadRelease(0));
+        active_only.tick();
+
+        assert!(active_only.pad(pad(0)).active);
+        assert!(!active_only.is_pad_held(0));
+        let active_snapshot = render_lines(80, 24, &active_only).join("\n");
+        assert!(active_snapshot.contains("KICK▶ "));
+
+        let held_snapshot = render_lines(80, 24, &populated_app()).join("\n");
+        assert!(held_snapshot.contains("KICK●!"));
+        assert!(!held_snapshot.contains("KICK▶!"));
+
+        let mut both = populated_app_with_audio(
+            FakeAudio::ready()
+                .with_stop_error("keep held")
+                .with_telemetry(telemetry),
+        );
+        both.tick();
+        assert!(both.is_pad_held(0));
+        assert!(render_lines(80, 24, &both).join("\n").contains("KICK▶!"));
+    }
+
+    #[test]
     fn render_reads_only_cached_app_view_state() {
         let reads = Rc::new(Cell::new(0));
         let app = App::with_audio(Box::new(
@@ -883,6 +1080,34 @@ mod tests {
     }
 
     #[test]
+    fn wider_terminals_never_shrink_the_performance_column() {
+        let app = ready_app();
+        let mut previous = 0usize;
+        let mut at_109 = 0;
+        for width in 80..=140 {
+            let row = &render_lines(width, 24, &app)[4];
+            let performance_x = row
+                .chars()
+                .enumerate()
+                .filter_map(|(index, character)| (character == '┌').then_some(index))
+                .nth(1)
+                .expect("performance block starts on row four");
+            let performance_width = usize::from(width).saturating_sub(performance_x + 1);
+            assert!(
+                performance_width >= previous,
+                "performance shrank at width {width}: {previous} -> {performance_width}"
+            );
+            if width == 109 {
+                at_109 = performance_width;
+            }
+            if width == 110 {
+                assert!(performance_width > at_109);
+            }
+            previous = performance_width;
+        }
+    }
+
+    #[test]
     fn truncation_is_utf8_safe_and_uses_terminal_display_width() {
         let fitted = super::fit("긴이름의샘플.wav", 8);
         assert_eq!(super::display_width(&fitted), 8);
@@ -892,5 +1117,91 @@ mod tests {
         picker.open_picker_at("/아주/긴/다중바이트/샘플/디렉터리/경로");
         let snapshot = render_lines(80, 24, &picker);
         assert!(snapshot.iter().any(|line| line.contains("LOAD SAMPLE")));
+    }
+
+    #[test]
+    fn palette_cursor_tracks_multibyte_middle_and_long_horizontal_windows() {
+        let mut unicode = ready_app();
+        unicode.open_palette();
+        unicode.apply_terminal_event(Event::Paste("가나다".to_owned()));
+        unicode.apply_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            super::palette_window(unicode.palette_text(), unicode.palette_cursor(), 60),
+            ":가나▏다"
+        );
+        let snapshot = render_lines(80, 24, &unicode).join("\n");
+        assert!(snapshot.contains('▏'));
+
+        let mut long = ready_app();
+        long.open_palette();
+        long.apply_terminal_event(Event::Paste("x".repeat(120)));
+        long.apply_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        for _ in 0..60 {
+            long.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        let snapshot = render_lines(80, 24, &long).join("\n");
+        assert!(snapshot.contains("x▏x"));
+        assert_eq!(snapshot.matches('▏').count(), 1);
+    }
+
+    #[test]
+    fn picker_viewport_always_contains_the_selected_entry() {
+        for cursor in [0, 14, 15, 19] {
+            let snapshot = render_lines(80, 24, &picker_at(cursor)).join("\n");
+            assert!(
+                snapshot.contains(&format!("> sample-{cursor:02}.wav")),
+                "cursor {cursor} was outside viewport"
+            );
+        }
+    }
+
+    #[test]
+    fn picker_distinguishes_loading_empty_and_failed_scans_with_old_entries() {
+        let mut initial_loading = ready_app();
+        initial_loading.open_picker_at("/initial-target");
+        let snapshot = render_lines(80, 24, &initial_loading).join("\n");
+        assert!(snapshot.contains("Loading /initial-target…"));
+        assert!(!snapshot.contains("(empty directory)"));
+
+        let mut loading = ready_app();
+        loading.open_picker_at("/samples");
+        complete_picker_scan(&mut loading, 2);
+        loading.open_picker_at("/slow-target");
+        let snapshot = render_lines(80, 24, &loading).join("\n");
+        assert!(snapshot.contains("sample-00.wav"));
+        assert!(snapshot.contains("Loading /slow-target…"));
+
+        let requests = loading.take_worker_requests();
+        let [
+            crate::WorkerRequest::ScanDirectory {
+                request_id, path, ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected pending picker scan")
+        };
+        assert!(loading.apply_worker_result(WorkerResult::Scanned {
+            request_id: *request_id,
+            path: path.clone(),
+            result: Err(
+                "permission denied because this diagnostic is intentionally very long".to_owned()
+            ),
+        }));
+        let snapshot = render_lines(80, 24, &loading).join("\n");
+        assert!(snapshot.contains("sample-00.wav"));
+        assert!(snapshot.contains("× /slow-target: permission denied"));
+        let error_line = snapshot
+            .lines()
+            .find(|line| line.contains("× /slow-target"))
+            .unwrap();
+        assert!(error_line.contains('…'));
+        assert!(!error_line.contains("intentionally very long"));
+
+        let mut empty = ready_app();
+        empty.open_picker_at("/empty");
+        complete_picker_scan(&mut empty, 0);
+        let snapshot = render_lines(80, 24, &empty).join("\n");
+        assert!(snapshot.contains("(empty directory)"));
+        assert!(!snapshot.contains("Loading"));
     }
 }

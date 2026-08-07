@@ -106,6 +106,28 @@ mod tests {
     }
 
     #[test]
+    fn active_pad_bits_cover_all_banks_without_aliasing() {
+        let first = PadId::first();
+        let last = PadId::new(sampler_core::BankId::new(9).unwrap(), 15).unwrap();
+        let other = PadId::new(sampler_core::BankId::new(1).unwrap(), 0).unwrap();
+        let telemetry = Telemetry {
+            active_pads: [1, 0, 1 << 31],
+            rendered_frame: 0,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 2,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+        };
+
+        assert!(telemetry.is_pad_active(first));
+        assert!(telemetry.is_pad_active(last));
+        assert!(!telemetry.is_pad_active(other));
+    }
+
+    #[test]
     fn runtime_failure_closes_every_controller_operation() {
         let (mut controller, ports) = audio_channels_with_capacities(8, 256, 8);
         ports.shared.mark_failed();
@@ -203,6 +225,7 @@ pub enum CriticalEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Telemetry {
+    pub active_pads: [u64; 3],
     pub rendered_frame: Frame,
     pub last_triggered_frame: Option<Frame>,
     pub peak_left: f32,
@@ -211,6 +234,17 @@ pub struct Telemetry {
     pub late_commands: u64,
     pub invalid_commands: u64,
     pub command_overflows: u64,
+}
+
+impl Telemetry {
+    pub fn is_pad_active(self, pad: PadId) -> bool {
+        let index = usize::from(u8::from(pad.bank())) * 16 + usize::from(pad.index());
+        let word = index / u64::BITS as usize;
+        let bit = index % u64::BITS as usize;
+        self.active_pads
+            .get(word)
+            .is_some_and(|value| value & (1u64 << bit) != 0)
+    }
 }
 
 pub struct AudioController {

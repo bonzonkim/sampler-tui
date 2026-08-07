@@ -625,6 +625,7 @@ impl AudioEngine {
         }
 
         let telemetry = Telemetry {
+            active_pads: self.active_pad_bits(),
             rendered_frame: self.rendered_frame,
             last_triggered_frame: self.last_triggered_frame,
             peak_left: self.telemetry_peak_left,
@@ -640,6 +641,16 @@ impl AudioEngine {
         self.next_telemetry_frame = self
             .next_telemetry_frame
             .saturating_add(telemetry_interval(self.sample_rate));
+    }
+
+    fn active_pad_bits(&self) -> [u64; 3] {
+        let mut bits = [0; 3];
+        for voice in self.voices.iter().flatten() {
+            let index = usize::from(u8::from(voice.pad.bank())) * PADS_PER_BANK
+                + usize::from(voice.pad.index());
+            bits[index / u64::BITS as usize] |= 1u64 << (index % u64::BITS as usize);
+        }
+        bits
     }
 
     fn retire_unused_samples(&mut self) {
@@ -1140,6 +1151,8 @@ mod tests {
         assert!(telemetry.peak_left > 0.0 && telemetry.peak_left < 1.0);
         assert_eq!(telemetry.peak_left, telemetry.peak_right);
         assert_eq!(telemetry.active_voices, 1);
+        assert!(telemetry.is_pad_active(PadId::first()));
+        assert!(!telemetry.is_pad_active(PadId::new(BankId::new(0).unwrap(), 1).unwrap()));
         engine.render_frames(1_599, |_| {});
         assert_eq!(controller.latest_telemetry(), None);
     }
@@ -1167,6 +1180,23 @@ mod tests {
         assert_eq!(telemetry.rendered_frame, 3_200);
         assert_eq!(telemetry.last_triggered_frame, Some(1_600));
         assert_eq!(telemetry.active_voices, 0);
+    }
+
+    #[test]
+    fn telemetry_keeps_a_released_one_shot_pad_active_until_its_voice_finishes() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        controller
+            .install(pad, constant_sample(4_000, 1.0), PadSettings::default())
+            .unwrap();
+        controller.trigger(pad, 0, 1.0).unwrap();
+        controller.release(pad, 1).unwrap();
+
+        engine.render_frames(1_600, |_| {});
+
+        let telemetry = controller.latest_telemetry().unwrap();
+        assert_eq!(telemetry.active_voices, 1);
+        assert!(telemetry.is_pad_active(pad));
     }
 
     #[test]

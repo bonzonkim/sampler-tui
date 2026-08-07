@@ -299,6 +299,7 @@ mod tests {
 
     fn telemetry(rendered_frame: Frame, last_triggered_frame: Option<Frame>) -> Telemetry {
         Telemetry {
+            active_pads: [0; 3],
             rendered_frame,
             last_triggered_frame,
             peak_left: 0.0,

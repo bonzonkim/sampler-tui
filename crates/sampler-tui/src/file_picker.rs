@@ -35,6 +35,8 @@ impl DirectoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePicker {
     directory: PathBuf,
+    pending_directory: Option<PathBuf>,
+    failed_directory: Option<PathBuf>,
     show_hidden: bool,
     entries: Vec<DirectoryEntry>,
     cursor: usize,
@@ -46,6 +48,8 @@ impl FilePicker {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             directory: path.into(),
+            pending_directory: None,
+            failed_directory: None,
             show_hidden: false,
             entries: Vec::new(),
             cursor: 0,
@@ -67,6 +71,18 @@ impl FilePicker {
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub fn pending_directory(&self) -> Option<&Path> {
+        self.pending_directory.as_deref()
+    }
+
+    pub fn failed_directory(&self) -> Option<&Path> {
+        self.failed_directory.as_deref()
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.pending_directory.is_some()
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -101,7 +117,8 @@ impl FilePicker {
     }
 
     pub fn begin_scan(&mut self, path: impl Into<PathBuf>) -> u64 {
-        self.directory = path.into();
+        self.pending_directory = Some(path.into());
+        self.failed_directory = None;
         self.request_id = self.request_id.wrapping_add(1);
         self.error = None;
         self.request_id
@@ -109,9 +126,7 @@ impl FilePicker {
 
     pub fn toggle_hidden(&mut self) -> u64 {
         self.show_hidden = !self.show_hidden;
-        self.request_id = self.request_id.wrapping_add(1);
-        self.error = None;
-        self.request_id
+        self.begin_scan(self.directory.clone())
     }
 
     pub fn apply_scan(
@@ -122,12 +137,21 @@ impl FilePicker {
         if request_id != self.request_id {
             return false;
         }
+        let Some(target) = self.pending_directory.take() else {
+            return false;
+        };
         match result {
             Ok(entries) => {
+                self.directory = target;
+                self.cursor = 0;
                 self.replace_entries(entries);
                 self.error = None;
+                self.failed_directory = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.failed_directory = Some(target);
+                self.error = Some(error);
+            }
         }
         true
     }
@@ -246,7 +270,8 @@ mod tests {
         picker.begin_scan(path("/two"));
 
         assert!(!picker.apply_scan(old, Ok(vec![entry("wrong.wav", File)])));
-        assert_eq!(picker.directory(), path("/two"));
+        assert_eq!(picker.directory(), path("/one"));
+        assert_eq!(picker.pending_directory(), Some(path("/two")));
     }
 
     #[test]
@@ -255,8 +280,37 @@ mod tests {
         let request_id = picker.begin_scan(path("/two"));
 
         assert!(picker.apply_scan(request_id, Err("permission denied".to_owned())));
+        assert_eq!(picker.directory(), path("/one"));
         assert_eq!(picker.visible_names(), ["keep.wav"]);
         assert_eq!(picker.error(), Some("permission denied"));
+        assert_eq!(picker.failed_directory(), Some(path("/two")));
+        assert!(!picker.is_scanning());
+    }
+
+    #[test]
+    fn slow_scan_keeps_committed_directory_and_entries_visible() {
+        let mut picker = FilePicker::from_scan(path("/one"), false, vec![entry("keep.wav", File)]);
+
+        picker.begin_scan(path("/two"));
+
+        assert_eq!(picker.directory(), path("/one"));
+        assert_eq!(picker.visible_names(), ["keep.wav"]);
+        assert_eq!(picker.pending_directory(), Some(path("/two")));
+        assert!(picker.is_scanning());
+    }
+
+    #[test]
+    fn successful_empty_scan_commits_an_empty_complete_directory() {
+        let mut picker = FilePicker::from_scan(path("/one"), false, vec![entry("keep.wav", File)]);
+        let request_id = picker.begin_scan(path("/empty"));
+
+        assert!(picker.apply_scan(request_id, Ok(Vec::new())));
+
+        assert_eq!(picker.directory(), path("/empty"));
+        assert!(picker.entries().is_empty());
+        assert!(!picker.is_scanning());
+        assert_eq!(picker.pending_directory(), None);
+        assert_eq!(picker.error(), None);
     }
 
     #[cfg(unix)]

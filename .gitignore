@@ -1,8 +1,8 @@
 /target/
 /.superpowers/
+/.worktrees/
 *.wav
 *.aif
 *.aiff
 *.flac
 *.mp3
-

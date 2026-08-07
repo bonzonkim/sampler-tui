@@ -61,3 +61,13 @@ pub enum PrepareError {
     #[error(transparent)]
     Sample(#[from] SampleError),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlError {
+    #[error("audio command queue is full")]
+    CommandQueueFull,
+    #[error("no free sample slot is available")]
+    NoFreeSampleSlot,
+    #[error("trigger velocity must be finite and in 0.0..=1.0")]
+    InvalidVelocity,
+}

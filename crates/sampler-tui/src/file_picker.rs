@@ -126,7 +126,11 @@ impl FilePicker {
 
     pub fn toggle_hidden(&mut self) -> u64 {
         self.show_hidden = !self.show_hidden;
-        self.begin_scan(self.directory.clone())
+        let target = self
+            .pending_directory
+            .clone()
+            .unwrap_or_else(|| self.directory.clone());
+        self.begin_scan(target)
     }
 
     pub fn apply_scan(
@@ -311,6 +315,37 @@ mod tests {
         assert!(!picker.is_scanning());
         assert_eq!(picker.pending_directory(), None);
         assert_eq!(picker.error(), None);
+    }
+
+    #[test]
+    fn hidden_toggle_without_a_pending_scan_restarts_the_committed_directory() {
+        let mut picker = FilePicker::from_scan(path("/one"), false, vec![entry("keep.wav", File)]);
+
+        picker.toggle_hidden();
+
+        assert!(picker.show_hidden());
+        assert_eq!(picker.directory(), path("/one"));
+        assert_eq!(picker.pending_directory(), Some(path("/one")));
+        assert_eq!(picker.visible_names(), ["keep.wav"]);
+    }
+
+    #[test]
+    fn repeated_hidden_toggles_restart_the_pending_target_and_reject_prior_ids() {
+        let mut picker = FilePicker::from_scan(path("/one"), false, vec![entry("keep.wav", File)]);
+        let first = picker.begin_scan(path("/two"));
+        let second = picker.toggle_hidden();
+
+        assert!(picker.show_hidden());
+        assert_eq!(picker.directory(), path("/one"));
+        assert_eq!(picker.pending_directory(), Some(path("/two")));
+        assert!(!picker.apply_scan(first, Ok(Vec::new())));
+
+        let third = picker.toggle_hidden();
+        assert!(!picker.show_hidden());
+        assert_eq!(picker.pending_directory(), Some(path("/two")));
+        assert!(!picker.apply_scan(second, Ok(Vec::new())));
+        assert!(picker.apply_scan(third, Ok(Vec::new())));
+        assert_eq!(picker.directory(), path("/two"));
     }
 
     #[cfg(unix)]

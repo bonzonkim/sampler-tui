@@ -657,10 +657,15 @@ impl App {
     }
 
     fn queue_current_picker_scan(&mut self, request_id: u64) {
+        let path = self
+            .file_picker
+            .pending_directory()
+            .unwrap_or_else(|| self.file_picker.directory())
+            .to_owned();
         self.pending_worker_requests
             .push(WorkerRequest::ScanDirectory {
                 request_id,
-                path: self.file_picker.directory().to_owned(),
+                path,
                 show_hidden: self.file_picker.show_hidden(),
             });
     }
@@ -1467,6 +1472,83 @@ mod tests {
             panic!("expected one normalized scan request")
         };
         assert_eq!(path, &current_dir.join("drums"));
+    }
+
+    #[test]
+    fn repeated_hidden_toggles_queue_the_pending_directory_and_supersede_prior_scans() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_picker_at("/one");
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::ScanDirectory {
+                request_id,
+                path: committed_path,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected committed-directory scan")
+        };
+        assert!(app.apply_worker_result(WorkerResult::Scanned {
+            request_id: *request_id,
+            path: committed_path.clone(),
+            result: Ok(Vec::new()),
+        }));
+
+        app.open_picker_at("/two");
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::ScanDirectory {
+                request_id: first_id,
+                path: first_path,
+                show_hidden: false,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected initial pending scan")
+        };
+        assert_eq!(first_path, path("/two"));
+
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::ScanDirectory {
+                request_id: second_id,
+                path: second_path,
+                show_hidden: true,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected first hidden rescan")
+        };
+        assert_eq!(second_path, path("/two"));
+
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::ScanDirectory {
+                request_id: third_id,
+                path: third_path,
+                show_hidden: false,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected second hidden rescan")
+        };
+        assert_eq!(third_path, path("/two"));
+        assert!(*first_id < *second_id && *second_id < *third_id);
+
+        assert!(!app.apply_worker_result(WorkerResult::Scanned {
+            request_id: *first_id,
+            path: first_path.clone(),
+            result: Ok(Vec::new()),
+        }));
+        assert!(app.apply_worker_result(WorkerResult::Scanned {
+            request_id: *third_id,
+            path: third_path.clone(),
+            result: Ok(Vec::new()),
+        }));
+        assert_eq!(app.file_picker().directory(), path("/two"));
     }
 
     #[cfg(unix)]

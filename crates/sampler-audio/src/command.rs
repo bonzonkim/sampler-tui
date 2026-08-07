@@ -129,6 +129,20 @@ mod tests {
         assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
         assert_eq!(ports.commands.slots(), 0);
     }
+
+    #[test]
+    fn rejected_timed_command_does_not_advance_the_stop_fence() {
+        let (mut controller, ports) = audio_channels_with_capacities(1, 256, 8);
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        assert_eq!(
+            controller.trigger(PadId::first(), 1, 1.0),
+            Err(ControlError::CommandQueueFull)
+        );
+
+        controller.stop_all().unwrap();
+
+        assert_eq!(ports.shared.take_stop_fence(), Some(1));
+    }
 }
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -217,7 +231,7 @@ pub struct EnginePorts {
 
 pub(crate) struct SharedControlState {
     fence_sequence: AtomicU64,
-    requests: AtomicU64,
+    stop_requested: AtomicBool,
     command_overflows: AtomicU64,
     failed: AtomicBool,
 }
@@ -226,7 +240,7 @@ impl SharedControlState {
     fn new() -> Self {
         Self {
             fence_sequence: AtomicU64::new(0),
-            requests: AtomicU64::new(0),
+            stop_requested: AtomicBool::new(false),
             command_overflows: AtomicU64::new(0),
             failed: AtomicBool::new(false),
         }
@@ -234,13 +248,13 @@ impl SharedControlState {
 
     fn request(&self, fence_sequence: u64) {
         self.fence_sequence.store(fence_sequence, Ordering::Relaxed);
-        self.requests.fetch_add(1, Ordering::Release);
+        self.stop_requested.store(true, Ordering::Release);
     }
 
-    pub(crate) fn snapshot(&self) -> (u64, u64) {
-        let requests = self.requests.load(Ordering::Acquire);
-        let fence_sequence = self.fence_sequence.load(Ordering::Relaxed);
-        (requests, fence_sequence)
+    pub(crate) fn take_stop_fence(&self) -> Option<u64> {
+        self.stop_requested
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.fence_sequence.load(Ordering::Acquire))
     }
 
     fn record_command_overflow(&self) {
@@ -352,23 +366,31 @@ impl AudioController {
         if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
             return Err(ControlError::InvalidVelocity);
         }
-        let sequence = self.take_timed_sequence();
-        self.push_command(AudioCommand::Trigger {
+        let sequence = self.next_timed_sequence;
+        let result = self.push_command(AudioCommand::Trigger {
             pad,
             at_frame,
             velocity,
             sequence,
-        })
+        });
+        if result.is_ok() {
+            self.advance_timed_sequence();
+        }
+        result
     }
 
     pub fn release(&mut self, pad: PadId, at_frame: Frame) -> Result<(), ControlError> {
         self.ensure_open()?;
-        let sequence = self.take_timed_sequence();
-        self.push_command(AudioCommand::Release {
+        let sequence = self.next_timed_sequence;
+        let result = self.push_command(AudioCommand::Release {
             pad,
             at_frame,
             sequence,
-        })
+        });
+        if result.is_ok() {
+            self.advance_timed_sequence();
+        }
+        result
     }
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
@@ -424,10 +446,8 @@ impl AudioController {
         }
     }
 
-    fn take_timed_sequence(&mut self) -> u64 {
-        let sequence = self.next_timed_sequence;
+    fn advance_timed_sequence(&mut self) {
         self.next_timed_sequence = self.next_timed_sequence.wrapping_add(1);
-        sequence
     }
 
     fn ensure_open(&self) -> Result<(), ControlError> {

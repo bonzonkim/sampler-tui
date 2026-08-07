@@ -98,6 +98,7 @@ fn decodes_mono_wav_without_changing_channel_count() {
     assert_eq!(decoded.sample_rate, 44_100);
     assert_eq!(decoded.channels.len(), 1);
     assert_eq!(decoded.frames(), 3);
+    assert!(decoded.channels[0].iter().all(|sample| sample.is_finite()));
     assert!(decoded.channels[0][1] > 0.99);
 }
 

@@ -128,7 +128,6 @@ pub struct AudioEngine {
     voices: [Option<AudioVoice>; VOICE_COUNT],
     pending: [Option<ScheduledAction>; PENDING_COUNT],
     pending_len: usize,
-    observed_stop_requests: u64,
     active_stop_fence: Option<u64>,
     deferred_retirement: Option<CriticalEvent>,
     rendered_frame: Frame,
@@ -164,7 +163,6 @@ impl AudioEngine {
             voices: [None; VOICE_COUNT],
             pending: [None; PENDING_COUNT],
             pending_len: 0,
-            observed_stop_requests: 0,
             active_stop_fence: None,
             deferred_retirement: None,
             rendered_frame: 0,
@@ -398,12 +396,10 @@ impl AudioEngine {
     }
 
     fn apply_stop_fence(&mut self) {
-        let (requests, fence_sequence) = self.ports.shared.snapshot();
-        if requests == self.observed_stop_requests {
+        let Some(fence_sequence) = self.ports.shared.take_stop_fence() else {
             return;
-        }
+        };
 
-        self.observed_stop_requests = requests;
         self.active_stop_fence = Some(fence_sequence);
         self.stop_all();
 

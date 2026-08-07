@@ -1,14 +1,18 @@
 use std::array;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::SampleBuffer;
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{BankId, PadId, PadSettings};
 
 use crate::audio::AudioPort;
-use crate::input::InputAction;
+use crate::file_picker::FilePicker;
+use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{WorkerRequest, WorkerResult};
+use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 
 pub const PAD_VIEW_COUNT: usize = 160;
 pub const PREVIEW_COLUMNS: usize = 64;
@@ -69,6 +73,12 @@ pub struct App {
     audio: Option<Box<dyn AudioPort>>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
     overlay: Option<Overlay>,
+    palette: LineEditor,
+    palette_error: Option<String>,
+    file_picker: FilePicker,
+    pending_worker_requests: Vec<WorkerRequest>,
+    device_retry_requests: usize,
+    keyboard_capabilities: KeyboardCapabilities,
     status: String,
     audio_unavailable_message: Option<String>,
     should_quit: bool,
@@ -93,6 +103,14 @@ impl App {
             audio,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
             overlay,
+            palette: LineEditor::default(),
+            palette_error: None,
+            file_picker: FilePicker::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            pending_worker_requests: Vec::new(),
+            device_retry_requests: 0,
+            keyboard_capabilities: KeyboardCapabilities::default(),
             status: audio_error.clone().unwrap_or_default(),
             audio_unavailable_message: audio_error,
             should_quit: false,
@@ -107,6 +125,40 @@ impl App {
             InputAction::BankDelta(delta) => self.change_bank(delta),
             InputAction::StopAll => self.stop_all(),
             InputAction::Quit => self.should_quit = true,
+        }
+    }
+
+    pub fn apply_terminal_event(&mut self, event: Event) {
+        match event {
+            Event::Key(key) => self.apply_key(key),
+            Event::Paste(text) if self.overlay == Some(Overlay::Palette) => {
+                self.palette.insert_str(&text);
+                self.palette_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn apply_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Repeat {
+            return;
+        }
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+            && self.overlay.is_some()
+        {
+            self.close_overlay();
+            return;
+        }
+
+        match self.overlay.as_ref() {
+            Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
+            Some(Overlay::ConfirmQuit) => self.apply_confirmation_key(key),
+            Some(Overlay::Palette) => self.apply_palette_key(key),
+            Some(Overlay::FilePicker) => self.apply_picker_key(key),
+            Some(Overlay::Help) => self.apply_help_key(key),
+            None => self.apply_perform_key(key),
         }
     }
 
@@ -128,6 +180,80 @@ impl App {
 
     pub fn overlay(&self) -> Option<&Overlay> {
         self.overlay.as_ref()
+    }
+
+    pub fn open_help(&mut self) {
+        self.overlay = Some(Overlay::Help);
+    }
+
+    pub fn open_palette(&mut self) {
+        self.palette.clear();
+        self.palette_error = None;
+        self.overlay = Some(Overlay::Palette);
+    }
+
+    pub fn open_picker(&mut self) {
+        let source_parent = self
+            .selected_pad_id()
+            .and_then(|pad| self.pad(pad).source.as_deref())
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(ToOwned::to_owned);
+        let directory = source_parent
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        self.open_picker_at(directory);
+    }
+
+    pub fn open_picker_at(&mut self, directory: impl Into<PathBuf>) {
+        let directory = directory.into();
+        let request_id = self.file_picker.begin_scan(directory.clone());
+        self.pending_worker_requests
+            .push(WorkerRequest::ScanDirectory {
+                request_id,
+                path: directory,
+                show_hidden: self.file_picker.show_hidden(),
+            });
+        self.overlay = Some(Overlay::FilePicker);
+    }
+
+    pub fn open_quit_confirmation(&mut self) {
+        self.overlay = Some(Overlay::ConfirmQuit);
+    }
+
+    pub fn close_overlay(&mut self) {
+        self.overlay = None;
+    }
+
+    pub fn palette_text(&self) -> &str {
+        self.palette.text()
+    }
+
+    pub fn palette_cursor(&self) -> usize {
+        self.palette.cursor()
+    }
+
+    pub fn palette_error(&self) -> Option<&str> {
+        self.palette_error.as_deref()
+    }
+
+    pub fn file_picker(&self) -> &FilePicker {
+        &self.file_picker
+    }
+
+    pub fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
+        mem::take(&mut self.pending_worker_requests)
+    }
+
+    pub fn device_retry_requests(&self) -> usize {
+        self.device_retry_requests
+    }
+
+    pub fn take_device_retry_requests(&mut self) -> usize {
+        mem::take(&mut self.device_retry_requests)
+    }
+
+    pub fn set_keyboard_capabilities(&mut self, capabilities: KeyboardCapabilities) {
+        self.keyboard_capabilities = capabilities;
     }
 
     pub fn status(&self) -> &str {
@@ -166,7 +292,23 @@ impl App {
             result,
         } = result
         else {
-            return false;
+            let WorkerResult::Scanned {
+                request_id,
+                path,
+                result,
+            } = result
+            else {
+                unreachable!()
+            };
+            if path != self.file_picker.directory() {
+                return false;
+            }
+            let error = result.as_ref().err().cloned();
+            let applied = self.file_picker.apply_scan(request_id, result);
+            if applied && let Some(error) = error {
+                self.status = error;
+            }
+            return applied;
         };
         let offset = pad_offset(pad);
         if self.pads[offset].generation != generation
@@ -226,6 +368,200 @@ impl App {
             Ok(()) => self.held_pad_by_key[index] = Some(pad),
             Err(error) => self.status = error,
         }
+    }
+
+    fn apply_device_error_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::NONE
+            && matches!(key.code, KeyCode::Char('r' | 'R'))
+        {
+            self.device_retry_requests = self.device_retry_requests.saturating_add(1);
+        }
+    }
+
+    fn apply_confirmation_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                self.should_quit = true;
+                self.overlay = None;
+            }
+            KeyCode::Char('n' | 'N') => self.overlay = None,
+            _ => {}
+        }
+    }
+
+    fn apply_palette_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Enter => self.execute_palette(),
+            KeyCode::Left => self.palette.move_left(),
+            KeyCode::Right => self.palette.move_right(),
+            KeyCode::Home => self.palette.move_home(),
+            KeyCode::End => self.palette.move_end(),
+            KeyCode::Backspace => self.palette.backspace(),
+            KeyCode::Delete => self.palette.delete(),
+            KeyCode::Char(character)
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.palette.insert(character);
+            }
+            _ => return,
+        }
+        if key.code != KeyCode::Enter {
+            self.palette_error = None;
+        }
+    }
+
+    fn execute_palette(&mut self) {
+        let command = match parse_palette(self.palette.text()) {
+            Ok(command) => command,
+            Err(error) => {
+                self.palette_error = Some(error);
+                return;
+            }
+        };
+        self.palette_error = None;
+        match command {
+            PaletteCommand::OpenPicker => self.open_picker(),
+            PaletteCommand::LoadPath(path) => {
+                self.begin_selected_load(path);
+                self.overlay = None;
+            }
+            PaletteCommand::Bank(bank) => {
+                self.active_bank = bank;
+                self.overlay = None;
+            }
+            PaletteCommand::Select(index) => {
+                self.selected_pad = index;
+                self.overlay = None;
+            }
+            PaletteCommand::StopAll => {
+                self.stop_all();
+                self.overlay = None;
+            }
+            PaletteCommand::Help => self.open_help(),
+            PaletteCommand::Quit => {
+                self.should_quit = true;
+                self.overlay = None;
+            }
+        }
+    }
+
+    fn apply_picker_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Up => self.file_picker.move_cursor(-1),
+            KeyCode::Down => self.file_picker.move_cursor(1),
+            KeyCode::Home => self.file_picker.select_first(),
+            KeyCode::End => self.file_picker.select_last(),
+            KeyCode::Backspace => self.open_picker_parent(),
+            KeyCode::Char('.') if key.modifiers == KeyModifiers::NONE => {
+                let request_id = self.file_picker.toggle_hidden();
+                self.queue_current_picker_scan(request_id);
+            }
+            KeyCode::Enter => self.open_picker_selection(),
+            _ => {}
+        }
+    }
+
+    fn apply_help_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press
+            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('?')
+        {
+            self.overlay = None;
+        }
+    }
+
+    fn apply_perform_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press {
+            match key.code {
+                KeyCode::Char('?')
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    self.open_help();
+                }
+                KeyCode::Char(':')
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    self.open_palette();
+                }
+                KeyCode::Char('l') if key.modifiers == KeyModifiers::NONE => {
+                    self.open_picker();
+                }
+                KeyCode::Left => self.move_selection(-1, 0),
+                KeyCode::Right => self.move_selection(1, 0),
+                KeyCode::Up => self.move_selection(0, -1),
+                KeyCode::Down => self.move_selection(0, 1),
+                _ => {
+                    if let Some(action) = map_key(key, self.keyboard_capabilities) {
+                        self.apply(action);
+                    }
+                }
+            }
+        } else if let Some(action) = map_key(key, self.keyboard_capabilities) {
+            self.apply(action);
+        }
+    }
+
+    fn move_selection(&mut self, horizontal: isize, vertical: isize) {
+        let row = self.selected_pad / 4;
+        let column = self.selected_pad % 4;
+        let row = row.saturating_add_signed(vertical).min(3);
+        let column = column.saturating_add_signed(horizontal).min(3);
+        self.selected_pad = row * 4 + column;
+    }
+
+    fn selected_pad_id(&self) -> Option<PadId> {
+        let index = u8::try_from(self.selected_pad).ok()?;
+        PadId::new(self.active_bank, index).ok()
+    }
+
+    fn begin_selected_load(&mut self, path: PathBuf) {
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        if let Some(request) = self.begin_load(pad, path) {
+            self.pending_worker_requests.push(request);
+        }
+    }
+
+    fn open_picker_parent(&mut self) {
+        let Some(parent) = self.file_picker.directory().parent().map(ToOwned::to_owned) else {
+            self.status = "already at filesystem root".to_owned();
+            return;
+        };
+        self.open_picker_at(parent);
+    }
+
+    fn open_picker_selection(&mut self) {
+        let Some(entry) = self.file_picker.selected().cloned() else {
+            return;
+        };
+        if entry.is_directory() {
+            self.open_picker_at(entry.path);
+        } else if entry.is_selectable_file() {
+            self.begin_selected_load(entry.path);
+            self.overlay = None;
+        } else {
+            self.status = "entry is not a supported audio file".to_owned();
+        }
+    }
+
+    fn queue_current_picker_scan(&mut self, request_id: u64) {
+        self.pending_worker_requests
+            .push(WorkerRequest::ScanDirectory {
+                request_id,
+                path: self.file_picker.directory().to_owned(),
+                show_hidden: self.file_picker.show_hidden(),
+            });
     }
 
     fn release_pad(&mut self, index: usize) {
@@ -327,6 +663,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
     use sampler_core::{BankId, PadId, PadSettings};
 
@@ -784,5 +1121,135 @@ mod tests {
         app.apply(InputAction::PadPress(0));
         assert!(app.status().contains("no output device"));
         assert!(!app.should_quit());
+    }
+
+    fn key(character: char, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Char(character), modifiers, kind)
+    }
+
+    #[test]
+    fn device_modal_retry_wins_over_the_r_pad_key() {
+        let mut app = App::without_audio("no output device");
+
+        app.apply_key(key('r', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(app.device_retry_requests(), 1);
+        assert_eq!(app.selected_pad(), 0);
+    }
+
+    #[test]
+    fn pasted_text_only_changes_the_open_palette() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_terminal_event(Event::Paste("stop-all".into()));
+        assert!(calls.snapshot().is_empty());
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("stop-all".into()));
+
+        assert_eq!(app.palette_text(), "stop-all");
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn help_and_picker_keys_do_not_fall_through_to_pads() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.open_help();
+        app.apply_key(key('q', KeyModifiers::NONE, KeyEventKind::Press));
+        app.close_overlay();
+        app.open_picker();
+        app.apply_key(key('q', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn invalid_palette_command_stays_open_with_inline_error() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("select 0".into()));
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(app.overlay(), Some(&super::Overlay::Palette));
+        assert_eq!(app.palette_error(), Some("select expects 1..=16"));
+    }
+
+    #[test]
+    fn shifted_question_mark_opens_help_without_triggering_a_pad() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key('?', KeyModifiers::SHIFT, KeyEventKind::Press));
+
+        assert_eq!(app.overlay(), Some(&super::Overlay::Help));
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn picker_for_a_relative_filename_starts_in_the_current_directory() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.begin_load(pad(0, 0), path("kick.wav"));
+
+        app.open_picker();
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one scan request")
+        };
+        assert_eq!(path, &std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn picker_without_a_source_reopens_at_the_current_directory() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_picker_at("/other");
+        app.close_overlay();
+        app.take_worker_requests();
+
+        app.open_picker();
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one scan request")
+        };
+        assert_eq!(path, &std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn stale_picker_error_for_the_same_directory_is_silent() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_picker_at("/samples");
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::ScanDirectory {
+                request_id: stale_id,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected one stale scan request")
+        };
+        let stale_id = *stale_id;
+        app.open_picker_at("/samples");
+        app.take_worker_requests();
+
+        let applied = app.apply_worker_result(WorkerResult::Scanned {
+            request_id: stale_id,
+            path: "/samples".into(),
+            result: Err("stale failure".to_owned()),
+        });
+
+        assert!(!applied);
+        assert_eq!(app.status(), "");
     }
 }

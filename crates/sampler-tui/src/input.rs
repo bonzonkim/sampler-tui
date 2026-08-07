@@ -24,6 +24,13 @@ pub fn map_key(event: KeyEvent, capabilities: KeyboardCapabilities) -> Option<In
         return None;
     }
 
+    if event.kind == KeyEventKind::Press
+        && event.code == KeyCode::Esc
+        && event.modifiers == KeyModifiers::SHIFT
+    {
+        return Some(InputAction::StopAll);
+    }
+
     let KeyCode::Char(character) = event.code else {
         return None;
     };
@@ -172,5 +179,15 @@ mod tests {
             Some(InputAction::Quit)
         );
         assert_eq!(map_key(key('w', CONTROL, PRESS), caps), None);
+    }
+
+    #[test]
+    fn shift_escape_is_the_emergency_stop() {
+        let caps = KeyboardCapabilities {
+            release_events: true,
+        };
+        let event = KeyEvent::new_with_kind(KeyCode::Esc, SHIFT, PRESS);
+
+        assert_eq!(map_key(event, caps), Some(InputAction::StopAll));
     }
 }

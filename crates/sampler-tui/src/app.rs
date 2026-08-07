@@ -11,7 +11,7 @@ use sampler_core::{BankId, PadId, PadSettings};
 use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
-use crate::loader::{WorkerRequest, WorkerResult};
+use crate::loader::{WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError};
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 
 pub const PAD_VIEW_COUNT: usize = 160;
@@ -180,6 +180,10 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if self.audio.is_none() && is_explicit_device_retry(key) {
+            self.device_retry_requests = self.device_retry_requests.saturating_add(1);
+            return;
+        }
 
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
@@ -294,12 +298,11 @@ impl App {
     pub fn open_picker_at(&mut self, directory: impl Into<PathBuf>) {
         let directory = resolve_picker_directory(&self.current_dir, directory.into());
         let request_id = self.file_picker.begin_scan(directory.clone());
-        self.pending_worker_requests
-            .push(WorkerRequest::ScanDirectory {
-                request_id,
-                path: directory,
-                show_hidden: self.file_picker.show_hidden(),
-            });
+        self.queue_worker_request(WorkerRequest::ScanDirectory {
+            request_id,
+            path: directory,
+            show_hidden: self.file_picker.show_hidden(),
+        });
         self.overlay = Some(Overlay::FilePicker);
     }
 
@@ -310,6 +313,9 @@ impl App {
     pub fn close_overlay(&mut self) {
         if self.overlay == Some(Overlay::Palette) {
             self.palette_error = None;
+        }
+        if let Some(Overlay::DeviceError(error)) = &self.overlay {
+            self.status = format!("{error} · Ctrl+R retries audio");
         }
         self.overlay = None;
     }
@@ -334,6 +340,28 @@ impl App {
         mem::take(&mut self.pending_worker_requests)
     }
 
+    pub fn apply_worker_send_error(
+        &mut self,
+        request: WorkerRequest,
+        error: WorkerSendError,
+    ) -> bool {
+        let message = error.to_string();
+        if let WorkerRequest::LoadSample {
+            pad,
+            generation,
+            path,
+            ..
+        } = request
+        {
+            let view = &mut self.pads[pad_offset(pad)];
+            if view.generation == generation && view.source.as_deref() == Some(path.as_path()) {
+                view.state = PadLoadState::Error(message.clone());
+            }
+        }
+        self.status = message;
+        true
+    }
+
     pub fn device_retry_requests(&self) -> usize {
         self.device_retry_requests
     }
@@ -344,6 +372,20 @@ impl App {
 
     pub fn retry_default_device(&mut self) -> bool {
         self.retry_default_device_with(open_default_audio)
+    }
+
+    pub fn shutdown_audio(&mut self) -> Result<(), String> {
+        self.audio_format = None;
+        self.held_pad_by_key.fill(None);
+        for pad in &mut self.pads {
+            pad.active = false;
+        }
+        let Some(mut audio) = self.audio.take() else {
+            return Ok(());
+        };
+        let result = audio.stop_all();
+        drop(audio);
+        result
     }
 
     fn retry_default_device_with(
@@ -658,7 +700,7 @@ impl App {
             return;
         };
         if let Some(request) = self.begin_load(pad, path) {
-            self.pending_worker_requests.push(request);
+            self.queue_worker_request(request);
         }
     }
 
@@ -694,12 +736,11 @@ impl App {
             .pending_directory()
             .unwrap_or_else(|| self.file_picker.directory())
             .to_owned();
-        self.pending_worker_requests
-            .push(WorkerRequest::ScanDirectory {
-                request_id,
-                path,
-                show_hidden: self.file_picker.show_hidden(),
-            });
+        self.queue_worker_request(WorkerRequest::ScanDirectory {
+            request_id,
+            path,
+            show_hidden: self.file_picker.show_hidden(),
+        });
     }
 
     fn release_pad(&mut self, index: usize) {
@@ -790,6 +831,16 @@ impl App {
             .unwrap_or_else(|| "audio device is unavailable".to_owned());
     }
 
+    fn queue_worker_request(&mut self, request: WorkerRequest) -> bool {
+        if self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY {
+            self.pending_worker_requests.push(request);
+            true
+        } else {
+            self.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
+            false
+        }
+    }
+
     fn fail_audio(&mut self, error: String) {
         self.audio = None;
         self.audio_format = None;
@@ -818,6 +869,7 @@ impl App {
                     .as_ref()
                     .filter(|sample| sample.sample_rate() == sample_rate)
                 {
+                    view.generation = view.generation.wrapping_add(1);
                     match audio.install(pad, Arc::clone(sample), view.settings) {
                         Ok(_) => view.state = PadLoadState::Ready,
                         Err(error) => {
@@ -828,22 +880,29 @@ impl App {
                     continue;
                 }
 
-                if let Some(path) = view.source.clone() {
+                let request = if let Some(path) = view.source.clone() {
                     view.generation = view.generation.wrapping_add(1);
                     view.state = PadLoadState::Loading;
-                    self.pending_worker_requests
-                        .push(WorkerRequest::LoadSample {
-                            pad,
-                            generation: view.generation,
-                            path,
-                            engine_rate: sample_rate,
-                        });
+                    Some(WorkerRequest::LoadSample {
+                        pad,
+                        generation: view.generation,
+                        path,
+                        engine_rate: sample_rate,
+                    })
                 } else if view.sample.is_some() || view.state != PadLoadState::Empty {
                     let error = format!(
                         "cannot reload pad for {sample_rate} Hz because its source path is unavailable"
                     );
                     view.state = PadLoadState::Error(error.clone());
                     local_error = Some(error);
+                    None
+                } else {
+                    None
+                };
+                if let Some(request) = request
+                    && !self.queue_worker_request(request)
+                {
+                    local_error = Some(WorkerSendError::WorkerBusy.to_string());
                 }
             }
         }
@@ -891,6 +950,14 @@ fn sanitize_peak(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+fn is_explicit_device_retry(key: KeyEvent) -> bool {
+    let allowed = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    key.kind == KeyEventKind::Press
+        && matches!(key.code, KeyCode::Char('r' | 'R'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.difference(allowed).is_empty()
 }
 
 fn pad_offset(pad: PadId) -> usize {
@@ -944,6 +1011,7 @@ mod tests {
         calls: CallLog,
         maintenance: Rc<RefCell<Vec<&'static str>>>,
         runtime_error: Option<String>,
+        shutdown: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
     impl FakeAudio {
@@ -960,6 +1028,7 @@ mod tests {
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
                 runtime_error: None,
+                shutdown: None,
             }
         }
 
@@ -1000,6 +1069,19 @@ mod tests {
         fn failing_runtime(mut self, error: &str) -> Self {
             self.runtime_error = Some(error.to_owned());
             self
+        }
+
+        fn with_shutdown_log(mut self, shutdown: Rc<RefCell<Vec<&'static str>>>) -> Self {
+            self.shutdown = Some(shutdown);
+            self
+        }
+    }
+
+    impl Drop for FakeAudio {
+        fn drop(&mut self) {
+            if let Some(shutdown) = &self.shutdown {
+                shutdown.borrow_mut().push("drop-audio");
+            }
         }
     }
 
@@ -1057,6 +1139,9 @@ mod tests {
         }
 
         fn stop_all(&mut self) -> Result<(), String> {
+            if let Some(shutdown) = &self.shutdown {
+                shutdown.borrow_mut().push("stop-all");
+            }
             if let Some(error) = self.stop_all_error.take() {
                 return Err(error);
             }
@@ -1108,6 +1193,23 @@ mod tests {
             ))
         );
         assert_eq!(app.status(), "device disconnected");
+    }
+
+    #[test]
+    fn shutdown_stops_and_drops_audio_even_when_stop_all_fails() {
+        let shutdown = Rc::new(RefCell::new(Vec::new()));
+        let audio = FakeAudio::ready(48_000, 2)
+            .failing_stop_all_once("stop-all queue is full")
+            .with_shutdown_log(Rc::clone(&shutdown));
+        let mut app = App::with_audio(Box::new(audio));
+
+        assert_eq!(
+            app.shutdown_audio(),
+            Err("stop-all queue is full".to_owned())
+        );
+
+        assert_eq!(*shutdown.borrow(), ["stop-all", "drop-audio"]);
+        assert_eq!(app.audio_format(), None);
     }
 
     #[test]
@@ -1167,6 +1269,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn later_matching_rate_retry_rejects_an_older_wrong_rate_result() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let request = app.begin_load(pad(0, 0), path("kick.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "kick.wav"));
+        let retained = Arc::clone(app.pad(pad(0, 0)).sample.as_ref().unwrap());
+        app.maintain_audio();
+
+        let changed_rate = FakeAudio::ready(44_100, 2).failing_runtime("replacement disconnected");
+        app.retry_default_device_with(|| Ok(Box::new(changed_rate)));
+        let stale_request = app.take_worker_requests().pop().unwrap();
+        let WorkerRequest::LoadSample {
+            generation: stale_generation,
+            ..
+        } = stale_request
+        else {
+            panic!("wrong request")
+        };
+        app.maintain_audio();
+
+        let original_rate = FakeAudio::ready(48_000, 2);
+        let calls = original_rate.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(original_rate)));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+        assert!(!app.apply_worker_result(loaded_at_rate(
+            pad(0, 0),
+            stale_generation,
+            "kick.wav",
+            44_100,
+        )));
+        assert!(Arc::ptr_eq(
+            app.pad(pad(0, 0)).sample.as_ref().unwrap(),
+            &retained
+        ));
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Ready);
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+    }
+
+    #[test]
+    fn recovery_backpressure_is_bounded_visible_and_leaves_later_pads_recoverable() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        for index in 0..10 {
+            let pad = pad(0, index);
+            let source = format!("pad-{index}.wav");
+            let request = app.begin_load(pad, &source).unwrap();
+            let WorkerRequest::LoadSample { generation, .. } = request else {
+                panic!("wrong request")
+            };
+            app.apply_worker_result(loaded(pad, generation, &source));
+        }
+        app.maintain_audio();
+
+        app.retry_default_device_with(|| Ok(Box::new(FakeAudio::ready(44_100, 2))));
+
+        let requests = app.take_worker_requests();
+        assert_eq!(requests.len(), 8);
+        assert_eq!(app.status(), "loader busy");
+        for index in 8..10 {
+            assert_eq!(
+                app.pad(pad(0, index)).state,
+                PadLoadState::Error("loader busy".to_owned())
+            );
+        }
+
+        for request in requests {
+            let WorkerRequest::LoadSample {
+                pad,
+                generation,
+                path,
+                ..
+            } = request
+            else {
+                panic!("wrong request")
+            };
+            app.apply_worker_result(loaded_at_rate(
+                pad,
+                generation,
+                path.to_str().unwrap(),
+                44_100,
+            ));
+        }
+
+        app.retry_default_device_with(|| Ok(Box::new(FakeAudio::ready(44_100, 2))));
+        let later_requests = app.take_worker_requests();
+        assert_eq!(later_requests.len(), 2);
+        assert_eq!(
+            later_requests
+                .iter()
+                .map(|request| match request {
+                    WorkerRequest::LoadSample { pad, .. } => *pad,
+                    _ => panic!("wrong request"),
+                })
+                .collect::<Vec<_>>(),
+            [pad(0, 8), pad(0, 9)]
+        );
+    }
+
     fn pad(bank: u8, index: u8) -> PadId {
         PadId::new(BankId::new(bank).unwrap(), index).unwrap()
     }
@@ -1176,16 +1381,20 @@ mod tests {
     }
 
     fn loaded(pad: PadId, generation: u64, source: &str) -> WorkerResult {
-        let buffer = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        loaded_at_rate(pad, generation, source, 48_000)
+    }
+
+    fn loaded_at_rate(pad: PadId, generation: u64, source: &str, sample_rate: u32) -> WorkerResult {
+        let buffer = Arc::new(SampleBuffer::new(sample_rate, vec![0.25, -0.25]).unwrap());
         WorkerResult::Loaded {
             pad,
             generation,
             path: source.into(),
             result: Ok(LoadedSample {
                 buffer,
-                source_rate: 48_000,
+                source_rate: sample_rate,
                 source_frames: 1,
-                duration: std::time::Duration::from_nanos(20_833),
+                duration: std::time::Duration::from_secs_f64(1.0 / f64::from(sample_rate)),
                 preview: [PreviewColumn { min: -2, max: 2 }; 64],
             }),
         }
@@ -1470,6 +1679,31 @@ mod tests {
 
         assert_eq!(app.device_retry_requests(), 1);
         assert_eq!(app.selected_pad(), 0);
+    }
+
+    #[test]
+    fn dismissed_startup_and_runtime_failures_keep_an_explicit_retry_route() {
+        let startup_failure = App::without_audio("no output device");
+        let runtime_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut runtime_failure = App::with_audio(Box::new(runtime_audio));
+        runtime_failure.maintain_audio();
+
+        for mut app in [startup_failure, runtime_failure] {
+            app.apply_key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            ));
+            assert!(app.status().contains("Ctrl+R"));
+
+            app.apply_key(key('r', KeyModifiers::NONE, KeyEventKind::Press));
+            assert_eq!(app.selected_pad(), 7);
+            assert_eq!(app.device_retry_requests(), 0);
+
+            app.open_help();
+            app.apply_key(key('r', KeyModifiers::CONTROL, KeyEventKind::Press));
+            assert_eq!(app.device_retry_requests(), 1);
+        }
     }
 
     #[test]

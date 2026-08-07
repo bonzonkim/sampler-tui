@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
 use std::sync::mpsc::TryRecvError;
@@ -107,6 +106,7 @@ trait EventLoopApp {
     fn maintain_audio(&mut self) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest>;
+    fn apply_worker_send_error(&mut self, request: WorkerRequest, error: WorkerSendError) -> bool;
     fn take_device_retry_requests(&mut self) -> usize;
     fn retry_default_device(&mut self) -> bool;
     fn apply_terminal_event(&mut self, event: Event);
@@ -124,6 +124,10 @@ impl EventLoopApp for App {
 
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
         App::take_worker_requests(self)
+    }
+
+    fn apply_worker_send_error(&mut self, request: WorkerRequest, error: WorkerSendError) -> bool {
+        App::apply_worker_send_error(self, request, error)
     }
 
     fn take_device_retry_requests(&mut self) -> usize {
@@ -173,7 +177,6 @@ impl EventLoopDrawer<App> for TerminalDrawer<'_> {
 struct LoopState {
     next_tick: Instant,
     dirty: bool,
-    pending_requests: VecDeque<WorkerRequest>,
 }
 
 impl LoopState {
@@ -181,7 +184,6 @@ impl LoopState {
         Self {
             next_tick,
             dirty: true,
-            pending_requests: VecDeque::new(),
         }
     }
 }
@@ -238,13 +240,18 @@ where
         state.next_tick = now.checked_add(TICK_INTERVAL).unwrap_or(now);
     }
 
-    state.pending_requests.extend(app.take_worker_requests());
-    while let Some(request) = state.pending_requests.front().cloned() {
-        match worker.try_send(request) {
-            Ok(()) => {
-                state.pending_requests.pop_front();
+    let mut requests = app.take_worker_requests().into_iter();
+    while let Some(request) = requests.next() {
+        match worker.try_send(request.clone()) {
+            Ok(()) => {}
+            Err(WorkerSendError::WorkerBusy) => {
+                state.dirty |= app.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
+                for request in requests {
+                    state.dirty |=
+                        app.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
+                }
+                break;
             }
-            Err(WorkerSendError::WorkerBusy) => break,
             Err(WorkerSendError::WorkerClosed) => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -341,6 +348,7 @@ where
     preserve_primary(primary, cleanup)
 }
 
+#[cfg(test)]
 fn run_with_enhancements<O, F, T, E>(ops: O, run: F) -> Result<T, E>
 where
     O: KeyboardEnhancementOps,
@@ -350,6 +358,72 @@ where
     let mut guard = KeyboardEnhancementGuard::acquire(ops).map_err(E::from)?;
     let primary = run(guard.release_events());
     let cleanup = guard.release().map_err(E::from);
+    preserve_primary(primary, cleanup)
+}
+
+trait AudioShutdown {
+    type Error;
+
+    fn shutdown_audio(&mut self) -> Result<(), Self::Error>;
+}
+
+impl AudioShutdown for App {
+    type Error = DynError;
+
+    fn shutdown_audio(&mut self) -> Result<(), Self::Error> {
+        App::shutdown_audio(self).map_err(|error| Box::new(io::Error::other(error)) as DynError)
+    }
+}
+
+struct AudioShutdownGuard<'a, A: AudioShutdown> {
+    app: &'a mut A,
+    active: bool,
+}
+
+impl<'a, A: AudioShutdown> AudioShutdownGuard<'a, A> {
+    fn new(app: &'a mut A) -> Self {
+        Self { app, active: true }
+    }
+
+    fn app(&mut self) -> &mut A {
+        self.app
+    }
+
+    fn shutdown(&mut self) -> Result<(), A::Error> {
+        self.active = false;
+        self.app.shutdown_audio()
+    }
+}
+
+impl<A: AudioShutdown> Drop for AudioShutdownGuard<'_, A> {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.app.shutdown_audio();
+        }
+    }
+}
+
+fn run_with_audio_and_enhancements<A, O, F, T, E>(app: &mut A, ops: O, run: F) -> Result<T, E>
+where
+    A: AudioShutdown<Error = E>,
+    O: KeyboardEnhancementOps,
+    F: FnOnce(&mut A, bool) -> Result<T, E>,
+    E: From<io::Error>,
+{
+    let mut keyboard = match KeyboardEnhancementGuard::acquire(ops) {
+        Ok(keyboard) => keyboard,
+        Err(error) => {
+            let primary = Err(E::from(error));
+            return preserve_primary(primary, app.shutdown_audio());
+        }
+    };
+    let release_events = keyboard.release_events();
+    let mut audio = AudioShutdownGuard::new(app);
+    let primary = run(audio.app(), release_events);
+    let cleanup = audio.shutdown();
+    let primary = preserve_primary(primary, cleanup);
+    let cleanup = keyboard.release().map_err(E::from);
     preserve_primary(primary, cleanup)
 }
 
@@ -377,11 +451,15 @@ pub fn run_tui() -> Result<(), DynError> {
         &mut lifecycle,
         &mut worker,
         |terminal, worker| {
-            run_with_enhancements(CrosstermKeyboardEnhancementOps, |release_events| {
-                app.set_keyboard_capabilities(KeyboardCapabilities { release_events });
-                run_event_loop(terminal, &mut app, &mut events, worker)
-                    .map_err(|error| Box::new(error) as DynError)
-            })
+            run_with_audio_and_enhancements(
+                &mut app,
+                CrosstermKeyboardEnhancementOps,
+                |app, release_events| {
+                    app.set_keyboard_capabilities(KeyboardCapabilities { release_events });
+                    run_event_loop(terminal, app, &mut events, worker)
+                        .map_err(|error| Box::new(error) as DynError)
+                },
+            )
         },
         |worker| worker.join().map_err(|error| Box::new(error) as DynError),
     )
@@ -437,6 +515,8 @@ mod tests {
         ticks: usize,
         device_retry_requests: usize,
         device_retry_attempts: usize,
+        worker_requests: Vec<WorkerRequest>,
+        worker_send_errors: Vec<(WorkerRequest, WorkerSendError)>,
     }
 
     impl EventLoopApp for FakeApp {
@@ -451,7 +531,16 @@ mod tests {
         }
 
         fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
-            Vec::new()
+            std::mem::take(&mut self.worker_requests)
+        }
+
+        fn apply_worker_send_error(
+            &mut self,
+            request: WorkerRequest,
+            error: WorkerSendError,
+        ) -> bool {
+            self.worker_send_errors.push((request, error));
+            true
         }
 
         fn apply_terminal_event(&mut self, _event: Event) {
@@ -475,6 +564,8 @@ mod tests {
     #[derive(Default)]
     struct FakeWorker {
         results: VecDeque<WorkerResult>,
+        send_error: Option<WorkerSendError>,
+        sent: usize,
     }
 
     impl EventLoopWorker for FakeWorker {
@@ -485,6 +576,10 @@ mod tests {
         }
 
         fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendError> {
+            if let Some(error) = self.send_error {
+                return Err(error);
+            }
+            self.sent += 1;
             Ok(())
         }
     }
@@ -551,6 +646,7 @@ mod tests {
         let mut events = FakeEvents::default();
         let mut worker = FakeWorker {
             results: (0..20).map(|_| failed_scan()).collect(),
+            ..FakeWorker::default()
         };
         let mut drawer = FakeDrawer::default();
         let mut state = LoopState::new(now);
@@ -640,6 +736,52 @@ mod tests {
         assert_eq!(app.device_retry_attempts, 1);
         assert_eq!(app.device_retry_requests, 0);
         assert_eq!(drawer.draws, 1);
+    }
+
+    #[test]
+    fn full_worker_is_visible_without_retaining_an_unbounded_terminal_queue() {
+        let mut app = FakeApp {
+            worker_requests: vec![WorkerRequest::Shutdown; 8],
+            ..FakeApp::default()
+        };
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker {
+            send_error: Some(WorkerSendError::WorkerBusy),
+            ..FakeWorker::default()
+        };
+        let mut drawer = FakeDrawer::default();
+        let now = Instant::now();
+        let mut state = LoopState::new(now + Duration::from_secs(1));
+
+        run_iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.worker_send_errors.len(), 8);
+        assert!(
+            app.worker_send_errors
+                .iter()
+                .all(|(_, error)| *error == WorkerSendError::WorkerBusy)
+        );
+        assert_eq!(drawer.draws, 1);
+
+        worker.send_error = None;
+        run_iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(worker.sent, 0);
     }
 
     #[test]
@@ -805,6 +947,116 @@ mod tests {
         fn request_shutdown(&mut self) {
             self.calls.lock().unwrap().push("request");
         }
+    }
+
+    struct FakeShutdownApp {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AudioShutdown for FakeShutdownApp {
+        type Error = io::Error;
+
+        fn shutdown_audio(&mut self) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("stop-all");
+            self.calls.lock().unwrap().push("drop-audio");
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct OrderedEnhancementOps {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl KeyboardEnhancementOps for OrderedEnhancementOps {
+        fn supports_keyboard_enhancement(&self) -> io::Result<bool> {
+            self.calls.lock().unwrap().push("query");
+            Ok(true)
+        }
+
+        fn push_keyboard_enhancement(&self, _flags: KeyboardEnhancementFlags) -> io::Result<()> {
+            self.calls.lock().unwrap().push("push");
+            Ok(())
+        }
+
+        fn pop_keyboard_enhancement(&self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("pop");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn audio_stops_and_drops_before_keyboard_and_terminal_restoration() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = FakeTerminalLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = OrderedEnhancementOps {
+            calls: Arc::clone(&calls),
+        };
+
+        let result: io::Result<()> = run_with_terminal_lifecycle(
+            &mut lifecycle,
+            &mut worker,
+            |_, _| {
+                run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
+                    calls.lock().unwrap().push("loop");
+                    Err(io::Error::other("loop"))
+                })
+            },
+            |_| {
+                calls.lock().unwrap().push("join");
+                Err(io::Error::other("join"))
+            },
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "loop");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init",
+                "query",
+                "push",
+                "loop",
+                "stop-all",
+                "drop-audio",
+                "pop",
+                "request",
+                "restore",
+                "join",
+            ]
+        );
+    }
+
+    #[test]
+    fn panic_still_stops_and_drops_audio_before_popping_keyboard_enhancements() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = OrderedEnhancementOps {
+            calls: Arc::clone(&calls),
+        };
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _: io::Result<()> =
+                run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
+                    calls.lock().unwrap().push("loop");
+                    panic!("loop panic")
+                });
+        }));
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["query", "push", "loop", "stop-all", "drop-audio", "pop"]
+        );
     }
 
     #[test]

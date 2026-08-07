@@ -13,7 +13,7 @@ use sampler_core::PadId;
 use crate::app::{PREVIEW_COLUMNS, PreviewColumn};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind};
 
-const WORKER_CHANNEL_CAPACITY: usize = 8;
+pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerRequest {

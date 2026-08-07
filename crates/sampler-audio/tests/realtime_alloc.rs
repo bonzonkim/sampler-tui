@@ -6,7 +6,7 @@ use sampler_audio::{
     AudioController, AudioEngine, PadId, PadSettings, SampleBuffer, audio_channels,
     audio_channels_with_test_capacities, write_frames,
 };
-use sampler_core::PlaybackMode;
+use sampler_core::{BankId, PlaybackMode};
 
 struct CountingAllocator {
     enabled: AtomicBool,
@@ -113,6 +113,39 @@ fn measure_timed_and_immediate_command_ingestion() {
         engine.render_frames(96, |_| {});
     });
     drop(controller);
+}
+
+fn measure_live_and_recovery_command_ingestion() {
+    let (mut controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(48_000, ports).unwrap();
+    let first = Arc::new(SampleBuffer::new(48_000, vec![0.25; 16]).unwrap());
+    controller
+        .install(PadId::first(), first, PadSettings::default())
+        .unwrap();
+    engine.render_frames(1, |_| {});
+    let second_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+    let recovered = Arc::new(SampleBuffer::new(48_000, vec![0.5; 16]).unwrap());
+    controller
+        .install_recovery(second_pad, recovered, PadSettings::default())
+        .unwrap();
+    controller.trigger_live(PadId::first(), 0.75).unwrap();
+    controller.release_live(PadId::first()).unwrap();
+
+    assert_zero_callback_activity("live and recovery command ingestion", || {
+        engine.render_frames(1, |_| {});
+    });
+    assert_eq!(engine.executed_triggers(), 1);
+
+    let invalid = Arc::new(SampleBuffer::new(44_100, vec![0.25; 16]).unwrap());
+    let keepalive = Arc::clone(&invalid);
+    controller
+        .install_recovery(second_pad, invalid, PadSettings::default())
+        .unwrap();
+    assert_zero_callback_activity("invalid recovery command ingestion", || {
+        engine.render_frames(0, |_| {});
+    });
+    assert_eq!(controller.reclaim_retired(), 1);
+    drop(keepalive);
 }
 
 fn measure_invalid_command_handling() {
@@ -237,6 +270,7 @@ fn measure_render_horizon_publication() {
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
     measure_timed_and_immediate_command_ingestion();
+    measure_live_and_recovery_command_ingestion();
     measure_invalid_command_handling();
     measure_voice_completion_without_final_arc_drop();
     measure_sample_remap_retirement();

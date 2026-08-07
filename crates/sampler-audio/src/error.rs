@@ -32,6 +32,10 @@ pub enum DecodeError {
     Empty,
     #[error("decoded audio contains a non-finite sample")]
     NonFinite,
+    #[error("decoded audio has {frames} frames, exceeding the {max_frames}-frame limit")]
+    FrameLimitExceeded { frames: usize, max_frames: usize },
+    #[error("decoded audio needs {bytes} bytes, exceeding the {max_bytes}-byte limit")]
+    ByteLimitExceeded { bytes: usize, max_bytes: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -60,6 +64,8 @@ pub enum PrepareError {
     Resampling(#[source] rubato::ResampleError),
     #[error(transparent)]
     Sample(#[from] SampleError),
+    #[error("prepared audio has {frames} frames, exceeding the {max_frames}-frame limit")]
+    FrameLimitExceeded { frames: usize, max_frames: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

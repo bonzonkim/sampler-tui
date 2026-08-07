@@ -21,8 +21,9 @@ use sampler_tui::terminal::{
     run_event_loop_with_observer, run_with_runtime_lifecycle,
 };
 use sampler_tui::{
-    App, AudioPort, DirectoryEntry, DirectoryEntryKind, KeyboardCapabilities, LoadedSample,
-    PAD_KEYS, PREVIEW_COLUMNS, PreviewColumn, WorkerRequest, WorkerResult, WorkerSendError,
+    App, AudioPort, DirectoryEntry, DirectoryEntryKind, DirectoryScan, KeyboardCapabilities,
+    LoadedSample, PAD_KEYS, PREVIEW_COLUMNS, PreviewColumn, WorkerRequest, WorkerResult,
+    WorkerSendError,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -588,10 +589,10 @@ impl EventLoopWorker for HarnessWorker {
                 state.results.push_back(WorkerResult::Scanned {
                     request_id,
                     path,
-                    result: Ok(vec![DirectoryEntry {
+                    result: Ok(DirectoryScan::complete(vec![DirectoryEntry {
                         path: sample_path,
                         kind: DirectoryEntryKind::File,
-                    }]),
+                    }])),
                 });
                 state.events.borrow_mut().push_back(QueuedEvent {
                     event: Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

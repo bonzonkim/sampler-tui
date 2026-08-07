@@ -73,7 +73,7 @@ fn render_sample(frame: &mut Frame, area: Rect, app: &App) {
     let selected = app.selected_pad().min(15);
     let offset = usize::from(u8::from(app.active_bank())) * 16 + selected;
     let pad = &app.pads()[offset];
-    let label = selected_sample_label(pad);
+    let label = selected_sample_label(pad, app.pad_display_source(offset));
     let state = load_state_name(&pad.state);
     let summary = format!(
         " PAD {:02} · {} · {}",
@@ -95,7 +95,7 @@ fn render_sample(frame: &mut Frame, area: Rect, app: &App) {
             let magnitude = i16::from(column.min)
                 .unsigned_abs()
                 .max(i16::from(column.max).unsigned_abs());
-            let level = usize::from(magnitude).saturating_mul(8) / 127;
+            let level = usize::from(magnitude).min(8);
             preview.push(WAVE_CHARS[level.min(8)]);
         }
         frame.render_widget(
@@ -154,7 +154,14 @@ fn render_pads(frame: &mut Frame, area: Rect, app: &App) {
             let selected = app.selected_pad() == index;
             let held = app.is_pad_held(index);
             spans.push(Span::styled(
-                pad_cell(PAD_KEYS[index], pad, selected, held, cell_width),
+                pad_cell(
+                    PAD_KEYS[index],
+                    pad,
+                    app.pad_display_source(bank_offset + index),
+                    selected,
+                    held,
+                    cell_width,
+                ),
                 pad_style(&pad.state, selected, held),
             ));
         }
@@ -186,12 +193,19 @@ fn pad_style(state: &PadLoadState, selected: bool, held: bool) -> Style {
     Style::default().add_modifier(modifiers)
 }
 
-fn pad_cell(key: char, pad: &PadView, selected: bool, held: bool, width: usize) -> String {
+fn pad_cell(
+    key: char,
+    pad: &PadView,
+    display_source: Option<&Path>,
+    selected: bool,
+    held: bool,
+    width: usize,
+) -> String {
     if width == 0 {
         return String::new();
     }
     let label_budget = width.saturating_sub(7);
-    let label = truncate(&pad_label(pad), label_budget.max(1));
+    let label = truncate(&pad_label(pad, display_source), label_budget.max(1));
     let state = match pad.state {
         PadLoadState::Empty => '·',
         PadLoadState::WaitingForDevice => '◇',
@@ -322,6 +336,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "Shift + pad                                stop pad",
                 "[ / ]                                      previous / next bank",
                 "Arrow keys                                 select pad",
+                "Enter                                      trigger selected pad",
                 "l                                          load sample",
                 ":                                          command palette",
                 "Shift+Esc                                  stop all",
@@ -331,18 +346,6 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
         ),
         Overlay::Palette => render_palette(frame, area, app),
         Overlay::FilePicker => render_picker(frame, area, app),
-        Overlay::ConfirmQuit => render_list_overlay(
-            frame,
-            area,
-            " QUIT? ",
-            42,
-            5,
-            [
-                "Stop playback and quit?",
-                "Enter / y confirm",
-                "n / Esc cancel",
-            ],
-        ),
         Overlay::DeviceError(error) => render_list_overlay(
             frame,
             area,
@@ -452,7 +455,7 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
     let picker = app.file_picker();
     let directory = picker.directory().to_string_lossy();
-    let header = if let Some(pending) = picker.pending_directory() {
+    let mut header = if let Some(pending) = picker.pending_directory() {
         format!(
             "Loading {}… · Viewing {directory}",
             pending.to_string_lossy(),
@@ -465,6 +468,9 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!("Viewing {directory}")
     };
+    if picker.truncated() {
+        header.push_str(" · limited result set");
+    }
     frame.render_widget(
         Paragraph::new(truncate(&header, usize::from(inner.width))),
         Rect::new(inner.x, inner.y, inner.width, 1),
@@ -548,7 +554,7 @@ fn centered_rect(area: Rect, requested_width: u16, requested_height: u16) -> Rec
     )
 }
 
-fn pad_label(pad: &PadView) -> String {
+fn pad_label(pad: &PadView, display_source: Option<&Path>) -> String {
     if !pad.label.trim().is_empty() {
         return Path::new(pad.label.trim())
             .file_stem()
@@ -556,15 +562,14 @@ fn pad_label(pad: &PadView) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| pad.label.trim().to_owned());
     }
-    pad.source
-        .as_deref()
+    display_source
         .and_then(Path::file_stem)
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "----".to_owned())
 }
 
-fn selected_sample_label(pad: &PadView) -> String {
+fn selected_sample_label(pad: &PadView, display_source: Option<&Path>) -> String {
     let label = if !pad.label.trim().is_empty() {
         Path::new(pad.label.trim())
             .file_name()
@@ -572,8 +577,7 @@ fn selected_sample_label(pad: &PadView) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| pad.label.trim().to_owned())
     } else {
-        pad.source
-            .as_deref()
+        display_source
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
@@ -648,7 +652,7 @@ mod tests {
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
-    use crate::loader::{LoadedSample, WorkerResult};
+    use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
     use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
 
     use super::render;
@@ -761,6 +765,9 @@ mod tests {
 
     fn populated_app_with_audio(audio: FakeAudio) -> App {
         let mut app = loaded_states_app(audio);
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::StopAll);
         app
@@ -779,7 +786,7 @@ mod tests {
         };
         let mut preview = [PreviewColumn::default(); PREVIEW_COLUMNS];
         for (index, column) in preview.iter_mut().enumerate() {
-            let height = i8::try_from((index % 8) * 16).unwrap();
+            let height = i8::try_from(index % 9).unwrap();
             *column = PreviewColumn {
                 min: -height,
                 max: height,
@@ -810,7 +817,7 @@ mod tests {
             pad: pad(5),
             generation,
             path: error_path,
-            result: Err("decode failed".to_owned()),
+            result: Err(LoadSampleError::Decode("decode failed".to_owned())),
         });
         app
     }
@@ -916,15 +923,12 @@ mod tests {
         palette.open_palette();
         let mut picker = ready_app();
         picker.open_picker_at("/samples");
-        let mut confirm = ready_app();
-        confirm.open_quit_confirmation();
         let failed = App::without_audio("device disconnected");
 
         for (app, title) in [
             (help, "HELP"),
             (palette, "COMMAND"),
             (picker, "LOAD SAMPLE"),
-            (confirm, "QUIT?"),
             (failed, "AUDIO DEVICE ERROR"),
         ] {
             let snapshot = render_lines(100, 30, &app);
@@ -941,15 +945,12 @@ mod tests {
         palette.open_palette();
         let mut picker = ready_app();
         picker.open_picker_at("/samples");
-        let mut confirm = ready_app();
-        confirm.open_quit_confirmation();
         let failed = App::without_audio("device disconnected");
 
         for (app, rect) in [
             (help, (21, 7, 58, 15)),
             (palette, (19, 12, 62, 5)),
             (picker, (14, 5, 72, 19)),
-            (confirm, (29, 12, 42, 5)),
             (failed, (19, 11, 62, 7)),
         ] {
             let (x, y, width, height) = rect;
@@ -975,6 +976,32 @@ mod tests {
         assert!(snapshot.contains("CLAP×"), "error marker missing");
         assert!(snapshot.contains(">[1"), "selected marker missing");
         assert!(snapshot.contains("----·"), "empty marker missing");
+    }
+
+    #[test]
+    fn production_scale_preview_amplitudes_render_a_visible_waveform() {
+        let mut app = ready_app();
+        let sample_path = std::path::PathBuf::from("/samples/visible.wav");
+        let request = app.begin_load(pad(0), sample_path.clone()).unwrap();
+        let crate::WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0),
+            generation,
+            path: sample_path,
+            result: Ok(LoadedSample {
+                buffer: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                source_rate: 48_000,
+                source_frames: 64,
+                duration: Duration::from_secs_f64(64.0 / 48_000.0),
+                preview: [PreviewColumn { min: -8, max: 8 }; PREVIEW_COLUMNS],
+            }),
+        }));
+
+        let snapshot = render_lines(80, 24, &app).join("\n");
+
+        assert!(snapshot.lines().any(|line| line.contains("WAVE █")));
     }
 
     #[test]

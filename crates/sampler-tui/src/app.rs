@@ -6,17 +6,18 @@ use std::sync::Arc;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{SampleBuffer, Telemetry};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
-use sampler_core::{BankId, PadId, PadSettings};
+use sampler_core::{BankId, PadId, PadSettings, PlaybackMode};
 
 use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
-use crate::loader::{WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError};
+use crate::loader::{
+    MAX_DIRECTORY_ENTRIES, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
+};
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 
 pub const PAD_VIEW_COUNT: usize = 160;
 pub const PREVIEW_COLUMNS: usize = 64;
-const LIVE_SCHEDULE_AHEAD_FRAMES: u64 = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreviewColumn {
@@ -59,12 +60,30 @@ impl Default for PadView {
     }
 }
 
+enum PendingLoadPhase {
+    AwaitingWorker,
+    WorkerQueued,
+    Ready(crate::loader::LoadedSample),
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingLoadKind {
+    User,
+    Recovery,
+}
+
+struct PendingLoad {
+    path: PathBuf,
+    phase: PendingLoadPhase,
+    kind: PendingLoadKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     Help,
     Palette,
     FilePicker,
-    ConfirmQuit,
     DeviceError(String),
 }
 
@@ -82,7 +101,10 @@ pub struct App {
     file_picker: FilePicker,
     pending_worker_requests: Vec<WorkerRequest>,
     recovery_cursor: Option<usize>,
-    recovery_pending: [bool; PAD_VIEW_COUNT],
+    pending_loads: [Option<Box<PendingLoad>>; PAD_VIEW_COUNT],
+    committed_recovery_loads: [Option<Box<PendingLoad>>; PAD_VIEW_COUNT],
+    recovery_generations: [u64; PAD_VIEW_COUNT],
+    reinstall_pending: [bool; PAD_VIEW_COUNT],
     device_retry_requests: usize,
     keyboard_capabilities: KeyboardCapabilities,
     status: String,
@@ -124,7 +146,10 @@ impl App {
             current_dir,
             pending_worker_requests: Vec::new(),
             recovery_cursor: None,
-            recovery_pending: [false; PAD_VIEW_COUNT],
+            pending_loads: array::from_fn(|_| None),
+            committed_recovery_loads: array::from_fn(|_| None),
+            recovery_generations: [0; PAD_VIEW_COUNT],
+            reinstall_pending: [false; PAD_VIEW_COUNT],
             device_retry_requests: 0,
             keyboard_capabilities: KeyboardCapabilities::default(),
             status: audio_error.clone().unwrap_or_default(),
@@ -180,9 +205,14 @@ impl App {
             self.close_overlay();
             return;
         }
-        if map_key(key, self.keyboard_capabilities) == Some(InputAction::Quit) {
-            self.should_quit = true;
-            return;
+        if let Some(action) = map_key(key, self.keyboard_capabilities) {
+            match action {
+                InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
+                    self.apply(action);
+                    return;
+                }
+                InputAction::PadPress(_) | InputAction::PadStop(_) | InputAction::BankDelta(_) => {}
+            }
         }
         if self.audio.is_none() && is_explicit_device_retry(key) {
             self.device_retry_requests = self.device_retry_requests.saturating_add(1);
@@ -191,7 +221,6 @@ impl App {
 
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
-            Some(Overlay::ConfirmQuit) => self.apply_confirmation_key(key),
             Some(Overlay::Palette) => self.apply_palette_key(key),
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
@@ -312,10 +341,6 @@ impl App {
         self.overlay = Some(Overlay::FilePicker);
     }
 
-    pub fn open_quit_confirmation(&mut self) {
-        self.overlay = Some(Overlay::ConfirmQuit);
-    }
-
     pub fn close_overlay(&mut self) {
         if self.overlay == Some(Overlay::Palette) {
             self.palette_error = None;
@@ -342,6 +367,18 @@ impl App {
         &self.file_picker
     }
 
+    pub(crate) fn pad_display_source(&self, offset: usize) -> Option<&Path> {
+        self.pads
+            .get(offset)
+            .and_then(|pad| pad.source.as_deref())
+            .or_else(|| {
+                self.pending_loads
+                    .get(offset)
+                    .and_then(Option::as_deref)
+                    .map(|pending| pending.path.as_path())
+            })
+    }
+
     pub fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
         mem::take(&mut self.pending_worker_requests)
     }
@@ -352,24 +389,42 @@ impl App {
         error: WorkerSendError,
     ) -> bool {
         let message = error.to_string();
-        if let WorkerRequest::LoadSample {
-            pad,
-            generation,
-            path,
-            ..
-        } = request
-        {
-            let offset = pad_offset(pad);
-            let view = &mut self.pads[offset];
-            if view.generation == generation && view.source.as_deref() == Some(path.as_path()) {
-                if error != WorkerSendError::WorkerBusy {
-                    self.recovery_pending[offset] = false;
+        let applied = match request {
+            WorkerRequest::LoadSample {
+                pad,
+                generation,
+                path,
+                ..
+            } => {
+                let offset = pad_offset(pad);
+                if let Some(kind) = self.matching_pending_load(offset, generation, &path) {
+                    if error == WorkerSendError::WorkerBusy {
+                        if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
+                            pending.phase = PendingLoadPhase::AwaitingWorker;
+                        }
+                        self.recovery_cursor.get_or_insert(offset);
+                    } else {
+                        if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
+                            pending.phase = PendingLoadPhase::Failed;
+                        }
+                    }
+                    self.pads[offset].state = PadLoadState::Error(message.clone());
+                    true
+                } else {
+                    false
                 }
-                view.state = PadLoadState::Error(message.clone());
             }
+            WorkerRequest::ScanDirectory {
+                request_id, path, ..
+            } if self.file_picker.pending_directory() == Some(path.as_path()) => self
+                .file_picker
+                .apply_scan(request_id, Err(message.clone())),
+            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => false,
+        };
+        if applied {
+            self.status = message;
         }
-        self.status = message;
-        true
+        applied
     }
 
     pub fn device_retry_requests(&self) -> usize {
@@ -387,7 +442,9 @@ impl App {
     pub fn shutdown_audio(&mut self) -> Result<(), String> {
         self.audio_format = None;
         self.recovery_cursor = None;
-        self.recovery_pending.fill(false);
+        self.pending_loads.fill_with(|| None);
+        self.committed_recovery_loads.fill_with(|| None);
+        self.reinstall_pending.fill(false);
         self.held_pad_by_key.fill(None);
         for pad in &mut self.pads {
             pad.active = false;
@@ -427,22 +484,37 @@ impl App {
         let path = path.into();
         let engine_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
         let offset = pad_offset(pad);
-        self.recovery_pending[offset] = false;
+        self.reinstall_pending[offset] = false;
         let view = &mut self.pads[offset];
         view.generation = view.generation.wrapping_add(1);
-        view.source = Some(path.clone());
         view.state = if engine_rate.is_some() {
             PadLoadState::Loading
         } else {
             PadLoadState::WaitingForDevice
         };
+        let generation = view.generation;
 
-        engine_rate.map(|engine_rate| WorkerRequest::LoadSample {
-            pad,
-            generation: view.generation,
-            path,
-            engine_rate,
-        })
+        if let Some(engine_rate) = engine_rate {
+            self.pending_loads[offset] = Some(Box::new(PendingLoad {
+                path: path.clone(),
+                phase: PendingLoadPhase::WorkerQueued,
+                kind: PendingLoadKind::User,
+            }));
+            Some(WorkerRequest::LoadSample {
+                pad,
+                generation,
+                path,
+                engine_rate,
+            })
+        } else {
+            self.pending_loads[offset] = Some(Box::new(PendingLoad {
+                path,
+                phase: PendingLoadPhase::AwaitingWorker,
+                kind: PendingLoadKind::User,
+            }));
+            self.recovery_cursor = Some(offset);
+            None
+        }
     }
 
     pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
@@ -465,55 +537,72 @@ impl App {
                 return false;
             }
             let error = result.as_ref().err().cloned();
+            let truncated = result.as_ref().is_ok_and(|scan| scan.truncated());
             let applied = self.file_picker.apply_scan(request_id, result);
-            if applied && let Some(error) = error {
-                self.status = error;
+            if applied {
+                if let Some(error) = error {
+                    self.status = error;
+                } else if truncated {
+                    self.status = format!(
+                        "directory results limited to the first {MAX_DIRECTORY_ENTRIES} entries"
+                    );
+                }
             }
             return applied;
         };
         let offset = pad_offset(pad);
-        if self.pads[offset].generation != generation
-            || self.pads[offset].source.as_deref() != Some(path.as_path())
-        {
+        let Some(kind) = self.matching_pending_load(offset, generation, &path) else {
             return false;
-        }
-        self.recovery_pending[offset] = false;
+        };
 
         let loaded = match result {
             Ok(loaded) => loaded,
             Err(error) => {
+                let error = error.to_string();
+                if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
+                    pending.phase = PendingLoadPhase::Failed;
+                }
                 self.pads[offset].state = PadLoadState::Error(error.clone());
                 self.status = error;
                 return true;
             }
         };
-        let Some(audio) = self.audio.as_mut() else {
+
+        *self.pending_load_slot_mut(offset, kind) = Some(Box::new(PendingLoad {
+            path,
+            phase: PendingLoadPhase::Ready(loaded),
+            kind,
+        }));
+        let Some(sample_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
             self.pads[offset].state = PadLoadState::WaitingForDevice;
+            self.recovery_cursor = Some(offset);
             return true;
         };
-        let settings = self.pads[offset].settings;
-        if let Err(error) = audio.install(pad, Arc::clone(&loaded.buffer), settings) {
-            self.pads[offset].state = PadLoadState::Error(error.clone());
-            self.status = error;
+        if self
+            .pending_load_slot(offset, kind)
+            .as_ref()
+            .and_then(|pending| match &pending.phase {
+                PendingLoadPhase::Ready(loaded) => Some(loaded.buffer.sample_rate()),
+                _ => None,
+            })
+            != Some(sample_rate)
+        {
+            if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
+                pending.phase = PendingLoadPhase::AwaitingWorker;
+            }
+            self.pads[offset].state = PadLoadState::Loading;
+            self.recovery_cursor = Some(offset);
             return true;
         }
-
-        let label = path
-            .file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-        let view = &mut self.pads[offset];
-        view.label = label.clone();
-        view.source = Some(path);
-        view.sample = Some(loaded.buffer);
-        view.preview = loaded.preview;
-        view.state = PadLoadState::Ready;
-        self.status = format!("Loaded {}", label.to_uppercase());
+        self.install_pending_load(offset, kind);
         true
     }
 
     fn press_pad(&mut self, index: usize) {
+        self.trigger_pad(index, true);
+    }
+
+    fn trigger_pad(&mut self, index: usize, track_physical_hold: bool) {
         if self.held_pad_by_key.get(index).is_some_and(Option::is_some) {
             return;
         }
@@ -525,11 +614,15 @@ impl App {
             self.report_audio_unavailable();
             return;
         };
-        let at = audio
-            .render_horizon()
-            .saturating_add(LIVE_SCHEDULE_AHEAD_FRAMES);
-        match audio.trigger(pad, at, 1.0) {
-            Ok(()) => self.held_pad_by_key[index] = Some(pad),
+        match audio.trigger_live(pad, 1.0) {
+            Ok(())
+                if track_physical_hold
+                    && (self.keyboard_capabilities.release_events
+                        || self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot) =>
+            {
+                self.held_pad_by_key[index] = Some(pad);
+            }
+            Ok(()) => {}
             Err(error) => self.status = error,
         }
     }
@@ -540,20 +633,6 @@ impl App {
             && matches!(key.code, KeyCode::Char('r' | 'R'))
         {
             self.device_retry_requests = self.device_retry_requests.saturating_add(1);
-        }
-    }
-
-    fn apply_confirmation_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
-                self.should_quit = true;
-                self.overlay = None;
-            }
-            KeyCode::Char('n' | 'N') => self.overlay = None,
-            _ => {}
         }
     }
 
@@ -688,6 +767,7 @@ impl App {
                 KeyCode::Right => self.move_selection(1, 0),
                 KeyCode::Up => self.move_selection(0, -1),
                 KeyCode::Down => self.move_selection(0, 1),
+                KeyCode::Enter => self.trigger_pad(self.selected_pad, false),
                 _ => {
                     if let Some(action) = map_key(key, self.keyboard_capabilities) {
                         self.apply(action);
@@ -767,14 +847,14 @@ impl App {
         let Some(pad) = self.held_pad_by_key[index] else {
             return;
         };
+        if self.pads[pad_offset(pad)].settings.mode == PlaybackMode::Loop {
+            return;
+        }
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
         };
-        let at = audio
-            .render_horizon()
-            .saturating_add(LIVE_SCHEDULE_AHEAD_FRAMES);
-        match audio.release(pad, at) {
+        match audio.release_live(pad) {
             Ok(()) => self.held_pad_by_key[index] = None,
             Err(error) => self.status = error,
         }
@@ -862,7 +942,7 @@ impl App {
         self.audio = None;
         self.audio_format = None;
         self.recovery_cursor = None;
-        self.recovery_pending.fill(false);
+        self.reinstall_pending.fill(false);
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
         for pad in &mut self.pads {
@@ -872,11 +952,18 @@ impl App {
         self.overlay = Some(Overlay::DeviceError(error));
     }
 
-    fn recover_audio(&mut self, mut audio: Box<dyn AudioPort>) {
+    fn recover_audio(&mut self, audio: Box<dyn AudioPort>) {
         let sample_rate = audio.sample_rate();
         let channels = audio.channels();
         let mut local_error = None;
-        let loader_busy = WorkerSendError::WorkerBusy.to_string();
+
+        self.audio = Some(audio);
+        self.audio_format = Some((sample_rate, channels));
+        self.audio_unavailable_message = None;
+        self.held_pad_by_key.fill(None);
+        self.overlay = None;
+        self.committed_recovery_loads.fill_with(|| None);
+        self.reinstall_pending.fill(false);
 
         for bank in 0..BANK_COUNT {
             let bank = BankId::new(bank).expect("bounded bank is valid");
@@ -885,59 +972,56 @@ impl App {
                 let offset = pad_offset(pad);
                 let view = &mut self.pads[offset];
 
-                if let Some(sample) = view
+                if view
                     .sample
                     .as_ref()
-                    .filter(|sample| sample.sample_rate() == sample_rate)
+                    .is_some_and(|sample| sample.sample_rate() == sample_rate)
                 {
-                    view.generation = view.generation.wrapping_add(1);
-                    self.recovery_pending[offset] = false;
-                    match audio.install(pad, Arc::clone(sample), view.settings) {
-                        Ok(_) => view.state = PadLoadState::Ready,
-                        Err(error) => {
-                            view.state = PadLoadState::Error(error.clone());
-                            local_error = Some(error);
-                        }
-                    }
-                    continue;
-                }
-
-                if view.source.is_some() {
-                    view.generation = view.generation.wrapping_add(1);
-                    self.recovery_pending[offset] = true;
-                    view.state = PadLoadState::Error(loader_busy.clone());
-                } else if view.sample.is_some() || view.state != PadLoadState::Empty {
-                    self.recovery_pending[offset] = false;
+                    self.reinstall_pending[offset] = true;
+                } else if let Some(path) = view.source.clone() {
+                    self.recovery_generations[offset] = self.recovery_generations[offset]
+                        .max(view.generation)
+                        .wrapping_add(1);
+                    self.committed_recovery_loads[offset] = Some(Box::new(PendingLoad {
+                        path,
+                        phase: PendingLoadPhase::AwaitingWorker,
+                        kind: PendingLoadKind::Recovery,
+                    }));
+                } else if self.pending_loads[offset].is_none()
+                    && (view.sample.is_some() || view.state != PadLoadState::Empty)
+                {
                     let error = format!(
                         "cannot reload pad for {sample_rate} Hz because its source path is unavailable"
                     );
                     view.state = PadLoadState::Error(error.clone());
                     local_error = Some(error);
-                } else {
-                    self.recovery_pending[offset] = false;
+                }
+
+                if let Some(pending) = self.pending_loads[offset].as_mut()
+                    && matches!(
+                        &pending.phase,
+                        PendingLoadPhase::Ready(loaded)
+                            if loaded.buffer.sample_rate() != sample_rate
+                    )
+                {
+                    pending.phase = PendingLoadPhase::AwaitingWorker;
+                }
+
+                let user_load_active = self.pending_loads[offset]
+                    .as_ref()
+                    .is_some_and(|pending| !matches!(pending.phase, PendingLoadPhase::Failed));
+                if self.reinstall_pending[offset]
+                    || self.committed_recovery_loads[offset].is_some()
+                    || user_load_active
+                {
+                    view.state = PadLoadState::Loading;
                 }
             }
         }
 
-        self.audio = Some(audio);
-        self.audio_format = Some((sample_rate, channels));
-        self.audio_unavailable_message = None;
-        self.held_pad_by_key.fill(None);
-        self.overlay = None;
         self.recovery_cursor = Some(0);
+        self.status = local_error.unwrap_or_else(|| "audio device connected".to_owned());
         self.pump_recovery_requests();
-        let recovery_overflow = self
-            .pads
-            .iter()
-            .zip(self.recovery_pending.iter().copied())
-            .any(|(pad, pending)| pending && matches!(pad.state, PadLoadState::Error(_)));
-        self.status = local_error.unwrap_or_else(|| {
-            if recovery_overflow {
-                loader_busy
-            } else {
-                "audio device connected".to_owned()
-            }
-        });
     }
 
     fn pump_recovery_requests(&mut self) -> bool {
@@ -948,63 +1032,256 @@ impl App {
             self.recovery_cursor = None;
             return false;
         };
-        let mut changed = false;
         let mut visited = 0;
 
-        while visited < PAD_VIEW_COUNT
-            && self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY
-        {
+        while visited < PAD_VIEW_COUNT {
             let offset = cursor;
             cursor = (cursor + 1) % PAD_VIEW_COUNT;
             visited += 1;
 
-            if !pad_needs_recovery(
-                &self.pads[offset],
-                self.recovery_pending[offset],
-                sample_rate,
-            ) || self.pads[offset].state == PadLoadState::Loading
-            {
-                continue;
+            if self.reinstall_pending[offset] {
+                self.recovery_cursor = Some(cursor);
+                self.reinstall_committed_sample(offset);
+                return true;
             }
 
-            let bank = u8::try_from(offset / usize::from(PADS_PER_BANK))
-                .expect("bounded pad bank fits in u8");
-            let index = u8::try_from(offset % usize::from(PADS_PER_BANK))
-                .expect("bounded pad index fits in u8");
-            let pad = PadId::new(BankId::new(bank).expect("bounded bank is valid"), index)
-                .expect("bounded pad is valid");
-            let view = &mut self.pads[offset];
-            let Some(path) = view.source.clone() else {
-                continue;
-            };
-            view.state = PadLoadState::Loading;
-            self.pending_worker_requests
-                .push(WorkerRequest::LoadSample {
-                    pad,
-                    generation: view.generation,
-                    path,
-                    engine_rate: sample_rate,
-                });
-            changed = true;
+            if let Some(pending) = self.committed_recovery_loads[offset].as_mut() {
+                if matches!(
+                    &pending.phase,
+                    PendingLoadPhase::Ready(loaded)
+                        if loaded.buffer.sample_rate() != sample_rate
+                ) {
+                    pending.phase = PendingLoadPhase::AwaitingWorker;
+                }
+
+                match pending.phase {
+                    PendingLoadPhase::AwaitingWorker => {
+                        let request = WorkerRequest::LoadSample {
+                            pad: pad_from_offset(offset),
+                            generation: self.recovery_generations[offset],
+                            path: pending.path.clone(),
+                            engine_rate: sample_rate,
+                        };
+                        pending.phase = PendingLoadPhase::WorkerQueued;
+                        self.pads[offset].state = PadLoadState::Loading;
+                        self.recovery_cursor = Some(cursor);
+                        self.queue_worker_request(request);
+                        return true;
+                    }
+                    PendingLoadPhase::Ready(_) => {
+                        self.recovery_cursor = Some(cursor);
+                        self.install_pending_load(offset, PendingLoadKind::Recovery);
+                        return true;
+                    }
+                    PendingLoadPhase::WorkerQueued => continue,
+                    PendingLoadPhase::Failed => {}
+                }
+            }
+
+            if let Some(pending) = self.pending_loads[offset].as_mut() {
+                if matches!(
+                    &pending.phase,
+                    PendingLoadPhase::Ready(loaded)
+                        if loaded.buffer.sample_rate() != sample_rate
+                ) {
+                    pending.phase = PendingLoadPhase::AwaitingWorker;
+                }
+
+                match pending.phase {
+                    PendingLoadPhase::AwaitingWorker => {
+                        let request = WorkerRequest::LoadSample {
+                            pad: pad_from_offset(offset),
+                            generation: self.pads[offset].generation,
+                            path: pending.path.clone(),
+                            engine_rate: sample_rate,
+                        };
+                        pending.phase = PendingLoadPhase::WorkerQueued;
+                        self.pads[offset].state = PadLoadState::Loading;
+                        self.recovery_cursor = Some(cursor);
+                        self.queue_worker_request(request);
+                        return true;
+                    }
+                    PendingLoadPhase::Ready(_) => {
+                        self.recovery_cursor = Some(cursor);
+                        self.install_pending_load(offset, PendingLoadKind::User);
+                        return true;
+                    }
+                    PendingLoadPhase::WorkerQueued | PendingLoadPhase::Failed => continue,
+                }
+            }
         }
 
-        let still_recovering = self
-            .pads
-            .iter()
-            .zip(self.recovery_pending.iter().copied())
-            .any(|(pad, pending)| pad_needs_recovery(pad, pending, sample_rate));
+        let still_recovering = self.recovery_action_pending();
         self.recovery_cursor = still_recovering.then_some(cursor);
-        changed
+        false
     }
-}
 
-fn pad_needs_recovery(pad: &PadView, pending: bool, sample_rate: u32) -> bool {
-    pending
-        && pad.source.is_some()
-        && pad
-            .sample
-            .as_ref()
-            .is_none_or(|sample| sample.sample_rate() != sample_rate)
+    fn pending_load_slot(&self, offset: usize, kind: PendingLoadKind) -> &Option<Box<PendingLoad>> {
+        match kind {
+            PendingLoadKind::User => &self.pending_loads[offset],
+            PendingLoadKind::Recovery => &self.committed_recovery_loads[offset],
+        }
+    }
+
+    fn pending_load_slot_mut(
+        &mut self,
+        offset: usize,
+        kind: PendingLoadKind,
+    ) -> &mut Option<Box<PendingLoad>> {
+        match kind {
+            PendingLoadKind::User => &mut self.pending_loads[offset],
+            PendingLoadKind::Recovery => &mut self.committed_recovery_loads[offset],
+        }
+    }
+
+    fn matching_pending_load(
+        &self,
+        offset: usize,
+        generation: u64,
+        path: &Path,
+    ) -> Option<PendingLoadKind> {
+        [PendingLoadKind::User, PendingLoadKind::Recovery]
+            .into_iter()
+            .find(|kind| {
+                let expected_generation = match kind {
+                    PendingLoadKind::User => self.pads[offset].generation,
+                    PendingLoadKind::Recovery => self.recovery_generations[offset],
+                };
+                expected_generation == generation
+                    && self
+                        .pending_load_slot(offset, *kind)
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.path == path
+                                && matches!(pending.phase, PendingLoadPhase::WorkerQueued)
+                        })
+            })
+    }
+
+    fn install_pending_load(&mut self, offset: usize, kind: PendingLoadKind) {
+        let Some(mut pending) = self.pending_load_slot_mut(offset, kind).take() else {
+            return;
+        };
+        let PendingLoadPhase::Ready(loaded) = pending.phase else {
+            *self.pending_load_slot_mut(offset, kind) = Some(pending);
+            return;
+        };
+        let Some(audio) = self.audio.as_mut() else {
+            pending.phase = PendingLoadPhase::Ready(loaded);
+            *self.pending_load_slot_mut(offset, kind) = Some(pending);
+            self.pads[offset].state = PadLoadState::WaitingForDevice;
+            return;
+        };
+        if loaded.buffer.sample_rate() != audio.sample_rate() {
+            pending.phase = PendingLoadPhase::AwaitingWorker;
+            *self.pending_load_slot_mut(offset, kind) = Some(pending);
+            self.pads[offset].state = PadLoadState::Loading;
+            self.recovery_cursor = Some(offset);
+            return;
+        }
+
+        let pad = pad_from_offset(offset);
+        let settings = self.pads[offset].settings;
+        let install_result = match pending.kind {
+            PendingLoadKind::User => audio.install(pad, Arc::clone(&loaded.buffer), settings),
+            PendingLoadKind::Recovery => {
+                audio.install_recovery(pad, Arc::clone(&loaded.buffer), settings)
+            }
+        };
+        if let Err(error) = install_result {
+            pending.phase = PendingLoadPhase::Ready(loaded);
+            *self.pending_load_slot_mut(offset, kind) = Some(pending);
+            self.pads[offset].state = PadLoadState::Error(error.clone());
+            self.status = error;
+            self.recovery_cursor.get_or_insert(offset);
+            return;
+        }
+
+        let label = pending
+            .path
+            .file_name()
+            .unwrap_or(pending.path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let view = &mut self.pads[offset];
+        view.label = label.clone();
+        view.source = Some(pending.path);
+        view.sample = Some(loaded.buffer);
+        view.preview = loaded.preview;
+        view.state = PadLoadState::Ready;
+        self.reinstall_pending[offset] = false;
+        if kind == PendingLoadKind::User {
+            self.committed_recovery_loads[offset] = None;
+        }
+        let action = if kind == PendingLoadKind::Recovery {
+            "Recovered"
+        } else {
+            "Loaded"
+        };
+        self.status = format!("{action} {}", label.to_uppercase());
+    }
+
+    fn reinstall_committed_sample(&mut self, offset: usize) {
+        let pad = pad_from_offset(offset);
+        let Some(sample) = self.pads[offset].sample.as_ref().cloned() else {
+            self.reinstall_pending[offset] = false;
+            return;
+        };
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        if sample.sample_rate() != audio.sample_rate() {
+            self.reinstall_pending[offset] = false;
+            if let Some(path) = self.pads[offset].source.clone() {
+                self.recovery_generations[offset] = self.recovery_generations[offset]
+                    .max(self.pads[offset].generation)
+                    .wrapping_add(1);
+                self.committed_recovery_loads[offset] = Some(Box::new(PendingLoad {
+                    path,
+                    phase: PendingLoadPhase::AwaitingWorker,
+                    kind: PendingLoadKind::Recovery,
+                }));
+                self.pads[offset].state = PadLoadState::Loading;
+                self.recovery_cursor = Some(offset);
+            }
+            return;
+        }
+
+        match audio.install_recovery(pad, sample, self.pads[offset].settings) {
+            Ok(_) => {
+                self.reinstall_pending[offset] = false;
+                self.pads[offset].state = PadLoadState::Ready;
+            }
+            Err(error) => {
+                self.pads[offset].state = PadLoadState::Error(error.clone());
+                self.status = error;
+                self.recovery_cursor.get_or_insert(offset);
+            }
+        }
+    }
+
+    fn recovery_action_pending(&self) -> bool {
+        self.reinstall_pending
+            .iter()
+            .copied()
+            .any(|pending| pending)
+            || self
+                .committed_recovery_loads
+                .iter()
+                .flatten()
+                .any(|pending| {
+                    matches!(
+                        pending.phase,
+                        PendingLoadPhase::AwaitingWorker | PendingLoadPhase::Ready(_)
+                    )
+                })
+            || self.pending_loads.iter().flatten().any(|pending| {
+                matches!(
+                    pending.phase,
+                    PendingLoadPhase::AwaitingWorker | PendingLoadPhase::Ready(_)
+                )
+            })
+    }
 }
 
 fn resolve_picker_directory(current_dir: &Path, directory: PathBuf) -> PathBuf {
@@ -1055,20 +1332,32 @@ fn pad_offset(pad: PadId) -> usize {
     usize::from(u8::from(pad.bank())) * usize::from(PADS_PER_BANK) + usize::from(pad.index())
 }
 
+fn pad_from_offset(offset: usize) -> PadId {
+    let bank =
+        u8::try_from(offset / usize::from(PADS_PER_BANK)).expect("bounded pad bank fits in u8");
+    let index =
+        u8::try_from(offset % usize::from(PADS_PER_BANK)).expect("bounded pad index fits in u8");
+    PadId::new(BankId::new(bank).expect("bounded bank is valid"), index)
+        .expect("bounded pad is valid")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
-    use sampler_core::{BankId, PadId, PadSettings};
+    use sampler_core::{BankId, PadId, PadSettings, PlaybackMode};
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
 
-    use crate::loader::{LoadedSample, WorkerRequest, WorkerResult, WorkerSendError};
+    use crate::DirectoryScan;
+    use crate::loader::{
+        LoadSampleError, LoadedSample, WorkerRequest, WorkerResult, WorkerSendError,
+    };
 
     use super::{App, PadLoadState, PreviewColumn};
 
@@ -1094,6 +1383,7 @@ mod tests {
         sample_rate: u32,
         channels: u16,
         horizon: Frame,
+        horizon_reads: Rc<Cell<usize>>,
         trigger_error: Option<String>,
         release_error: Option<String>,
         stop_pad_error: Option<String>,
@@ -1111,6 +1401,7 @@ mod tests {
                 sample_rate,
                 channels,
                 horizon: 0,
+                horizon_reads: Rc::new(Cell::new(0)),
                 trigger_error: None,
                 release_error: None,
                 stop_pad_error: None,
@@ -1186,6 +1477,8 @@ mod tests {
         }
 
         fn render_horizon(&self) -> Frame {
+            self.horizon_reads
+                .set(self.horizon_reads.get().saturating_add(1));
             self.horizon
         }
 
@@ -1213,11 +1506,34 @@ mod tests {
             Ok(())
         }
 
+        fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), String> {
+            if let Some(error) = &self.trigger_error {
+                return Err(error.clone());
+            }
+            self.calls.0.borrow_mut().push(AudioCall::Trigger(
+                pad,
+                self.horizon.saturating_add(64),
+                velocity,
+            ));
+            Ok(())
+        }
+
         fn release(&mut self, pad: PadId, at: Frame) -> Result<(), String> {
             if let Some(error) = self.release_error.take() {
                 return Err(error);
             }
             self.calls.0.borrow_mut().push(AudioCall::Release(pad, at));
+            Ok(())
+        }
+
+        fn release_live(&mut self, pad: PadId) -> Result<(), String> {
+            if let Some(error) = self.release_error.take() {
+                return Err(error);
+            }
+            self.calls
+                .0
+                .borrow_mut()
+                .push(AudioCall::Release(pad, self.horizon.saturating_add(64)));
             Ok(())
         }
 
@@ -1420,36 +1736,24 @@ mod tests {
 
         app.retry_default_device_with(|| Ok(Box::new(FakeAudio::ready(44_100, 2))));
 
-        let requests = app.take_worker_requests();
-        assert_eq!(requests.len(), 8);
-        for index in 8..12 {
-            assert_eq!(
-                app.pad(pad(0, index)).state,
-                PadLoadState::Error("loader busy".to_owned())
-            );
-        }
-
-        for request in requests {
-            app.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
-        }
+        let [first] = app.take_worker_requests().try_into().unwrap();
+        assert!(matches!(
+            first,
+            WorkerRequest::LoadSample { pad: pad_id, .. } if pad_id == pad(0, 0)
+        ));
+        app.apply_worker_send_error(first, WorkerSendError::WorkerBusy);
         assert_eq!(app.status(), "loader busy");
 
         app.maintain_audio();
-        let requests = app.take_worker_requests();
-        assert_eq!(requests.len(), 8);
-        assert_eq!(
-            requests
-                .iter()
-                .take(4)
-                .map(|request| match request {
-                    WorkerRequest::LoadSample { pad, .. } => *pad,
-                    _ => panic!("wrong request"),
-                })
-                .collect::<Vec<_>>(),
-            [pad(0, 8), pad(0, 9), pad(0, 10), pad(0, 11)]
-        );
+        let [second] = app.take_worker_requests().try_into().unwrap();
+        assert!(matches!(
+            second,
+            WorkerRequest::LoadSample { pad: pad_id, .. } if pad_id == pad(0, 1)
+        ));
 
-        for request in requests {
+        let mut requests = vec![second];
+        let mut completed = Vec::new();
+        while let Some(request) = requests.pop() {
             let WorkerRequest::LoadSample {
                 pad: pad_id,
                 generation,
@@ -1460,24 +1764,15 @@ mod tests {
                 panic!("wrong request")
             };
 
-            if pad_id == pad(0, 0) {
+            if pad_id == pad(0, 1) {
                 app.apply_worker_result(WorkerResult::Loaded {
                     pad: pad_id,
                     generation,
                     path,
-                    result: Err("unreadable early pad".to_owned()),
+                    result: Err(LoadSampleError::Decode("unreadable early pad".to_owned())),
                 });
-            } else if pad_id.index() < 8 {
-                app.apply_worker_send_error(
-                    WorkerRequest::LoadSample {
-                        pad: pad_id,
-                        generation,
-                        path,
-                        engine_rate: 44_100,
-                    },
-                    WorkerSendError::WorkerBusy,
-                );
             } else {
+                completed.push(pad_id);
                 app.apply_worker_result(loaded_at_rate(
                     pad_id,
                     generation,
@@ -1485,11 +1780,16 @@ mod tests {
                     44_100,
                 ));
             }
+
+            app.maintain_audio();
+            requests.extend(app.take_worker_requests());
         }
 
+        assert_eq!(completed.len(), 11);
+        assert!(completed.contains(&pad(0, 0)));
         assert_eq!(app.pad(pad(0, 11)).state, PadLoadState::Ready);
         assert_eq!(
-            app.pad(pad(0, 0)).state,
+            app.pad(pad(0, 1)).state,
             PadLoadState::Error("unreadable early pad".to_owned())
         );
     }
@@ -1520,7 +1820,7 @@ mod tests {
             pad: pad_id,
             generation,
             path,
-            result: Err("loader busy".to_owned()),
+            result: Err(LoadSampleError::Decode("loader busy".to_owned())),
         });
 
         app.maintain_audio();
@@ -1569,8 +1869,178 @@ mod tests {
 
         app.apply_worker_result(loaded(pad(0, 0), old_generation, "old.wav"));
 
-        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("new.wav")));
+        assert_eq!(app.pad(pad(0, 0)).source, None);
+        assert_eq!(
+            app.pending_loads[0]
+                .as_ref()
+                .map(|pending| pending.path.as_path()),
+            Some(path("new.wav"))
+        );
         assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Loading);
+    }
+
+    #[test]
+    fn failed_replacement_keeps_committed_source_and_sample_paired() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let first = app.begin_load(pad(0, 0), path("old.wav")).unwrap();
+        let WorkerRequest::LoadSample {
+            generation: first_generation,
+            ..
+        } = first
+        else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), first_generation, "old.wav"));
+        let committed = Arc::clone(app.pad(pad(0, 0)).sample.as_ref().unwrap());
+
+        let replacement = app.begin_load(pad(0, 0), path("new.wav")).unwrap();
+        let WorkerRequest::LoadSample {
+            generation: replacement_generation,
+            path: result_path,
+            ..
+        } = replacement
+        else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0, 0),
+            generation: replacement_generation,
+            path: result_path,
+            result: Err(LoadSampleError::Decode(
+                "replacement decode failed".to_owned(),
+            )),
+        });
+
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("old.wav")));
+        assert!(Arc::ptr_eq(
+            app.pad(pad(0, 0)).sample.as_ref().unwrap(),
+            &committed
+        ));
+    }
+
+    #[test]
+    fn device_retry_after_a_failed_replacement_reinstalls_the_committed_sample() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let first = app.begin_load(pad(0, 0), "old.wav").unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = first else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "old.wav"));
+
+        let replacement = app.begin_load(pad(0, 0), "new.wav").unwrap();
+        let WorkerRequest::LoadSample {
+            generation,
+            path: result_path,
+            ..
+        } = replacement
+        else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0, 0),
+            generation,
+            path: result_path,
+            result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
+        });
+        app.maintain_audio();
+
+        let replacement_audio = FakeAudio::ready(48_000, 2);
+        let calls = replacement_audio.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement_audio)));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("old.wav")));
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Ready);
+    }
+
+    #[test]
+    fn same_rate_retry_recovers_committed_sample_while_replacement_remains_pending() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let first = app.begin_load(pad(0, 0), "old.wav").unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = first else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "old.wav"));
+        let replacement = app.begin_load(pad(0, 0), "new.wav").unwrap();
+        app.maintain_audio();
+
+        let replacement_audio = FakeAudio::ready(48_000, 2);
+        let calls = replacement_audio.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement_audio)));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+        let WorkerRequest::LoadSample {
+            generation,
+            path: result_path,
+            ..
+        } = replacement
+        else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0, 0),
+            generation,
+            path: result_path,
+            result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
+        });
+
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("old.wav")));
+        assert_eq!(
+            app.pad(pad(0, 0)).sample.as_ref().unwrap().sample_rate(),
+            48_000
+        );
+    }
+
+    #[test]
+    fn changed_rate_retry_recovers_committed_source_while_replacement_remains_pending() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let first = app.begin_load(pad(0, 0), "old.wav").unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = first else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "old.wav"));
+        let replacement = app.begin_load(pad(0, 0), "new.wav").unwrap();
+        app.maintain_audio();
+
+        let replacement_audio = FakeAudio::ready(44_100, 2);
+        let calls = replacement_audio.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement_audio)));
+        let [recovery] = app.take_worker_requests().try_into().unwrap();
+        let WorkerRequest::LoadSample {
+            generation,
+            path: recovery_path,
+            ..
+        } = recovery
+        else {
+            panic!("wrong request")
+        };
+        assert_eq!(recovery_path, path("old.wav"));
+        app.apply_worker_result(loaded_at_rate(pad(0, 0), generation, "old.wav", 44_100));
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+
+        let WorkerRequest::LoadSample {
+            generation,
+            path: result_path,
+            ..
+        } = replacement
+        else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0, 0),
+            generation,
+            path: result_path,
+            result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
+        });
+
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("old.wav")));
+        assert_eq!(
+            app.pad(pad(0, 0)).sample.as_ref().unwrap().sample_rate(),
+            44_100
+        );
     }
 
     #[test]
@@ -1618,8 +2088,35 @@ mod tests {
         let request = app.begin_load(pad(0, 0), path("kick.wav"));
 
         assert!(request.is_none());
-        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("kick.wav")));
+        assert_eq!(app.pad(pad(0, 0)).source, None);
+        assert_eq!(
+            app.pending_loads[0]
+                .as_ref()
+                .map(|pending| pending.path.as_path()),
+            Some(path("kick.wav"))
+        );
         assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::WaitingForDevice);
+    }
+
+    #[test]
+    fn no_device_pending_load_is_scheduled_after_retry() {
+        let mut app = App::without_audio("no output device");
+        app.begin_load(pad(0, 0), "kick.wav");
+        let generation = app.pad(pad(0, 0)).generation;
+
+        app.retry_default_device_with(|| Ok(Box::new(FakeAudio::ready(44_100, 2))));
+
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::LoadSample {
+                pad: pad(0, 0),
+                generation,
+                path: "kick.wav".into(),
+                engine_rate: 44_100,
+            }]
+        );
+        assert_eq!(app.pad(pad(0, 0)).source, None);
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Loading);
     }
 
     #[test]
@@ -1637,10 +2134,45 @@ mod tests {
     }
 
     #[test]
+    fn pad_press_uses_the_causal_live_port_without_a_separate_horizon_read() {
+        let fake = FakeAudio::ready(48_000, 2).with_horizon(10_000);
+        let horizon_reads = Rc::clone(&fake.horizon_reads);
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(5));
+
+        assert_eq!(horizon_reads.get(), 0);
+    }
+
+    #[test]
+    fn fallback_one_shot_press_rearms_without_a_release_event() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.pads[0].settings =
+            PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::PadPress(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
+        );
+        assert!(!app.is_pad_held(0));
+    }
+
+    #[test]
     fn bank_navigation_is_bounded_and_release_targets_the_original_pad() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::BankDelta(1));
         app.apply(InputAction::PadRelease(0));
@@ -1657,6 +2189,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
 
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::BankDelta(1));
@@ -1677,6 +2212,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2).failing_release_once("release queue is full");
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
 
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::PadRelease(0));
@@ -1697,6 +2235,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2).failing_stop_pad_once("stop queue is full");
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
 
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::PadStop(0));
@@ -1720,6 +2261,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
 
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::BankDelta(1));
@@ -1741,6 +2285,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2).failing_stop_all_once("stop-all queue is full");
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
 
         app.apply(InputAction::PadPress(0));
         app.apply(InputAction::StopAll);
@@ -1906,6 +2453,73 @@ mod tests {
     }
 
     #[test]
+    fn modal_overlay_does_not_swallow_a_held_pad_release() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Press));
+        app.open_help();
+
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Release));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+        assert!(!app.is_pad_held(0));
+        assert_eq!(app.overlay(), Some(&super::Overlay::Help));
+    }
+
+    #[test]
+    fn modal_overlay_does_not_swallow_shift_escape_stop_all() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.apply(InputAction::PadPress(0));
+        app.open_help();
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::Trigger(pad(0, 0), 64, 1.0), AudioCall::StopAll]
+        );
+        assert!(!app.is_pad_held(0));
+        assert_eq!(app.overlay(), Some(&super::Overlay::Help));
+    }
+
+    #[test]
+    fn enter_triggers_the_selected_pad_in_perform_mode() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 1), 64, 1.0)]);
+        assert!(!app.is_pad_held(1));
+    }
+
+    #[test]
     fn invalid_palette_command_stays_open_with_inline_error() {
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
         app.open_palette();
@@ -2007,7 +2621,11 @@ mod tests {
     fn picker_resolves_a_nested_relative_source_and_backs_up_to_current_directory() {
         let current_dir = std::env::current_dir().unwrap();
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
-        app.begin_load(pad(0, 0), path("samples/kick.wav"));
+        let request = app.begin_load(pad(0, 0), path("samples/kick.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "samples/kick.wav"));
 
         app.open_picker();
 
@@ -2088,7 +2706,7 @@ mod tests {
         assert!(app.apply_worker_result(WorkerResult::Scanned {
             request_id: *request_id,
             path: committed_path.clone(),
-            result: Ok(Vec::new()),
+            result: Ok(DirectoryScan::complete(Vec::new())),
         }));
 
         app.open_picker_at("/two");
@@ -2137,12 +2755,12 @@ mod tests {
         assert!(!app.apply_worker_result(WorkerResult::Scanned {
             request_id: *first_id,
             path: first_path.clone(),
-            result: Ok(Vec::new()),
+            result: Ok(DirectoryScan::complete(Vec::new())),
         }));
         assert!(app.apply_worker_result(WorkerResult::Scanned {
             request_id: *third_id,
             path: third_path.clone(),
-            result: Ok(Vec::new()),
+            result: Ok(DirectoryScan::complete(Vec::new())),
         }));
         assert_eq!(app.file_picker().directory(), path("/two"));
     }
@@ -2208,6 +2826,34 @@ mod tests {
         });
 
         assert!(!applied);
+        assert_eq!(app.status(), "");
+    }
+
+    #[test]
+    fn rejected_current_scan_clears_pending_state_and_keeps_old_entries() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_picker_at("/samples");
+        let request = app.take_worker_requests().pop().unwrap();
+
+        app.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
+
+        assert!(!app.file_picker().is_scanning());
+        assert_eq!(app.file_picker().failed_directory(), Some(path("/samples")));
+        assert_eq!(app.file_picker().error(), Some("loader busy"));
+        assert_eq!(app.status(), "loader busy");
+    }
+
+    #[test]
+    fn rejected_stale_scan_for_the_same_directory_is_silent() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_picker_at("/samples");
+        let stale = app.take_worker_requests().pop().unwrap();
+        app.open_picker_at("/samples");
+        app.take_worker_requests();
+
+        assert!(!app.apply_worker_send_error(stale, WorkerSendError::WorkerBusy));
+
+        assert!(app.file_picker().is_scanning());
         assert_eq!(app.status(), "");
     }
 }

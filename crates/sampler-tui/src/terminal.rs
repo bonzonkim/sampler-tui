@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -437,32 +437,81 @@ pub trait TerminalLifecycle {
     type Terminal;
 
     fn initialize(&mut self) -> io::Result<Self::Terminal>;
+    fn show_cursor(&mut self, _terminal: &mut Self::Terminal) -> io::Result<()> {
+        Ok(())
+    }
     fn restore(&mut self) -> io::Result<()>;
 }
 
-#[derive(Default)]
-struct RatatuiTerminalLifecycle {
-    raw_mode: bool,
-    alternate_screen: bool,
+trait TerminalModeOps {
+    fn enable_raw_mode(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+    fn enter_alternate_screen(&mut self) -> io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> io::Result<()>;
+    fn enable_bracketed_paste(&mut self) -> io::Result<()>;
+    fn disable_bracketed_paste(&mut self) -> io::Result<()>;
 }
 
-impl TerminalLifecycle for RatatuiTerminalLifecycle {
-    type Terminal = ratatui::DefaultTerminal;
+struct CrosstermTerminalModeOps;
 
-    fn initialize(&mut self) -> io::Result<Self::Terminal> {
-        enable_raw_mode()?;
-        self.raw_mode = true;
-
-        let mut stdout = io::stdout();
-        self.alternate_screen = true;
-        execute!(stdout, EnterAlternateScreen)?;
-
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))
+impl TerminalModeOps for CrosstermTerminalModeOps {
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        enable_raw_mode()
     }
 
-    fn restore(&mut self) -> io::Result<()> {
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen)
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen)
+    }
+
+    fn enable_bracketed_paste(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableBracketedPaste)
+    }
+
+    fn disable_bracketed_paste(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), DisableBracketedPaste)
+    }
+}
+
+#[derive(Default)]
+struct TerminalModeState {
+    raw_mode: bool,
+    alternate_screen: bool,
+    bracketed_paste: bool,
+}
+
+impl TerminalModeState {
+    fn initialize(&mut self, ops: &mut impl TerminalModeOps) -> io::Result<()> {
+        ops.enable_raw_mode()?;
+        self.raw_mode = true;
+
+        self.alternate_screen = true;
+        ops.enter_alternate_screen()?;
+
+        self.bracketed_paste = true;
+        ops.enable_bracketed_paste()
+    }
+
+    fn restore(&mut self, ops: &mut impl TerminalModeOps) -> io::Result<()> {
+        let bracketed_paste = if self.bracketed_paste {
+            let result = ops.disable_bracketed_paste();
+            if result.is_ok() {
+                self.bracketed_paste = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
+
         let raw_mode = if self.raw_mode {
-            let result = disable_raw_mode();
+            let result = ops.disable_raw_mode();
             if result.is_ok() {
                 self.raw_mode = false;
             }
@@ -472,8 +521,7 @@ impl TerminalLifecycle for RatatuiTerminalLifecycle {
         };
 
         let alternate_screen = if self.alternate_screen {
-            let mut stdout = io::stdout();
-            let result = execute!(stdout, LeaveAlternateScreen);
+            let result = ops.leave_alternate_screen();
             if result.is_ok() {
                 self.alternate_screen = false;
             }
@@ -482,7 +530,31 @@ impl TerminalLifecycle for RatatuiTerminalLifecycle {
             Ok(())
         };
 
-        preserve_primary(raw_mode, alternate_screen)
+        let cleanup = preserve_primary(bracketed_paste, raw_mode);
+        preserve_primary(cleanup, alternate_screen)
+    }
+}
+
+#[derive(Default)]
+struct RatatuiTerminalLifecycle {
+    modes: TerminalModeState,
+}
+
+impl TerminalLifecycle for RatatuiTerminalLifecycle {
+    type Terminal = ratatui::DefaultTerminal;
+
+    fn initialize(&mut self) -> io::Result<Self::Terminal> {
+        self.modes.initialize(&mut CrosstermTerminalModeOps)?;
+
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))
+    }
+
+    fn show_cursor(&mut self, terminal: &mut Self::Terminal) -> io::Result<()> {
+        terminal.show_cursor()
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        self.modes.restore(&mut CrosstermTerminalModeOps)
     }
 }
 
@@ -575,6 +647,11 @@ where
         .map_or(Ok(()), KeyboardEnhancementGuard::release)
         .map_err(E::from);
     shutdown.request_shutdown();
+    let cursor_cleanup = terminal
+        .as_mut()
+        .map_or(Ok(()), |terminal| lifecycle.show_cursor(terminal))
+        .map_err(E::from);
+    drop(terminal.take());
     let terminal_cleanup = lifecycle.restore().map_err(E::from);
     let worker_cleanup = join(shutdown.worker());
     let panic_report = panic_capture.restore();
@@ -583,12 +660,14 @@ where
         Ok(primary) => {
             let primary = preserve_primary(primary, audio_cleanup);
             let primary = preserve_primary(primary, keyboard_cleanup);
+            let primary = preserve_primary(primary, cursor_cleanup);
             let primary = preserve_primary(primary, terminal_cleanup);
             preserve_primary(primary, worker_cleanup)
         }
         Err(payload) => {
             drop(audio_cleanup);
             drop(keyboard_cleanup);
+            drop(cursor_cleanup);
             drop(terminal_cleanup);
             drop(worker_cleanup);
             report_panic(
@@ -1164,6 +1243,153 @@ mod tests {
             self.calls.lock().unwrap().push("restore");
             Ok(())
         }
+    }
+
+    struct FakeTerminalModeOps {
+        calls: Vec<&'static str>,
+        fail_enable_paste: bool,
+    }
+
+    impl TerminalModeOps for FakeTerminalModeOps {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.calls.push("enable-raw");
+            Ok(())
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.calls.push("disable-raw");
+            Ok(())
+        }
+
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.calls.push("enter-alt");
+            Ok(())
+        }
+
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.calls.push("leave-alt");
+            Ok(())
+        }
+
+        fn enable_bracketed_paste(&mut self) -> io::Result<()> {
+            self.calls.push("enable-paste");
+            if self.fail_enable_paste {
+                Err(io::Error::other("enable paste failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn disable_bracketed_paste(&mut self) -> io::Result<()> {
+            self.calls.push("disable-paste");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_modes_enable_and_disable_bracketed_paste_transactionally() {
+        let mut modes = TerminalModeState::default();
+        let mut ops = FakeTerminalModeOps {
+            calls: Vec::new(),
+            fail_enable_paste: true,
+        };
+
+        let error = modes.initialize(&mut ops).unwrap_err();
+        assert_eq!(error.to_string(), "enable paste failed");
+        modes.restore(&mut ops).unwrap();
+
+        assert_eq!(
+            ops.calls,
+            [
+                "enable-raw",
+                "enter-alt",
+                "enable-paste",
+                "disable-paste",
+                "disable-raw",
+                "leave-alt",
+            ]
+        );
+    }
+
+    struct DropTrackedTerminal {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropTrackedTerminal {
+        fn drop(&mut self) {
+            self.calls.lock().unwrap().push("drop-terminal");
+        }
+    }
+
+    struct CursorTrackedLifecycle {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl TerminalLifecycle for CursorTrackedLifecycle {
+        type Terminal = DropTrackedTerminal;
+
+        fn initialize(&mut self) -> io::Result<Self::Terminal> {
+            self.calls.lock().unwrap().push("init");
+            Ok(DropTrackedTerminal {
+                calls: Arc::clone(&self.calls),
+            })
+        }
+
+        fn show_cursor(&mut self, _terminal: &mut Self::Terminal) -> io::Result<()> {
+            self.calls.lock().unwrap().push("show-cursor");
+            Ok(())
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("restore");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cursor_is_shown_and_terminal_dropped_before_screen_restore_and_worker_join() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = CursorTrackedLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+
+        let result: io::Result<()> = run_with_runtime_lifecycle(
+            &mut app,
+            FakeEnhancementOps::unsupported(),
+            &mut lifecycle,
+            &mut worker,
+            |_, _, _, _| {
+                calls.lock().unwrap().push("loop");
+                Ok(())
+            },
+            |_| {
+                calls.lock().unwrap().push("join");
+                Ok(())
+            },
+            |_| {},
+        );
+
+        result.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init",
+                "loop",
+                "stop-all",
+                "drop-audio",
+                "request",
+                "show-cursor",
+                "drop-terminal",
+                "restore",
+                "join",
+            ]
+        );
     }
 
     struct PartialInitErrorLifecycle {

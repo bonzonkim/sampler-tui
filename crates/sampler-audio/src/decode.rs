@@ -13,6 +13,12 @@ use symphonia::{
 
 use crate::error::DecodeError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_frames: usize,
+    pub max_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedAudio {
     pub sample_rate: u32,
@@ -46,9 +52,33 @@ impl DecodedAudio {
     pub fn frames(&self) -> usize {
         self.channels[0].len()
     }
+
+    pub fn new_with_limits(
+        sample_rate: u32,
+        channels: Vec<Vec<f32>>,
+        limits: DecodeLimits,
+    ) -> Result<Self, DecodeError> {
+        let frames = channels.first().map_or(0, Vec::len);
+        validate_payload_limits(frames, channels.len(), limits)?;
+        Self::new(sample_rate, channels)
+    }
 }
 
 pub fn decode_path(path: &Path) -> Result<DecodedAudio, DecodeError> {
+    decode_path_inner(path, None)
+}
+
+pub fn decode_path_with_limits(
+    path: &Path,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    decode_path_inner(path, Some(limits))
+}
+
+fn decode_path_inner(
+    path: &Path,
+    limits: Option<DecodeLimits>,
+) -> Result<DecodedAudio, DecodeError> {
     let source = File::open(path).map_err(|error| DecodeError::Open {
         path: path.to_path_buf(),
         message: error.to_string(),
@@ -131,7 +161,13 @@ pub fn decode_path(path: &Path) -> Result<DecodedAudio, DecodeError> {
                     channels = (0..count).map(|_| Vec::new()).collect();
                 }
 
-                packet_samples.resize(buffer.samples_interleaved(), 0.0);
+                let packet_sample_count = buffer.samples_interleaved();
+                let packet_frames = packet_sample_count / count;
+                if let Some(limits) = limits {
+                    let decoded_frames = channels[0].len().saturating_add(packet_frames);
+                    validate_payload_limits(decoded_frames, count, limits)?;
+                }
+                packet_samples.resize(packet_sample_count, 0.0);
                 buffer.copy_to_slice_interleaved(&mut packet_samples);
                 for frame in packet_samples.chunks_exact(count) {
                     for (channel, sample) in channels.iter_mut().zip(frame) {
@@ -149,12 +185,41 @@ pub fn decode_path(path: &Path) -> Result<DecodedAudio, DecodeError> {
         }
     }
 
-    DecodedAudio::new(sample_rate.unwrap_or_default(), channels)
+    match limits {
+        Some(limits) => {
+            DecodedAudio::new_with_limits(sample_rate.unwrap_or_default(), channels, limits)
+        }
+        None => DecodedAudio::new(sample_rate.unwrap_or_default(), channels),
+    }
+}
+
+fn validate_payload_limits(
+    frames: usize,
+    channels: usize,
+    limits: DecodeLimits,
+) -> Result<(), DecodeError> {
+    if frames > limits.max_frames {
+        return Err(DecodeError::FrameLimitExceeded {
+            frames,
+            max_frames: limits.max_frames,
+        });
+    }
+    let bytes = frames
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .unwrap_or(usize::MAX);
+    if bytes > limits.max_bytes {
+        return Err(DecodeError::ByteLimitExceeded {
+            bytes,
+            max_bytes: limits.max_bytes,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DecodedAudio;
+    use super::{DecodeLimits, DecodedAudio};
     use crate::DecodeError;
 
     #[test]
@@ -167,5 +232,28 @@ mod tests {
             DecodedAudio::new(48_000, vec![vec![0.0], vec![0.0], vec![0.0]]).unwrap_err(),
             DecodeError::UnsupportedChannels(3)
         );
+    }
+
+    #[test]
+    fn decoded_payload_enforces_independent_frame_and_byte_limits() {
+        let over_frames = DecodedAudio::new_with_limits(
+            48_000,
+            vec![vec![0.0; 3]],
+            DecodeLimits {
+                max_frames: 2,
+                max_bytes: 64,
+            },
+        );
+        assert!(over_frames.is_err());
+
+        let over_bytes = DecodedAudio::new_with_limits(
+            48_000,
+            vec![vec![0.0; 2], vec![0.0; 2]],
+            DecodeLimits {
+                max_frames: 2,
+                max_bytes: 15,
+            },
+        );
+        assert!(over_bytes.is_err());
     }
 }

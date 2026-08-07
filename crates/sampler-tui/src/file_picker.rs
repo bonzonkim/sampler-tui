@@ -14,6 +14,58 @@ pub struct DirectoryEntry {
     pub kind: DirectoryEntryKind,
 }
 
+impl Ord for DirectoryEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_entries(self, other)
+    }
+}
+
+impl PartialOrd for DirectoryEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryScan {
+    entries: Vec<DirectoryEntry>,
+    truncated: bool,
+}
+
+impl DirectoryScan {
+    pub fn new(entries: Vec<DirectoryEntry>, truncated: bool) -> Self {
+        Self { entries, truncated }
+    }
+
+    pub fn complete(entries: Vec<DirectoryEntry>) -> Self {
+        Self::new(entries, false)
+    }
+
+    pub fn entries(&self) -> &[DirectoryEntry] {
+        &self.entries
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn into_parts(self) -> (Vec<DirectoryEntry>, bool) {
+        (self.entries, self.truncated)
+    }
+}
+
+impl From<Vec<DirectoryEntry>> for DirectoryScan {
+    fn from(entries: Vec<DirectoryEntry>) -> Self {
+        Self::complete(entries)
+    }
+}
+
+impl FromIterator<DirectoryEntry> for DirectoryScan {
+    fn from_iter<T: IntoIterator<Item = DirectoryEntry>>(iter: T) -> Self {
+        Self::complete(iter.into_iter().collect())
+    }
+}
+
 impl DirectoryEntry {
     pub fn display_name(&self) -> String {
         self.path
@@ -42,6 +94,7 @@ pub struct FilePicker {
     cursor: usize,
     request_id: u64,
     error: Option<String>,
+    truncated: bool,
 }
 
 impl FilePicker {
@@ -55,9 +108,11 @@ impl FilePicker {
             cursor: 0,
             request_id: 0,
             error: None,
+            truncated: false,
         }
     }
 
+    #[cfg(test)]
     pub fn from_scan(
         path: impl Into<PathBuf>,
         show_hidden: bool,
@@ -116,6 +171,10 @@ impl FilePicker {
         self.error.as_deref()
     }
 
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     pub fn begin_scan(&mut self, path: impl Into<PathBuf>) -> u64 {
         self.pending_directory = Some(path.into());
         self.failed_directory = None;
@@ -133,11 +192,7 @@ impl FilePicker {
         self.begin_scan(target)
     }
 
-    pub fn apply_scan(
-        &mut self,
-        request_id: u64,
-        result: Result<Vec<DirectoryEntry>, String>,
-    ) -> bool {
+    pub fn apply_scan(&mut self, request_id: u64, result: Result<DirectoryScan, String>) -> bool {
         if request_id != self.request_id {
             return false;
         }
@@ -145,10 +200,12 @@ impl FilePicker {
             return false;
         };
         match result {
-            Ok(entries) => {
+            Ok(scan) => {
+                let (entries, truncated) = scan.into_parts();
                 self.directory = target;
                 self.cursor = 0;
-                self.replace_entries(entries);
+                self.entries = entries;
+                self.truncated = truncated;
                 self.error = None;
                 self.failed_directory = None;
             }
@@ -173,6 +230,7 @@ impl FilePicker {
         self.cursor = self.entries.len().saturating_sub(1);
     }
 
+    #[cfg(test)]
     fn replace_entries(&mut self, entries: Vec<DirectoryEntry>) {
         self.entries = entries
             .into_iter()
@@ -189,7 +247,7 @@ impl FilePicker {
     }
 }
 
-fn supported_audio_path(path: &Path) -> bool {
+pub(crate) fn supported_audio_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -220,6 +278,7 @@ fn entry_group(entry: &DirectoryEntry) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn is_hidden(path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
@@ -239,7 +298,7 @@ fn is_hidden(path: &Path) -> bool {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{DirectoryEntry, DirectoryEntryKind, FilePicker};
+    use super::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 
     use DirectoryEntryKind::{Directory, File};
 
@@ -273,7 +332,10 @@ mod tests {
         let old = picker.request_id();
         picker.begin_scan(path("/two"));
 
-        assert!(!picker.apply_scan(old, Ok(vec![entry("wrong.wav", File)])));
+        assert!(!picker.apply_scan(
+            old,
+            Ok(DirectoryScan::complete(vec![entry("wrong.wav", File)])),
+        ));
         assert_eq!(picker.directory(), path("/one"));
         assert_eq!(picker.pending_directory(), Some(path("/two")));
     }
@@ -308,7 +370,7 @@ mod tests {
         let mut picker = FilePicker::from_scan(path("/one"), false, vec![entry("keep.wav", File)]);
         let request_id = picker.begin_scan(path("/empty"));
 
-        assert!(picker.apply_scan(request_id, Ok(Vec::new())));
+        assert!(picker.apply_scan(request_id, Ok(DirectoryScan::complete(Vec::new()))));
 
         assert_eq!(picker.directory(), path("/empty"));
         assert!(picker.entries().is_empty());
@@ -338,13 +400,13 @@ mod tests {
         assert!(picker.show_hidden());
         assert_eq!(picker.directory(), path("/one"));
         assert_eq!(picker.pending_directory(), Some(path("/two")));
-        assert!(!picker.apply_scan(first, Ok(Vec::new())));
+        assert!(!picker.apply_scan(first, Ok(DirectoryScan::complete(Vec::new()))));
 
         let third = picker.toggle_hidden();
         assert!(!picker.show_hidden());
         assert_eq!(picker.pending_directory(), Some(path("/two")));
-        assert!(!picker.apply_scan(second, Ok(Vec::new())));
-        assert!(picker.apply_scan(third, Ok(Vec::new())));
+        assert!(!picker.apply_scan(second, Ok(DirectoryScan::complete(Vec::new()))));
+        assert!(picker.apply_scan(third, Ok(DirectoryScan::complete(Vec::new()))));
         assert_eq!(picker.directory(), path("/two"));
     }
 

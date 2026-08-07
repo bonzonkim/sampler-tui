@@ -9,6 +9,14 @@ pub fn prepare_sample(
     decoded: DecodedAudio,
     target_rate: u32,
 ) -> Result<SampleBuffer, PrepareError> {
+    prepare_sample_with_frame_limit(decoded, target_rate, usize::MAX)
+}
+
+pub fn prepare_sample_with_frame_limit(
+    decoded: DecodedAudio,
+    target_rate: u32,
+    max_output_frames: usize,
+) -> Result<SampleBuffer, PrepareError> {
     if target_rate == 0 {
         return Err(PrepareError::ZeroTargetRate);
     }
@@ -16,9 +24,10 @@ pub fn prepare_sample(
     let decoded = DecodedAudio::new(decoded.sample_rate, decoded.channels)?;
     let source_rate = decoded.sample_rate;
     let input_frames = decoded.frames();
-    let stereo = interleave_stereo(&decoded);
 
     if source_rate == target_rate {
+        enforce_frame_limit(input_frames, max_output_frames)?;
+        let stereo = interleave_stereo(&decoded);
         return Ok(SampleBuffer::new(target_rate, stereo)?);
     }
 
@@ -34,9 +43,11 @@ pub fn prepare_sample(
         FixedAsync::Input,
     )
     .map_err(PrepareError::ResamplerConstruction)?;
+    let output_frames = resampler.process_all_needed_output_len(input_frames);
+    enforce_frame_limit(output_frames, max_output_frames)?;
+    let stereo = interleave_stereo(&decoded);
     let input = InterleavedSlice::new(&stereo, 2, input_frames)
         .expect("stereo input is exactly two samples per frame");
-    let output_frames = resampler.process_all_needed_output_len(input_frames);
     let mut output = vec![0.0; output_frames * 2];
     let mut output_buffer = InterleavedSlice::new_mut(&mut output, 2, output_frames)
         .expect("resampler output allocation is exactly two samples per frame");
@@ -46,6 +57,14 @@ pub fn prepare_sample(
     output.truncate(output_frames * 2);
 
     Ok(SampleBuffer::new(target_rate, output)?)
+}
+
+fn enforce_frame_limit(frames: usize, max_frames: usize) -> Result<(), PrepareError> {
+    if frames > max_frames {
+        Err(PrepareError::FrameLimitExceeded { frames, max_frames })
+    } else {
+        Ok(())
+    }
 }
 
 fn interleave_stereo(decoded: &DecodedAudio) -> Vec<f32> {
@@ -87,5 +106,14 @@ mod tests {
             prepare_sample(decoded, 0),
             Err(PrepareError::ZeroTargetRate)
         ));
+    }
+
+    #[test]
+    fn prepared_payload_is_rejected_before_exceeding_its_frame_budget() {
+        let decoded = DecodedAudio::new(48_000, vec![vec![0.0; 3]]).unwrap();
+
+        let result = prepare_sample_with_frame_limit(decoded, 48_000, 2);
+
+        assert!(result.is_err());
     }
 }

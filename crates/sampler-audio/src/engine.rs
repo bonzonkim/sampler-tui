@@ -262,27 +262,54 @@ impl AudioEngine {
     fn drain_commands(&mut self) {
         let mut processed = 0;
         while processed < MAX_COMMANDS_PER_RENDER {
-            let timed_action = match self.ports.commands.peek() {
+            let (timed_action, is_live) = match self.ports.commands.peek() {
                 Ok(AudioCommand::Trigger {
                     pad,
                     at_frame,
                     velocity,
                     sequence,
-                }) => Some(ScheduledAction::Trigger {
-                    pad: *pad,
-                    at_frame: *at_frame,
-                    velocity: *velocity,
-                    sequence: *sequence,
-                }),
+                }) => (
+                    Some(ScheduledAction::Trigger {
+                        pad: *pad,
+                        at_frame: *at_frame,
+                        velocity: *velocity,
+                        sequence: *sequence,
+                    }),
+                    false,
+                ),
                 Ok(AudioCommand::Release {
                     pad,
                     at_frame,
                     sequence,
-                }) => Some(ScheduledAction::Release {
-                    pad: *pad,
-                    at_frame: *at_frame,
-                    sequence: *sequence,
-                }),
+                }) => (
+                    Some(ScheduledAction::Release {
+                        pad: *pad,
+                        at_frame: *at_frame,
+                        sequence: *sequence,
+                    }),
+                    false,
+                ),
+                Ok(AudioCommand::TriggerLive {
+                    pad,
+                    velocity,
+                    sequence,
+                }) => (
+                    Some(ScheduledAction::Trigger {
+                        pad: *pad,
+                        at_frame: self.rendered_frame,
+                        velocity: *velocity,
+                        sequence: *sequence,
+                    }),
+                    true,
+                ),
+                Ok(AudioCommand::ReleaseLive { pad, sequence }) => (
+                    Some(ScheduledAction::Release {
+                        pad: *pad,
+                        at_frame: self.rendered_frame,
+                        sequence: *sequence,
+                    }),
+                    true,
+                ),
                 Ok(AudioCommand::InstallSample {
                     slot,
                     buffer,
@@ -293,7 +320,7 @@ impl AudioEngine {
                 {
                     break;
                 }
-                Ok(_) => None,
+                Ok(_) => (None, false),
                 Err(_) => break,
             };
 
@@ -302,6 +329,14 @@ impl AudioEngine {
                     if self.ports.commands.pop().is_err() {
                         break;
                     }
+                    processed += 1;
+                    continue;
+                }
+                if is_live {
+                    if self.ports.commands.pop().is_err() {
+                        break;
+                    }
+                    self.execute_action(action);
                     processed += 1;
                     continue;
                 }
@@ -323,12 +358,16 @@ impl AudioEngine {
     }
 
     fn execute_immediate(&mut self, command: AudioCommand) {
+        if matches!(&command, AudioCommand::InstallSample { recovery: true, .. }) {
+            self.ports.shared.complete_recovery_command();
+        }
         match command {
             AudioCommand::InstallSample {
                 pad,
                 slot,
                 buffer,
                 settings,
+                ..
             } => self.install_sample(pad, slot, buffer, settings),
             AudioCommand::UpdatePad { pad, settings } => {
                 if settings_are_valid(settings) && self.pad_binding(pad).slot.is_some() {
@@ -338,7 +377,10 @@ impl AudioEngine {
                 }
             }
             AudioCommand::StopPad { pad } => self.stop_pad(pad),
-            AudioCommand::Trigger { .. } | AudioCommand::Release { .. } => {
+            AudioCommand::Trigger { .. }
+            | AudioCommand::TriggerLive { .. }
+            | AudioCommand::Release { .. }
+            | AudioCommand::ReleaseLive { .. } => {
                 self.invalid_commands = self.invalid_commands.saturating_add(1);
             }
         }
@@ -762,7 +804,7 @@ mod tests {
     use super::*;
     use crate::{
         AudioController, PadId, PadSettings, SampleBuffer, audio_channels,
-        command::audio_channels_with_capacities,
+        command::{RECOVERY_COMMAND_CAPACITY, audio_channels_with_capacities},
     };
     use sampler_core::{BankId, ChokeGroup};
 
@@ -796,6 +838,83 @@ mod tests {
         engine.render_frames(8, |_| {});
 
         assert_eq!(controller.render_horizon(), u64::MAX);
+    }
+
+    #[test]
+    fn live_trigger_enqueued_after_a_large_callback_drain_runs_at_the_next_callback_start() {
+        let (mut controller, mut engine) = harness();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(1_024, 0.25),
+                PadSettings::default(),
+            )
+            .unwrap();
+        engine.render_frames(1, |_| {});
+        let mut queued = false;
+
+        engine.render_frames(512, |_| {
+            if !queued {
+                controller.trigger_live(PadId::first(), 1.0).unwrap();
+                queued = true;
+            }
+        });
+        assert_eq!(engine.executed_triggers(), 0);
+
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.last_triggered_frame, Some(513));
+        assert_eq!(engine.late_commands(), 0);
+    }
+
+    #[test]
+    fn live_trigger_runs_when_the_future_action_array_is_full() {
+        let (mut controller, mut engine) = harness();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(1_024, 0.25),
+                PadSettings::default(),
+            )
+            .unwrap();
+        engine.render_frames(1, |_| {});
+        for _ in 0..PENDING_COUNT {
+            controller.trigger(PadId::first(), 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+
+        controller.trigger_live(PadId::first(), 1.0).unwrap();
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.last_triggered_frame, Some(1));
+        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+    }
+
+    #[test]
+    fn recovery_installs_leave_room_for_live_input_in_one_drain_budget() {
+        let (mut controller, mut engine) = harness();
+        let mut accepted_installs = 0;
+        for index in 0..PAD_COUNT {
+            let bank = BankId::new((index / PADS_PER_BANK) as u8).unwrap();
+            let pad = PadId::new(bank, (index % PADS_PER_BANK) as u8).unwrap();
+            if controller
+                .install_recovery(pad, constant_sample(8, 0.25), PadSettings::default())
+                .is_ok()
+            {
+                accepted_installs += 1;
+            }
+        }
+        controller.trigger_live(PadId::first(), 1.0).unwrap();
+
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(accepted_installs, RECOVERY_COMMAND_CAPACITY);
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.late_commands(), 0);
     }
 
     #[test]

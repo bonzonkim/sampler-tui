@@ -37,6 +37,8 @@ cargo run -p sampler-tui -- play path/to/sample.wav
 
 The no-argument command opens the 80x24-minimum performance TUI. The diagnostic `play` command prints the active device rate/channel count and decoded duration, schedules one one-shot, and exits after rendered-frame completion. A successful exit is programmatic path evidence, not proof that the output was heard or free of audible artifacts. Run `cargo run -p sampler-tui -- --help` for its usage.
 
+The interactive loader is deliberately bounded: a directory view keeps the first 4,096 worker-sorted supported entries and marks a truncated result; encoded inputs above 128 MiB, decoded payloads above 8,388,608 frames or 64 MiB, and prepared output above 8,388,608 frames are rejected with a visible error. These are safety limits, not claims about what a particular codec or audio device can handle below those thresholds.
+
 ## Roadmap
 
 1. Add offline mixing, sample decoding/resampling, real device output, and responsive pad triggering.

@@ -33,7 +33,8 @@ mod tests {
             .retirements
             .push(CriticalEvent::RetiredSample { slot, buffer })
             .unwrap();
-        assert_eq!(controller.reclaim_retired(), 1);
+        assert_eq!(controller.reclaim_retired_slot(), Some(slot));
+        assert_eq!(controller.reclaim_retired_slot(), None);
         assert_eq!(controller.available_slots(), 256);
     }
 
@@ -72,6 +73,70 @@ mod tests {
         );
         assert_eq!(controller.available_slots(), 256);
         assert_eq!(controller.command_overflows(), 1);
+    }
+
+    #[test]
+    fn recovery_admission_is_exact_and_does_not_reduce_ordinary_install_capacity() {
+        let (mut controller, ports) = audio_channels_with_capacities(128, 256, 8);
+        for _ in 0..RECOVERY_COMMAND_CAPACITY {
+            controller
+                .install_recovery(
+                    PadId::first(),
+                    Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                    PadSettings::default(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            controller.install_recovery(
+                PadId::first(),
+                Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                PadSettings::default(),
+            ),
+            Err(ControlError::CommandQueueFull)
+        );
+        controller
+            .install(
+                PadId::first(),
+                Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                PadSettings::default(),
+            )
+            .unwrap();
+
+        let mut engine = crate::AudioEngine::new(48_000, ports).unwrap();
+        engine.render_frames(0, |_| {});
+        controller
+            .install_recovery(
+                PadId::first(),
+                Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                PadSettings::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_recovery_queue_push_rolls_back_its_admission_credit() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 256, 8);
+        controller.stop_pad(PadId::first()).unwrap();
+        for _ in 0..=RECOVERY_COMMAND_CAPACITY {
+            assert_eq!(
+                controller.install_recovery(
+                    PadId::first(),
+                    Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                    PadSettings::default(),
+                ),
+                Err(ControlError::CommandQueueFull)
+            );
+        }
+        ports.commands.pop().unwrap();
+
+        controller
+            .install_recovery(
+                PadId::first(),
+                Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                PadSettings::default(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -167,7 +232,7 @@ mod tests {
     }
 }
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use sampler_core::{Frame, PadId, PadSettings};
@@ -175,6 +240,7 @@ use sampler_core::{Frame, PadId, PadSettings};
 use crate::{ControlError, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
 
 pub const COMMAND_CAPACITY: usize = 1024;
+pub const RECOVERY_COMMAND_CAPACITY: usize = 32;
 pub const RETIREMENT_CAPACITY: usize = 256;
 pub const TELEMETRY_CAPACITY: usize = 64;
 
@@ -185,6 +251,7 @@ pub enum AudioCommand {
         slot: SampleSlot,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        recovery: bool,
     },
     Trigger {
         pad: PadId,
@@ -192,9 +259,18 @@ pub enum AudioCommand {
         velocity: f32,
         sequence: u64,
     },
+    TriggerLive {
+        pad: PadId,
+        velocity: f32,
+        sequence: u64,
+    },
     Release {
         pad: PadId,
         at_frame: Frame,
+        sequence: u64,
+    },
+    ReleaseLive {
+        pad: PadId,
         sequence: u64,
     },
     UpdatePad {
@@ -269,6 +345,7 @@ pub(crate) struct SharedControlState {
     stop_requested: AtomicBool,
     command_overflows: AtomicU64,
     failed: AtomicBool,
+    queued_recovery_commands: AtomicUsize,
 }
 
 impl SharedControlState {
@@ -279,6 +356,7 @@ impl SharedControlState {
             stop_requested: AtomicBool::new(false),
             command_overflows: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            queued_recovery_commands: AtomicUsize::new(0),
         }
     }
 
@@ -319,6 +397,22 @@ impl SharedControlState {
 
     fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    fn reserve_recovery_command(&self) -> bool {
+        self.queued_recovery_commands
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < RECOVERY_COMMAND_CAPACITY).then_some(queued + 1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn complete_recovery_command(&self) {
+        let previous = self.queued_recovery_commands.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "recovery command completion must match admission"
+        );
     }
 }
 
@@ -383,6 +477,25 @@ impl AudioController {
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, ControlError> {
+        self.install_inner(pad, buffer, settings, false)
+    }
+
+    pub fn install_recovery(
+        &mut self,
+        pad: PadId,
+        buffer: Arc<SampleBuffer>,
+        settings: PadSettings,
+    ) -> Result<SampleSlot, ControlError> {
+        self.install_inner(pad, buffer, settings, true)
+    }
+
+    fn install_inner(
+        &mut self,
+        pad: PadId,
+        buffer: Arc<SampleBuffer>,
+        settings: PadSettings,
+        recovery: bool,
+    ) -> Result<SampleSlot, ControlError> {
         self.ensure_open()?;
         let Some(index) = self.free_slots.iter().position(|is_free| *is_free) else {
             return Err(ControlError::NoFreeSampleSlot);
@@ -390,13 +503,23 @@ impl AudioController {
         let slot = SampleSlot::new(index).expect("free-slot map matches sample-slot bounds");
         self.free_slots[index] = false;
 
+        if recovery && !self.shared.reserve_recovery_command() {
+            self.free_slots[index] = true;
+            self.shared.record_command_overflow();
+            return Err(ControlError::CommandQueueFull);
+        }
+
         let command = AudioCommand::InstallSample {
             pad,
             slot,
             buffer,
             settings,
+            recovery,
         };
         if let Err(error) = self.push_command(command) {
+            if recovery {
+                self.shared.complete_recovery_command();
+            }
             self.free_slots[index] = true;
             return Err(error);
         }
@@ -427,6 +550,23 @@ impl AudioController {
         result
     }
 
+    pub fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
+            return Err(ControlError::InvalidVelocity);
+        }
+        let sequence = self.next_timed_sequence;
+        let result = self.push_command(AudioCommand::TriggerLive {
+            pad,
+            velocity,
+            sequence,
+        });
+        if result.is_ok() {
+            self.advance_timed_sequence();
+        }
+        result
+    }
+
     pub fn release(&mut self, pad: PadId, at_frame: Frame) -> Result<(), ControlError> {
         self.ensure_open()?;
         let sequence = self.next_timed_sequence;
@@ -435,6 +575,16 @@ impl AudioController {
             at_frame,
             sequence,
         });
+        if result.is_ok() {
+            self.advance_timed_sequence();
+        }
+        result
+    }
+
+    pub fn release_live(&mut self, pad: PadId) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        let sequence = self.next_timed_sequence;
+        let result = self.push_command(AudioCommand::ReleaseLive { pad, sequence });
         if result.is_ok() {
             self.advance_timed_sequence();
         }
@@ -468,12 +618,17 @@ impl AudioController {
 
     pub fn reclaim_retired(&mut self) -> usize {
         let mut reclaimed = 0;
-        while let Ok(CriticalEvent::RetiredSample { slot, buffer }) = self.retirements.pop() {
-            drop(buffer);
-            self.free_slots[slot.index()] = true;
+        while self.reclaim_retired_slot().is_some() {
             reclaimed += 1;
         }
         reclaimed
+    }
+
+    pub fn reclaim_retired_slot(&mut self) -> Option<SampleSlot> {
+        let CriticalEvent::RetiredSample { slot, buffer } = self.retirements.pop().ok()?;
+        drop(buffer);
+        self.free_slots[slot.index()] = true;
+        Some(slot)
     }
 
     pub fn available_slots(&self) -> usize {

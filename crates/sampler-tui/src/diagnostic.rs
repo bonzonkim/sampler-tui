@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sampler_audio::{
-    AudioSession, Frame, PadId, PadSettings, Telemetry, decode_path, prepare_sample,
-};
+use sampler_audio::{Frame, PadId, PadSettings, Telemetry, decode_path, prepare_sample};
+
+use crate::audio::{AudioPort, open_default_audio};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INITIAL_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -33,18 +33,18 @@ impl fmt::Display for DiagnosticError {
 impl Error for DiagnosticError {}
 
 pub fn play(path: PathBuf) -> Result<(), DynError> {
-    let mut session = AudioSession::open_default()?;
+    let mut audio = open_default_audio().map_err(io::Error::other)?;
     let decoded = decode_path(&path)?;
     let decoded_duration = frame_duration(decoded.frames(), decoded.sample_rate)?;
     let decoded_rate = decoded.sample_rate;
-    let sample = prepare_sample(decoded, session.sample_rate())?;
+    let sample = prepare_sample(decoded, audio.sample_rate())?;
     let sample_frames = u64::try_from(sample.frames())?;
     let playback_duration = frame_duration(sample.frames(), sample.sample_rate())?;
 
     println!(
         "Output device: {} Hz, {} channel(s)",
-        session.sample_rate(),
-        session.channels()
+        audio.sample_rate(),
+        audio.channels()
     );
     println!(
         "Decoded duration: {:.3} s ({} Hz source)",
@@ -52,16 +52,16 @@ pub fn play(path: PathBuf) -> Result<(), DynError> {
         decoded_rate
     );
 
-    session
-        .controller_mut()
-        .install(PadId::first(), Arc::new(sample), PadSettings::default())?;
-    let initial_frame = wait_for_initial_telemetry(&mut session)?;
+    audio
+        .install(PadId::first(), Arc::new(sample), PadSettings::default())
+        .map_err(io::Error::other)?;
+    let initial_frame = wait_for_initial_telemetry(audio.as_mut())?;
     let trigger_frame = initial_frame
         .checked_add(128)
         .ok_or_else(|| io::Error::other("audio frame counter overflow before trigger"))?;
-    session
-        .controller_mut()
-        .trigger(PadId::first(), trigger_frame, 1.0)?;
+    audio
+        .trigger(PadId::first(), trigger_frame, 1.0)
+        .map_err(io::Error::other)?;
 
     let deadline = checked_deadline(
         Instant::now(),
@@ -69,16 +69,16 @@ pub fn play(path: PathBuf) -> Result<(), DynError> {
     )?;
     let mut completion = None;
     loop {
-        if let Some(error) = session.poll_error() {
-            return Err(Box::new(error));
+        if let Some(error) = audio.poll_runtime_error() {
+            return Err(Box::new(io::Error::other(error)));
         }
         ensure_before_deadline(
             Instant::now(),
             deadline,
             "playback timed out before rendered-frame completion",
         )?;
-        session.controller_mut().reclaim_retired();
-        if let Some(telemetry) = session.controller_mut().latest_telemetry() {
+        audio.reclaim_retired();
+        if let Some(telemetry) = audio.latest_telemetry() {
             if completion.is_none() {
                 completion = completion_from_trigger_ack(telemetry, sample_frames);
                 if completion.is_none() && telemetry.last_triggered_frame.is_some() {
@@ -97,19 +97,19 @@ pub fn play(path: PathBuf) -> Result<(), DynError> {
     }
 }
 
-fn wait_for_initial_telemetry(session: &mut AudioSession) -> Result<Frame, DynError> {
+fn wait_for_initial_telemetry(audio: &mut dyn AudioPort) -> Result<Frame, DynError> {
     let deadline = checked_deadline(Instant::now(), INITIAL_TELEMETRY_TIMEOUT)?;
     loop {
-        if let Some(error) = session.poll_error() {
-            return Err(Box::new(error));
+        if let Some(error) = audio.poll_runtime_error() {
+            return Err(Box::new(io::Error::other(error)));
         }
         ensure_before_deadline(
             Instant::now(),
             deadline,
             "timed out waiting for initial audio telemetry",
         )?;
-        session.controller_mut().reclaim_retired();
-        if let Some(telemetry) = session.controller_mut().latest_telemetry() {
+        audio.reclaim_retired();
+        if let Some(telemetry) = audio.latest_telemetry() {
             return Ok(telemetry.rendered_frame);
         }
         sleep_until_next_poll(deadline);

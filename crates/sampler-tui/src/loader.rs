@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -7,13 +8,20 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use sampler_audio::{SampleBuffer, decode_path, prepare_sample};
+use sampler_audio::{
+    DecodeLimits, SampleBuffer, decode_path_with_limits, prepare_sample_with_frame_limit,
+};
 use sampler_core::PadId;
 
 use crate::app::{PREVIEW_COLUMNS, PreviewColumn};
-use crate::file_picker::{DirectoryEntry, DirectoryEntryKind};
+use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
+pub const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+pub const MAX_ENCODED_FILE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_DECODED_FRAMES: usize = 8_388_608;
+pub const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PREPARED_FRAMES: usize = 8_388_608;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerRequest {
@@ -36,13 +44,13 @@ pub enum WorkerResult {
     Scanned {
         request_id: u64,
         path: PathBuf,
-        result: Result<Vec<DirectoryEntry>, String>,
+        result: Result<DirectoryScan, String>,
     },
     Loaded {
         pad: PadId,
         generation: u64,
         path: PathBuf,
-        result: Result<LoadedSample, String>,
+        result: Result<LoadedSample, LoadSampleError>,
     },
 }
 
@@ -54,6 +62,30 @@ pub struct LoadedSample {
     pub duration: Duration,
     pub preview: [PreviewColumn; PREVIEW_COLUMNS],
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadSampleError {
+    Metadata(String),
+    EncodedFileTooLarge { bytes: u64, max_bytes: u64 },
+    Decode(String),
+    Prepare(String),
+}
+
+impl fmt::Display for LoadSampleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metadata(error) => write!(formatter, "could not inspect sample payload: {error}"),
+            Self::EncodedFileTooLarge { bytes, max_bytes } => write!(
+                formatter,
+                "encoded sample payload {bytes} bytes exceeds the {max_bytes}-byte encoded input limit"
+            ),
+            Self::Decode(error) => formatter.write_str(error),
+            Self::Prepare(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl Error for LoadSampleError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSendError {
@@ -194,9 +226,10 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
     }
 }
 
-fn scan_directory(path: &Path, show_hidden: bool) -> Result<Vec<DirectoryEntry>, String> {
+fn scan_directory(path: &Path, show_hidden: bool) -> Result<DirectoryScan, String> {
     let reader = fs::read_dir(path).map_err(|error| format_error(&error))?;
-    let mut entries = Vec::new();
+    let mut entries = BTreeSet::new();
+    let mut truncated = false;
     for item in reader {
         let item = item.map_err(|error| format_error(&error))?;
         if !show_hidden && hidden_name(&item.file_name()) {
@@ -212,12 +245,20 @@ fn scan_directory(path: &Path, show_hidden: bool) -> Result<Vec<DirectoryEntry>,
         } else {
             continue;
         };
-        entries.push(DirectoryEntry {
+        let entry = DirectoryEntry {
             path: item.path(),
             kind,
-        });
+        };
+        if kind == DirectoryEntryKind::File && !supported_audio_path(&entry.path) {
+            continue;
+        }
+        entries.insert(entry);
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            entries.pop_last();
+            truncated = true;
+        }
     }
-    Ok(entries)
+    Ok(DirectoryScan::new(entries.into_iter().collect(), truncated))
 }
 
 fn hidden_name(name: &std::ffi::OsStr) -> bool {
@@ -232,13 +273,31 @@ fn hidden_name(name: &std::ffi::OsStr) -> bool {
     }
 }
 
-fn load_sample(path: &Path, engine_rate: u32) -> Result<LoadedSample, String> {
-    let decoded = decode_path(path).map_err(|error| format_error(&error))?;
+fn load_sample(path: &Path, engine_rate: u32) -> Result<LoadedSample, LoadSampleError> {
+    let encoded_bytes = fs::metadata(path)
+        .map_err(|error| LoadSampleError::Metadata(format_error(&error)))?
+        .len();
+    if encoded_bytes > MAX_ENCODED_FILE_BYTES {
+        return Err(LoadSampleError::EncodedFileTooLarge {
+            bytes: encoded_bytes,
+            max_bytes: MAX_ENCODED_FILE_BYTES,
+        });
+    }
+    let decoded = decode_path_with_limits(
+        path,
+        DecodeLimits {
+            max_frames: MAX_DECODED_FRAMES,
+            max_bytes: MAX_DECODED_BYTES,
+        },
+    )
+    .map_err(|error| LoadSampleError::Decode(format_error(&error)))?;
     let source_rate = decoded.sample_rate;
     let source_frames = decoded.frames();
     let duration = source_duration(source_frames, source_rate);
-    let buffer =
-        Arc::new(prepare_sample(decoded, engine_rate).map_err(|error| format_error(&error))?);
+    let buffer = Arc::new(
+        prepare_sample_with_frame_limit(decoded, engine_rate, MAX_PREPARED_FRAMES)
+            .map_err(|error| LoadSampleError::Prepare(format_error(&error)))?,
+    );
     let preview = build_preview(&buffer);
     Ok(LoadedSample {
         buffer,
@@ -328,7 +387,7 @@ fn format_error(error: &dyn Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -338,13 +397,39 @@ mod tests {
     use sampler_core::{BankId, PadId};
 
     use super::{
-        WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, frame_duration,
-        preview_column, try_send_request, worker_loop,
+        MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES, WorkerHandle, WorkerPanicked, WorkerRequest,
+        WorkerResult, WorkerSendError, frame_duration, load_sample, preview_column, scan_directory,
+        try_send_request, worker_loop,
     };
+    use crate::DirectoryEntry;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     struct WavFixture(PathBuf);
+
+    struct DirectoryFixture(PathBuf);
+
+    impl DirectoryFixture {
+        fn new(label: &str) -> Self {
+            let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sampler-tui-loader-{label}-{}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for DirectoryFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     impl WavFixture {
         fn path(&self) -> &Path {
@@ -434,6 +519,54 @@ mod tests {
         assert!(sample.preview.iter().any(|column| column.max > 0));
         assert!(sample.preview.iter().any(|column| column.min < 0));
         worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worker_scan_filters_and_sorts_before_returning_to_the_ui() {
+        let fixture = DirectoryFixture::new("sorted-scan");
+        fs::create_dir(fixture.path().join("beats")).unwrap();
+        for name in ["z.mp3", "notes.txt", "A.WAV"] {
+            File::create(fixture.path().join(name)).unwrap();
+        }
+
+        let scan = scan_directory(fixture.path(), false).unwrap();
+        let names = scan
+            .entries()
+            .iter()
+            .map(DirectoryEntry::display_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["beats", "A.WAV", "z.mp3"]);
+        assert!(!scan.truncated());
+    }
+
+    #[test]
+    fn directory_scan_payload_is_capped_and_reports_truncation() {
+        let fixture = DirectoryFixture::new("bounded-scan");
+        for index in 0..=MAX_DIRECTORY_ENTRIES {
+            fs::create_dir(fixture.path().join(format!("dir-{index:04}"))).unwrap();
+        }
+
+        let scan = scan_directory(fixture.path(), false).unwrap();
+
+        assert_eq!(scan.entries().len(), MAX_DIRECTORY_ENTRIES);
+        assert!(scan.truncated());
+    }
+
+    #[test]
+    fn encoded_file_budget_rejects_a_sparse_oversized_payload_before_decode() {
+        let fixture = DirectoryFixture::new("encoded-budget");
+        let path = fixture.path().join("oversized.wav");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_ENCODED_FILE_BYTES + 1).unwrap();
+
+        let error = load_sample(&path, 48_000).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the 134217728-byte encoded input limit")
+        );
     }
 
     #[test]

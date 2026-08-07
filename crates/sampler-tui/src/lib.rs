@@ -1,9 +1,12 @@
 pub mod app;
 pub mod audio;
+pub mod cli;
+pub mod diagnostic;
 pub mod file_picker;
 pub mod input;
 pub mod loader;
 pub mod palette;
+pub mod terminal;
 pub mod ui;
 
 pub use app::{
@@ -16,3 +19,7 @@ pub use loader::{
     LoadedSample, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
+pub use terminal::{
+    CrosstermEventSource, EventSource, KeyboardEnhancementGuard, MAX_EVENTS_PER_ITERATION,
+    run_event_loop, run_tui,
+};

@@ -176,6 +176,10 @@ impl App {
             self.close_overlay();
             return;
         }
+        if map_key(key, self.keyboard_capabilities) == Some(InputAction::Quit) {
+            self.should_quit = true;
+            return;
+        }
 
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
@@ -243,6 +247,23 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn maintain_audio(&mut self) -> bool {
+        let Some(audio) = self.audio.as_mut() else {
+            return false;
+        };
+        audio.reclaim_retired();
+        let Some(error) = audio.poll_runtime_error() else {
+            return false;
+        };
+
+        self.audio = None;
+        self.audio_format = None;
+        self.audio_unavailable_message = Some(error.clone());
+        self.status = error.clone();
+        self.overlay = Some(Overlay::DeviceError(error));
+        true
     }
 
     pub fn pad(&self, pad: PadId) -> &PadView {
@@ -844,6 +865,8 @@ mod tests {
         stop_all_error: Option<String>,
         install_error: Option<String>,
         calls: CallLog,
+        maintenance: Rc<RefCell<Vec<&'static str>>>,
+        runtime_error: Option<String>,
     }
 
     impl FakeAudio {
@@ -858,6 +881,8 @@ mod tests {
                 stop_all_error: None,
                 install_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
+                maintenance: Rc::new(RefCell::new(Vec::new())),
+                runtime_error: None,
             }
         }
 
@@ -892,6 +917,11 @@ mod tests {
 
         fn failing_install(mut self, error: &str) -> Self {
             self.install_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_runtime(mut self, error: &str) -> Self {
+            self.runtime_error = Some(error.to_owned());
             self
         }
     }
@@ -962,6 +992,7 @@ mod tests {
         }
 
         fn reclaim_retired(&mut self) -> usize {
+            self.maintenance.borrow_mut().push("reclaim");
             0
         }
 
@@ -970,8 +1001,36 @@ mod tests {
         }
 
         fn poll_runtime_error(&mut self) -> Option<String> {
-            None
+            self.maintenance.borrow_mut().push("poll");
+            self.runtime_error.take()
         }
+    }
+
+    #[test]
+    fn audio_maintenance_reclaims_before_polling_runtime_errors() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let maintenance = Rc::clone(&audio.maintenance);
+        let mut app = App::with_audio(Box::new(audio));
+
+        assert!(!app.maintain_audio());
+        assert_eq!(*maintenance.borrow(), ["reclaim", "poll"]);
+    }
+
+    #[test]
+    fn an_audio_runtime_error_moves_the_app_to_device_failed_state() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(audio));
+
+        assert!(app.maintain_audio());
+
+        assert_eq!(app.audio_format(), None);
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::DeviceError(
+                "device disconnected".to_owned()
+            ))
+        );
+        assert_eq!(app.status(), "device disconnected");
     }
 
     fn pad(bank: u8, index: u8) -> PadId {
@@ -1277,6 +1336,15 @@ mod tests {
 
         assert_eq!(app.device_retry_requests(), 1);
         assert_eq!(app.selected_pad(), 0);
+    }
+
+    #[test]
+    fn control_q_quits_even_when_a_modal_is_open() {
+        let mut app = App::without_audio("no output device");
+
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+
+        assert!(app.should_quit());
     }
 
     #[test]

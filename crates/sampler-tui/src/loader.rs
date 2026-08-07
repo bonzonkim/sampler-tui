@@ -116,12 +116,14 @@ impl WorkerHandle {
         self.results.recv_timeout(timeout)
     }
 
-    pub fn shutdown(&mut self) -> Result<(), WorkerPanicked> {
+    pub fn request_shutdown(&mut self) {
         if let Some(sender) = self.requests.take() {
             let _ = sender.try_send(WorkerRequest::Shutdown);
             drop(sender);
         }
+    }
 
+    pub fn join(&mut self) -> Result<(), WorkerPanicked> {
         if let Some(worker) = self.worker.take() {
             loop {
                 match self.results.recv_timeout(Duration::from_millis(10)) {
@@ -134,6 +136,11 @@ impl WorkerHandle {
             worker.join().map_err(|_| WorkerPanicked)?;
         }
         Ok(())
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), WorkerPanicked> {
+        self.request_shutdown();
+        self.join()
     }
 }
 
@@ -524,6 +531,19 @@ mod tests {
             Ok(())
         );
         shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_can_be_requested_before_the_worker_is_joined() {
+        let mut worker = WorkerHandle::spawn();
+
+        worker.request_shutdown();
+
+        assert_eq!(
+            worker.try_send(WorkerRequest::Shutdown),
+            Err(WorkerSendError::WorkerClosed)
+        );
+        assert_eq!(worker.join(), Ok(()));
     }
 
     #[test]

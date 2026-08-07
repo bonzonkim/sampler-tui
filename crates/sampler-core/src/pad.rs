@@ -160,6 +160,18 @@ impl PadSettings {
     }
 }
 
+impl Default for PadSettings {
+    fn default() -> Self {
+        Self {
+            mode: PlaybackMode::OneShot,
+            gain_db: 0.0,
+            pan: 0.0,
+            pitch_semitones: 0.0,
+            choke_group: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

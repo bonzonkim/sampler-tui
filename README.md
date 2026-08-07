@@ -19,7 +19,7 @@ Delivery slice 1 is complete. The core currently provides:
 - reversible quantization and allocation-free pattern scheduling into caller-owned buffers;
 - a versioned TOML project document with portable `audio/` paths and nested validation.
 
-Delivery slice 2 is audible through the system default output device. The audio path decodes WAV, AIFF, FLAC, and MP3, converts samples to the active device rate, schedules one-shot playback on the bounded real-time engine, and reports device or runtime failures without entering terminal raw mode.
+Delivery slice 2 is provisional. The default-device path has been exercised programmatically on macOS through rendered-frame completion, but no human hearing or one-shot-cleanliness verification was performed. Hermetic automated decode tests cover WAV, AIFF, FLAC, and MP3. Linux playback, human audibility, and device-disconnect behavior remain unchecked.
 
 ## Build and test
 
@@ -32,7 +32,7 @@ cargo build --workspace --release
 cargo run -p sampler-tui -- play path/to/sample.wav
 ```
 
-The diagnostic command prints the active device rate/channel count and decoded duration, plays one clean one-shot, and exits after rendered-frame completion. Run `cargo run -p sampler-tui -- --help` for its usage.
+The diagnostic command prints the active device rate/channel count and decoded duration, schedules one one-shot, and exits after rendered-frame completion. A successful exit is programmatic path evidence, not proof that the output was heard or free of audible artifacts. Run `cargo run -p sampler-tui -- --help` for its usage.
 
 ## Roadmap
 

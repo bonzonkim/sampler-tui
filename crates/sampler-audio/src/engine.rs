@@ -135,6 +135,7 @@ pub struct AudioEngine {
     last_triggered_frame: Option<Frame>,
     late_commands: u64,
     invalid_commands: u64,
+    executed_triggers: u64,
     telemetry_peak_left: f32,
     telemetry_peak_right: f32,
     next_telemetry_frame: Frame,
@@ -170,6 +171,7 @@ impl AudioEngine {
             last_triggered_frame: None,
             late_commands: 0,
             invalid_commands: 0,
+            executed_triggers: 0,
             telemetry_peak_left: 0.0,
             telemetry_peak_right: 0.0,
             next_telemetry_frame: telemetry_interval,
@@ -227,6 +229,10 @@ impl AudioEngine {
 
     pub fn invalid_commands(&self) -> u64 {
         self.invalid_commands
+    }
+
+    pub fn executed_triggers(&self) -> u64 {
+        self.executed_triggers
     }
 
     pub fn pending_actions(&self) -> usize {
@@ -462,6 +468,7 @@ impl AudioEngine {
         match action {
             ScheduledAction::Trigger { pad, velocity, .. } => {
                 if self.trigger(pad, velocity) {
+                    self.executed_triggers = self.executed_triggers.saturating_add(1);
                     self.last_triggered_frame = Some(self.rendered_frame);
                 }
             }

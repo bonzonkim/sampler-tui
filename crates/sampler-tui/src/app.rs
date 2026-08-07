@@ -1,6 +1,6 @@
 use std::array;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -75,6 +75,7 @@ pub struct App {
     overlay: Option<Overlay>,
     palette: LineEditor,
     palette_error: Option<String>,
+    current_dir: PathBuf,
     file_picker: FilePicker,
     pending_worker_requests: Vec<WorkerRequest>,
     device_retry_requests: usize,
@@ -96,6 +97,8 @@ impl App {
 
     fn new(audio: Option<Box<dyn AudioPort>>, audio_error: Option<String>) -> Self {
         let overlay = audio_error.clone().map(Overlay::DeviceError);
+        let current_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from(std::path::MAIN_SEPARATOR_STR));
         Self {
             active_bank: BankId::new(0).expect("bank zero is valid"),
             selected_pad: 0,
@@ -105,9 +108,8 @@ impl App {
             overlay,
             palette: LineEditor::default(),
             palette_error: None,
-            file_picker: FilePicker::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
+            file_picker: FilePicker::new(current_dir.clone()),
+            current_dir,
             pending_worker_requests: Vec::new(),
             device_retry_requests: 0,
             keyboard_capabilities: KeyboardCapabilities::default(),
@@ -131,7 +133,7 @@ impl App {
     pub fn apply_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.apply_key(key),
-            Event::Paste(text) if self.overlay == Some(Overlay::Palette) => {
+            Event::Paste(text) if self.overlay == Some(Overlay::Palette) && !text.is_empty() => {
                 self.palette.insert_str(&text);
                 self.palette_error = None;
             }
@@ -199,13 +201,12 @@ impl App {
             .and_then(|path| path.parent())
             .filter(|path| !path.as_os_str().is_empty())
             .map(ToOwned::to_owned);
-        let directory = source_parent
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let directory = source_parent.unwrap_or_else(|| self.current_dir.clone());
         self.open_picker_at(directory);
     }
 
     pub fn open_picker_at(&mut self, directory: impl Into<PathBuf>) {
-        let directory = directory.into();
+        let directory = resolve_picker_directory(&self.current_dir, directory.into());
         let request_id = self.file_picker.begin_scan(directory.clone());
         self.pending_worker_requests
             .push(WorkerRequest::ScanDirectory {
@@ -221,6 +222,9 @@ impl App {
     }
 
     pub fn close_overlay(&mut self) {
+        if self.overlay == Some(Overlay::Palette) {
+            self.palette_error = None;
+        }
         self.overlay = None;
     }
 
@@ -397,22 +401,46 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        match key.code {
-            KeyCode::Enter => self.execute_palette(),
-            KeyCode::Left => self.palette.move_left(),
-            KeyCode::Right => self.palette.move_right(),
-            KeyCode::Home => self.palette.move_home(),
-            KeyCode::End => self.palette.move_end(),
-            KeyCode::Backspace => self.palette.backspace(),
-            KeyCode::Delete => self.palette.delete(),
+        let text_changed = match key.code {
+            KeyCode::Enter => {
+                self.execute_palette();
+                false
+            }
+            KeyCode::Left => {
+                self.palette.move_left();
+                false
+            }
+            KeyCode::Right => {
+                self.palette.move_right();
+                false
+            }
+            KeyCode::Home => {
+                self.palette.move_home();
+                false
+            }
+            KeyCode::End => {
+                self.palette.move_end();
+                false
+            }
+            KeyCode::Backspace => {
+                let prior_len = self.palette.text().len();
+                self.palette.backspace();
+                self.palette.text().len() != prior_len
+            }
+            KeyCode::Delete => {
+                let prior_len = self.palette.text().len();
+                self.palette.delete();
+                self.palette.text().len() != prior_len
+            }
             KeyCode::Char(character)
                 if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
             {
                 self.palette.insert(character);
+                true
             }
             _ => return,
-        }
-        if key.code != KeyCode::Enter {
+        };
+        if text_changed {
             self.palette_error = None;
         }
     }
@@ -651,6 +679,34 @@ impl App {
             .clone()
             .unwrap_or_else(|| "audio device is unavailable".to_owned());
     }
+}
+
+fn resolve_picker_directory(current_dir: &Path, directory: PathBuf) -> PathBuf {
+    let absolute = if directory.as_os_str().is_empty() {
+        current_dir.to_owned()
+    } else if directory.is_absolute() {
+        directory
+    } else {
+        current_dir.join(directory)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn pad_offset(pad: PadId) -> usize {
@@ -1184,6 +1240,62 @@ mod tests {
     }
 
     #[test]
+    fn palette_error_survives_multibyte_and_no_op_cursor_navigation() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("wat한".into()));
+        let press = |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
+        app.apply_key(press(KeyCode::Enter));
+        let error = Some("unknown command: wat한");
+        assert_eq!(app.palette_error(), error);
+
+        app.apply_key(press(KeyCode::Left));
+        assert_eq!(app.palette_cursor(), 3);
+        assert_eq!(app.palette_error(), error);
+        app.apply_key(press(KeyCode::Right));
+        assert_eq!(app.palette_cursor(), 6);
+        assert_eq!(app.palette_error(), error);
+        app.apply_key(press(KeyCode::End));
+        assert_eq!(app.palette_error(), error);
+        app.apply_key(press(KeyCode::Home));
+        app.apply_key(press(KeyCode::Home));
+        app.apply_key(press(KeyCode::Left));
+        app.apply_key(press(KeyCode::Backspace));
+        assert_eq!(app.palette_cursor(), 0);
+        assert_eq!(app.palette_error(), error);
+        app.apply_key(press(KeyCode::End));
+        app.apply_key(press(KeyCode::Delete));
+        app.apply_terminal_event(Event::Paste(String::new()));
+        assert_eq!(app.palette_cursor(), 6);
+        assert_eq!(app.palette_error(), error);
+
+        app.apply_key(key('x', KeyModifiers::NONE, KeyEventKind::Press));
+        assert_eq!(app.palette_error(), None);
+    }
+
+    #[test]
+    fn closing_the_palette_clears_its_inline_error() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("wat".into()));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(app.palette_error(), Some("unknown command: wat"));
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(app.overlay(), None);
+        assert_eq!(app.palette_error(), None);
+    }
+
+    #[test]
     fn shifted_question_mark_opens_help_without_triggering_a_pad() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
@@ -1207,6 +1319,93 @@ mod tests {
             panic!("expected one scan request")
         };
         assert_eq!(path, &std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn picker_resolves_a_nested_relative_source_and_backs_up_to_current_directory() {
+        let current_dir = std::env::current_dir().unwrap();
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.begin_load(pad(0, 0), path("samples/kick.wav"));
+
+        app.open_picker();
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one nested scan request")
+        };
+        assert!(path.is_absolute());
+        assert_eq!(path, &current_dir.join("samples"));
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one parent scan request")
+        };
+        assert_eq!(path, &current_dir);
+    }
+
+    #[test]
+    fn empty_relative_picker_directory_maps_to_current_directory_before_parent_navigation() {
+        let current_dir = std::env::current_dir().unwrap();
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.open_picker_at("");
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one normalized scan request")
+        };
+        assert_eq!(path, &current_dir);
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one normalized parent scan request")
+        };
+        assert_eq!(path, current_dir.parent().unwrap());
+        assert!(!path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn relative_picker_directory_is_lexically_normalized() {
+        let current_dir = std::env::current_dir().unwrap();
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.open_picker_at("samples/../drums/.");
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one normalized scan request")
+        };
+        assert_eq!(path, &current_dir.join("drums"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_picker_normalization_preserves_non_unicode_components() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let relative = PathBuf::from(OsString::from_vec(vec![b's', 0x80, b'm', b'p']));
+        let current_dir = std::env::current_dir().unwrap();
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.open_picker_at(relative.clone());
+
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ScanDirectory { path, .. }] = requests.as_slice() else {
+            panic!("expected one lossless scan request")
+        };
+        assert_eq!(path, &current_dir.join(relative));
     }
 
     #[test]

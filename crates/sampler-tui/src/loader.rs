@@ -105,13 +105,7 @@ impl WorkerHandle {
     }
 
     pub fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendError> {
-        let Some(sender) = &self.requests else {
-            return Err(WorkerSendError::WorkerClosed);
-        };
-        sender.try_send(request).map_err(|error| match error {
-            TrySendError::Full(_) => WorkerSendError::WorkerBusy,
-            TrySendError::Disconnected(_) => WorkerSendError::WorkerClosed,
-        })
+        try_send_request(self.requests.as_ref(), request)
     }
 
     pub fn try_recv(&self) -> Result<WorkerResult, mpsc::TryRecvError> {
@@ -141,6 +135,19 @@ impl WorkerHandle {
         }
         Ok(())
     }
+}
+
+fn try_send_request(
+    sender: Option<&SyncSender<WorkerRequest>>,
+    request: WorkerRequest,
+) -> Result<(), WorkerSendError> {
+    let Some(sender) = sender else {
+        return Err(WorkerSendError::WorkerClosed);
+    };
+    sender.try_send(request).map_err(|error| match error {
+        TrySendError::Full(_) => WorkerSendError::WorkerBusy,
+        TrySendError::Disconnected(_) => WorkerSendError::WorkerClosed,
+    })
 }
 
 impl Drop for WorkerHandle {
@@ -236,18 +243,24 @@ fn load_sample(path: &Path, engine_rate: u32) -> Result<LoadedSample, String> {
 }
 
 fn source_duration(frames: usize, sample_rate: u32) -> Duration {
+    frame_duration(frames as u128, sample_rate)
+}
+
+fn frame_duration(frames: u128, sample_rate: u32) -> Duration {
     if sample_rate == 0 {
         return Duration::ZERO;
     }
-    let frames = frames as u128;
     let rate = u128::from(sample_rate);
-    let seconds = (frames / rate).min(u128::from(u64::MAX)) as u64;
-    let nanos = if seconds == u64::MAX {
-        999_999_999
-    } else {
-        ((frames % rate) * 1_000_000_000 / rate) as u32
-    };
-    Duration::new(seconds, nanos)
+    let seconds = frames / rate;
+    let remainder = frames % rate;
+    match seconds.cmp(&u128::from(u64::MAX)) {
+        std::cmp::Ordering::Greater => Duration::MAX,
+        std::cmp::Ordering::Equal if remainder > 0 => Duration::MAX,
+        std::cmp::Ordering::Equal => Duration::from_secs(u64::MAX),
+        std::cmp::Ordering::Less => {
+            Duration::new(seconds as u64, (remainder * 1_000_000_000 / rate) as u32)
+        }
+    }
 }
 
 fn build_preview(buffer: &SampleBuffer) -> [PreviewColumn; PREVIEW_COLUMNS] {
@@ -259,20 +272,28 @@ fn build_preview(buffer: &SampleBuffer) -> [PreviewColumn; PREVIEW_COLUMNS] {
         if start == end {
             return PreviewColumn::default();
         }
-
-        let mut min = 1.0_f32;
-        let mut max = -1.0_f32;
-        for sample in &buffer.data()[start * 2..end * 2] {
-            if sample.is_finite() {
-                min = min.min(*sample);
-                max = max.max(*sample);
-            }
-        }
-        PreviewColumn {
-            min: preview_level(min),
-            max: preview_level(max),
-        }
+        preview_column(&buffer.data()[start * 2..end * 2])
     })
+}
+
+fn preview_column(samples: &[f32]) -> PreviewColumn {
+    let mut min = 1.0_f32;
+    let mut max = -1.0_f32;
+    let mut found_finite = false;
+    for sample in samples {
+        if sample.is_finite() {
+            found_finite = true;
+            min = min.min(*sample);
+            max = max.max(*sample);
+        }
+    }
+    if !found_finite {
+        return PreviewColumn::default();
+    }
+    PreviewColumn {
+        min: preview_level(min),
+        max: preview_level(max),
+    }
 }
 
 fn preview_level(sample: f32) -> i8 {
@@ -303,11 +324,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use sampler_core::{BankId, PadId};
 
-    use super::{WorkerHandle, WorkerRequest, WorkerResult};
+    use super::{
+        WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, frame_duration,
+        preview_column, try_send_request, worker_loop,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -347,6 +373,30 @@ mod tests {
 
     fn pad(bank: u8, index: u8) -> PadId {
         PadId::new(BankId::new(bank).unwrap(), index).unwrap()
+    }
+
+    fn worker_with_capacities(request_capacity: usize, result_capacity: usize) -> WorkerHandle {
+        let (requests, request_receiver) = mpsc::sync_channel(request_capacity);
+        let (result_sender, results) = mpsc::sync_channel(result_capacity);
+        let worker = thread::spawn(move || worker_loop(request_receiver, result_sender));
+        WorkerHandle {
+            requests: Some(requests),
+            results,
+            worker: Some(worker),
+        }
+    }
+
+    fn panicked_worker() -> WorkerHandle {
+        let (requests, request_receiver) = mpsc::sync_channel(8);
+        let (result_sender, results) = mpsc::sync_channel(8);
+        drop(request_receiver);
+        drop(result_sender);
+        let worker = thread::spawn(|| panic!("injected loader panic"));
+        WorkerHandle {
+            requests: Some(requests),
+            results,
+            worker: Some(worker),
+        }
     }
 
     #[test]
@@ -405,5 +455,81 @@ mod tests {
                 .all(|column| column.min == 0 && column.max == 0)
         );
         worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preview_bin_without_finite_samples_is_empty() {
+        assert_eq!(
+            preview_column(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]),
+            crate::PreviewColumn::default()
+        );
+    }
+
+    #[test]
+    fn exact_maximum_whole_second_duration_keeps_zero_fraction() {
+        assert_eq!(
+            frame_duration(u128::from(u64::MAX), 1),
+            Duration::from_secs(u64::MAX)
+        );
+        assert_eq!(
+            frame_duration(u128::from(u64::MAX) * 2, 2),
+            Duration::from_secs(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn duration_saturates_when_maximum_seconds_has_a_fraction_or_is_exceeded() {
+        let maximum_seconds = u128::from(u64::MAX);
+
+        assert_eq!(frame_duration(maximum_seconds * 2 + 1, 2), Duration::MAX);
+        assert_eq!(frame_duration(maximum_seconds + 1, 1), Duration::MAX);
+    }
+
+    #[test]
+    fn request_try_send_distinguishes_full_and_closed_channels() {
+        let (full_sender, _full_receiver) = mpsc::sync_channel(1);
+        try_send_request(Some(&full_sender), WorkerRequest::Shutdown).unwrap();
+        assert_eq!(
+            try_send_request(Some(&full_sender), WorkerRequest::Shutdown),
+            Err(WorkerSendError::WorkerBusy)
+        );
+
+        let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
+        drop(closed_receiver);
+        assert_eq!(
+            try_send_request(Some(&closed_sender), WorkerRequest::Shutdown),
+            Err(WorkerSendError::WorkerClosed)
+        );
+        assert_eq!(
+            try_send_request(None, WorkerRequest::Shutdown),
+            Err(WorkerSendError::WorkerClosed)
+        );
+    }
+
+    #[test]
+    fn shutdown_drains_a_saturated_result_channel_before_joining() {
+        let mut worker = worker_with_capacities(8, 0);
+        worker
+            .try_send(WorkerRequest::ScanDirectory {
+                request_id: 1,
+                path: std::env::temp_dir().join("sampler-tui-definitely-missing-directory"),
+                show_hidden: false,
+            })
+            .unwrap();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let shutdown = thread::spawn(move || done_sender.send(worker.shutdown()).unwrap());
+
+        assert_eq!(
+            done_receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_reports_a_worker_thread_panic() {
+        let mut worker = panicked_worker();
+
+        assert_eq!(worker.shutdown(), Err(WorkerPanicked));
     }
 }

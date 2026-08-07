@@ -7,7 +7,7 @@ mod tests {
 
     #[test]
     fn controller_never_silently_drops_a_trigger() {
-        let (mut controller, mut ports) = audio_channels(1, 256, 8);
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 256, 8);
         let pad = PadId::first();
         controller.trigger(pad, 10, 1.0).unwrap();
         assert_eq!(
@@ -22,7 +22,7 @@ mod tests {
 
     #[test]
     fn retired_slots_return_to_the_free_pool_off_thread() {
-        let (mut controller, mut ports) = audio_channels(8, 256, 8);
+        let (mut controller, mut ports) = audio_channels_with_capacities(8, 256, 8);
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
         let slot = controller
             .install(PadId::first(), sample, PadSettings::default())
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn controller_validates_velocity() {
-        let (mut controller, _) = audio_channels(8, 256, 8);
+        let (mut controller, _) = audio_channels_with_capacities(8, 256, 8);
         assert_eq!(
             controller.trigger(PadId::first(), 0, f32::NAN),
             Err(ControlError::InvalidVelocity)
@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn command_queue_accepts_its_exact_capacity() {
-        let (mut controller, mut ports) = audio_channels(2, 256, 8);
+        let (mut controller, mut ports) = audio_channels_with_capacities(2, 256, 8);
         let pad = PadId::first();
         controller.trigger(pad, 0, 1.0).unwrap();
         controller.trigger(pad, 1, 1.0).unwrap();
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn install_returns_slot_when_command_queue_is_full() {
-        let (mut controller, _) = audio_channels(1, 256, 8);
+        let (mut controller, _) = audio_channels_with_capacities(1, 256, 8);
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
         assert_eq!(
@@ -72,6 +72,22 @@ mod tests {
         );
         assert_eq!(controller.available_slots(), 256);
         assert_eq!(controller.command_overflows(), 1);
+    }
+
+    #[test]
+    fn production_channels_use_the_command_capacity_constant() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        for frame in 0..COMMAND_CAPACITY {
+            controller.trigger(pad, frame as u64, 1.0).unwrap();
+        }
+        assert_eq!(
+            controller.trigger(pad, COMMAND_CAPACITY as u64, 1.0),
+            Err(ControlError::CommandQueueFull)
+        );
+        for _ in 0..COMMAND_CAPACITY {
+            assert!(ports.commands.pop().is_ok());
+        }
     }
 }
 use std::sync::Arc;
@@ -153,7 +169,20 @@ pub struct EnginePorts {
     pub telemetry: Producer<Telemetry>,
 }
 
-pub fn audio_channels(
+pub fn audio_channels() -> (AudioController, EnginePorts) {
+    audio_channels_with_capacity_values(COMMAND_CAPACITY, RETIREMENT_CAPACITY, TELEMETRY_CAPACITY)
+}
+
+#[cfg(test)]
+fn audio_channels_with_capacities(
+    command_capacity: usize,
+    retirement_capacity: usize,
+    telemetry_capacity: usize,
+) -> (AudioController, EnginePorts) {
+    audio_channels_with_capacity_values(command_capacity, retirement_capacity, telemetry_capacity)
+}
+
+fn audio_channels_with_capacity_values(
     command_capacity: usize,
     retirement_capacity: usize,
     telemetry_capacity: usize,

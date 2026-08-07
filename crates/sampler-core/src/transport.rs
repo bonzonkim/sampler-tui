@@ -1,0 +1,1 @@
+//! Sample-clock transport model.

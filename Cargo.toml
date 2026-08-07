@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/sampler-core", "crates/sampler-audio", "crates/sampler-tui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+toml = "1.1.4"
+

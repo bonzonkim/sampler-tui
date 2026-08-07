@@ -1,0 +1,1 @@
+//! Fixed-capacity voice allocation.

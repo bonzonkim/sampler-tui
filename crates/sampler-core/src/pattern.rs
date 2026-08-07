@@ -129,6 +129,12 @@ impl Pattern {
         end: Frame,
         output: &mut [ScheduledEvent],
     ) -> ScheduleResult {
+        if start >= end {
+            return ScheduleResult {
+                written: 0,
+                dropped: 0,
+            };
+        }
         let first = self.events.partition_point(|event| event.frame < start);
         let last = self.events.partition_point(|event| event.frame < end);
         let matching = &self.events[first..last];
@@ -222,6 +228,29 @@ mod tests {
         let result = pattern.schedule_range(100, 200, &mut output);
         assert_eq!(result.written, 1);
         assert_eq!(output[0].event_id, EventId(1));
+    }
+
+    #[test]
+    fn empty_or_reversed_range_schedules_nothing() {
+        let mut pattern = Pattern::new(1_000);
+        pattern
+            .insert(PatternEvent::new(EventId(1), pad(), 100, 1.0, None).unwrap())
+            .unwrap();
+        let mut output = [ScheduledEvent::EMPTY; 1];
+        assert_eq!(
+            pattern.schedule_range(200, 100, &mut output),
+            ScheduleResult {
+                written: 0,
+                dropped: 0
+            }
+        );
+        assert_eq!(
+            pattern.schedule_range(100, 100, &mut output),
+            ScheduleResult {
+                written: 0,
+                dropped: 0
+            }
+        );
     }
 
     #[test]

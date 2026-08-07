@@ -1,6 +1,9 @@
 use std::error::Error;
-use std::io;
+use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe, PanicHookInfo, catch_unwind, resume_unwind};
 use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -8,6 +11,9 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 
 use crate::audio::{AudioPort, open_default_audio};
 use crate::input::KeyboardCapabilities;
@@ -19,6 +25,82 @@ const MAX_WORKER_RESULTS_PER_ITERATION: usize = 8;
 const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 type DynError = Box<dyn Error>;
+type PanicHook = dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static;
+
+static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+struct UiPanicCapture {
+    _hook_lock: MutexGuard<'static, ()>,
+    previous: Arc<PanicHook>,
+    captured: Arc<Mutex<Option<String>>>,
+}
+
+impl UiPanicCapture {
+    fn install() -> Self {
+        let hook_lock = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = Arc::<PanicHook>::from(panic::take_hook());
+        let captured = Arc::new(Mutex::new(None));
+        let ui_thread = thread::current().id();
+        let previous_for_hook = Arc::clone(&previous);
+        let captured_for_hook = Arc::clone(&captured);
+        panic::set_hook(Box::new(move |info| {
+            if thread::current().id() == ui_thread {
+                let mut captured = captured_for_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *captured = Some(format_panic(info));
+            } else {
+                previous_for_hook(info);
+            }
+        }));
+        Self {
+            _hook_lock: hook_lock,
+            previous,
+            captured,
+        }
+    }
+
+    fn restore(self) -> Option<String> {
+        let Self {
+            _hook_lock,
+            previous,
+            captured,
+        } = self;
+        panic::set_hook(Box::new(move |info| previous(info)));
+        let report = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(_hook_lock);
+        report
+    }
+}
+
+fn format_panic(info: &PanicHookInfo<'_>) -> String {
+    let message = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    let thread = thread::current();
+    let thread_name = thread.name().unwrap_or("unnamed");
+    match info.location() {
+        Some(location) => format!(
+            "thread '{thread_name}' panicked at {}:{}:{}:\n{message}",
+            location.file(),
+            location.line(),
+            location.column()
+        ),
+        None => format!("thread '{thread_name}' panicked:\n{message}"),
+    }
+}
+
+fn report_panic_to_stderr(message: &str) {
+    let _ = writeln!(io::stderr().lock(), "{message}");
+}
 
 pub trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -286,21 +368,58 @@ pub fn run_event_loop(
 trait TerminalLifecycle {
     type Terminal;
 
-    fn run<F, R>(&mut self, run: F) -> R
-    where
-        F: FnOnce(&mut Self::Terminal) -> R;
+    fn initialize(&mut self) -> io::Result<Self::Terminal>;
+    fn restore(&mut self) -> io::Result<()>;
 }
 
-struct RatatuiTerminalLifecycle;
+#[derive(Default)]
+struct RatatuiTerminalLifecycle {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
 
 impl TerminalLifecycle for RatatuiTerminalLifecycle {
     type Terminal = ratatui::DefaultTerminal;
 
-    fn run<F, R>(&mut self, run: F) -> R
-    where
-        F: FnOnce(&mut Self::Terminal) -> R,
-    {
-        ratatui::run(run)
+    fn initialize(&mut self) -> io::Result<Self::Terminal> {
+        enable_raw_mode()?;
+        self.raw_mode = true;
+
+        let mut stdout = io::stdout();
+        self.alternate_screen = true;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            return preserve_primary(Err(error), self.restore());
+        }
+
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout())) {
+            Ok(terminal) => Ok(terminal),
+            Err(error) => preserve_primary(Err(error), self.restore()),
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let raw_mode = if self.raw_mode {
+            let result = disable_raw_mode();
+            if result.is_ok() {
+                self.raw_mode = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
+
+        let alternate_screen = if self.alternate_screen {
+            let mut stdout = io::stdout();
+            let result = execute!(stdout, LeaveAlternateScreen);
+            if result.is_ok() {
+                self.alternate_screen = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
+
+        preserve_primary(raw_mode, alternate_screen)
     }
 }
 
@@ -328,24 +447,44 @@ impl<W: ShutdownWorker> Drop for WorkerShutdownGuard<'_, W> {
     }
 }
 
-fn run_with_terminal_lifecycle<L, W, F, J, T, E>(
+fn run_with_terminal_lifecycle<L, W, F, J, R, T, E>(
     lifecycle: &mut L,
     worker: &mut W,
     run: F,
     join: J,
+    report_panic: R,
 ) -> Result<T, E>
 where
     L: TerminalLifecycle,
     W: ShutdownWorker,
     F: FnOnce(&mut L::Terminal, &mut W) -> Result<T, E>,
     J: FnOnce(&mut W) -> Result<(), E>,
+    R: FnOnce(&str),
+    E: From<io::Error>,
 {
-    let primary = lifecycle.run(|terminal| {
+    let mut terminal = lifecycle.initialize().map_err(E::from)?;
+    let panic_capture = UiPanicCapture::install();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut shutdown = WorkerShutdownGuard(worker);
-        run(terminal, shutdown.worker())
-    });
+        run(&mut terminal, shutdown.worker())
+    }));
+    let terminal_cleanup = lifecycle.restore().map_err(E::from);
     let cleanup = join(worker);
-    preserve_primary(primary, cleanup)
+    let panic_report = panic_capture.restore();
+
+    match outcome {
+        Ok(primary) => preserve_primary(preserve_primary(primary, terminal_cleanup), cleanup),
+        Err(payload) => {
+            drop(terminal_cleanup);
+            drop(cleanup);
+            report_panic(
+                panic_report
+                    .as_deref()
+                    .unwrap_or("thread panicked with no captured diagnostic"),
+            );
+            resume_unwind(payload)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -445,7 +584,7 @@ pub fn run_tui() -> Result<(), DynError> {
     let mut app = app_with_default_audio(open_default_audio);
     let mut events = CrosstermEventSource;
     let mut worker = WorkerHandle::spawn();
-    let mut lifecycle = RatatuiTerminalLifecycle;
+    let mut lifecycle = RatatuiTerminalLifecycle::default();
 
     run_with_terminal_lifecycle(
         &mut lifecycle,
@@ -462,6 +601,7 @@ pub fn run_tui() -> Result<(), DynError> {
             )
         },
         |worker| worker.join().map_err(|error| Box::new(error) as DynError),
+        report_panic_to_stderr,
     )
 }
 
@@ -928,14 +1068,14 @@ mod tests {
     impl TerminalLifecycle for FakeTerminalLifecycle {
         type Terminal = ();
 
-        fn run<F, R>(&mut self, run: F) -> R
-        where
-            F: FnOnce(&mut Self::Terminal) -> R,
-        {
+        fn initialize(&mut self) -> io::Result<Self::Terminal> {
             self.calls.lock().unwrap().push("init");
-            let result = run(&mut ());
+            Ok(())
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
             self.calls.lock().unwrap().push("restore");
-            result
+            Ok(())
         }
     }
 
@@ -1014,6 +1154,7 @@ mod tests {
                 calls.lock().unwrap().push("join");
                 Err(io::Error::other("join"))
             },
+            |_| {},
         );
 
         assert_eq!(result.unwrap_err().to_string(), "loop");
@@ -1060,6 +1201,63 @@ mod tests {
     }
 
     #[test]
+    fn production_lifecycle_contains_panic_through_terminal_restore_and_worker_join() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = FakeTerminalLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = OrderedEnhancementOps {
+            calls: Arc::clone(&calls),
+        };
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _: io::Result<()> = run_with_terminal_lifecycle(
+                &mut lifecycle,
+                &mut worker,
+                |_, _| {
+                    run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
+                        calls.lock().unwrap().push("loop");
+                        panic!("loop panic")
+                    })
+                },
+                |_| {
+                    calls.lock().unwrap().push("join");
+                    Err(io::Error::other("join"))
+                },
+                |message| {
+                    assert!(message.contains("loop panic"));
+                    calls.lock().unwrap().push("report");
+                },
+            );
+        }));
+
+        let panic = outcome.unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"loop panic"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init",
+                "query",
+                "push",
+                "loop",
+                "stop-all",
+                "drop-audio",
+                "pop",
+                "request",
+                "restore",
+                "join",
+                "report",
+            ]
+        );
+    }
+
+    #[test]
     fn worker_is_requested_before_terminal_restore_and_joined_afterward() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = FakeTerminalLifecycle {
@@ -1069,20 +1267,21 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let result: Result<(), &str> = run_with_terminal_lifecycle(
+        let result: io::Result<()> = run_with_terminal_lifecycle(
             &mut lifecycle,
             &mut worker,
             |_, _| {
                 calls.lock().unwrap().push("loop");
-                Err("loop")
+                Err(io::Error::other("loop"))
             },
             |_| {
                 calls.lock().unwrap().push("join");
-                Err("join")
+                Err(io::Error::other("join"))
             },
+            |_| {},
         );
 
-        assert_eq!(result, Err("loop"));
+        assert_eq!(result.unwrap_err().to_string(), "loop");
         assert_eq!(
             *calls.lock().unwrap(),
             ["init", "loop", "request", "restore", "join"]

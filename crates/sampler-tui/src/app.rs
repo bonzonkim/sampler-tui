@@ -8,7 +8,7 @@ use sampler_audio::{SampleBuffer, Telemetry};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{BankId, PadId, PadSettings};
 
-use crate::audio::AudioPort;
+use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{WorkerRequest, WorkerResult};
@@ -258,11 +258,7 @@ impl App {
             return false;
         };
 
-        self.audio = None;
-        self.audio_format = None;
-        self.audio_unavailable_message = Some(error.clone());
-        self.status = error.clone();
-        self.overlay = Some(Overlay::DeviceError(error));
+        self.fail_audio(error);
         true
     }
 
@@ -344,6 +340,21 @@ impl App {
 
     pub fn take_device_retry_requests(&mut self) -> usize {
         mem::take(&mut self.device_retry_requests)
+    }
+
+    pub fn retry_default_device(&mut self) -> bool {
+        self.retry_default_device_with(open_default_audio)
+    }
+
+    fn retry_default_device_with(
+        &mut self,
+        open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>, String>,
+    ) -> bool {
+        match open_audio() {
+            Ok(audio) => self.recover_audio(audio),
+            Err(error) => self.fail_audio(error),
+        }
+        true
     }
 
     pub fn set_keyboard_capabilities(&mut self, capabilities: KeyboardCapabilities) {
@@ -778,6 +789,72 @@ impl App {
             .clone()
             .unwrap_or_else(|| "audio device is unavailable".to_owned());
     }
+
+    fn fail_audio(&mut self, error: String) {
+        self.audio = None;
+        self.audio_format = None;
+        self.audio_unavailable_message = Some(error.clone());
+        self.held_pad_by_key.fill(None);
+        for pad in &mut self.pads {
+            pad.active = false;
+        }
+        self.status = error.clone();
+        self.overlay = Some(Overlay::DeviceError(error));
+    }
+
+    fn recover_audio(&mut self, mut audio: Box<dyn AudioPort>) {
+        let sample_rate = audio.sample_rate();
+        let channels = audio.channels();
+        let mut local_error = None;
+
+        for bank in 0..BANK_COUNT {
+            let bank = BankId::new(bank).expect("bounded bank is valid");
+            for index in 0..PADS_PER_BANK {
+                let pad = PadId::new(bank, index).expect("bounded pad is valid");
+                let view = &mut self.pads[pad_offset(pad)];
+
+                if let Some(sample) = view
+                    .sample
+                    .as_ref()
+                    .filter(|sample| sample.sample_rate() == sample_rate)
+                {
+                    match audio.install(pad, Arc::clone(sample), view.settings) {
+                        Ok(_) => view.state = PadLoadState::Ready,
+                        Err(error) => {
+                            view.state = PadLoadState::Error(error.clone());
+                            local_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(path) = view.source.clone() {
+                    view.generation = view.generation.wrapping_add(1);
+                    view.state = PadLoadState::Loading;
+                    self.pending_worker_requests
+                        .push(WorkerRequest::LoadSample {
+                            pad,
+                            generation: view.generation,
+                            path,
+                            engine_rate: sample_rate,
+                        });
+                } else if view.sample.is_some() || view.state != PadLoadState::Empty {
+                    let error = format!(
+                        "cannot reload pad for {sample_rate} Hz because its source path is unavailable"
+                    );
+                    view.state = PadLoadState::Error(error.clone());
+                    local_error = Some(error);
+                }
+            }
+        }
+
+        self.audio = Some(audio);
+        self.audio_format = Some((sample_rate, channels));
+        self.audio_unavailable_message = None;
+        self.held_pad_by_key.fill(None);
+        self.overlay = None;
+        self.status = local_error.unwrap_or_else(|| "audio device connected".to_owned());
+    }
 }
 
 fn resolve_picker_directory(current_dir: &Path, directory: PathBuf) -> PathBuf {
@@ -1031,6 +1108,63 @@ mod tests {
             ))
         );
         assert_eq!(app.status(), "device disconnected");
+    }
+
+    #[test]
+    fn runtime_failure_preserves_pads_and_retry_reinstalls_matching_rate() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let request = app.begin_load(pad(0, 0), path("kick.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "kick.wav"));
+
+        app.maintain_audio();
+
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::DeviceError(_))
+        ));
+        assert!(app.pad(pad(0, 0)).sample.is_some());
+
+        let replacement = FakeAudio::ready(48_000, 2);
+        let calls = replacement.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Ready);
+        assert_eq!(
+            calls.snapshot().last(),
+            Some(&AudioCall::Install(pad(0, 0)))
+        );
+    }
+
+    #[test]
+    fn retry_at_a_new_rate_reloads_from_source_instead_of_reusing_pcm() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        let request = app.begin_load(pad(0, 0), path("kick.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+        app.apply_worker_result(loaded(pad(0, 0), generation, "kick.wav"));
+        app.maintain_audio();
+
+        let replacement = FakeAudio::ready(44_100, 2);
+        let calls = replacement.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Loading);
+        assert_eq!(calls.snapshot(), []);
+        assert_eq!(
+            app.take_worker_requests().last(),
+            Some(&WorkerRequest::LoadSample {
+                pad: pad(0, 0),
+                generation: generation.wrapping_add(1),
+                path: "kick.wav".into(),
+                engine_rate: 44_100,
+            })
+        );
     }
 
     fn pad(bank: u8, index: u8) -> PadId {

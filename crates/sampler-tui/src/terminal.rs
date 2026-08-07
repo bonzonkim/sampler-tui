@@ -10,6 +10,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
+use crate::audio::{AudioPort, open_default_audio};
 use crate::input::KeyboardCapabilities;
 use crate::loader::{WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError};
 use crate::{App, ui};
@@ -106,6 +107,8 @@ trait EventLoopApp {
     fn maintain_audio(&mut self) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest>;
+    fn take_device_retry_requests(&mut self) -> usize;
+    fn retry_default_device(&mut self) -> bool;
     fn apply_terminal_event(&mut self, event: Event);
     fn tick(&mut self);
 }
@@ -121,6 +124,14 @@ impl EventLoopApp for App {
 
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
         App::take_worker_requests(self)
+    }
+
+    fn take_device_retry_requests(&mut self) -> usize {
+        App::take_device_retry_requests(self)
+    }
+
+    fn retry_default_device(&mut self) -> bool {
+        App::retry_default_device(self)
     }
 
     fn apply_terminal_event(&mut self, event: Event) {
@@ -215,6 +226,10 @@ where
         }
         app.apply_terminal_event(events.read()?);
         state.dirty = true;
+    }
+
+    if app.take_device_retry_requests() > 0 {
+        state.dirty |= app.retry_default_device();
     }
 
     if now >= state.next_tick {
@@ -345,8 +360,15 @@ fn preserve_primary<T, E>(primary: Result<T, E>, cleanup: Result<(), E>) -> Resu
     }
 }
 
+fn app_with_default_audio(open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>, String>) -> App {
+    match open_audio() {
+        Ok(audio) => App::with_audio(audio),
+        Err(error) => App::without_audio(error),
+    }
+}
+
 pub fn run_tui() -> Result<(), DynError> {
-    let mut app = App::without_audio("audio device is not initialized");
+    let mut app = app_with_default_audio(open_default_audio);
     let mut events = CrosstermEventSource;
     let mut worker = WorkerHandle::spawn();
     let mut lifecycle = RatatuiTerminalLifecycle;
@@ -413,6 +435,8 @@ mod tests {
         worker_results: usize,
         events_applied: usize,
         ticks: usize,
+        device_retry_requests: usize,
+        device_retry_attempts: usize,
     }
 
     impl EventLoopApp for FakeApp {
@@ -436,6 +460,15 @@ mod tests {
 
         fn tick(&mut self) {
             self.ticks += 1;
+        }
+
+        fn take_device_retry_requests(&mut self) -> usize {
+            std::mem::take(&mut self.device_retry_requests)
+        }
+
+        fn retry_default_device(&mut self) -> bool {
+            self.device_retry_attempts += 1;
+            true
         }
     }
 
@@ -580,6 +613,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(drawer.draws, 0);
+    }
+
+    #[test]
+    fn retry_request_burst_opens_the_default_device_once() {
+        let mut app = FakeApp {
+            device_retry_requests: 3,
+            ..FakeApp::default()
+        };
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker::default();
+        let mut drawer = FakeDrawer::default();
+        let now = Instant::now();
+        let mut state = LoopState::new(now + Duration::from_secs(1));
+
+        run_iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.device_retry_attempts, 1);
+        assert_eq!(app.device_retry_requests, 0);
+        assert_eq!(drawer.draws, 1);
+    }
+
+    #[test]
+    fn startup_audio_failure_preserves_the_browsable_app_model() {
+        let mut app = app_with_default_audio(|| Err("no output device".to_owned()));
+
+        assert_eq!(app.audio_format(), None);
+        assert_eq!(
+            app.overlay(),
+            Some(&crate::Overlay::DeviceError("no output device".to_owned()))
+        );
+        assert_eq!(app.pads().len(), crate::PAD_VIEW_COUNT);
+
+        app.close_overlay();
+        app.open_help();
+        assert_eq!(app.overlay(), Some(&crate::Overlay::Help));
     }
 
     #[derive(Clone)]

@@ -2,8 +2,10 @@
 
 mod decode;
 mod error;
+mod resample;
 mod sample;
 
 pub use decode::{DecodedAudio, decode_path};
-pub use error::{DecodeError, SampleError};
+pub use error::{DecodeError, PrepareError, SampleError};
+pub use resample::prepare_sample;
 pub use sample::{SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};

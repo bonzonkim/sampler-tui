@@ -47,3 +47,17 @@ pub enum SampleError {
     #[error("sample slot {0} is out of range")]
     SlotOutOfRange(usize),
 }
+
+#[derive(Debug, Error)]
+pub enum PrepareError {
+    #[error("target sample rate must be non-zero")]
+    ZeroTargetRate,
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error("could not create resampler: {0}")]
+    ResamplerConstruction(#[source] rubato::ResamplerConstructionError),
+    #[error("could not resample audio: {0}")]
+    Resampling(#[source] rubato::ResampleError),
+    #[error(transparent)]
+    Sample(#[from] SampleError),
+}

@@ -129,27 +129,23 @@ impl Pattern {
         end: Frame,
         output: &mut [ScheduledEvent],
     ) -> ScheduleResult {
-        let mut written = 0;
-        let mut dropped = 0;
-        for event in self
-            .events
-            .iter()
-            .filter(|event| event.frame >= start && event.frame < end)
-        {
-            if let Some(slot) = output.get_mut(written) {
-                *slot = ScheduledEvent {
-                    event_id: event.id,
-                    pad: event.pad,
-                    at: event.frame,
-                    velocity: event.velocity,
-                    duration: event.duration,
-                };
-                written += 1;
-            } else {
-                dropped += 1;
-            }
+        let first = self.events.partition_point(|event| event.frame < start);
+        let last = self.events.partition_point(|event| event.frame < end);
+        let matching = &self.events[first..last];
+        let written = matching.len().min(output.len());
+        for (slot, event) in output.iter_mut().zip(matching.iter()).take(written) {
+            *slot = ScheduledEvent {
+                event_id: event.id,
+                pad: event.pad,
+                at: event.frame,
+                velocity: event.velocity,
+                duration: event.duration,
+            };
         }
-        ScheduleResult { written, dropped }
+        ScheduleResult {
+            written,
+            dropped: matching.len() - written,
+        }
     }
 
     pub fn length_frames(&self) -> Frame {

@@ -5,7 +5,8 @@ use std::{collections::HashSet, path::Component, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EventId, Meter, ModelError, PadId, PadSettings, PatternEvent, Resolution, Tempo, Transport,
+    BankId, ChokeGroup, EventId, Meter, ModelError, PadId, PadSettings, PatternEvent, PlaybackMode,
+    Resolution, Tempo, Transport,
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -30,6 +31,179 @@ pub enum ProjectError {
     DuplicatePattern(String),
     #[error("invalid project model: {0}")]
     InvalidModel(ModelError),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireProjectDocument {
+    schema_version: u32,
+    name: String,
+    #[serde(default)]
+    pads: Vec<WireProjectPad>,
+    #[serde(default)]
+    patterns: Vec<WireProjectPattern>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireProjectPad {
+    pad: WirePadId,
+    audio_path: String,
+    settings: WirePadSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePadId {
+    bank: u8,
+    index: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePadSettings {
+    mode: PlaybackMode,
+    gain_db: f32,
+    pan: f32,
+    pitch_semitones: f32,
+    choke_group: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireProjectPattern {
+    name: String,
+    sample_rate: u32,
+    tempo: f64,
+    meter: WireMeter,
+    bars: u16,
+    resolution: Resolution,
+    swing: f64,
+    #[serde(default)]
+    events: Vec<WirePatternEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireMeter {
+    numerator: u8,
+    denominator: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePatternEvent {
+    id: u64,
+    pad: WirePadId,
+    frame: u64,
+    velocity: f32,
+    duration: Option<u64>,
+    original_offset: Option<i64>,
+}
+
+impl TryFrom<WirePadId> for PadId {
+    type Error = ProjectError;
+
+    fn try_from(value: WirePadId) -> Result<Self, Self::Error> {
+        let bank = BankId::new(value.bank).map_err(ProjectError::InvalidModel)?;
+        PadId::new(bank, value.index).map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl TryFrom<WirePadSettings> for PadSettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WirePadSettings) -> Result<Self, Self::Error> {
+        let choke_group = value
+            .choke_group
+            .map(ChokeGroup::new)
+            .transpose()
+            .map_err(ProjectError::InvalidModel)?;
+        PadSettings::new(
+            value.mode,
+            value.gain_db,
+            value.pan,
+            value.pitch_semitones,
+            choke_group,
+        )
+        .map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl TryFrom<WireProjectPad> for ProjectPad {
+    type Error = ProjectError;
+
+    fn try_from(value: WireProjectPad) -> Result<Self, Self::Error> {
+        ProjectPad::new(
+            value.pad.try_into()?,
+            value.audio_path,
+            value.settings.try_into()?,
+        )
+    }
+}
+
+impl TryFrom<WirePatternEvent> for PatternEvent {
+    type Error = ProjectError;
+
+    fn try_from(value: WirePatternEvent) -> Result<Self, Self::Error> {
+        let mut event = PatternEvent::new(
+            EventId(value.id),
+            value.pad.try_into()?,
+            value.frame,
+            value.velocity,
+            value.duration,
+        )
+        .map_err(ProjectError::InvalidModel)?;
+        event.original_offset = value.original_offset;
+        Ok(event)
+    }
+}
+
+impl TryFrom<WireProjectPattern> for ProjectPattern {
+    type Error = ProjectError;
+
+    fn try_from(value: WireProjectPattern) -> Result<Self, Self::Error> {
+        let pattern = ProjectPattern {
+            name: value.name,
+            sample_rate: value.sample_rate,
+            tempo: Tempo::new(value.tempo).map_err(ProjectError::InvalidModel)?,
+            meter: Meter::new(value.meter.numerator, value.meter.denominator)
+                .map_err(ProjectError::InvalidModel)?,
+            bars: value.bars,
+            resolution: value.resolution,
+            swing: value.swing,
+            events: value
+                .events
+                .into_iter()
+                .map(PatternEvent::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        pattern.validate()?;
+        Ok(pattern)
+    }
+}
+
+impl TryFrom<WireProjectDocument> for ProjectDocument {
+    type Error = ProjectError;
+
+    fn try_from(value: WireProjectDocument) -> Result<Self, Self::Error> {
+        let project = ProjectDocument {
+            schema_version: value.schema_version,
+            name: value.name,
+            pads: value
+                .pads
+                .into_iter()
+                .map(ProjectPad::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            patterns: value
+                .patterns
+                .into_iter()
+                .map(ProjectPattern::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        project.validate()?;
+        Ok(project)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,10 +250,9 @@ impl ProjectDocument {
             }
             _ => {}
         }
-        let project: Self =
+        let project: WireProjectDocument =
             toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
-        project.validate()?;
-        Ok(project)
+        project.try_into()
     }
 
     fn validate(&self) -> Result<(), ProjectError> {
@@ -230,6 +403,37 @@ mod tests {
     use super::*;
     use crate::{BankId, PadId, PadSettings};
 
+    fn project_with_event_pad(index: u8) -> String {
+        format!(
+            r#"
+schema_version = 1
+name = "unsafe"
+pads = []
+
+[[patterns]]
+name = "beat"
+sample_rate = 48000
+tempo = 120.0
+bars = 1
+resolution = "sixteenth"
+swing = 0.5
+
+[patterns.meter]
+numerator = 4
+denominator = 4
+
+[[patterns.events]]
+id = 1
+frame = 0
+velocity = 1.0
+
+[patterns.events.pad]
+bank = 0
+index = {index}
+"#
+        )
+    }
+
     #[test]
     fn project_round_trip_preserves_portable_relative_paths() {
         let mut project = ProjectDocument::empty("beat-one");
@@ -287,5 +491,45 @@ mod tests {
             ProjectDocument::from_toml("not = [valid"),
             Err(ProjectError::TomlSyntax(_))
         ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_pattern_event_pad_as_model_error() {
+        assert_eq!(
+            ProjectDocument::from_toml(&project_with_event_pad(16)).unwrap_err(),
+            ProjectError::InvalidModel(ModelError::PadOutOfRange(16))
+        );
+    }
+
+    #[test]
+    fn invalid_pattern_numbers_are_classified_as_model_errors() {
+        let valid = project_with_event_pad(0);
+        let cases = [
+            (
+                valid.replace("tempo = 120.0", "tempo = 10.0"),
+                ModelError::TempoOutOfRange,
+            ),
+            (
+                valid.replace("denominator = 4", "denominator = 3"),
+                ModelError::InvalidMeter {
+                    numerator: 4,
+                    denominator: 3,
+                },
+            ),
+            (
+                valid.replace("swing = 0.5", "swing = 0.9"),
+                ModelError::SwingOutOfRange,
+            ),
+            (
+                valid.replace("frame = 0", "frame = 96000"),
+                ModelError::InvalidEvent,
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                ProjectDocument::from_toml(&source).unwrap_err(),
+                ProjectError::InvalidModel(expected)
+            );
+        }
     }
 }

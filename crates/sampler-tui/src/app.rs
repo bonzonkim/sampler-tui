@@ -8,6 +8,7 @@ use sampler_core::{BankId, PadId, PadSettings};
 
 use crate::audio::AudioPort;
 use crate::input::InputAction;
+use crate::loader::{WorkerRequest, WorkerResult};
 
 pub const PAD_VIEW_COUNT: usize = 160;
 pub const PREVIEW_COLUMNS: usize = 64;
@@ -137,6 +138,75 @@ impl App {
         self.should_quit
     }
 
+    pub fn begin_load(&mut self, pad: PadId, path: impl Into<PathBuf>) -> Option<WorkerRequest> {
+        let path = path.into();
+        let engine_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
+        let view = &mut self.pads[pad_offset(pad)];
+        view.generation = view.generation.wrapping_add(1);
+        view.source = Some(path.clone());
+        view.state = if engine_rate.is_some() {
+            PadLoadState::Loading
+        } else {
+            PadLoadState::WaitingForDevice
+        };
+
+        engine_rate.map(|engine_rate| WorkerRequest::LoadSample {
+            pad,
+            generation: view.generation,
+            path,
+            engine_rate,
+        })
+    }
+
+    pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
+        let WorkerResult::Loaded {
+            pad,
+            generation,
+            path,
+            result,
+        } = result
+        else {
+            return false;
+        };
+        let offset = pad_offset(pad);
+        if self.pads[offset].generation != generation
+            || self.pads[offset].source.as_deref() != Some(path.as_path())
+        {
+            return false;
+        }
+
+        let loaded = match result {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.pads[offset].state = PadLoadState::Error(error.clone());
+                self.status = error;
+                return true;
+            }
+        };
+        let Some(audio) = self.audio.as_mut() else {
+            self.pads[offset].state = PadLoadState::WaitingForDevice;
+            return true;
+        };
+        let settings = self.pads[offset].settings;
+        if let Err(error) = audio.install(pad, Arc::clone(&loaded.buffer), settings) {
+            self.pads[offset].state = PadLoadState::Error(error.clone());
+            self.status = error;
+            return true;
+        }
+
+        let view = &mut self.pads[offset];
+        view.label = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        view.source = Some(path);
+        view.sample = Some(loaded.buffer);
+        view.preview = loaded.preview;
+        view.state = PadLoadState::Ready;
+        true
+    }
+
     fn press_pad(&mut self, index: usize) {
         if self.held_pad_by_key.get(index).is_some_and(Option::is_some) {
             return;
@@ -263,10 +333,13 @@ mod tests {
     use crate::audio::AudioPort;
     use crate::input::InputAction;
 
-    use super::App;
+    use crate::loader::{LoadedSample, WorkerRequest, WorkerResult};
+
+    use super::{App, PadLoadState, PreviewColumn};
 
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
+        Install(PadId),
         Trigger(PadId, Frame, f32),
         Release(PadId, Frame),
         StopPad(PadId),
@@ -290,6 +363,7 @@ mod tests {
         release_error: Option<String>,
         stop_pad_error: Option<String>,
         stop_all_error: Option<String>,
+        install_error: Option<String>,
         calls: CallLog,
     }
 
@@ -303,6 +377,7 @@ mod tests {
                 release_error: None,
                 stop_pad_error: None,
                 stop_all_error: None,
+                install_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
             }
         }
@@ -335,6 +410,11 @@ mod tests {
         fn call_log(&self) -> CallLog {
             self.calls.clone()
         }
+
+        fn failing_install(mut self, error: &str) -> Self {
+            self.install_error = Some(error.to_owned());
+            self
+        }
     }
 
     impl AudioPort for FakeAudio {
@@ -352,11 +432,15 @@ mod tests {
 
         fn install(
             &mut self,
-            _pad: PadId,
+            pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
         ) -> Result<SampleSlot, String> {
-            Err("sample installation is not used by these tests".to_owned())
+            if let Some(error) = self.install_error.take() {
+                return Err(error);
+            }
+            self.calls.0.borrow_mut().push(AudioCall::Install(pad));
+            SampleSlot::new(0).map_err(|error| error.to_string())
         }
 
         fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String> {
@@ -413,6 +497,88 @@ mod tests {
 
     fn pad(bank: u8, index: u8) -> PadId {
         PadId::new(BankId::new(bank).unwrap(), index).unwrap()
+    }
+
+    fn path(value: &str) -> &std::path::Path {
+        std::path::Path::new(value)
+    }
+
+    fn loaded(pad: PadId, generation: u64, source: &str) -> WorkerResult {
+        let buffer = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        WorkerResult::Loaded {
+            pad,
+            generation,
+            path: source.into(),
+            result: Ok(LoadedSample {
+                buffer,
+                source_rate: 48_000,
+                source_frames: 1,
+                duration: std::time::Duration::from_nanos(20_833),
+                preview: [PreviewColumn { min: -2, max: 2 }; 64],
+            }),
+        }
+    }
+
+    #[test]
+    fn app_discards_a_superseded_load_generation() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.begin_load(pad(0, 0), path("old.wav"));
+        let old_generation = app.pad(pad(0, 0)).generation;
+        app.begin_load(pad(0, 0), path("new.wav"));
+
+        app.apply_worker_result(loaded(pad(0, 0), old_generation, "old.wav"));
+
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("new.wav")));
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Loading);
+    }
+
+    #[test]
+    fn matching_load_is_installed_before_replacing_the_pad_sample() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        let request = app.begin_load(pad(0, 0), path("new.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+
+        app.apply_worker_result(loaded(pad(0, 0), generation, "new.wav"));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Ready);
+        assert!(app.pad(pad(0, 0)).sample.is_some());
+    }
+
+    #[test]
+    fn install_failure_preserves_the_prior_ready_sample() {
+        let fake = FakeAudio::ready(48_000, 2).failing_install("install queue is full");
+        let mut app = App::with_audio(Box::new(fake));
+        let first = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
+        app.pads[0].sample = Some(Arc::clone(&first));
+        app.pads[0].state = PadLoadState::Ready;
+        let request = app.begin_load(pad(0, 0), path("new.wav")).unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("wrong request")
+        };
+
+        app.apply_worker_result(loaded(pad(0, 0), generation, "new.wav"));
+
+        assert!(Arc::ptr_eq(
+            app.pad(pad(0, 0)).sample.as_ref().unwrap(),
+            &first
+        ));
+        assert!(matches!(app.pad(pad(0, 0)).state, PadLoadState::Error(_)));
+    }
+
+    #[test]
+    fn no_device_retains_the_path_without_creating_a_load_request() {
+        let mut app = App::without_audio("no output device");
+
+        let request = app.begin_load(pad(0, 0), path("kick.wav"));
+
+        assert!(request.is_none());
+        assert_eq!(app.pad(pad(0, 0)).source.as_deref(), Some(path("kick.wav")));
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::WaitingForDevice);
     }
 
     #[test]

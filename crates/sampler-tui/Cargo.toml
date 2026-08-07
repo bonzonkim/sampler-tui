@@ -9,3 +9,6 @@ license.workspace = true
 crossterm.workspace = true
 sampler-audio = { path = "../sampler-audio" }
 sampler-core = { path = "../sampler-core" }
+
+[dev-dependencies]
+hound = "3.5.1"

@@ -823,6 +823,7 @@ name = "sampler-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "hound",
  "sampler-audio",
  "sampler-core",
 ]

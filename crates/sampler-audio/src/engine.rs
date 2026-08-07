@@ -96,10 +96,12 @@ enum ScheduledAction {
         pad: PadId,
         at_frame: Frame,
         velocity: f32,
+        sequence: u64,
     },
     Release {
         pad: PadId,
         at_frame: Frame,
+        sequence: u64,
     },
 }
 
@@ -107,6 +109,12 @@ impl ScheduledAction {
     fn at_frame(self) -> Frame {
         match self {
             Self::Trigger { at_frame, .. } | Self::Release { at_frame, .. } => at_frame,
+        }
+    }
+
+    fn sequence(self) -> u64 {
+        match self {
+            Self::Trigger { sequence, .. } | Self::Release { sequence, .. } => sequence,
         }
     }
 }
@@ -120,6 +128,8 @@ pub struct AudioEngine {
     voices: [Option<AudioVoice>; VOICE_COUNT],
     pending: [Option<ScheduledAction>; PENDING_COUNT],
     pending_len: usize,
+    observed_stop_requests: u64,
+    active_stop_fence: Option<u64>,
     deferred_retirement: Option<CriticalEvent>,
     rendered_frame: Frame,
     last_triggered_frame: Option<Frame>,
@@ -153,6 +163,8 @@ impl AudioEngine {
             voices: [None; VOICE_COUNT],
             pending: [None; PENDING_COUNT],
             pending_len: 0,
+            observed_stop_requests: 0,
+            active_stop_fence: None,
             deferred_retirement: None,
             rendered_frame: 0,
             last_triggered_frame: None,
@@ -185,6 +197,7 @@ impl AudioEngine {
 
     pub fn render_frames(&mut self, frame_count: usize, mut write_frame: impl FnMut([f32; 2])) {
         self.flush_deferred_retirement();
+        self.apply_stop_fence();
         self.drain_commands();
 
         for _ in 0..frame_count {
@@ -241,14 +254,21 @@ impl AudioEngine {
                     pad,
                     at_frame,
                     velocity,
+                    sequence,
                 }) => Some(ScheduledAction::Trigger {
                     pad: *pad,
                     at_frame: *at_frame,
                     velocity: *velocity,
+                    sequence: *sequence,
                 }),
-                Ok(AudioCommand::Release { pad, at_frame }) => Some(ScheduledAction::Release {
+                Ok(AudioCommand::Release {
+                    pad,
+                    at_frame,
+                    sequence,
+                }) => Some(ScheduledAction::Release {
                     pad: *pad,
                     at_frame: *at_frame,
+                    sequence: *sequence,
                 }),
                 Ok(AudioCommand::InstallSample {
                     slot,
@@ -265,6 +285,13 @@ impl AudioEngine {
             };
 
             if let Some(action) = timed_action {
+                if self.action_is_stopped(action) {
+                    if self.ports.commands.pop().is_err() {
+                        break;
+                    }
+                    processed += 1;
+                    continue;
+                }
                 if self.pending_len == PENDING_COUNT {
                     break;
                 }
@@ -298,7 +325,6 @@ impl AudioEngine {
                 }
             }
             AudioCommand::StopPad { pad } => self.stop_pad(pad),
-            AudioCommand::StopAll => self.stop_all(),
             AudioCommand::Trigger { .. } | AudioCommand::Release { .. } => {
                 self.invalid_commands = self.invalid_commands.saturating_add(1);
             }
@@ -363,6 +389,38 @@ impl AudioEngine {
         if let Err(PushError::Full(event)) = self.ports.retirements.push(event) {
             self.deferred_retirement = Some(event);
         }
+    }
+
+    fn apply_stop_fence(&mut self) {
+        let (requests, fence_sequence) = self.ports.shared.snapshot();
+        if requests == self.observed_stop_requests {
+            return;
+        }
+
+        self.observed_stop_requests = requests;
+        self.active_stop_fence = Some(fence_sequence);
+        self.stop_all();
+
+        let old_len = self.pending_len;
+        let mut retained = 0;
+        for index in 0..old_len {
+            let Some(action) = self.pending[index] else {
+                continue;
+            };
+            if !self.action_is_stopped(action) {
+                self.pending[retained] = Some(action);
+                retained += 1;
+            }
+        }
+        for index in retained..old_len {
+            self.pending[index] = None;
+        }
+        self.pending_len = retained;
+    }
+
+    fn action_is_stopped(&self, action: ScheduledAction) -> bool {
+        self.active_stop_fence
+            .is_some_and(|fence| sequence_is_at_or_before(action.sequence(), fence))
     }
 
     fn insert_pending(&mut self, action: ScheduledAction) {
@@ -562,6 +620,7 @@ impl AudioEngine {
             active_voices: self.allocator.active_voices(),
             late_commands: self.late_commands,
             invalid_commands: self.invalid_commands,
+            command_overflows: self.ports.shared.command_overflows(),
         };
         let _ = self.ports.telemetry.push(telemetry);
         self.telemetry_peak_left = 0.0;
@@ -653,6 +712,13 @@ fn telemetry_interval(sample_rate: u32) -> Frame {
     Frame::from(sample_rate.div_ceil(30).max(1))
 }
 
+fn sequence_is_at_or_before(sequence: u64, fence: u64) -> bool {
+    // Sequence numbers use serial-number arithmetic, so a fence remains causal
+    // across u64 wrap. Outstanding commands are many orders of magnitude below
+    // the half-range where serial-number ordering becomes ambiguous.
+    fence.wrapping_sub(sequence) < (1_u64 << 63)
+}
+
 fn pad_index(pad: PadId) -> usize {
     usize::from(u8::from(pad.bank())) * PADS_PER_BANK + usize::from(pad.index())
 }
@@ -727,6 +793,59 @@ mod tests {
         }
         assert_eq!(engine.pending_actions(), 128);
         assert_eq!(engine.queued_commands(), 2);
+    }
+
+    fn stop_all_outcome(saturate_pending: bool) -> (usize, usize, usize, usize) {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(PadId::first(), constant_sample(8, 0.5), settings)
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        engine.render_frames(32, |_| {});
+        assert_eq!(engine.active_voices(), 1);
+
+        if saturate_pending {
+            for frame in 10_000..10_130 {
+                controller.trigger(PadId::first(), frame, 1.0).unwrap();
+            }
+            engine.render_frames(0, |_| {});
+            engine.render_frames(0, |_| {});
+            engine.render_frames(0, |_| {});
+            assert_eq!(engine.pending_actions(), PENDING_COUNT);
+            assert_eq!(engine.queued_commands(), 2);
+        }
+
+        controller.stop_all().unwrap();
+        let post_fence_frame = engine.rendered_frame() + Frame::from(RELEASE_FRAMES);
+        controller
+            .trigger(PadId::first(), post_fence_frame, 1.0)
+            .unwrap();
+
+        engine.render_frames(usize::from(RELEASE_FRAMES), |_| {});
+        let stopped = (
+            engine.active_voices(),
+            engine.pending_actions(),
+            engine.queued_commands(),
+        );
+        engine.render_frames(1, |_| {});
+        (stopped.0, stopped.1, stopped.2, engine.active_voices())
+    }
+
+    #[test]
+    fn stop_all_is_the_same_causal_fence_with_empty_or_full_pending_storage() {
+        let empty = stop_all_outcome(false);
+        let full = stop_all_outcome(true);
+
+        assert_eq!(empty, (0, 1, 0, 1));
+        assert_eq!(full, empty);
+    }
+
+    #[test]
+    fn stop_fence_sequence_order_wraps_without_canceling_newer_commands() {
+        assert!(sequence_is_at_or_before(u64::MAX, 0));
+        assert!(sequence_is_at_or_before(0, 0));
+        assert!(!sequence_is_at_or_before(1, 0));
     }
 
     #[test]

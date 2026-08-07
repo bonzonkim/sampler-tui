@@ -89,8 +89,49 @@ mod tests {
             assert!(ports.commands.pop().is_ok());
         }
     }
+
+    #[test]
+    fn telemetry_reports_controller_command_overflow_snapshot() {
+        let (mut controller, ports) = audio_channels_with_capacities(1, 256, 8);
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        assert_eq!(
+            controller.trigger(PadId::first(), 1, 1.0),
+            Err(ControlError::CommandQueueFull)
+        );
+        let mut engine = crate::AudioEngine::new(48_000, ports).unwrap();
+
+        engine.render_frames(1_600, |_| {});
+
+        assert_eq!(controller.latest_telemetry().unwrap().command_overflows, 1);
+    }
+
+    #[test]
+    fn runtime_failure_closes_every_controller_operation() {
+        let (mut controller, ports) = audio_channels_with_capacities(8, 256, 8);
+        ports.shared.mark_failed();
+        let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
+        let pad = PadId::first();
+
+        assert_eq!(
+            controller.install(pad, sample, PadSettings::default()),
+            Err(ControlError::ClosedSession)
+        );
+        assert_eq!(
+            controller.trigger(pad, 0, f32::NAN),
+            Err(ControlError::ClosedSession)
+        );
+        assert_eq!(controller.release(pad, 0), Err(ControlError::ClosedSession));
+        assert_eq!(
+            controller.update_pad(pad, PadSettings::default()),
+            Err(ControlError::ClosedSession)
+        );
+        assert_eq!(controller.stop_pad(pad), Err(ControlError::ClosedSession));
+        assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
+        assert_eq!(ports.commands.slots(), 0);
+    }
 }
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use sampler_core::{Frame, PadId, PadSettings};
@@ -113,10 +154,12 @@ pub enum AudioCommand {
         pad: PadId,
         at_frame: Frame,
         velocity: f32,
+        sequence: u64,
     },
     Release {
         pad: PadId,
         at_frame: Frame,
+        sequence: u64,
     },
     UpdatePad {
         pad: PadId,
@@ -125,7 +168,6 @@ pub enum AudioCommand {
     StopPad {
         pad: PadId,
     },
-    StopAll,
 }
 
 impl AudioCommand {
@@ -154,20 +196,72 @@ pub struct Telemetry {
     pub active_voices: usize,
     pub late_commands: u64,
     pub invalid_commands: u64,
+    pub command_overflows: u64,
 }
 
 pub struct AudioController {
     commands: Producer<AudioCommand>,
     retirements: Consumer<CriticalEvent>,
     telemetry: Consumer<Telemetry>,
+    shared: Arc<SharedControlState>,
     free_slots: [bool; SAMPLE_SLOT_COUNT],
-    command_overflows: u64,
+    next_timed_sequence: u64,
 }
 
 pub struct EnginePorts {
     pub commands: Consumer<AudioCommand>,
     pub retirements: Producer<CriticalEvent>,
     pub telemetry: Producer<Telemetry>,
+    pub(crate) shared: Arc<SharedControlState>,
+}
+
+pub(crate) struct SharedControlState {
+    fence_sequence: AtomicU64,
+    requests: AtomicU64,
+    command_overflows: AtomicU64,
+    failed: AtomicBool,
+}
+
+impl SharedControlState {
+    fn new() -> Self {
+        Self {
+            fence_sequence: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            command_overflows: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn request(&self, fence_sequence: u64) {
+        self.fence_sequence.store(fence_sequence, Ordering::Relaxed);
+        self.requests.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        let requests = self.requests.load(Ordering::Acquire);
+        let fence_sequence = self.fence_sequence.load(Ordering::Relaxed);
+        (requests, fence_sequence)
+    }
+
+    fn record_command_overflow(&self) {
+        let _ =
+            self.command_overflows
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |count| {
+                    Some(count.saturating_add(1))
+                });
+    }
+
+    pub(crate) fn command_overflows(&self) -> u64 {
+        self.command_overflows.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
 }
 
 pub fn audio_channels() -> (AudioController, EnginePorts) {
@@ -191,19 +285,22 @@ fn audio_channels_with_capacity_values(
     let (command_producer, command_consumer) = RingBuffer::new(command_capacity);
     let (retirement_producer, retirement_consumer) = RingBuffer::new(retirement_capacity);
     let (telemetry_producer, telemetry_consumer) = RingBuffer::new(telemetry_capacity);
+    let shared = Arc::new(SharedControlState::new());
 
     (
         AudioController {
             commands: command_producer,
             retirements: retirement_consumer,
             telemetry: telemetry_consumer,
+            shared: Arc::clone(&shared),
             free_slots: [true; SAMPLE_SLOT_COUNT],
-            command_overflows: 0,
+            next_timed_sequence: 1,
         },
         EnginePorts {
             commands: command_consumer,
             retirements: retirement_producer,
             telemetry: telemetry_producer,
+            shared,
         },
     )
 }
@@ -215,6 +312,7 @@ impl AudioController {
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, ControlError> {
+        self.ensure_open()?;
         let Some(index) = self.free_slots.iter().position(|is_free| *is_free) else {
             return Err(ControlError::NoFreeSampleSlot);
         };
@@ -227,9 +325,9 @@ impl AudioController {
             buffer,
             settings,
         };
-        if self.push_command(command).is_err() {
+        if let Err(error) = self.push_command(command) {
             self.free_slots[index] = true;
-            return Err(ControlError::CommandQueueFull);
+            return Err(error);
         }
 
         Ok(slot)
@@ -241,30 +339,44 @@ impl AudioController {
         at_frame: Frame,
         velocity: f32,
     ) -> Result<(), ControlError> {
+        self.ensure_open()?;
         if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
             return Err(ControlError::InvalidVelocity);
         }
+        let sequence = self.take_timed_sequence();
         self.push_command(AudioCommand::Trigger {
             pad,
             at_frame,
             velocity,
+            sequence,
         })
     }
 
     pub fn release(&mut self, pad: PadId, at_frame: Frame) -> Result<(), ControlError> {
-        self.push_command(AudioCommand::Release { pad, at_frame })
+        self.ensure_open()?;
+        let sequence = self.take_timed_sequence();
+        self.push_command(AudioCommand::Release {
+            pad,
+            at_frame,
+            sequence,
+        })
     }
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
+        self.ensure_open()?;
         self.push_command(AudioCommand::UpdatePad { pad, settings })
     }
 
     pub fn stop_pad(&mut self, pad: PadId) -> Result<(), ControlError> {
+        self.ensure_open()?;
         self.push_command(AudioCommand::StopPad { pad })
     }
 
     pub fn stop_all(&mut self) -> Result<(), ControlError> {
-        self.push_command(AudioCommand::StopAll)
+        self.ensure_open()?;
+        self.shared
+            .request(self.next_timed_sequence.wrapping_sub(1));
+        Ok(())
     }
 
     pub fn latest_telemetry(&mut self) -> Option<Telemetry> {
@@ -290,13 +402,28 @@ impl AudioController {
     }
 
     pub fn command_overflows(&self) -> u64 {
-        self.command_overflows
+        self.shared.command_overflows()
     }
 
     fn push_command(&mut self, command: AudioCommand) -> Result<(), ControlError> {
+        self.ensure_open()?;
         if self.commands.push(command).is_err() {
-            self.command_overflows += 1;
+            self.shared.record_command_overflow();
             Err(ControlError::CommandQueueFull)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn take_timed_sequence(&mut self) -> u64 {
+        let sequence = self.next_timed_sequence;
+        self.next_timed_sequence = self.next_timed_sequence.wrapping_add(1);
+        sequence
+    }
+
+    fn ensure_open(&self) -> Result<(), ControlError> {
+        if self.shared.is_failed() {
+            Err(ControlError::ClosedSession)
         } else {
             Ok(())
         }

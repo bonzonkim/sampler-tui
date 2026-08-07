@@ -64,6 +64,8 @@ pub enum PrepareError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ControlError {
+    #[error("audio session is closed after a runtime failure")]
+    ClosedSession,
     #[error("audio command queue is full")]
     CommandQueueFull,
     #[error("no free sample slot is available")]

@@ -306,6 +306,7 @@ mod tests {
             active_voices: 0,
             late_commands: 0,
             invalid_commands: 0,
+            command_overflows: 0,
         }
     }
 }

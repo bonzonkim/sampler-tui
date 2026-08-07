@@ -1,9 +1,13 @@
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 
-use crate::{AudioController, AudioEngine, DeviceBufferError, DeviceError, audio_channels};
+use crate::{
+    AudioController, AudioEngine, DeviceBufferError, DeviceError, audio_channels,
+    command::SharedControlState,
+};
 
 pub struct AudioSession {
     _stream: Stream,
@@ -32,6 +36,7 @@ impl AudioSession {
         }
 
         let (controller, ports) = audio_channels();
+        let shared = Arc::clone(&ports.shared);
         let engine = AudioEngine::new(sample_rate, ports).map_err(|_| {
             DeviceError::UnsupportedConfiguration {
                 sample_rate,
@@ -43,40 +48,40 @@ impl AudioSession {
         let (error_sender, errors) = mpsc::channel();
         let stream = match sample_format {
             SampleFormat::F32 => {
-                build_stream::<f32>(&device, &config, channels, engine, error_sender)
+                build_stream::<f32>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::F64 => {
-                build_stream::<f64>(&device, &config, channels, engine, error_sender)
+                build_stream::<f64>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::I8 => {
-                build_stream::<i8>(&device, &config, channels, engine, error_sender)
+                build_stream::<i8>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::I16 => {
-                build_stream::<i16>(&device, &config, channels, engine, error_sender)
+                build_stream::<i16>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::I24 => {
-                build_stream::<cpal::I24>(&device, &config, channels, engine, error_sender)
+                build_stream::<cpal::I24>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::I32 => {
-                build_stream::<i32>(&device, &config, channels, engine, error_sender)
+                build_stream::<i32>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::I64 => {
-                build_stream::<i64>(&device, &config, channels, engine, error_sender)
+                build_stream::<i64>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::U8 => {
-                build_stream::<u8>(&device, &config, channels, engine, error_sender)
+                build_stream::<u8>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::U16 => {
-                build_stream::<u16>(&device, &config, channels, engine, error_sender)
+                build_stream::<u16>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::U24 => {
-                build_stream::<cpal::U24>(&device, &config, channels, engine, error_sender)
+                build_stream::<cpal::U24>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::U32 => {
-                build_stream::<u32>(&device, &config, channels, engine, error_sender)
+                build_stream::<u32>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::U64 => {
-                build_stream::<u64>(&device, &config, channels, engine, error_sender)
+                build_stream::<u64>(&device, &config, channels, engine, error_sender, shared)
             }
             SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
                 return Err(DeviceError::UnsupportedSampleFormat(sample_format));
@@ -118,6 +123,7 @@ fn build_stream<T>(
     channels: u16,
     mut engine: AudioEngine,
     error_sender: Sender<cpal::Error>,
+    shared: Arc<SharedControlState>,
 ) -> Result<Stream, cpal::Error>
 where
     T: SizedSample + FromSample<f32>,
@@ -126,10 +132,19 @@ where
         *config,
         move |output, _| write_device(&mut engine, usize::from(channels), output),
         move |error| {
-            let _ = error_sender.send(error);
+            report_runtime_error(&shared, &error_sender, error);
         },
         None,
     )
+}
+
+fn report_runtime_error(
+    shared: &SharedControlState,
+    error_sender: &Sender<cpal::Error>,
+    error: cpal::Error,
+) {
+    shared.mark_failed();
+    let _ = error_sender.send(error);
 }
 
 fn write_device<T>(engine: &mut AudioEngine, channels: usize, output: &mut [T])
@@ -213,6 +228,7 @@ fn sanitize(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ControlError, PadId};
 
     #[test]
     fn mono_device_averages_stereo() {
@@ -263,5 +279,26 @@ mod tests {
         assert!(write_frames(&frames, 0, &mut [0.0_f32; 1]).is_err());
         assert!(write_frames(&frames, 2, &mut [0.0_f32; 3]).is_err());
         assert!(write_frames(&frames, 2, &mut [0.0_f32; 4]).is_err());
+    }
+
+    #[test]
+    fn consuming_runtime_error_does_not_reopen_the_controller() {
+        let (mut controller, ports) = audio_channels();
+        let (error_sender, errors) = mpsc::channel();
+        report_runtime_error(
+            &ports.shared,
+            &error_sender,
+            cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+        );
+
+        assert!(matches!(
+            errors.try_recv().ok().map(DeviceError::Runtime),
+            Some(DeviceError::Runtime(_))
+        ));
+        assert!(errors.try_recv().is_err());
+        assert_eq!(
+            controller.trigger(PadId::first(), 0, 1.0),
+            Err(ControlError::ClosedSession)
+        );
     }
 }

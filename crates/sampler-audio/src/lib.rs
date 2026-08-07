@@ -11,6 +11,7 @@ mod sample;
 pub use command::{
     AudioCommand, AudioController, COMMAND_CAPACITY, CriticalEvent, EnginePorts,
     RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, audio_channels,
+    audio_channels_with_test_capacities,
 };
 pub use decode::{DecodedAudio, decode_path};
 pub use device::{AudioSession, write_frames};

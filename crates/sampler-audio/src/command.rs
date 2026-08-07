@@ -277,6 +277,15 @@ pub(crate) fn audio_channels_with_capacities(
     audio_channels_with_capacity_values(command_capacity, retirement_capacity, telemetry_capacity)
 }
 
+#[doc(hidden)]
+pub fn audio_channels_with_test_capacities(
+    command_capacity: usize,
+    retirement_capacity: usize,
+    telemetry_capacity: usize,
+) -> (AudioController, EnginePorts) {
+    audio_channels_with_capacity_values(command_capacity, retirement_capacity, telemetry_capacity)
+}
+
 fn audio_channels_with_capacity_values(
     command_capacity: usize,
     retirement_capacity: usize,

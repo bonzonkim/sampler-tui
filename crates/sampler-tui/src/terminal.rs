@@ -152,17 +152,25 @@ pub struct KeyboardEnhancementGuard<O: KeyboardEnhancementOps = CrosstermKeyboar
 
 impl<O: KeyboardEnhancementOps> KeyboardEnhancementGuard<O> {
     pub fn acquire(ops: O) -> io::Result<Self> {
-        let supported = ops.supports_keyboard_enhancement()?;
+        let mut guard = Self::inactive(ops);
+        guard.enable()?;
+        Ok(guard)
+    }
+
+    fn inactive(ops: O) -> Self {
+        Self { ops, active: false }
+    }
+
+    fn enable(&mut self) -> io::Result<()> {
+        let supported = self.ops.supports_keyboard_enhancement()?;
         if supported {
-            ops.push_keyboard_enhancement(
+            self.ops.push_keyboard_enhancement(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
             )?;
+            self.active = true;
         }
-        Ok(Self {
-            ops,
-            active: supported,
-        })
+        Ok(())
     }
 
     pub fn release_events(&self) -> bool {
@@ -387,14 +395,9 @@ impl TerminalLifecycle for RatatuiTerminalLifecycle {
 
         let mut stdout = io::stdout();
         self.alternate_screen = true;
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-            return preserve_primary(Err(error), self.restore());
-        }
+        execute!(stdout, EnterAlternateScreen)?;
 
-        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout())) {
-            Ok(terminal) => Ok(terminal),
-            Err(error) => preserve_primary(Err(error), self.restore()),
-        }
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))
     }
 
     fn restore(&mut self) -> io::Result<()> {
@@ -433,21 +436,40 @@ impl ShutdownWorker for WorkerHandle {
     }
 }
 
-struct WorkerShutdownGuard<'a, W: ShutdownWorker>(&'a mut W);
+struct WorkerShutdownGuard<'a, W: ShutdownWorker> {
+    worker: &'a mut W,
+    active: bool,
+}
 
 impl<W: ShutdownWorker> WorkerShutdownGuard<'_, W> {
+    fn new(worker: &mut W) -> WorkerShutdownGuard<'_, W> {
+        WorkerShutdownGuard {
+            worker,
+            active: true,
+        }
+    }
+
     fn worker(&mut self) -> &mut W {
-        self.0
+        self.worker
+    }
+
+    fn request_shutdown(&mut self) {
+        if self.active {
+            self.active = false;
+            self.worker.request_shutdown();
+        }
     }
 }
 
 impl<W: ShutdownWorker> Drop for WorkerShutdownGuard<'_, W> {
     fn drop(&mut self) {
-        self.0.request_shutdown();
+        self.request_shutdown();
     }
 }
 
-fn run_with_terminal_lifecycle<L, W, F, J, R, T, E>(
+fn run_with_runtime_lifecycle<A, O, L, W, F, J, R, T, E>(
+    app: &mut A,
+    enhancements: O,
     lifecycle: &mut L,
     worker: &mut W,
     run: F,
@@ -455,28 +477,60 @@ fn run_with_terminal_lifecycle<L, W, F, J, R, T, E>(
     report_panic: R,
 ) -> Result<T, E>
 where
+    A: AudioShutdown<Error = E>,
+    O: KeyboardEnhancementOps,
     L: TerminalLifecycle,
     W: ShutdownWorker,
-    F: FnOnce(&mut L::Terminal, &mut W) -> Result<T, E>,
+    F: FnOnce(&mut L::Terminal, &mut A, bool, &mut W) -> Result<T, E>,
     J: FnOnce(&mut W) -> Result<(), E>,
     R: FnOnce(&str),
     E: From<io::Error>,
 {
-    let mut terminal = lifecycle.initialize().map_err(E::from)?;
+    let mut shutdown = WorkerShutdownGuard::new(worker);
+    let mut audio = AudioShutdownGuard::new(app);
+    let mut terminal = None;
+    let mut keyboard = None;
     let panic_capture = UiPanicCapture::install();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut shutdown = WorkerShutdownGuard(worker);
-        run(&mut terminal, shutdown.worker())
+        terminal = Some(lifecycle.initialize().map_err(E::from)?);
+        keyboard = Some(KeyboardEnhancementGuard::inactive(enhancements));
+        keyboard
+            .as_mut()
+            .expect("keyboard guard was initialized")
+            .enable()
+            .map_err(E::from)?;
+        let release_events = keyboard
+            .as_ref()
+            .is_some_and(KeyboardEnhancementGuard::release_events);
+        run(
+            terminal.as_mut().expect("terminal was initialized"),
+            audio.app(),
+            release_events,
+            shutdown.worker(),
+        )
     }));
+    let audio_cleanup = audio.shutdown();
+    let keyboard_cleanup = keyboard
+        .as_mut()
+        .map_or(Ok(()), KeyboardEnhancementGuard::release)
+        .map_err(E::from);
+    shutdown.request_shutdown();
     let terminal_cleanup = lifecycle.restore().map_err(E::from);
-    let cleanup = join(worker);
+    let worker_cleanup = join(shutdown.worker());
     let panic_report = panic_capture.restore();
 
     match outcome {
-        Ok(primary) => preserve_primary(preserve_primary(primary, terminal_cleanup), cleanup),
+        Ok(primary) => {
+            let primary = preserve_primary(primary, audio_cleanup);
+            let primary = preserve_primary(primary, keyboard_cleanup);
+            let primary = preserve_primary(primary, terminal_cleanup);
+            preserve_primary(primary, worker_cleanup)
+        }
         Err(payload) => {
+            drop(audio_cleanup);
+            drop(keyboard_cleanup);
             drop(terminal_cleanup);
-            drop(cleanup);
+            drop(worker_cleanup);
             report_panic(
                 panic_report
                     .as_deref()
@@ -543,29 +597,6 @@ impl<A: AudioShutdown> Drop for AudioShutdownGuard<'_, A> {
     }
 }
 
-fn run_with_audio_and_enhancements<A, O, F, T, E>(app: &mut A, ops: O, run: F) -> Result<T, E>
-where
-    A: AudioShutdown<Error = E>,
-    O: KeyboardEnhancementOps,
-    F: FnOnce(&mut A, bool) -> Result<T, E>,
-    E: From<io::Error>,
-{
-    let mut keyboard = match KeyboardEnhancementGuard::acquire(ops) {
-        Ok(keyboard) => keyboard,
-        Err(error) => {
-            let primary = Err(E::from(error));
-            return preserve_primary(primary, app.shutdown_audio());
-        }
-    };
-    let release_events = keyboard.release_events();
-    let mut audio = AudioShutdownGuard::new(app);
-    let primary = run(audio.app(), release_events);
-    let cleanup = audio.shutdown();
-    let primary = preserve_primary(primary, cleanup);
-    let cleanup = keyboard.release().map_err(E::from);
-    preserve_primary(primary, cleanup)
-}
-
 fn preserve_primary<T, E>(primary: Result<T, E>, cleanup: Result<(), E>) -> Result<T, E> {
     match primary {
         Err(error) => Err(error),
@@ -586,19 +617,15 @@ pub fn run_tui() -> Result<(), DynError> {
     let mut worker = WorkerHandle::spawn();
     let mut lifecycle = RatatuiTerminalLifecycle::default();
 
-    run_with_terminal_lifecycle(
+    run_with_runtime_lifecycle(
+        &mut app,
+        CrosstermKeyboardEnhancementOps,
         &mut lifecycle,
         &mut worker,
-        |terminal, worker| {
-            run_with_audio_and_enhancements(
-                &mut app,
-                CrosstermKeyboardEnhancementOps,
-                |app, release_events| {
-                    app.set_keyboard_capabilities(KeyboardCapabilities { release_events });
-                    run_event_loop(terminal, app, &mut events, worker)
-                        .map_err(|error| Box::new(error) as DynError)
-                },
-            )
+        |terminal, app, release_events, worker| {
+            app.set_keyboard_capabilities(KeyboardCapabilities { release_events });
+            run_event_loop(terminal, app, &mut events, worker)
+                .map_err(|error| Box::new(error) as DynError)
         },
         |worker| worker.join().map_err(|error| Box::new(error) as DynError),
         report_panic_to_stderr,
@@ -1079,6 +1106,24 @@ mod tests {
         }
     }
 
+    struct PartialInitErrorLifecycle {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl TerminalLifecycle for PartialInitErrorLifecycle {
+        type Terminal = ();
+
+        fn initialize(&mut self) -> io::Result<Self::Terminal> {
+            self.calls.lock().unwrap().push("init-partial");
+            Err(io::Error::other("init failed"))
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("restore");
+            Ok(())
+        }
+    }
+
     struct FakeCleanupWorker {
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
@@ -1125,6 +1170,189 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum EnhancementPanic {
+        Query,
+        Push,
+    }
+
+    #[derive(Clone)]
+    struct PanickingEnhancementOps {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        panic_at: EnhancementPanic,
+    }
+
+    impl KeyboardEnhancementOps for PanickingEnhancementOps {
+        fn supports_keyboard_enhancement(&self) -> io::Result<bool> {
+            self.calls.lock().unwrap().push("query");
+            if matches!(self.panic_at, EnhancementPanic::Query) {
+                panic!("query panic");
+            }
+            Ok(true)
+        }
+
+        fn push_keyboard_enhancement(&self, _flags: KeyboardEnhancementFlags) -> io::Result<()> {
+            self.calls.lock().unwrap().push("push");
+            if matches!(self.panic_at, EnhancementPanic::Push) {
+                panic!("push panic");
+            }
+            Ok(())
+        }
+
+        fn pop_keyboard_enhancement(&self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("pop");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn initialization_error_cleans_audio_before_partial_terminal_and_join() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = PartialInitErrorLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = OrderedEnhancementOps {
+            calls: Arc::clone(&calls),
+        };
+
+        let result: io::Result<()> = run_with_runtime_lifecycle(
+            &mut app,
+            enhancements,
+            &mut lifecycle,
+            &mut worker,
+            |_, _, _, _| Ok(()),
+            |_| {
+                calls.lock().unwrap().push("join");
+                Err(io::Error::other("join failed"))
+            },
+            |_| {},
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "init failed");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init-partial",
+                "stop-all",
+                "drop-audio",
+                "request",
+                "restore",
+                "join",
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_query_panic_cleans_audio_without_popping_keyboard() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = FakeTerminalLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = PanickingEnhancementOps {
+            calls: Arc::clone(&calls),
+            panic_at: EnhancementPanic::Query,
+        };
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _: io::Result<()> = run_with_runtime_lifecycle(
+                &mut app,
+                enhancements,
+                &mut lifecycle,
+                &mut worker,
+                |_, _, _, _| Ok(()),
+                |_| {
+                    calls.lock().unwrap().push("join");
+                    Err(io::Error::other("join failed"))
+                },
+                |message| {
+                    assert!(message.contains("query panic"));
+                    calls.lock().unwrap().push("report");
+                },
+            );
+        }));
+
+        let panic = outcome.unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"query panic"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init",
+                "query",
+                "stop-all",
+                "drop-audio",
+                "request",
+                "restore",
+                "join",
+                "report",
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_push_panic_cleans_audio_without_popping_unconfirmed_keyboard() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = FakeTerminalLifecycle {
+            calls: Arc::clone(&calls),
+        };
+        let mut worker = FakeCleanupWorker {
+            calls: Arc::clone(&calls),
+        };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
+        let enhancements = PanickingEnhancementOps {
+            calls: Arc::clone(&calls),
+            panic_at: EnhancementPanic::Push,
+        };
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _: io::Result<()> = run_with_runtime_lifecycle(
+                &mut app,
+                enhancements,
+                &mut lifecycle,
+                &mut worker,
+                |_, _, _, _| Ok(()),
+                |_| {
+                    calls.lock().unwrap().push("join");
+                    Err(io::Error::other("join failed"))
+                },
+                |message| {
+                    assert!(message.contains("push panic"));
+                    calls.lock().unwrap().push("report");
+                },
+            );
+        }));
+
+        let panic = outcome.unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"push panic"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "init",
+                "query",
+                "push",
+                "stop-all",
+                "drop-audio",
+                "request",
+                "restore",
+                "join",
+                "report",
+            ]
+        );
+    }
+
     #[test]
     fn audio_stops_and_drops_before_keyboard_and_terminal_restoration() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1141,14 +1369,14 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let result: io::Result<()> = run_with_terminal_lifecycle(
+        let result: io::Result<()> = run_with_runtime_lifecycle(
+            &mut app,
+            enhancements,
             &mut lifecycle,
             &mut worker,
-            |_, _| {
-                run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
-                    calls.lock().unwrap().push("loop");
-                    Err(io::Error::other("loop"))
-                })
+            |_, _, _, _| {
+                calls.lock().unwrap().push("loop");
+                Err(io::Error::other("loop"))
             },
             |_| {
                 calls.lock().unwrap().push("join");
@@ -1176,31 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn panic_still_stops_and_drops_audio_before_popping_keyboard_enhancements() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut app = FakeShutdownApp {
-            calls: Arc::clone(&calls),
-        };
-        let enhancements = OrderedEnhancementOps {
-            calls: Arc::clone(&calls),
-        };
-
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let _: io::Result<()> =
-                run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
-                    calls.lock().unwrap().push("loop");
-                    panic!("loop panic")
-                });
-        }));
-
-        assert!(outcome.is_err());
-        assert_eq!(
-            *calls.lock().unwrap(),
-            ["query", "push", "loop", "stop-all", "drop-audio", "pop"]
-        );
-    }
-
-    #[test]
     fn production_lifecycle_contains_panic_through_terminal_restore_and_worker_join() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = FakeTerminalLifecycle {
@@ -1217,14 +1420,14 @@ mod tests {
         };
 
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let _: io::Result<()> = run_with_terminal_lifecycle(
+            let _: io::Result<()> = run_with_runtime_lifecycle(
+                &mut app,
+                enhancements,
                 &mut lifecycle,
                 &mut worker,
-                |_, _| {
-                    run_with_audio_and_enhancements(&mut app, enhancements, |_, _| {
-                        calls.lock().unwrap().push("loop");
-                        panic!("loop panic")
-                    })
+                |_, _, _, _| {
+                    calls.lock().unwrap().push("loop");
+                    panic!("loop panic")
                 },
                 |_| {
                     calls.lock().unwrap().push("join");
@@ -1266,11 +1469,16 @@ mod tests {
         let mut worker = FakeCleanupWorker {
             calls: Arc::clone(&calls),
         };
+        let mut app = FakeShutdownApp {
+            calls: Arc::clone(&calls),
+        };
 
-        let result: io::Result<()> = run_with_terminal_lifecycle(
+        let result: io::Result<()> = run_with_runtime_lifecycle(
+            &mut app,
+            FakeEnhancementOps::unsupported(),
             &mut lifecycle,
             &mut worker,
-            |_, _| {
+            |_, _, _, _| {
                 calls.lock().unwrap().push("loop");
                 Err(io::Error::other("loop"))
             },
@@ -1284,7 +1492,15 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "loop");
         assert_eq!(
             *calls.lock().unwrap(),
-            ["init", "loop", "request", "restore", "join"]
+            [
+                "init",
+                "loop",
+                "stop-all",
+                "drop-audio",
+                "request",
+                "restore",
+                "join",
+            ]
         );
     }
 

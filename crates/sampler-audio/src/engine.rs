@@ -122,6 +122,7 @@ pub struct AudioEngine {
     pending_len: usize,
     deferred_retirement: Option<CriticalEvent>,
     rendered_frame: Frame,
+    last_triggered_frame: Option<Frame>,
     late_commands: u64,
     invalid_commands: u64,
     telemetry_peak_left: f32,
@@ -154,6 +155,7 @@ impl AudioEngine {
             pending_len: 0,
             deferred_retirement: None,
             rendered_frame: 0,
+            last_triggered_frame: None,
             late_commands: 0,
             invalid_commands: 0,
             telemetry_peak_left: 0.0,
@@ -400,7 +402,11 @@ impl AudioEngine {
 
     fn execute_action(&mut self, action: ScheduledAction) {
         match action {
-            ScheduledAction::Trigger { pad, velocity, .. } => self.trigger(pad, velocity),
+            ScheduledAction::Trigger { pad, velocity, .. } => {
+                if self.trigger(pad, velocity) {
+                    self.last_triggered_frame = Some(self.rendered_frame);
+                }
+            }
             ScheduledAction::Release { pad, .. } => {
                 if self.pad_binding(pad).slot.is_none() {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
@@ -411,19 +417,19 @@ impl AudioEngine {
         }
     }
 
-    fn trigger(&mut self, pad: PadId, velocity: f32) {
+    fn trigger(&mut self, pad: PadId, velocity: f32) -> bool {
         let binding = *self.pad_binding(pad);
         let Some(slot) = binding.slot else {
             self.invalid_commands = self.invalid_commands.saturating_add(1);
-            return;
+            return false;
         };
         if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
             self.invalid_commands = self.invalid_commands.saturating_add(1);
-            return;
+            return false;
         }
         if self.samples[slot.index()].buffer.is_none() {
             self.invalid_commands = self.invalid_commands.saturating_add(1);
-            return;
+            return false;
         }
 
         if let Some(group) = binding.settings.choke_group {
@@ -453,6 +459,7 @@ impl AudioEngine {
             right_gain: gain * pan_angle.sin(),
             envelope: Envelope::attack(),
         });
+        true
     }
 
     fn stop_pad(&mut self, pad: PadId) {
@@ -549,6 +556,7 @@ impl AudioEngine {
 
         let telemetry = Telemetry {
             rendered_frame: self.rendered_frame,
+            last_triggered_frame: self.last_triggered_frame,
             peak_left: self.telemetry_peak_left,
             peak_right: self.telemetry_peak_right,
             active_voices: self.allocator.active_voices(),
@@ -980,6 +988,31 @@ mod tests {
         assert_eq!(telemetry.active_voices, 1);
         engine.render_frames(1_599, |_| {});
         assert_eq!(controller.latest_telemetry(), None);
+    }
+
+    #[test]
+    fn telemetry_preserves_the_actual_late_trigger_frame_after_a_short_one_shot_ends() {
+        let (mut controller, mut engine) = harness();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(1, 1.0),
+                PadSettings::default(),
+            )
+            .unwrap();
+
+        engine.render_frames(1_600, |_| {});
+        assert_eq!(
+            controller.latest_telemetry().unwrap().last_triggered_frame,
+            None
+        );
+        controller.trigger(PadId::first(), 100, 1.0).unwrap();
+        engine.render_frames(1_600, |_| {});
+
+        let telemetry = controller.latest_telemetry().unwrap();
+        assert_eq!(telemetry.rendered_frame, 3_200);
+        assert_eq!(telemetry.last_triggered_frame, Some(1_600));
+        assert_eq!(telemetry.active_voices, 0);
     }
 
     #[test]

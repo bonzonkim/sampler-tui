@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,7 +8,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sampler_audio::{AudioSession, Frame, PadId, PadSettings, decode_path, prepare_sample};
+use sampler_audio::{
+    AudioSession, Frame, PadId, PadSettings, Telemetry, decode_path, prepare_sample,
+};
 
 const USAGE: &str = "Usage:\n  sampler-tui play <path>\n  sampler-tui --help";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -23,6 +26,23 @@ enum Action {
 
 #[derive(Debug, PartialEq, Eq)]
 struct InvalidUsage;
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliError {
+    DeadlineOverflow,
+    Timeout(&'static str),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineOverflow => formatter.write_str("playback deadline is out of range"),
+            Self::Timeout(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for CliError {}
 
 fn main() -> ExitCode {
     let action = match parse_args(std::env::args_os()) {
@@ -88,56 +108,86 @@ fn play(path: PathBuf) -> Result<(), DynError> {
     let trigger_frame = initial_frame
         .checked_add(128)
         .ok_or_else(|| io::Error::other("audio frame counter overflow before trigger"))?;
-    let completion = completion_frame(trigger_frame, sample_frames)
-        .ok_or_else(|| io::Error::other("audio frame counter overflow before completion"))?;
     session
         .controller_mut()
         .trigger(PadId::first(), trigger_frame, 1.0)?;
 
-    let deadline = Instant::now() + playback_duration.saturating_add(Duration::from_secs(5));
+    let deadline = checked_deadline(
+        Instant::now(),
+        playback_duration.saturating_add(Duration::from_secs(5)),
+    )?;
+    let mut completion = None;
     loop {
-        session.controller_mut().reclaim_retired();
         if let Some(error) = session.poll_error() {
             return Err(Box::new(error));
         }
-        if session
-            .controller_mut()
-            .latest_telemetry()
-            .is_some_and(|telemetry| rendered_past_completion(telemetry.rendered_frame, completion))
-        {
-            return Ok(());
-        }
-        sleep_until_next_poll(
+        ensure_before_deadline(
+            Instant::now(),
             deadline,
             "playback timed out before rendered-frame completion",
         )?;
+        session.controller_mut().reclaim_retired();
+        if let Some(telemetry) = session.controller_mut().latest_telemetry() {
+            if completion.is_none() {
+                completion = completion_from_trigger_ack(telemetry, sample_frames);
+                if completion.is_none() && telemetry.last_triggered_frame.is_some() {
+                    return Err(Box::new(io::Error::other(
+                        "audio frame counter overflow before completion",
+                    )));
+                }
+            }
+            if completion.is_some_and(|completion| {
+                rendered_past_completion(telemetry.rendered_frame, completion)
+            }) {
+                return Ok(());
+            }
+        }
+        sleep_until_next_poll(deadline);
     }
 }
 
 fn wait_for_initial_telemetry(session: &mut AudioSession) -> Result<Frame, DynError> {
-    let deadline = Instant::now() + INITIAL_TELEMETRY_TIMEOUT;
+    let deadline = checked_deadline(Instant::now(), INITIAL_TELEMETRY_TIMEOUT)?;
     loop {
-        session.controller_mut().reclaim_retired();
         if let Some(error) = session.poll_error() {
             return Err(Box::new(error));
         }
+        ensure_before_deadline(
+            Instant::now(),
+            deadline,
+            "timed out waiting for initial audio telemetry",
+        )?;
+        session.controller_mut().reclaim_retired();
         if let Some(telemetry) = session.controller_mut().latest_telemetry() {
             return Ok(telemetry.rendered_frame);
         }
-        sleep_until_next_poll(deadline, "timed out waiting for initial audio telemetry")?;
+        sleep_until_next_poll(deadline);
     }
 }
 
-fn sleep_until_next_poll(deadline: Instant, timeout_message: &'static str) -> Result<(), DynError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::TimedOut,
-            timeout_message,
-        )));
+fn checked_deadline(start: Instant, duration: Duration) -> Result<Instant, CliError> {
+    start
+        .checked_add(duration)
+        .ok_or(CliError::DeadlineOverflow)
+}
+
+fn ensure_before_deadline(
+    now: Instant,
+    deadline: Instant,
+    timeout_message: &'static str,
+) -> Result<(), CliError> {
+    if now >= deadline {
+        Err(CliError::Timeout(timeout_message))
+    } else {
+        Ok(())
     }
-    thread::sleep(POLL_INTERVAL.min(remaining));
-    Ok(())
+}
+
+fn sleep_until_next_poll(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        thread::sleep(POLL_INTERVAL.min(remaining));
+    }
 }
 
 fn frame_duration(frames: usize, sample_rate: u32) -> Result<Duration, DynError> {
@@ -157,6 +207,10 @@ fn completion_frame(trigger_frame: Frame, sample_frames: u64) -> Option<Frame> {
     trigger_frame.checked_add(sample_frames)?.checked_add(64)
 }
 
+fn completion_from_trigger_ack(telemetry: Telemetry, sample_frames: u64) -> Option<Frame> {
+    completion_frame(telemetry.last_triggered_frame?, sample_frames)
+}
+
 fn rendered_past_completion(rendered_frame: Frame, completion: Frame) -> bool {
     rendered_frame > completion
 }
@@ -174,6 +228,8 @@ fn report_error(error: &dyn Error) {
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    use sampler_audio::Telemetry;
 
     use super::*;
 
@@ -207,5 +263,49 @@ mod tests {
         assert_eq!(boundary, 193);
         assert!(!rendered_past_completion(193, boundary));
         assert!(rendered_past_completion(194, boundary));
+    }
+
+    #[test]
+    fn stale_pre_trigger_telemetry_cannot_supply_a_completion_frame() {
+        let telemetry = telemetry(10_000, None);
+        assert_eq!(completion_from_trigger_ack(telemetry, 1), None);
+    }
+
+    #[test]
+    fn a_late_actual_trigger_frame_shifts_the_completion_threshold() {
+        let telemetry = telemetry(3_200, Some(1_600));
+        assert_eq!(completion_from_trigger_ack(telemetry, 1), Some(1_665));
+        assert!(rendered_past_completion(telemetry.rendered_frame, 1_665));
+    }
+
+    #[test]
+    fn a_deadline_rejects_work_at_the_exact_boundary() {
+        let deadline = Instant::now();
+        let before = deadline.checked_sub(Duration::from_nanos(1)).unwrap();
+        assert!(ensure_before_deadline(before, deadline, "timeout").is_ok());
+        assert!(matches!(
+            ensure_before_deadline(deadline, deadline, "timeout"),
+            Err(CliError::Timeout("timeout"))
+        ));
+    }
+
+    #[test]
+    fn an_unrepresentable_instant_deadline_is_a_typed_error() {
+        assert!(matches!(
+            checked_deadline(Instant::now(), Duration::MAX),
+            Err(CliError::DeadlineOverflow)
+        ));
+    }
+
+    fn telemetry(rendered_frame: Frame, last_triggered_frame: Option<Frame>) -> Telemetry {
+        Telemetry {
+            rendered_frame,
+            last_triggered_frame,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+        }
     }
 }

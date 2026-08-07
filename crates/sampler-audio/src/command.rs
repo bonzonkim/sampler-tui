@@ -148,6 +148,7 @@ pub enum CriticalEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Telemetry {
     pub rendered_frame: Frame,
+    pub last_triggered_frame: Option<Frame>,
     pub peak_left: f32,
     pub peak_right: f32,
     pub active_voices: usize,

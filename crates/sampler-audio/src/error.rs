@@ -77,3 +77,31 @@ pub enum EngineError {
     #[error("engine sample rate must be non-zero")]
     ZeroSampleRate,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DeviceBufferError {
+    #[error("device channel count must be non-zero")]
+    ZeroChannels,
+    #[error("output buffer length {samples} is not divisible by {channels} channels")]
+    MisalignedOutput { samples: usize, channels: usize },
+    #[error("{frames} frames cannot fill an output buffer containing {output_frames} frames")]
+    FrameCountMismatch { frames: usize, output_frames: usize },
+}
+
+#[derive(Debug, Error)]
+pub enum DeviceError {
+    #[error("no default output device is available")]
+    NoDefaultOutputDevice,
+    #[error("could not query the default output configuration: {0}")]
+    DefaultOutputConfig(#[source] cpal::Error),
+    #[error("unsupported output configuration: {channels} channels at {sample_rate} Hz")]
+    UnsupportedConfiguration { sample_rate: u32, channels: u16 },
+    #[error("unsupported output sample format: {0}")]
+    UnsupportedSampleFormat(cpal::SampleFormat),
+    #[error("could not build the output stream: {0}")]
+    BuildStream(#[source] cpal::Error),
+    #[error("could not start the output stream: {0}")]
+    PlayStream(#[source] cpal::Error),
+    #[error("output stream failed: {0}")]
+    Runtime(#[source] cpal::Error),
+}

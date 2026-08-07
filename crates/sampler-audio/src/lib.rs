@@ -2,6 +2,7 @@
 
 mod command;
 mod decode;
+mod device;
 mod engine;
 mod error;
 mod resample;
@@ -12,8 +13,12 @@ pub use command::{
     RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, audio_channels,
 };
 pub use decode::{DecodedAudio, decode_path};
+pub use device::{AudioSession, write_frames};
 pub use engine::AudioEngine;
-pub use error::{ControlError, DecodeError, EngineError, PrepareError, SampleError};
+pub use error::{
+    ControlError, DecodeError, DeviceBufferError, DeviceError, EngineError, PrepareError,
+    SampleError,
+};
 pub use resample::prepare_sample;
 pub use sample::{SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
 pub use sampler_core::{Frame, PadId, PadSettings};

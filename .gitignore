@@ -1,0 +1,8 @@
+/target/
+/.superpowers/
+*.wav
+*.aif
+*.aiff
+*.flac
+*.mp3
+

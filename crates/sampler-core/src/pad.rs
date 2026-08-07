@@ -64,6 +64,13 @@ pub struct PadId {
 }
 
 impl PadId {
+    pub const fn first() -> Self {
+        Self {
+            bank: BankId(0),
+            index: 0,
+        }
+    }
+
     pub fn new(bank: BankId, index: u8) -> Result<Self, ModelError> {
         (index < PADS_PER_BANK)
             .then_some(Self { bank, index })

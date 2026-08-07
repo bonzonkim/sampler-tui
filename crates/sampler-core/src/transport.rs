@@ -132,6 +132,13 @@ impl Transport {
         (frames_per_quarter * self.meter.quarters_per_bar() * f64::from(self.bars)).round() as Frame
     }
 
+    pub fn step_count(self) -> u32 {
+        (self.meter.quarters_per_bar()
+            * f64::from(self.bars)
+            * f64::from(self.resolution.steps_per_quarter()))
+        .round() as u32
+    }
+
     pub fn play(&mut self) {
         self.playing = true;
     }

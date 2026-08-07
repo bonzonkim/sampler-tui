@@ -138,6 +138,9 @@ impl App {
     }
 
     fn press_pad(&mut self, index: usize) {
+        if self.held_pad_by_key.get(index).is_some_and(Option::is_some) {
+            return;
+        }
         let Some(pad) = self.pad_in_active_bank(index) else {
             return;
         };
@@ -159,7 +162,7 @@ impl App {
         if !self.validate_pad_index(index) {
             return;
         }
-        let Some(pad) = self.held_pad_by_key[index].take() else {
+        let Some(pad) = self.held_pad_by_key[index] else {
             return;
         };
         let Some(audio) = self.audio.as_mut() else {
@@ -169,8 +172,9 @@ impl App {
         let at = audio
             .render_horizon()
             .saturating_add(LIVE_SCHEDULE_AHEAD_FRAMES);
-        if let Err(error) = audio.release(pad, at) {
-            self.status = error;
+        match audio.release(pad, at) {
+            Ok(()) => self.held_pad_by_key[index] = None,
+            Err(error) => self.status = error,
         }
     }
 
@@ -179,24 +183,27 @@ impl App {
             return;
         };
         self.selected_pad = index;
-        self.held_pad_by_key[index] = None;
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
         };
-        if let Err(error) = audio.stop_pad(pad) {
-            self.status = error;
+        match audio.stop_pad(pad) {
+            Ok(()) if self.held_pad_by_key[index] == Some(pad) => {
+                self.held_pad_by_key[index] = None;
+            }
+            Ok(()) => {}
+            Err(error) => self.status = error,
         }
     }
 
     fn stop_all(&mut self) {
-        self.held_pad_by_key.fill(None);
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
         };
-        if let Err(error) = audio.stop_all() {
-            self.status = error;
+        match audio.stop_all() {
+            Ok(()) => self.held_pad_by_key.fill(None),
+            Err(error) => self.status = error,
         }
     }
 
@@ -280,6 +287,9 @@ mod tests {
         channels: u16,
         horizon: Frame,
         trigger_error: Option<String>,
+        release_error: Option<String>,
+        stop_pad_error: Option<String>,
+        stop_all_error: Option<String>,
         calls: CallLog,
     }
 
@@ -290,6 +300,9 @@ mod tests {
                 channels,
                 horizon: 0,
                 trigger_error: None,
+                release_error: None,
+                stop_pad_error: None,
+                stop_all_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
             }
         }
@@ -301,6 +314,21 @@ mod tests {
 
         fn failing_trigger(mut self, error: &str) -> Self {
             self.trigger_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_release_once(mut self, error: &str) -> Self {
+            self.release_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_stop_pad_once(mut self, error: &str) -> Self {
+            self.stop_pad_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_stop_all_once(mut self, error: &str) -> Self {
+            self.stop_all_error = Some(error.to_owned());
             self
         }
 
@@ -343,16 +371,25 @@ mod tests {
         }
 
         fn release(&mut self, pad: PadId, at: Frame) -> Result<(), String> {
+            if let Some(error) = self.release_error.take() {
+                return Err(error);
+            }
             self.calls.0.borrow_mut().push(AudioCall::Release(pad, at));
             Ok(())
         }
 
         fn stop_pad(&mut self, pad: PadId) -> Result<(), String> {
+            if let Some(error) = self.stop_pad_error.take() {
+                return Err(error);
+            }
             self.calls.0.borrow_mut().push(AudioCall::StopPad(pad));
             Ok(())
         }
 
         fn stop_all(&mut self) -> Result<(), String> {
+            if let Some(error) = self.stop_all_error.take() {
+                return Err(error);
+            }
             self.calls.0.borrow_mut().push(AudioCall::StopAll);
             Ok(())
         }
@@ -405,6 +442,113 @@ mod tests {
         assert_eq!(
             calls.snapshot().last(),
             Some(&AudioCall::Release(pad(0, 0), 64))
+        );
+    }
+
+    #[test]
+    fn duplicate_press_does_not_retrigger_or_replace_the_held_pad() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::BankDelta(1));
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::PadRelease(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_release_keeps_the_held_pad_for_retry() {
+        let fake = FakeAudio::ready(48_000, 2).failing_release_once("release queue is full");
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::PadRelease(0));
+        assert!(app.status().contains("release queue is full"));
+        app.apply(InputAction::PadRelease(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_stop_pad_keeps_the_slot_held_until_stop_retry_succeeds() {
+        let fake = FakeAudio::ready(48_000, 2).failing_stop_pad_once("stop queue is full");
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::PadStop(0));
+        assert!(app.status().contains("stop queue is full"));
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::PadStop(0));
+        app.apply(InputAction::PadPress(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopPad(pad(0, 0)),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn bank_switched_stop_does_not_forget_the_original_held_pad() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::BankDelta(1));
+        app.apply(InputAction::PadStop(0));
+        app.apply(InputAction::PadRelease(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopPad(pad(1, 0)),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_stop_all_keeps_slots_held_until_stop_retry_succeeds() {
+        let fake = FakeAudio::ready(48_000, 2).failing_stop_all_once("stop-all queue is full");
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::StopAll);
+        assert!(app.status().contains("stop-all queue is full"));
+        app.apply(InputAction::PadPress(0));
+        app.apply(InputAction::StopAll);
+        app.apply(InputAction::PadPress(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopAll,
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
         );
     }
 

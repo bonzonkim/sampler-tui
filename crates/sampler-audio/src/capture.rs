@@ -171,6 +171,27 @@ impl CaptureShared {
     fn set_state(&self, state: CaptureState) {
         self.state.store(state.raw(), Ordering::Release);
     }
+
+    fn reserve_arm(&self) -> Result<(), CaptureState> {
+        self.state
+            .compare_exchange(
+                CaptureState::IDLE,
+                CaptureState::ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(CaptureState::from_raw)
+    }
+
+    fn release_arm_reservation(&self) {
+        let _ = self.state.compare_exchange(
+            CaptureState::ARMED,
+            CaptureState::IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 pub struct CaptureController {
@@ -181,16 +202,22 @@ pub struct CaptureController {
 
 impl CaptureController {
     pub fn arm(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
-        match self.shared.state() {
-            CaptureState::Idle => self.send(CaptureCommand::Arm(buffer)),
-            CaptureState::CompletionPending => Err(CaptureSendFailure::new(
+        let command = CaptureCommand::Arm(buffer);
+        match self.shared.reserve_arm() {
+            Ok(()) => match self.send(command) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    self.shared.release_arm_reservation();
+                    Err(failure)
+                }
+            },
+            Err(CaptureState::CompletionPending) => Err(CaptureSendFailure::new(
                 CaptureError::CompletionPending,
-                CaptureCommand::Arm(buffer),
+                command,
             )),
-            CaptureState::Armed | CaptureState::Recording => Err(CaptureSendFailure::new(
-                CaptureError::InvalidState,
-                CaptureCommand::Arm(buffer),
-            )),
+            Err(CaptureState::Idle | CaptureState::Armed | CaptureState::Recording) => {
+                Err(CaptureSendFailure::new(CaptureError::InvalidState, command))
+            }
         }
     }
 
@@ -617,11 +644,26 @@ mod tests {
 
     #[test]
     fn command_backpressure_returns_the_owned_command() {
-        let (mut controller, _core) = capture_channels(1, 1);
+        let (mut controller, mut core) = capture_channels(1, 1);
         controller.start(31).unwrap();
         let failure = controller.arm(buffer(31, 1)).unwrap_err();
         assert_eq!(failure.error(), CaptureError::CommandFull);
         assert!(matches!(failure.into_command(), CaptureCommand::Arm(_)));
+        assert_eq!(controller.state(), CaptureState::Idle);
+
+        core.poll_commands();
+        controller.arm(buffer(31, 1)).unwrap();
+    }
+
+    #[test]
+    fn closed_arm_admission_rolls_back_the_shared_state() {
+        let (mut controller, core) = capture_channels(1, 1);
+        drop(core);
+
+        let failure = controller.arm(buffer(32, 1)).unwrap_err();
+        assert_eq!(failure.error(), CaptureError::CommandClosed);
+        assert!(matches!(failure.into_command(), CaptureCommand::Arm(_)));
+        assert_eq!(controller.state(), CaptureState::Idle);
     }
 
     #[test]
@@ -639,5 +681,35 @@ mod tests {
         };
         assert_eq!(returned.stereo.as_ptr(), allocation);
         assert_eq!(core.state(), CaptureState::Armed);
+    }
+
+    #[test]
+    fn queued_second_arm_is_rejected_without_disturbing_the_first_take() {
+        let (mut controller, mut core) = capture_channels(2, 2);
+        let first = buffer(51, 1);
+        let first_allocation = first.stereo.as_ptr();
+        controller.arm(first).unwrap();
+
+        let second = buffer(52, 1);
+        let second_allocation = second.stereo.as_ptr();
+        let failure = controller.arm(second).unwrap_err();
+        assert_eq!(failure.error(), CaptureError::InvalidState);
+        let CaptureCommand::Arm(returned) = failure.into_command() else {
+            panic!("second arm rejection must return the original command");
+        };
+        assert_eq!(returned.stereo.as_ptr(), second_allocation);
+
+        core.poll_commands();
+        assert_eq!(core.state(), CaptureState::Armed);
+        controller.start(51).unwrap();
+        core.poll_commands();
+        controller.cancel(51).unwrap();
+        core.poll_commands();
+
+        let CaptureOutcome::Cancelled(returned) = controller.try_next_outcome().unwrap() else {
+            panic!("first take must remain cancellable");
+        };
+        assert_eq!(returned.stereo.as_ptr(), first_allocation);
+        assert_eq!(core.state(), CaptureState::Idle);
     }
 }

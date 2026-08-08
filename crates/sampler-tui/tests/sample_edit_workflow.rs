@@ -1,6 +1,7 @@
-//! Full-stack sample editing evidence. Device I/O is the only substituted boundary: WAV decode
-//! and recipe rendering use the real worker, commands use the real controller, and auditioning
-//! uses a real `AudioEngine`.
+//! Full-stack sample editing evidence. WAV decode and recipe rendering use the real worker,
+//! commands use the real controller, and auditioning uses a real `AudioEngine`; physical device
+//! I/O is substituted. The port also exposes explicit runtime-device and general-install rejection
+//! controls, while worker-busy injection exercises App's typed send-error boundary.
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -16,6 +17,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use sampler_audio::{
     AudioController, AudioEngine, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
     PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+    audio_channels_with_test_capacities,
 };
 use sampler_core::{
     BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SAMPLE_PHASE_SCALE,
@@ -27,6 +29,7 @@ use sampler_tui::{
 };
 
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+const EXPECTED_RECOVERY_CREDITS: usize = 32;
 
 struct Fixture {
     directory: PathBuf,
@@ -66,6 +69,10 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         Self::write("rate-mapping.wav", 48_000, &frames)
+    }
+
+    fn identity_48_000_frames() -> Self {
+        Self::write("identity.wav", 48_000, &vec![[0.5, 0.25]; 48_000])
     }
 
     fn write(name: &str, sample_rate: u32, frames: &[[f32; 2]]) -> Self {
@@ -159,7 +166,9 @@ impl AudioPort for ControllerPort {
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, String> {
-        self.install(pad, sample, settings)
+        self.controller()
+            .install_recovery(pad, sample, settings)
+            .map_err(|error| error.to_string())
     }
 
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String> {
@@ -382,6 +391,41 @@ fn audio_pair(sample_rate: u32) -> (ControllerPort, AudioEngine, Rc<ProbeState>)
 
 fn pad(index: u8) -> PadId {
     PadId::new(BankId::new(0).unwrap(), index).unwrap()
+}
+
+#[test]
+fn recovery_port_uses_the_controller_recovery_admission_limit() {
+    let (controller, _ports) = audio_channels_with_test_capacities(128, 256, 8);
+    let probe = Rc::new(ProbeState::default());
+    let mut port = ControllerPort {
+        sample_rate: 48_000,
+        controller: Rc::new(RefCell::new(controller)),
+        probe,
+    };
+
+    for _ in 0..EXPECTED_RECOVERY_CREDITS {
+        port.install_recovery(
+            pad(0),
+            Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+            PadSettings::default(),
+        )
+        .expect("recovery credit available");
+    }
+    assert!(
+        port.install_recovery(
+            pad(0),
+            Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+            PadSettings::default(),
+        )
+        .is_err(),
+        "the 33rd recovery must exhaust the controller's reserved recovery credits"
+    );
+    port.install(
+        pad(1),
+        Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+        PadSettings::default(),
+    )
+    .expect("recovery credits do not consume ordinary install capacity");
 }
 
 #[test]
@@ -640,12 +684,14 @@ fn settings_backpressure_stale_results_and_one_level_undo_are_failure_atomic() {
 #[test]
 fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft() {
     let fixture = Fixture::rate_mapping_48_000_frames();
+    let identity_fixture = Fixture::identity_48_000_frames();
     let source_before = fixture.bytes();
+    let identity_source_before = identity_fixture.bytes();
     let mut harness = Harness::new(48_000);
     let first = pad(0);
     let second = pad(1);
     harness.load(first, &fixture.path);
-    harness.load(second, &fixture.path);
+    harness.load(second, &identity_fixture.path);
     harness.enter_sample();
 
     harness.palette("trim-start 12000");
@@ -721,6 +767,20 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
         harness.app.pad(first).sample.as_ref().unwrap().frames(),
         22_050
     );
+    let recovered_base = harness.app.base_sample(first).unwrap();
+    let recovered = harness.app.pad(first).sample.as_ref().unwrap();
+    assert_eq!(
+        &recovered.data()[..2],
+        &recovered_base.data()[11_025 * 2..11_025 * 2 + 2]
+    );
+    assert_eq!(
+        &recovered.data()[recovered.data().len() - 2..],
+        &recovered_base.data()[33_074 * 2..33_074 * 2 + 2]
+    );
+    assert_ne!(
+        &recovered.data()[..2],
+        &recovered_base.data()[33_074 * 2..33_074 * 2 + 2]
+    );
     assert_eq!(
         harness.app.base_sample(second).unwrap().sample_rate(),
         48_000
@@ -756,8 +816,42 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
         44_100
     );
     assert_eq!(harness.app.base_sample(second).unwrap().frames(), 44_100);
+    let identity_base = harness.app.base_sample(second).unwrap();
+    let identity = harness.app.pad(second).sample.as_ref().unwrap();
+    assert!(Arc::ptr_eq(identity, identity_base));
+    assert_eq!(&identity.data()[..2], &identity_base.data()[..2]);
+    assert_eq!(
+        &identity.data()[identity.data().len() - 2..],
+        &identity_base.data()[identity_base.data().len() - 2..]
+    );
+    assert!(identity.data()[0] > 0.0 && identity.data()[1] > 0.0);
     assert_eq!(harness.app.committed_sample_recipe(first), Some(committed));
     assert_eq!(harness.app.sample_editor().draft(), uncommitted);
     assert_ne!(harness.app.sample_editor().draft(), committed);
+
+    harness.app.apply(InputAction::PadPress(1));
+    let mut identity_audition = Vec::new();
+    harness
+        .engine
+        .render_frames(65, |frame| identity_audition.push(frame));
+    assert!(identity_audition.last().unwrap()[0] > 0.0);
+    assert!(identity_audition.last().unwrap()[1] > 0.0);
+    harness.app.apply(InputAction::PadRelease(1));
+    harness.app.apply(InputAction::StopAll);
+    harness.engine.render_frames(65, |_| {});
+
+    harness.app.apply(InputAction::PadPress(0));
+    let mut committed_audition = Vec::new();
+    harness
+        .engine
+        .render_frames(65, |frame| committed_audition.push(frame));
+    let committed_first = committed_audition.last().unwrap();
+    assert!(
+        committed_first[0] < 0.0 && committed_first[1] < 0.0,
+        "committed callback frame {committed_first:?}, triggers {}",
+        harness.engine.executed_triggers()
+    );
+    assert_eq!(harness.engine.executed_triggers(), 2);
     assert_eq!(fixture.bytes(), source_before);
+    assert_eq!(identity_fixture.bytes(), identity_source_before);
 }

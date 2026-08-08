@@ -207,6 +207,15 @@ struct PendingPatternTransport {
     playing: bool,
 }
 
+#[derive(Clone)]
+struct ApplySampleContext {
+    pad: PadId,
+    pad_generation: u64,
+    source: Option<PathBuf>,
+    base_frames: usize,
+    base_rate: u32,
+}
+
 pub struct App {
     active_bank: BankId,
     selected_pad: usize,
@@ -229,6 +238,7 @@ pub struct App {
     current_session_bound: [bool; PAD_VIEW_COUNT],
     sample_editor: Box<SampleEditorState>,
     editor: SampleEditor,
+    apply_sample_context: Option<ApplySampleContext>,
     edit_result_advanced: bool,
     device_retry_requests: usize,
     keyboard_capabilities: KeyboardCapabilities,
@@ -290,6 +300,7 @@ impl App {
                 generation_exhausted: [false; PAD_VIEW_COUNT],
             }),
             editor: SampleEditor::open_empty(PadId::first(), PadSettings::default()),
+            apply_sample_context: None,
             edit_result_advanced: false,
             device_retry_requests: 0,
             keyboard_capabilities: KeyboardCapabilities::default(),
@@ -718,6 +729,7 @@ impl App {
             Some(Overlay::ApplySample { .. } | Overlay::DiscardSample { .. })
         ) {
             self.editor.cancel_confirmation();
+            self.apply_sample_context = None;
         }
         if self.overlay == Some(Overlay::Palette) {
             self.palette_error = None;
@@ -1500,6 +1512,18 @@ impl App {
         true
     }
 
+    fn require_sample_editor_key(&mut self) -> bool {
+        if self.editor.committed().is_none() {
+            self.status = "selected pad is empty".to_owned();
+            return false;
+        }
+        if self.editor_operation_pending() {
+            self.status = "sample edit is pending".to_owned();
+            return false;
+        }
+        true
+    }
+
     fn apply_picker_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -1542,6 +1566,10 @@ impl App {
     fn apply_global_pattern_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Tab if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                if self.patterns.view() == WorkspaceView::Sample && self.editor_operation_pending()
+                {
+                    return true;
+                }
                 let view = if key.modifiers == KeyModifiers::SHIFT {
                     self.patterns.view().previous()
                 } else {
@@ -1679,6 +1707,20 @@ impl App {
             self.request_editor_undo();
             return;
         }
+        if matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Enter
+                | KeyCode::Char('m' | 'n' | 'u' | 'o' | 'g' | 'l')
+        ) && !self.require_sample_editor_key()
+        {
+            return;
+        }
         match key.code {
             KeyCode::Char('?')
                 if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
@@ -1757,6 +1799,18 @@ impl App {
             .and_then(|before| before.frame_range(frames).ok())
             .map_or(0, |range| range.len());
         let after_frames = recipe.frame_range(frames).map_or(0, |range| range.len());
+        let Some(base_rate) = self.base_sample(pad).map(|sample| sample.sample_rate()) else {
+            self.editor
+                .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
+            return;
+        };
+        self.apply_sample_context = Some(ApplySampleContext {
+            pad,
+            pad_generation: self.pads[pad_offset(pad)].generation,
+            source: self.pads[pad_offset(pad)].source.clone(),
+            base_frames: frames,
+            base_rate,
+        });
         self.overlay = Some(Overlay::ApplySample {
             pad,
             before_frames,
@@ -1794,11 +1848,33 @@ impl App {
         let Some(Overlay::ApplySample { pad, .. }) = self.overlay.clone() else {
             return;
         };
-        let recipe = self.editor.draft();
+        let selected = self.selected_pad_id();
+        let context_matches = self.apply_sample_context.as_ref().is_some_and(|context| {
+            context.pad == pad
+                && context.pad_generation == self.pads[pad_offset(pad)].generation
+                && context.source == self.pads[pad_offset(pad)].source
+                && self.base_sample(pad).is_some_and(|base| {
+                    base.frames() == context.base_frames && base.sample_rate() == context.base_rate
+                })
+        });
+        if selected != Some(pad)
+            || self.editor.pad() != pad
+            || !context_matches
+            || self.editor_operation_pending()
+        {
+            self.editor
+                .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
+            self.status = "sample changed while apply confirmation was open".to_owned();
+            return;
+        }
+        let Some(SampleEditorIntent::Apply { recipe, .. }) = self.editor.confirm_apply() else {
+            return;
+        };
         match self.request_sample_edit(pad, recipe) {
             Ok(()) => {
                 self.editor.observe_pending();
                 self.overlay = None;
+                self.apply_sample_context = None;
             }
             Err(error) => {
                 self.status = error.to_string();
@@ -5726,5 +5802,105 @@ mod tests {
         app.retry_with(Box::new(FakeAudio::ready(48_000, 2)));
         assert!(app.sample_editor().draft().normalize);
         assert!(app.sample_editor().is_dirty());
+    }
+
+    #[test]
+    fn apply_confirmation_rejects_a_replaced_source_without_queueing_an_edit() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "first.wav").unwrap()
+        else {
+            panic!("expected initial load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "first.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ApplySample { .. })
+        ));
+
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "second.wav").unwrap()
+        else {
+            panic!("expected replacement load");
+        };
+        assert!(app.apply_worker_result(loaded_with_frames(
+            pad,
+            generation,
+            "second.wav",
+            48_000,
+            2,
+        )));
+        let edit_generation = app.sample_editor.generations[0];
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.sample_editor.generations[0], edit_generation);
+        assert!(app.sample_editor.pending[0].is_none());
+        assert!(app.sample_editor().draft().normalize);
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Error(
+                crate::SampleEditorError::SelectedPadReplaced
+            )
+        ));
+    }
+
+    #[test]
+    fn empty_sample_keys_match_palette_rejection_without_mutating_settings() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let pad = pad(0, 0);
+        let prior = app.pad(pad).settings;
+
+        for key_code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('o'),
+            KeyCode::Char('g'),
+            KeyCode::Char('l'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('n'),
+            KeyCode::Char('u'),
+        ] {
+            app.apply_key(KeyEvent::new(key_code, KeyModifiers::NONE));
+        }
+
+        assert_eq!(app.pad(pad).settings, prior);
+        assert_eq!(app.sample_editor().settings(), prior);
+        assert_eq!(app.status(), "selected pad is empty");
+    }
+
+    #[test]
+    fn pending_sample_edit_blocks_navigation_without_opening_discard() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+        assert_eq!(app.overlay(), None);
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Pending
+        ));
     }
 }

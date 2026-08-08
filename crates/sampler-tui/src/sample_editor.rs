@@ -412,6 +412,19 @@ impl SampleEditor {
         })
     }
 
+    /// Re-reads the live confirmation state at the final admission boundary. Callers must not
+    /// reuse a recipe captured before an external replacement or a pending transition.
+    pub fn confirm_apply(&mut self) -> Option<SampleEditorIntent> {
+        if self.status != SampleEditorStatus::ApplyConfirmation {
+            return None;
+        }
+        self.committed?;
+        Some(SampleEditorIntent::Apply {
+            pad: self.pad,
+            recipe: self.draft,
+        })
+    }
+
     pub fn request_undo(&mut self) -> Option<SampleEditorIntent> {
         if matches!(
             self.status,

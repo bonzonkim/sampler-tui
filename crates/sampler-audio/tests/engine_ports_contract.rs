@@ -1,9 +1,27 @@
 use std::sync::Arc;
 
 use sampler_audio::{
-    AudioCommand, ControlError, PadId, PadSettings, SampleBuffer,
+    AudioCommand, ControlError, PadId, PadSettings, PatternRetirement, SampleBuffer,
     audio_channels_with_test_capacities,
 };
+use sampler_core::{EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport};
+
+fn pattern_snapshot() -> Arc<sampler_core::PatternSnapshot> {
+    let transport = Transport::new(
+        48_000,
+        Tempo::new(120.0).unwrap(),
+        Meter::new(4, 4).unwrap(),
+        1,
+        Resolution::Sixteenth,
+    )
+    .unwrap();
+    Arc::new(
+        EditablePattern::new(PatternSlotId::new(0).unwrap(), "Pattern", transport)
+            .unwrap()
+            .compile()
+            .unwrap(),
+    )
+}
 
 #[test]
 fn public_ports_consume_both_lanes_and_release_shared_admission() {
@@ -41,4 +59,29 @@ fn public_ports_consume_both_lanes_and_release_shared_admission() {
         controller.stop_pad(pad),
         Err(ControlError::CommandQueueFull)
     );
+}
+
+#[test]
+fn public_pattern_retirement_constructor_round_trips_the_owner() {
+    let (mut controller, mut ports) = audio_channels_with_test_capacities(8, 8, 8);
+    let owner_slot = controller.install_pattern(pattern_snapshot()).unwrap();
+    let installed_snapshot = match ports.immediate_commands.pop().unwrap() {
+        AudioCommand::InstallPattern {
+            owner_slot: command_owner,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(command_owner, owner_slot);
+            snapshot
+        }
+        command => panic!("expected pattern install, got {command:?}"),
+    };
+
+    ports
+        .pattern_retirements
+        .push(PatternRetirement::new(owner_slot, installed_snapshot))
+        .unwrap();
+
+    assert_eq!(controller.reclaim_retired_pattern(), Some(owner_slot));
+    assert_ne!(owner_slot.generation(), 0);
 }

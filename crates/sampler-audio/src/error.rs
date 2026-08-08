@@ -78,6 +78,8 @@ pub enum ControlError {
     NoFreeSampleSlot,
     #[error("no free pattern snapshot slot is available")]
     NoFreePatternSlot,
+    #[error("live command identifiers are exhausted")]
+    LiveCommandIdExhausted,
     #[error("trigger velocity must be finite and in 0.0..=1.0")]
     InvalidVelocity,
 }

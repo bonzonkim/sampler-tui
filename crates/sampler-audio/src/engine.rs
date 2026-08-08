@@ -327,6 +327,13 @@ impl AudioEngine {
             {
                 return false;
             }
+            Ok(
+                AudioCommand::InstallPattern { .. }
+                | AudioCommand::SelectPattern { .. }
+                | AudioCommand::PatternPlay { .. }
+                | AudioCommand::PatternStop { .. }
+                | AudioCommand::SetRecordCapture { .. },
+            ) => return false,
             Ok(_) => None,
             Err(_) => return false,
         };
@@ -414,9 +421,9 @@ impl AudioEngine {
             AudioCommand::StopPad { pad } => self.stop_pad(pad),
             AudioCommand::InstallPattern { .. }
             | AudioCommand::SelectPattern { .. }
-            | AudioCommand::PatternPlay
-            | AudioCommand::PatternStop
-            | AudioCommand::SetRecordCapture(_) => {
+            | AudioCommand::PatternPlay { .. }
+            | AudioCommand::PatternStop { .. }
+            | AudioCommand::SetRecordCapture { .. } => {
                 self.invalid_commands = self.invalid_commands.saturating_add(1);
             }
             AudioCommand::Trigger { .. }
@@ -845,10 +852,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        AudioController, PadId, PadSettings, SampleBuffer, audio_channels,
+        AudioController, ControlError, PadId, PadSettings, PatternSwitch, SampleBuffer,
+        audio_channels,
         command::{RECOVERY_COMMAND_CAPACITY, audio_channels_with_capacities},
     };
-    use sampler_core::{BankId, ChokeGroup};
+    use sampler_core::{
+        BankId, ChokeGroup, EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport,
+    };
 
     fn harness() -> (AudioController, AudioEngine) {
         let (controller, ports) = audio_channels();
@@ -857,6 +867,72 @@ mod tests {
 
     fn constant_sample(frames: usize, value: f32) -> Arc<SampleBuffer> {
         Arc::new(SampleBuffer::new(48_000, vec![value; frames * 2]).unwrap())
+    }
+
+    fn pattern_snapshot(slot: u8) -> Arc<sampler_core::PatternSnapshot> {
+        let transport = Transport::new(
+            48_000,
+            Tempo::new(120.0).unwrap(),
+            Meter::new(4, 4).unwrap(),
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap();
+        Arc::new(
+            EditablePattern::new(PatternSlotId::new(slot).unwrap(), "Pattern", transport)
+                .unwrap()
+                .compile()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn unsupported_pattern_install_stays_queued_without_callback_drop() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let snapshot = pattern_snapshot(0);
+        let owner_slot = controller.install_pattern(Arc::clone(&snapshot)).unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        assert_eq!(engine.queued_commands(), 2);
+
+        engine.render_frames(0, |_| {});
+
+        assert_eq!(engine.queued_commands(), 1);
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        assert_eq!(engine.invalid_commands(), 0);
+        assert_eq!(owner_slot.index(), 0);
+        assert_eq!(
+            controller
+                .install_pattern(pattern_snapshot(1))
+                .unwrap()
+                .index(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_unsupported_pattern_control_stays_queued() {
+        type PatternSubmission = fn(&mut AudioController) -> Result<(), ControlError>;
+        let submissions: [PatternSubmission; 4] = [
+            |controller| {
+                controller.select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            },
+            AudioController::play_pattern,
+            AudioController::stop_pattern,
+            |controller| controller.set_record_capture(Some((PatternSlotId::new(0).unwrap(), 7))),
+        ];
+
+        for submit in submissions {
+            let (mut controller, ports) = audio_channels();
+            let mut engine = AudioEngine::new(48_000, ports).unwrap();
+            submit(&mut controller).unwrap();
+
+            engine.render_frames(0, |_| {});
+
+            assert_eq!(engine.queued_commands(), 1);
+            assert_eq!(engine.invalid_commands(), 0);
+        }
     }
 
     #[test]

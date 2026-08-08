@@ -1,4 +1,5 @@
 use std::array;
+use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
 use std::path::{Component, Path, PathBuf};
@@ -336,7 +337,7 @@ pub struct App {
     pending_explicit_save: Option<PendingProjectSave>,
     pending_autosave_save: Option<PendingProjectSave>,
     in_flight_project: Option<InFlightProjectOperation>,
-    pending_recovery_cleanup: Option<RecoveryCleanup>,
+    pending_recovery_cleanup: VecDeque<RecoveryCleanup>,
     save_as_identity: Option<(PathBuf, ProjectId, String)>,
     project_save_error: Option<ProjectSaveFailure>,
     recovery_cleanup_warning: Option<ProjectStoreError>,
@@ -433,7 +434,7 @@ impl App {
             pending_explicit_save: None,
             pending_autosave_save: None,
             in_flight_project: None,
-            pending_recovery_cleanup: None,
+            pending_recovery_cleanup: VecDeque::with_capacity(WORKER_CHANNEL_CAPACITY),
             save_as_identity: None,
             project_save_error: None,
             recovery_cleanup_warning: None,
@@ -652,6 +653,13 @@ impl App {
             self.autosave_retry_since = Some(now);
             changed = true;
         }
+        if self.pending_autosave_save.as_ref().is_some_and(|pending| {
+            pending.descriptor.revision < self.project_session.current_revision()
+        }) {
+            self.pending_autosave_save = None;
+            self.project_session.set_pending_autosave(None);
+            changed = true;
+        }
 
         if self.in_flight_project.is_none()
             && self.pending_explicit_save.is_none()
@@ -708,7 +716,7 @@ impl App {
             self.enqueue_project_save(save);
             return true;
         }
-        if let Some(cleanup) = self.pending_recovery_cleanup.take() {
+        if let Some(cleanup) = self.pending_recovery_cleanup.pop_front() {
             self.pending_worker_requests
                 .push(WorkerRequest::DiscardRecovery {
                     token: cleanup.token,
@@ -767,7 +775,10 @@ impl App {
     }
 
     fn ensure_project_request_available(&self) -> Result<(), ProjectSaveError> {
-        if self.pending_explicit_save.is_some() || self.in_flight_project.is_some() {
+        if self.pending_explicit_save.is_some()
+            || self.in_flight_project.is_some()
+            || self.pending_recovery_cleanup.len() >= WORKER_CHANNEL_CAPACITY
+        {
             Err(ProjectSaveError::OperationPending)
         } else {
             Ok(())
@@ -1411,7 +1422,7 @@ impl App {
         }
         self.in_flight_project = None;
         if error == WorkerSendError::WorkerBusy {
-            self.pending_recovery_cleanup = Some(request);
+            self.pending_recovery_cleanup.push_front(request);
         } else {
             self.recovery_cleanup_warning = Some(ProjectStoreError::Filesystem {
                 operation: "send recovery cleanup",
@@ -1930,7 +1941,10 @@ impl App {
                             self.project_session.mark_explicit_saved(revision);
                         }
                         if let Ok(cleanup_token) = self.allocate_project_token() {
-                            self.pending_recovery_cleanup = Some(RecoveryCleanup {
+                            debug_assert!(
+                                self.pending_recovery_cleanup.len() < WORKER_CHANNEL_CAPACITY
+                            );
+                            self.pending_recovery_cleanup.push_back(RecoveryCleanup {
                                 token: cleanup_token,
                                 directory: receipt.directory,
                                 project_id,
@@ -3728,7 +3742,8 @@ mod tests {
     };
 
     use super::{
-        App, EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, SampleEditStatus,
+        App, EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, RecoveryCleanup,
+        SampleEditStatus,
     };
     use crate::pattern::{PatternWorkspace, WorkspaceView};
     use crate::project_session::ProjectSnapshotError;
@@ -8060,6 +8075,27 @@ mod tests {
         (**request).clone()
     }
 
+    fn take_recovery_cleanup(app: &mut App) -> RecoveryCleanup {
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::DiscardRecovery {
+                token,
+                directory,
+                project_id,
+                revision,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected one recovery cleanup request");
+        };
+        RecoveryCleanup {
+            token: *token,
+            directory: directory.clone(),
+            project_id: *project_id,
+            revision: *revision,
+        }
+    }
+
     fn save_result(
         request: &ProjectSaveWorkerRequest,
         mappings: Vec<ProjectAssetMapping>,
@@ -8356,6 +8392,38 @@ mod tests {
     }
 
     #[test]
+    fn autosave_withholds_a_stale_pending_snapshot_until_the_newest_revision_is_quiet() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        for request_id in 0..crate::loader::WORKER_CHANNEL_CAPACITY as u64 {
+            app.pending_worker_requests
+                .push(WorkerRequest::ScanDirectory {
+                    request_id,
+                    path: PathBuf::from("."),
+                    show_hidden: false,
+                });
+        }
+        app.maintain_project(now + Duration::from_secs(2));
+        let stale_revision = app.project_session.pending_autosave().unwrap().revision;
+
+        app.project_session
+            .commit_project_mutation(now + Duration::from_secs(3), || Ok::<(), ()>(()))
+            .unwrap();
+        app.pending_worker_requests.clear();
+        assert!(app.maintain_project(now + Duration::from_secs(4)));
+        assert!(app.take_worker_requests().is_empty());
+        assert!(app.project_session.pending_autosave().is_none());
+        assert!(app.project_revision() > stale_revision);
+
+        assert!(app.maintain_project(now + Duration::from_secs(5)));
+        assert_eq!(
+            take_project_save(&mut app).request.snapshot.revision,
+            app.project_revision()
+        );
+    }
+
+    #[test]
     fn explicit_save_cancels_covered_autosave_and_does_not_recreate_recovery_while_clean() {
         let now = Instant::now();
         let mut app = project_app();
@@ -8378,7 +8446,7 @@ mod tests {
         assert!(app.apply_worker_result(save_result(&explicit, Vec::new())));
         assert_eq!(app.project_session.pending_autosave(), None);
 
-        app.pending_recovery_cleanup = None;
+        app.pending_recovery_cleanup.clear();
         assert!(!app.maintain_project(now + Duration::from_secs(20)));
         assert!(app.take_worker_requests().is_empty());
     }
@@ -8471,5 +8539,69 @@ mod tests {
         }));
         assert!(app.recovery_cleanup_warning().is_some());
         assert_eq!(app.project_session.saved_revision(), app.project_revision());
+    }
+
+    #[test]
+    fn recovery_cleanup_interleaving_preserves_fifo_order_and_busy_restores_the_exact_front() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let project_a = name_project(&mut app, "project-a", now);
+        app.request_save().unwrap();
+        app.maintain_project(now);
+        let save_a = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_result(&save_a, Vec::new())));
+
+        app.request_save_as("project-b").unwrap();
+        app.maintain_project(now + Duration::from_secs(1));
+        let save_b = take_project_save(&mut app);
+        let project_b = save_b.request.snapshot.project_id;
+        assert!(app.apply_worker_result(save_result(&save_b, Vec::new())));
+
+        app.maintain_project(now + Duration::from_secs(2));
+        let cleanup_a = take_recovery_cleanup(&mut app);
+        assert_eq!(cleanup_a.directory, PathBuf::from("project-a"));
+        assert_eq!(cleanup_a.project_id, project_a);
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::DiscardRecovery {
+                token: cleanup_a.token,
+                directory: cleanup_a.directory.clone(),
+                project_id: cleanup_a.project_id,
+                revision: cleanup_a.revision,
+            },
+            WorkerSendError::WorkerBusy,
+        ));
+
+        app.maintain_project(now + Duration::from_secs(3));
+        assert_eq!(take_recovery_cleanup(&mut app), cleanup_a);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup_a.token,
+            directory: cleanup_a.directory.clone(),
+            project_id: cleanup_a.project_id,
+            revision: cleanup_a.revision,
+            result: Ok(()),
+        }));
+
+        app.maintain_project(now + Duration::from_secs(4));
+        let cleanup_b = take_recovery_cleanup(&mut app);
+        assert_eq!(cleanup_b.directory, PathBuf::from("project-b"));
+        assert_eq!(cleanup_b.project_id, project_b);
+    }
+
+    #[test]
+    fn explicit_save_is_refused_when_the_bounded_cleanup_backlog_is_full() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        for second in 0..crate::loader::WORKER_CHANNEL_CAPACITY {
+            app.request_save().unwrap();
+            app.maintain_project(now + Duration::from_secs(second as u64));
+            let save = take_project_save(&mut app);
+            assert!(app.apply_worker_result(save_result(&save, Vec::new())));
+        }
+
+        assert_eq!(
+            app.request_save(),
+            Err(super::ProjectSaveError::OperationPending)
+        );
     }
 }

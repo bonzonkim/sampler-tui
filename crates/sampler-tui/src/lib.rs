@@ -21,6 +21,8 @@ pub use loader::{
     WorkerResult, WorkerSendError,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
+pub use sampler_audio::{LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch};
+pub use sampler_core::{PatternSlotId, PatternSnapshot};
 pub use terminal::{
     CrosstermEventSource, EventSource, KeyboardEnhancementGuard, MAX_EVENTS_PER_ITERATION,
     run_event_loop, run_tui,

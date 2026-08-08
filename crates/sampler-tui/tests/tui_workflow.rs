@@ -675,6 +675,15 @@ fn telemetry_with_peaks(
         late_commands: 0,
         invalid_commands: 0,
         command_overflows: 0,
+        pattern_slot: None,
+        pattern_generation: None,
+        pattern_playing: false,
+        pattern_recording: false,
+        pattern_origin: None,
+        pattern_playhead: 0,
+        pattern_loop_count: 0,
+        pattern_overflows: 0,
+        live_ack_overflows: 0,
     }
 }
 

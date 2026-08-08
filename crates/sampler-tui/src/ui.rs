@@ -1029,6 +1029,15 @@ mod tests {
             late_commands: 1,
             invalid_commands: 2,
             command_overflows: 3,
+            pattern_slot: None,
+            pattern_generation: None,
+            pattern_playing: false,
+            pattern_recording: false,
+            pattern_origin: None,
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
         };
         let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
 
@@ -1075,6 +1084,15 @@ mod tests {
             late_commands: 0,
             invalid_commands: 0,
             command_overflows: 0,
+            pattern_slot: None,
+            pattern_generation: None,
+            pattern_playing: false,
+            pattern_recording: false,
+            pattern_origin: None,
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
         };
         let mut active_only = loaded_states_app(FakeAudio::ready().with_telemetry(telemetry));
         active_only.apply(InputAction::PadPress(0));

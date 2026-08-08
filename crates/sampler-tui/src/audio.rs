@@ -4,10 +4,11 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use sampler_audio::{
-    AudioSession, ControlError, DeviceError, Frame, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot,
-    Telemetry,
+    AudioSession, ControlError, DeviceError, Frame, LiveAck, LiveCommandId,
+    PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT,
+    SampleBuffer, SampleSlot, Telemetry,
 };
-use sampler_core::{PadId, PadSettings};
+use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
 pub trait AudioPort {
     fn sample_rate(&self) -> u32;
@@ -36,6 +37,44 @@ pub trait AudioPort {
     fn release_live(&mut self, pad: PadId) -> Result<(), String> {
         let at = self.render_horizon().saturating_add(64);
         self.release(pad, at)
+    }
+    fn trigger_live_tracked(
+        &mut self,
+        _pad: PadId,
+        _velocity: f32,
+    ) -> Result<LiveCommandId, String> {
+        Err("tracked live audio is unsupported".into())
+    }
+    fn release_live_tracked(&mut self, _pad: PadId) -> Result<LiveCommandId, String> {
+        Err("tracked live audio is unsupported".into())
+    }
+    fn install_pattern(
+        &mut self,
+        _snapshot: Arc<PatternSnapshot>,
+    ) -> Result<PatternSnapshotSlot, String> {
+        Err("pattern audio is unsupported".into())
+    }
+    fn select_pattern(
+        &mut self,
+        _slot: PatternSlotId,
+        _switch: PatternSwitch,
+    ) -> Result<(), String> {
+        Err("pattern audio is unsupported".into())
+    }
+    fn play_pattern(&mut self) -> Result<(), String> {
+        Err("pattern audio is unsupported".into())
+    }
+    fn stop_pattern(&mut self) -> Result<(), String> {
+        Err("pattern audio is unsupported".into())
+    }
+    fn set_record_capture(&mut self, _capture: Option<(PatternSlotId, u64)>) -> Result<(), String> {
+        Err("pattern audio is unsupported".into())
+    }
+    fn drain_live_acks(&mut self, _output: &mut [LiveAck]) -> usize {
+        0
+    }
+    fn reclaim_retired_patterns(&mut self) -> usize {
+        0
     }
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String>;
     fn stop_all(&mut self) -> Result<(), String>;
@@ -76,6 +115,35 @@ trait SessionLike {
         let at = self.render_horizon().saturating_add(64);
         self.release(pad, at)
     }
+    fn trigger_live_tracked(
+        &mut self,
+        pad: PadId,
+        velocity: f32,
+    ) -> Result<LiveCommandId, Self::CommandError>;
+    fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, Self::CommandError>;
+    fn install_pattern(
+        &mut self,
+        snapshot: Arc<PatternSnapshot>,
+    ) -> Result<PatternSnapshotSlot, Self::CommandError>;
+    fn select_pattern(
+        &mut self,
+        slot: PatternSlotId,
+        switch: PatternSwitch,
+    ) -> Result<(), Self::CommandError>;
+    fn play_pattern(&mut self) -> Result<(), Self::CommandError>;
+    fn stop_pattern(&mut self) -> Result<(), Self::CommandError>;
+    fn set_record_capture(
+        &mut self,
+        capture: Option<(PatternSlotId, u64)>,
+    ) -> Result<(), Self::CommandError>;
+    fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize;
+    fn reclaim_retired_pattern(&mut self) -> Option<PatternSnapshotSlot>;
+    // The adapter consumes exact tokens above so it can ignore stale retirements.
+    #[expect(
+        dead_code,
+        reason = "the count-only controller boundary is retained for SessionLike parity"
+    )]
+    fn reclaim_retired_patterns(&mut self) -> usize;
     fn stop_pad(&mut self, pad: PadId) -> Result<(), Self::CommandError>;
     fn stop_all(&mut self) -> Result<(), Self::CommandError>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), Self::CommandError>;
@@ -138,6 +206,64 @@ impl SessionLike for AudioSession {
         self.controller_mut().release_live(pad)
     }
 
+    fn trigger_live_tracked(
+        &mut self,
+        pad: PadId,
+        velocity: f32,
+    ) -> Result<LiveCommandId, Self::CommandError> {
+        self.controller_mut().trigger_live_tracked(pad, velocity)
+    }
+
+    fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, Self::CommandError> {
+        self.controller_mut().release_live_tracked(pad)
+    }
+
+    fn install_pattern(
+        &mut self,
+        snapshot: Arc<PatternSnapshot>,
+    ) -> Result<PatternSnapshotSlot, Self::CommandError> {
+        self.controller_mut().install_pattern(snapshot)
+    }
+
+    fn select_pattern(
+        &mut self,
+        slot: PatternSlotId,
+        switch: PatternSwitch,
+    ) -> Result<(), Self::CommandError> {
+        self.controller_mut().select_pattern(slot, switch)
+    }
+
+    fn play_pattern(&mut self) -> Result<(), Self::CommandError> {
+        self.controller_mut().play_pattern()
+    }
+
+    fn stop_pattern(&mut self) -> Result<(), Self::CommandError> {
+        self.controller_mut().stop_pattern()
+    }
+
+    fn set_record_capture(
+        &mut self,
+        capture: Option<(PatternSlotId, u64)>,
+    ) -> Result<(), Self::CommandError> {
+        self.controller_mut().set_record_capture(capture)
+    }
+
+    fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
+        self.controller_mut().drain_live_acks(output)
+    }
+
+    fn reclaim_retired_pattern(&mut self) -> Option<PatternSnapshotSlot> {
+        self.controller_mut().reclaim_retired_pattern()
+    }
+
+    fn reclaim_retired_patterns(&mut self) -> usize {
+        let mut reclaimed = 0;
+        while self.reclaim_retired_pattern().is_some() {
+            reclaimed += 1;
+        }
+        reclaimed
+    }
+
     fn stop_pad(&mut self, pad: PadId) -> Result<(), Self::CommandError> {
         self.controller_mut().stop_pad(pad)
     }
@@ -170,6 +296,8 @@ impl SessionLike for AudioSession {
 pub struct SessionAudioPort<S = AudioSession> {
     session: Option<RefCell<S>>,
     retained_samples: [Option<Arc<SampleBuffer>>; SAMPLE_SLOT_COUNT],
+    retained_patterns: [Option<Arc<PatternSnapshot>>; PATTERN_SNAPSHOT_SLOT_COUNT],
+    retained_pattern_slots: [Option<PatternSnapshotSlot>; PATTERN_SNAPSHOT_SLOT_COUNT],
 }
 
 impl<S> SessionAudioPort<S> {
@@ -177,6 +305,8 @@ impl<S> SessionAudioPort<S> {
         Self {
             session: Some(RefCell::new(session)),
             retained_samples: array::from_fn(|_| None),
+            retained_patterns: array::from_fn(|_| None),
+            retained_pattern_slots: array::from_fn(|_| None),
         }
     }
 
@@ -197,6 +327,9 @@ impl<S> SessionAudioPort<S> {
 impl<S> Drop for SessionAudioPort<S> {
     fn drop(&mut self) {
         drop(self.session.take());
+        self.retained_samples.fill(None);
+        self.retained_patterns.fill(None);
+        self.retained_pattern_slots.fill(None);
     }
 }
 
@@ -270,6 +403,73 @@ where
             .map_err(|error| error.to_string())
     }
 
+    fn trigger_live_tracked(&mut self, pad: PadId, velocity: f32) -> Result<LiveCommandId, String> {
+        self.session_mut()
+            .trigger_live_tracked(pad, velocity)
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, String> {
+        self.session_mut()
+            .release_live_tracked(pad)
+            .map_err(|error| error.to_string())
+    }
+
+    fn install_pattern(
+        &mut self,
+        snapshot: Arc<PatternSnapshot>,
+    ) -> Result<PatternSnapshotSlot, String> {
+        let retained = Arc::clone(&snapshot);
+        let owner_slot = self
+            .session_mut()
+            .install_pattern(snapshot)
+            .map_err(|error| error.to_string())?;
+        self.retained_patterns[owner_slot.index()] = Some(retained);
+        self.retained_pattern_slots[owner_slot.index()] = Some(owner_slot);
+        Ok(owner_slot)
+    }
+
+    fn select_pattern(&mut self, slot: PatternSlotId, switch: PatternSwitch) -> Result<(), String> {
+        self.session_mut()
+            .select_pattern(slot, switch)
+            .map_err(|error| error.to_string())
+    }
+
+    fn play_pattern(&mut self) -> Result<(), String> {
+        self.session_mut()
+            .play_pattern()
+            .map_err(|error| error.to_string())
+    }
+
+    fn stop_pattern(&mut self) -> Result<(), String> {
+        self.session_mut()
+            .stop_pattern()
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_record_capture(&mut self, capture: Option<(PatternSlotId, u64)>) -> Result<(), String> {
+        self.session_mut()
+            .set_record_capture(capture)
+            .map_err(|error| error.to_string())
+    }
+
+    fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
+        self.session_mut().drain_live_acks(output)
+    }
+
+    fn reclaim_retired_patterns(&mut self) -> usize {
+        let mut reclaimed = 0;
+        while let Some(owner_slot) = self.session_mut().reclaim_retired_pattern() {
+            let index = owner_slot.index();
+            if self.retained_pattern_slots[index] == Some(owner_slot) {
+                self.retained_patterns[index] = None;
+                self.retained_pattern_slots[index] = None;
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String> {
         self.session_mut()
             .stop_pad(pad)
@@ -327,8 +527,14 @@ mod tests {
     use std::sync::{Arc, Weak};
     use std::thread::ThreadId;
 
-    use sampler_audio::{ControlError, SampleBuffer, SampleSlot, Telemetry};
-    use sampler_core::{PadId, PadSettings};
+    use sampler_audio::{
+        ControlError, LiveAck, LiveCommandId, PatternRetirement, PatternSnapshotSlot,
+        PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+    };
+    use sampler_core::{
+        EditablePattern, Meter, PadId, PadSettings, PatternSlotId, PatternSnapshot, Resolution,
+        Tempo, Transport,
+    };
 
     use super::{AudioPort, SessionAudioPort, SessionLike};
 
@@ -341,11 +547,28 @@ mod tests {
         retired: usize,
         retired_slots: VecDeque<SampleSlot>,
         ownership: Option<OwnershipProbe>,
+        pattern_calls: Vec<PatternCall>,
+        snapshot_ownership: Option<SnapshotOwnershipProbe>,
+        next_pattern_slot: Option<PatternSnapshotSlot>,
+        retired_pattern_slots: VecDeque<PatternSnapshotSlot>,
     }
 
     #[derive(Clone)]
     struct OwnershipProbe {
         installed: Rc<RefCell<Vec<Weak<SampleBuffer>>>>,
+        session_drop: Rc<RefCell<Vec<(ThreadId, bool)>>>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum PatternCall {
+        TrackedTrigger(LiveCommandId, PadId),
+        Select(PatternSlotId, PatternSwitch),
+        Play,
+    }
+
+    #[derive(Clone)]
+    struct SnapshotOwnershipProbe {
+        installed: Rc<RefCell<Vec<Weak<PatternSnapshot>>>>,
         session_drop: Rc<RefCell<Vec<(ThreadId, bool)>>>,
     }
 
@@ -360,6 +583,10 @@ mod tests {
                 retired: 0,
                 retired_slots: VecDeque::new(),
                 ownership: None,
+                pattern_calls: Vec::new(),
+                snapshot_ownership: None,
+                next_pattern_slot: None,
+                retired_pattern_slots: VecDeque::new(),
             }
         }
 
@@ -393,6 +620,25 @@ mod tests {
             self.ownership = Some(ownership);
             self
         }
+
+        fn with_snapshot_ownership_probe(mut self, ownership: SnapshotOwnershipProbe) -> Self {
+            self.snapshot_ownership = Some(ownership);
+            self
+        }
+
+        fn with_pattern_snapshot_slot(mut self, slot: PatternSnapshotSlot) -> Self {
+            self.next_pattern_slot = Some(slot);
+            self
+        }
+
+        fn with_retired_pattern_slot(mut self, slot: PatternSnapshotSlot) -> Self {
+            self.retired_pattern_slots.push_back(slot);
+            self
+        }
+
+        fn pattern_calls(&self) -> &[PatternCall] {
+            &self.pattern_calls
+        }
     }
 
     impl Drop for FakeSession {
@@ -403,6 +649,17 @@ mod tests {
                     .borrow()
                     .iter()
                     .all(|sample| sample.upgrade().is_some());
+                ownership
+                    .session_drop
+                    .borrow_mut()
+                    .push((std::thread::current().id(), owners_alive));
+            }
+            if let Some(ownership) = &self.snapshot_ownership {
+                let owners_alive = ownership
+                    .installed
+                    .borrow()
+                    .iter()
+                    .all(|snapshot| snapshot.upgrade().is_some());
                 ownership
                     .session_drop
                     .borrow_mut()
@@ -458,6 +715,77 @@ mod tests {
             Ok(())
         }
 
+        fn trigger_live_tracked(
+            &mut self,
+            pad: PadId,
+            _velocity: f32,
+        ) -> Result<LiveCommandId, Self::CommandError> {
+            let id = LiveCommandId::FIRST;
+            self.pattern_calls
+                .push(PatternCall::TrackedTrigger(id, pad));
+            Ok(id)
+        }
+
+        fn release_live_tracked(
+            &mut self,
+            _pad: PadId,
+        ) -> Result<LiveCommandId, Self::CommandError> {
+            Ok(LiveCommandId::FIRST)
+        }
+
+        fn install_pattern(
+            &mut self,
+            snapshot: Arc<PatternSnapshot>,
+        ) -> Result<PatternSnapshotSlot, Self::CommandError> {
+            if let Some(ownership) = &self.snapshot_ownership {
+                ownership
+                    .installed
+                    .borrow_mut()
+                    .push(Arc::downgrade(&snapshot));
+            }
+            Ok(self
+                .next_pattern_slot
+                .take()
+                .expect("test session needs an exact pattern snapshot slot"))
+        }
+
+        fn select_pattern(
+            &mut self,
+            slot: PatternSlotId,
+            switch: PatternSwitch,
+        ) -> Result<(), Self::CommandError> {
+            self.pattern_calls.push(PatternCall::Select(slot, switch));
+            Ok(())
+        }
+
+        fn play_pattern(&mut self) -> Result<(), Self::CommandError> {
+            self.pattern_calls.push(PatternCall::Play);
+            Ok(())
+        }
+
+        fn stop_pattern(&mut self) -> Result<(), Self::CommandError> {
+            Ok(())
+        }
+
+        fn set_record_capture(
+            &mut self,
+            _capture: Option<(PatternSlotId, u64)>,
+        ) -> Result<(), Self::CommandError> {
+            Ok(())
+        }
+
+        fn drain_live_acks(&mut self, _output: &mut [LiveAck]) -> usize {
+            0
+        }
+
+        fn reclaim_retired_patterns(&mut self) -> usize {
+            0
+        }
+
+        fn reclaim_retired_pattern(&mut self) -> Option<PatternSnapshotSlot> {
+            self.retired_pattern_slots.pop_front()
+        }
+
         fn stop_pad(&mut self, _pad: PadId) -> Result<(), Self::CommandError> {
             Ok(())
         }
@@ -506,7 +834,123 @@ mod tests {
             late_commands: 0,
             invalid_commands: 0,
             command_overflows: 0,
+            pattern_slot: None,
+            pattern_generation: None,
+            pattern_playing: false,
+            pattern_recording: false,
+            pattern_origin: None,
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
         }
+    }
+
+    fn pattern_slot(slot: u8) -> PatternSlotId {
+        PatternSlotId::new(slot).unwrap()
+    }
+
+    fn snapshot() -> Arc<PatternSnapshot> {
+        let transport = Transport::new(
+            48_000,
+            Tempo::new(120.0).unwrap(),
+            Meter::new(4, 4).unwrap(),
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap();
+        Arc::new(
+            EditablePattern::new(pattern_slot(0), "Pattern", transport)
+                .unwrap()
+                .compile()
+                .unwrap(),
+        )
+    }
+
+    fn pattern_snapshot_slot() -> PatternSnapshotSlot {
+        let (mut controller, _ports) = audio_channels();
+        controller.install_pattern(snapshot()).unwrap()
+    }
+
+    fn reused_pattern_snapshot_slots() -> (PatternSnapshotSlot, PatternSnapshotSlot) {
+        let (mut controller, mut ports) = audio_channels();
+        let first_snapshot = snapshot();
+        let first = controller
+            .install_pattern(Arc::clone(&first_snapshot))
+            .unwrap();
+        drop(ports.immediate_commands.pop().unwrap());
+        ports
+            .pattern_retirements
+            .push(PatternRetirement::new(first, first_snapshot))
+            .unwrap();
+        assert_eq!(controller.reclaim_retired_pattern(), Some(first));
+        let second = controller.install_pattern(snapshot()).unwrap();
+        (first, second)
+    }
+
+    #[test]
+    fn tracked_live_and_pattern_methods_delegate_without_horizon_math() {
+        let session = FakeSession::ready(48_000, 2);
+        let mut port = SessionAudioPort::new(session);
+
+        let id = port.trigger_live_tracked(PadId::first(), 1.0).unwrap();
+        port.select_pattern(pattern_slot(3), PatternSwitch::NextBoundary)
+            .unwrap();
+        port.play_pattern().unwrap();
+
+        assert_eq!(
+            port.session().borrow().pattern_calls(),
+            [
+                PatternCall::TrackedTrigger(id, PadId::first()),
+                PatternCall::Select(pattern_slot(3), PatternSwitch::NextBoundary),
+                PatternCall::Play,
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_snapshot_outlives_session_and_drops_on_adapter_thread() {
+        let installed = Rc::new(RefCell::new(Vec::new()));
+        let session_drop = Rc::new(RefCell::new(Vec::new()));
+        let probe = SnapshotOwnershipProbe {
+            installed: Rc::clone(&installed),
+            session_drop: Rc::clone(&session_drop),
+        };
+        let session = FakeSession::ready(48_000, 2)
+            .with_snapshot_ownership_probe(probe)
+            .with_pattern_snapshot_slot(pattern_snapshot_slot());
+        let mut port = SessionAudioPort::new(session);
+        let snapshot = snapshot();
+        let weak = Arc::downgrade(&snapshot);
+
+        port.install_pattern(Arc::clone(&snapshot)).unwrap();
+        drop(snapshot);
+        assert!(weak.upgrade().is_some());
+
+        let ui_thread = std::thread::current().id();
+        drop(port);
+
+        assert_eq!(*session_drop.borrow(), [(ui_thread, true)]);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn stale_pattern_retirement_does_not_clear_a_reused_owner_slot() {
+        let (stale, current) = reused_pattern_snapshot_slots();
+        assert_eq!(stale.index(), current.index());
+        assert_ne!(stale, current);
+        let session = FakeSession::ready(48_000, 2)
+            .with_pattern_snapshot_slot(current)
+            .with_retired_pattern_slot(stale);
+        let mut port = SessionAudioPort::new(session);
+        let snapshot = snapshot();
+        let weak = Arc::downgrade(&snapshot);
+
+        port.install_pattern(Arc::clone(&snapshot)).unwrap();
+        drop(snapshot);
+        assert_eq!(port.reclaim_retired_patterns(), 0);
+        assert!(port.session().borrow().retired_pattern_slots.is_empty());
+        assert!(weak.upgrade().is_some());
     }
 
     #[test]

@@ -3,11 +3,14 @@ use std::fmt;
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
-use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, SampleEditRecipe};
+use sampler_core::{
+    BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, ProjectId, SampleEditRecipe,
+};
 
 use crate::PatternSwitch;
 use crate::audio::{AudioPort, open_default_audio};
@@ -19,6 +22,8 @@ use crate::loader::{
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
+use crate::project_session::{ProjectSession, ProjectSnapshotError};
+use crate::project_store::{ProjectSavePad, ProjectSaveSnapshot, SourceFingerprint};
 use crate::sample_editor::{
     SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent, SampleMarker,
 };
@@ -117,6 +122,7 @@ pub enum SampleEditRequestError {
     NoUndo,
     RecoveryPending,
     GenerationExhausted,
+    ProjectRevisionExhausted,
 }
 
 impl fmt::Display for SampleEditRequestError {
@@ -132,6 +138,7 @@ impl fmt::Display for SampleEditRequestError {
                 formatter.write_str("sample is waiting for device-rate recovery")
             }
             Self::GenerationExhausted => formatter.write_str("sample edit generation is exhausted"),
+            Self::ProjectRevisionExhausted => formatter.write_str("project revision is exhausted"),
         }
     }
 }
@@ -171,6 +178,7 @@ struct SampleEditCheckpoint {
 struct SampleCommit {
     base: Option<Arc<SampleBuffer>>,
     source_generation: u64,
+    fingerprint: Option<SourceFingerprint>,
     recipe: SampleEditRecipe,
     base_preview: Option<EditPreview>,
     rendered_preview: Option<EditPreview>,
@@ -181,6 +189,7 @@ impl Default for SampleCommit {
         Self {
             base: None,
             source_generation: 0,
+            fingerprint: None,
             recipe: SampleEditRecipe::identity(),
             base_preview: None,
             rendered_preview: None,
@@ -266,6 +275,7 @@ pub struct App {
     pattern_submission_count: usize,
     pending_pattern_transport: Option<PendingPatternTransport>,
     should_quit: bool,
+    project_session: ProjectSession,
 }
 
 impl App {
@@ -347,6 +357,12 @@ impl App {
             pattern_submission_count: 0,
             pending_pattern_transport: None,
             should_quit: false,
+            project_session: ProjectSession::new(
+                ProjectId::from_bytes([0; 16]),
+                None,
+                "Untitled",
+                0,
+            ),
         }
     }
 
@@ -478,6 +494,75 @@ impl App {
         (self.meter_left, self.meter_right)
     }
 
+    pub fn project_revision(&self) -> u64 {
+        self.project_session.current_revision()
+    }
+
+    pub fn project_snapshot(&self) -> Result<ProjectSaveSnapshot, ProjectSnapshotError> {
+        if let Some(operation) = self.project_session.in_flight() {
+            return Err(ProjectSnapshotError::PendingProjectOperation(
+                operation.token,
+            ));
+        }
+        if self.editor.is_dirty() {
+            return Err(ProjectSnapshotError::DirtySampleDraft(self.editor.pad()));
+        }
+        let mut pads = Vec::with_capacity(PAD_VIEW_COUNT);
+        for offset in 0..PAD_VIEW_COUNT {
+            let pad = pad_from_offset(offset);
+            if self.pending_loads[offset].is_some()
+                || self.committed_recovery_loads[offset].is_some()
+            {
+                return Err(ProjectSnapshotError::PendingSampleLoad(pad));
+            }
+            if self.sample_editor.pending[offset].is_some() {
+                return Err(ProjectSnapshotError::PendingSampleEdit(pad));
+            }
+            if self.pads[offset].sample.is_none() {
+                continue;
+            }
+            let Some(source_path) = self.pads[offset].source.clone() else {
+                return Err(ProjectSnapshotError::UnresolvedSample(pad));
+            };
+            let Some(fingerprint) = self.sample_editor.commits[offset].fingerprint else {
+                return Err(ProjectSnapshotError::UnresolvedSample(pad));
+            };
+            pads.push(ProjectSavePad {
+                pad,
+                source_path,
+                source_generation: self.sample_editor.commits[offset].source_generation,
+                fingerprint,
+                settings: self.pads[offset].settings,
+                recipe: self.sample_editor.commits[offset].recipe,
+            });
+        }
+        let patterns = self
+            .patterns
+            .export_project_patterns()
+            .map_err(|error| ProjectSnapshotError::InvalidPatterns(error.to_string()))?;
+        Ok(ProjectSaveSnapshot {
+            project_id: self.project_session.project_id(),
+            name: self.project_session.name().to_owned(),
+            revision: self.project_session.current_revision(),
+            pads,
+            patterns,
+        })
+    }
+
+    pub fn discard_sample_draft(&mut self) {
+        self.editor.confirm_discard();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editor_mut_for_test(&mut self) -> &mut SampleEditor {
+        &mut self.editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn patterns_mut_for_test(&mut self) -> &mut PatternWorkspace {
+        &mut self.patterns
+    }
+
     pub fn tick(&mut self) {
         const METER_DECAY: f32 = 0.85;
 
@@ -517,13 +602,24 @@ impl App {
             if let Some(telemetry) = telemetry {
                 changed |= self.apply_telemetry(telemetry);
             }
+            let recording_mutation_budget = usize::try_from(
+                crate::MAX_PROJECT_REVISION.saturating_sub(self.project_revision()),
+            )
+            .unwrap_or(usize::MAX);
             let maintenance = {
                 let audio = self
                     .audio
                     .as_mut()
                     .expect("audio remains present after a successful poll");
-                self.patterns.maintain(audio.as_mut(), self.telemetry)
+                self.patterns.maintain_with_recording_budget(
+                    audio.as_mut(),
+                    self.telemetry,
+                    recording_mutation_budget,
+                )
             };
+            for _ in 0..maintenance.committed_mutations {
+                self.commit_project_mutation();
+            }
             changed |= maintenance.reclaimed_snapshots > 0
                 || maintenance.drained_acks > 0
                 || maintenance.compiled_slot.is_some()
@@ -624,6 +720,12 @@ impl App {
             self.sample_editor.pending[offset] = Some(pending);
             return false;
         };
+        if let Err(error) = self.ensure_project_mutation_available() {
+            pending.phase = PendingEditPhase::Ready(rendered);
+            self.sample_editor.pending[offset] = Some(pending);
+            self.status = error;
+            return true;
+        }
         let Some(audio) = self.audio.as_mut() else {
             pending.phase = PendingEditPhase::Ready(rendered);
             self.sample_editor.pending[offset] = Some(pending);
@@ -701,6 +803,7 @@ impl App {
             }
             self.sync_editor_to_selected_pad();
         }
+        self.commit_project_mutation();
         true
     }
 
@@ -713,12 +816,29 @@ impl App {
     pub fn update_pad_settings(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
         settings.validate().map_err(|error| error.to_string())?;
         let offset = pad_offset(pad);
+        if self.pads[offset].settings == settings {
+            return Ok(());
+        }
+        self.ensure_project_mutation_available()?;
         let bound_in_current_session = self.current_session_bound[offset];
         if bound_in_current_session && let Some(audio) = self.audio.as_mut() {
             audio.update_pad(pad, settings)?;
         }
         self.pads[offset].settings = settings;
+        self.commit_project_mutation();
         Ok(())
+    }
+
+    fn ensure_project_mutation_available(&self) -> Result<(), String> {
+        self.project_session
+            .ensure_mutation_available()
+            .map_err(|_| "project revision is exhausted".to_owned())
+    }
+
+    fn commit_project_mutation(&mut self) {
+        self.project_session
+            .commit_project_mutation(Instant::now(), || Ok::<(), ()>(()))
+            .expect("project mutation was preflighted before its domain commit");
     }
 
     pub fn overlay(&self) -> Option<&Overlay> {
@@ -958,6 +1078,10 @@ impl App {
     }
 
     pub fn begin_load(&mut self, pad: PadId, path: impl Into<PathBuf>) -> Option<WorkerRequest> {
+        if let Err(error) = self.ensure_project_mutation_available() {
+            self.status = error;
+            return None;
+        }
         let path = path.into();
         let engine_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
         let offset = pad_offset(pad);
@@ -1029,6 +1153,9 @@ impl App {
         else {
             return Err(SampleEditRequestError::EmptyPad);
         };
+        self.project_session
+            .ensure_mutation_available()
+            .map_err(|_| SampleEditRequestError::ProjectRevisionExhausted)?;
         self.start_sample_edit(offset, base, base_preview, recipe, PendingEditKind::Apply)
     }
 
@@ -1068,6 +1195,9 @@ impl App {
         } else {
             return Err(SampleEditRequestError::EmptyPad);
         };
+        self.project_session
+            .ensure_mutation_available()
+            .map_err(|_| SampleEditRequestError::ProjectRevisionExhausted)?;
         self.start_sample_edit(
             offset,
             base,
@@ -2303,9 +2433,17 @@ impl App {
         &mut self,
         edit: impl FnOnce(&mut PatternWorkspace) -> Result<(), sampler_core::PatternEditError>,
     ) {
+        if let Err(error) = self.ensure_project_mutation_available() {
+            self.status = error;
+            return;
+        }
+        let generation = self.patterns.selected_pattern().generation();
         if let Err(error) = edit(&mut self.patterns) {
             self.status = error.to_string();
         } else {
+            if self.patterns.selected_pattern().generation() != generation {
+                self.commit_project_mutation();
+            }
             self.overlay = None;
         }
     }
@@ -2760,13 +2898,13 @@ impl App {
             *self.pending_load_slot_mut(offset, kind) = Some(pending);
             return;
         };
-        let Some(audio) = self.audio.as_mut() else {
+        let Some(audio_sample_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
             pending.phase = PendingLoadPhase::Ready(loaded);
             *self.pending_load_slot_mut(offset, kind) = Some(pending);
             self.pads[offset].state = PadLoadState::WaitingForDevice;
             return;
         };
-        if loaded.rendered.sample_rate() != audio.sample_rate() {
+        if loaded.rendered.sample_rate() != audio_sample_rate {
             pending.phase = PendingLoadPhase::AwaitingWorker;
             *self.pending_load_slot_mut(offset, kind) = Some(pending);
             self.pads[offset].state = PadLoadState::Loading;
@@ -2774,8 +2912,20 @@ impl App {
             return;
         }
 
+        if kind == PendingLoadKind::User
+            && let Err(error) = self.ensure_project_mutation_available()
+        {
+            pending.phase = PendingLoadPhase::Ready(loaded);
+            *self.pending_load_slot_mut(offset, kind) = Some(pending);
+            self.pads[offset].state = PadLoadState::Error(error.clone());
+            self.status = error;
+            self.refresh_editor_for_offset(offset);
+            return;
+        }
+
         let pad = pad_from_offset(offset);
         let settings = self.pads[offset].settings;
+        let audio = self.audio.as_mut().expect("audio availability was checked");
         let install_result = match pending.kind {
             PendingLoadKind::User => audio.install(pad, Arc::clone(&loaded.rendered), settings),
             PendingLoadKind::Recovery => {
@@ -2803,6 +2953,7 @@ impl App {
         view.source = Some(pending.path);
         if kind == PendingLoadKind::User {
             self.sample_editor.commits[offset].source_generation = view.generation;
+            self.sample_editor.commits[offset].fingerprint = Some(loaded.fingerprint);
         }
         self.sample_editor.commits[offset].base = Some(loaded.base);
         self.sample_editor.commits[offset].recipe = loaded.recipe;
@@ -2825,6 +2976,9 @@ impl App {
         };
         self.status = format!("{action} {}", label.to_uppercase());
         self.refresh_editor_for_offset(offset);
+        if kind == PendingLoadKind::User {
+            self.commit_project_mutation();
+        }
     }
 
     fn reinstall_committed_sample(&mut self, offset: usize) {
@@ -3014,7 +3168,8 @@ mod tests {
     use super::{
         App, EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, SampleEditStatus,
     };
-    use crate::pattern::WorkspaceView;
+    use crate::pattern::{PatternWorkspace, WorkspaceView};
+    use crate::project_session::ProjectSnapshotError;
 
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
@@ -6810,5 +6965,236 @@ mod tests {
         }
 
         assert_eq!(app.sample_editor().draft().frame_range(7).unwrap(), 2..5);
+    }
+
+    fn project_app() -> App {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "project.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded_with_frames(
+            pad,
+            generation,
+            "project.wav",
+            48_000,
+            7,
+        )));
+        app.patterns.set_view(WorkspaceView::Sample);
+        app.sync_editor_to_selected_pad();
+        app
+    }
+
+    #[test]
+    fn project_revision_advances_only_for_committed_mutations() {
+        let mut app = project_app();
+        assert_eq!(app.project_revision(), 1);
+
+        let revision = app.project_revision();
+        app.patterns.toggle_view();
+        app.patterns.select_slot(PatternSlotId::new(1).unwrap());
+        app.patterns.move_cursor_steps(1);
+        app.apply_telemetry(app.telemetry());
+        assert_eq!(app.project_revision(), revision);
+
+        app.patterns.select_slot(PatternSlotId::new(0).unwrap());
+        for edit in [
+            |patterns: &mut PatternWorkspace| patterns.toggle_step(),
+            |patterns: &mut PatternWorkspace| patterns.toggle_step(),
+            |patterns: &mut PatternWorkspace| {
+                patterns.set_tempo(sampler_core::Tempo::new(124.0).unwrap())
+            },
+            |patterns: &mut PatternWorkspace| patterns.set_bars(2),
+            |patterns: &mut PatternWorkspace| {
+                patterns.set_resolution(sampler_core::Resolution::Eighth)
+            },
+            |patterns: &mut PatternWorkspace| patterns.set_swing(0.6),
+            |patterns: &mut PatternWorkspace| patterns.set_quantize(0.5),
+            |patterns: &mut PatternWorkspace| patterns.clear_selected(),
+            |patterns: &mut PatternWorkspace| patterns.undo_clear(),
+        ] {
+            let before = app.project_revision();
+            app.apply_pattern_edit(edit);
+            assert_eq!(app.project_revision(), before + 1);
+        }
+
+        let before = app.project_revision();
+        let settings = PadSettings {
+            gain_db: -3.0,
+            ..PadSettings::default()
+        };
+        app.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_update_once("settings rejected"),
+        ));
+        assert!(app.update_pad_settings(pad(0, 0), settings).is_err());
+        assert_eq!(app.project_revision(), before);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2)));
+        app.update_pad_settings(pad(0, 0), settings).unwrap();
+        assert_eq!(app.project_revision(), before + 1);
+    }
+
+    #[test]
+    fn admitted_apply_and_undo_each_advance_one_project_revision() {
+        let mut app = project_app();
+        let pad = pad(0, 0);
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+
+        let before_apply = app.project_revision();
+        app.request_sample_edit(pad, recipe).unwrap();
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::EditSample { generation, .. }] = requests.as_slice() else {
+            panic!("expected apply edit request");
+        };
+        assert!(app.apply_worker_result(edited(
+            &app,
+            pad,
+            *generation,
+            recipe,
+            48_000,
+            vec![-0.4, 0.4],
+        )));
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), before_apply + 1);
+
+        let before_undo = app.project_revision();
+        app.undo_sample_edit(pad).unwrap();
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::EditSample {
+                generation,
+                recipe: undo_recipe,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected undo edit request");
+        };
+        assert!(app.apply_worker_result(edited(
+            &app,
+            pad,
+            *generation,
+            *undo_recipe,
+            48_000,
+            vec![0.25, -0.25],
+        )));
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), before_undo + 1);
+    }
+
+    #[test]
+    fn snapshot_refuses_dirty_or_pending_sample_state_and_uses_editable_patterns() {
+        let mut app = project_app();
+        app.editor_mut_for_test().move_marker(1, false);
+        assert_eq!(
+            app.project_snapshot(),
+            Err(ProjectSnapshotError::DirtySampleDraft(pad(0, 0)))
+        );
+
+        app.discard_sample_draft();
+        app.patterns_mut_for_test().toggle_step().unwrap();
+        assert_eq!(app.project_snapshot().unwrap().patterns[0].events.len(), 1);
+
+        let pending_pad = pad(0, 1);
+        let _ = app.begin_load(pending_pad, "pending.wav");
+        assert_eq!(
+            app.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleLoad(pending_pad))
+        );
+    }
+
+    #[test]
+    fn rejected_audio_admission_keeps_tuple_and_revision_exact() {
+        let mut app = project_app();
+        let pad = pad(0, 0);
+        let offset = super::pad_offset(pad);
+        let before_revision = app.project_revision();
+        let before_source = app.pads[offset].source.clone();
+        let before_generation = app.sample_editor.commits[offset].source_generation;
+        let before_recipe = app.sample_editor.commits[offset].recipe;
+        let before_fingerprint = app.sample_editor.commits[offset].fingerprint;
+        let before_settings = app.pads[offset].settings;
+
+        app.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_install("install rejected"),
+        ));
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "replacement.wav").unwrap()
+        else {
+            panic!("expected replacement request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "replacement.wav")));
+
+        assert_eq!(app.project_revision(), before_revision);
+        assert_eq!(app.pads[offset].source, before_source);
+        assert_eq!(
+            app.sample_editor.commits[offset].source_generation,
+            before_generation
+        );
+        assert_eq!(app.sample_editor.commits[offset].recipe, before_recipe);
+        assert_eq!(
+            app.sample_editor.commits[offset].fingerprint,
+            before_fingerprint
+        );
+        assert_eq!(app.pads[offset].settings, before_settings);
+    }
+
+    #[test]
+    fn snapshot_refuses_an_exact_pending_project_operation() {
+        let mut app = project_app();
+        let token = crate::ProjectToken::new(77);
+        app.project_session
+            .set_in_flight(Some(crate::ProjectOperationDescriptor {
+                token,
+                kind: crate::SaveKind::Explicit,
+                project_id: app.project_session.project_id(),
+                directory: "project".into(),
+                revision: app.project_revision(),
+            }));
+
+        assert_eq!(
+            app.project_snapshot(),
+            Err(ProjectSnapshotError::PendingProjectOperation(token))
+        );
+    }
+
+    #[test]
+    fn exhausted_revision_refuses_mutation_without_partial_state_change() {
+        let mut app = project_app();
+        app.project_session
+            .set_current_revision_for_test(i64::MAX as u64);
+        let before_settings = app.pad(pad(0, 0)).settings;
+        let before_generation = app.pad(pad(0, 0)).generation;
+        let before_pattern = app.patterns.export_project_patterns().unwrap();
+
+        let settings = PadSettings {
+            gain_db: -6.0,
+            ..before_settings
+        };
+        assert!(app.update_pad_settings(pad(0, 0), settings).is_err());
+        app.apply_pattern_edit(|patterns| patterns.toggle_step());
+        assert!(app.begin_load(pad(0, 0), "refused.wav").is_none());
+        assert_eq!(
+            app.request_sample_edit(
+                pad(0, 0),
+                SampleEditRecipe {
+                    reversed: true,
+                    ..SampleEditRecipe::identity()
+                }
+            ),
+            Err(super::SampleEditRequestError::ProjectRevisionExhausted)
+        );
+
+        assert_eq!(app.pad(pad(0, 0)).settings, before_settings);
+        assert_eq!(app.pad(pad(0, 0)).generation, before_generation);
+        assert_eq!(
+            app.patterns.export_project_patterns().unwrap(),
+            before_pattern
+        );
+        assert_eq!(app.project_revision(), i64::MAX as u64);
     }
 }

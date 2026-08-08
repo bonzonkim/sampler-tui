@@ -7,7 +7,7 @@ mod tests {
         PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, TransportStamp,
         audio_channels_with_test_capacities,
     };
-    use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
+    use sampler_core::{PATTERN_SLOT_COUNT, PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
     use crate::AudioPort;
 
@@ -806,6 +806,85 @@ mod tests {
         assert!(workspace.pattern_for_generation(slot, 0).is_none());
         assert!(workspace.pattern_for_generation(slot, 1).is_some());
     }
+
+    #[test]
+    fn project_pattern_export_uses_all_sixteen_editable_slots() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.toggle_step().unwrap();
+
+        let exported = workspace.export_project_patterns().unwrap();
+
+        assert_eq!(exported.len(), PATTERN_SLOT_COUNT);
+        assert_eq!(exported[0].slot, PatternSlotId::new(0).unwrap());
+        assert_eq!(exported[0].events.len(), 1);
+        assert_eq!(exported[15].slot, PatternSlotId::new(15).unwrap());
+    }
+
+    #[test]
+    fn project_pattern_replace_is_atomic_and_resets_transient_state() {
+        let mut workspace = recording_workspace();
+        workspace.toggle_step().unwrap();
+        let before = workspace.export_project_patterns().unwrap();
+        let mut invalid = before.clone();
+        invalid[7].name.clear();
+
+        assert!(workspace.replace_project_patterns(invalid).is_err());
+        assert_eq!(workspace.export_project_patterns().unwrap(), before);
+
+        let replacement = PatternWorkspace::new(44_100)
+            .export_project_patterns()
+            .unwrap();
+        workspace
+            .replace_project_patterns(replacement.clone())
+            .unwrap();
+
+        assert_eq!(workspace.export_project_patterns().unwrap(), replacement);
+        assert!(!workspace.is_recording());
+        for slot in 0..PATTERN_SLOT_COUNT {
+            let slot = PatternSlotId::new(slot as u8).unwrap();
+            assert!(!workspace.has_pending_snapshot(slot));
+            assert!(workspace.needs_reinstall(slot));
+            assert!(!workspace.is_slot_ready(slot));
+        }
+    }
+
+    #[test]
+    fn record_ack_mutations_are_counted_and_revision_budgeted() {
+        let mut accepted = recording_workspace();
+        let stamp = origin(1_000);
+        accepted.note_live_trigger(0, command(91), pad(), 1.0);
+        let mut audio = FakeAudio {
+            acks: VecDeque::from([LiveAck {
+                id: command(91),
+                pad: pad(),
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_120,
+                transport: Some(stamp),
+            }]),
+            ..FakeAudio::default()
+        };
+        let maintenance =
+            accepted.maintain_with_recording_budget(&mut audio, recording_telemetry(stamp), 1);
+        assert_eq!(maintenance.committed_mutations, 1);
+        assert_eq!(accepted.selected_pattern().events().len(), 1);
+
+        let mut refused = recording_workspace();
+        refused.note_live_trigger(0, command(92), pad(), 1.0);
+        let mut audio = FakeAudio {
+            acks: VecDeque::from([LiveAck {
+                id: command(92),
+                pad: pad(),
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_120,
+                transport: Some(stamp),
+            }]),
+            ..FakeAudio::default()
+        };
+        let maintenance =
+            refused.maintain_with_recording_budget(&mut audio, recording_telemetry(stamp), 0);
+        assert_eq!(maintenance.committed_mutations, 0);
+        assert!(refused.selected_pattern().events().is_empty());
+    }
 }
 
 use std::{array, sync::Arc};
@@ -813,13 +892,38 @@ use std::{array, sync::Arc};
 use sampler_audio::{LiveAck, LiveAckKind, LiveCommandId, Telemetry, TransportStamp};
 use sampler_core::{
     BankId, EditablePattern, EventId, Meter, PATTERN_SLOT_COUNT, PadId, PatternCompileError,
-    PatternEditError, PatternEvent, PatternSlotId, PatternSnapshot, Resolution, Tempo, Transport,
+    PatternEditError, PatternEvent, PatternSlotId, PatternSnapshot, ProjectError, ProjectPattern,
+    Resolution, Tempo, Transport,
 };
 
 use crate::AudioPort;
 
 pub const MAX_RECORDING_KEYS: usize = 16;
 pub const MAX_ACKS_PER_MAINTENANCE: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectPatternWorkspaceError {
+    SlotCount { found: usize },
+    DuplicateSlot(PatternSlotId),
+    Project(ProjectError),
+}
+
+impl std::fmt::Display for ProjectPatternWorkspaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SlotCount { found } => write!(
+                formatter,
+                "project must contain exactly {PATTERN_SLOT_COUNT} patterns, found {found}"
+            ),
+            Self::DuplicateSlot(slot) => {
+                write!(formatter, "duplicate project pattern slot {}", slot.get())
+            }
+            Self::Project(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ProjectPatternWorkspaceError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceView {
@@ -952,6 +1056,7 @@ pub enum PatternStatus {
 pub struct PatternMaintenance {
     pub reclaimed_snapshots: usize,
     pub drained_acks: usize,
+    pub committed_mutations: usize,
     pub compiled_slot: Option<PatternSlotId>,
     pub submitted_slot: Option<PatternSlotId>,
     pub status: Option<PatternStatus>,
@@ -962,6 +1067,7 @@ impl PatternMaintenance {
         Self {
             reclaimed_snapshots: 0,
             drained_acks: 0,
+            committed_mutations: 0,
             compiled_slot: None,
             submitted_slot: None,
             status: None,
@@ -1104,6 +1210,73 @@ impl PatternWorkspace {
             installed_generations: [None; PATTERN_SLOT_COUNT],
             last_status: None,
         }
+    }
+
+    pub fn export_project_patterns(
+        &self,
+    ) -> Result<Vec<ProjectPattern>, ProjectPatternWorkspaceError> {
+        self.patterns
+            .iter()
+            .map(ProjectPattern::from_editable)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProjectPatternWorkspaceError::Project)
+    }
+
+    pub fn replace_project_patterns(
+        &mut self,
+        patterns: Vec<ProjectPattern>,
+    ) -> Result<(), ProjectPatternWorkspaceError> {
+        if patterns.len() != PATTERN_SLOT_COUNT {
+            return Err(ProjectPatternWorkspaceError::SlotCount {
+                found: patterns.len(),
+            });
+        }
+        let mut replacement: [Option<EditablePattern>; PATTERN_SLOT_COUNT] =
+            array::from_fn(|_| None);
+        for pattern in patterns {
+            let index = usize::from(pattern.slot().get());
+            if replacement[index].is_some() {
+                return Err(ProjectPatternWorkspaceError::DuplicateSlot(pattern.slot()));
+            }
+            replacement[index] = Some(pattern.to_editable().map_err(|error| {
+                ProjectPatternWorkspaceError::Project(ProjectError::InvalidPattern(error))
+            })?);
+        }
+        let Some(patterns) = replacement
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .and_then(|patterns| patterns.try_into().ok())
+            .map(Box::new)
+        else {
+            return Err(ProjectPatternWorkspaceError::SlotCount {
+                found: PATTERN_SLOT_COUNT,
+            });
+        };
+
+        self.patterns = patterns;
+        self.selected_slot = PatternSlotId::new(0).expect("first pattern slot is valid");
+        self.cursor = PatternCursor {
+            pad: PadId::new(BankId::new(0).expect("first bank is valid"), 0)
+                .expect("first pad is valid"),
+            step: 0,
+            bar: 0,
+        };
+        self.selected_event = None;
+        self.playing = false;
+        self.recording = None;
+        self.held_keys.fill(None);
+        self.dirty_patterns = array::from_fn(|index| {
+            Some(DirtyPattern {
+                generation: self.patterns[index].generation(),
+                ticket: index as u64,
+            })
+        });
+        self.next_dirty_ticket = PATTERN_SLOT_COUNT as u64;
+        self.pending_snapshots = array::from_fn(|_| None);
+        self.reinstall_pending.fill(true);
+        self.installed_generations.fill(None);
+        self.last_status = None;
+        Ok(())
     }
 
     pub fn view(&self) -> WorkspaceView {
@@ -1385,29 +1558,29 @@ impl PatternWorkspace {
             .and_then(|entry| entry.trigger_id)
     }
 
-    pub fn apply_ack(&mut self, ack: LiveAck) {
+    pub fn apply_ack(&mut self, ack: LiveAck) -> bool {
         let Some(key) = self.matching_held_key(ack) else {
-            return;
+            return false;
         };
         let Some(entry) = self.held_keys[key] else {
-            return;
+            return false;
         };
         let matching_trigger =
             matches!(ack.kind, LiveAckKind::Trigger { .. }) && entry.trigger_id == Some(ack.id);
         let matching_release =
             matches!(ack.kind, LiveAckKind::Release) && entry.release_id == Some(ack.id);
         if !matching_trigger && !matching_release {
-            return;
+            return false;
         }
 
         let Some(state) = self.recording else {
             self.held_keys[key] = None;
-            return;
+            return false;
         };
         let intent = state.intent();
         let Some(mut stamp) = ack.transport else {
             self.held_keys[key] = None;
-            return;
+            return false;
         };
         let accepted = match state {
             RecordingState::Pending(intent) => {
@@ -1423,7 +1596,7 @@ impl PatternWorkspace {
         };
         if !state.accepts_acks() || !accepted {
             self.held_keys[key] = None;
-            return;
+            return false;
         }
         if matches!(state, RecordingState::Pending(_)) && stamp != intent.stamp {
             self.recording = Some(RecordingState::Pending(RecordingIntent { stamp }));
@@ -1435,7 +1608,7 @@ impl PatternWorkspace {
             LiveAckKind::Trigger { velocity } => {
                 if ack.pad != entry.pad {
                     self.held_keys[key] = None;
-                    return;
+                    return false;
                 }
                 let frame = ack.frame.wrapping_sub(stamp.origin) % stamp.loop_frames;
                 let index = usize::from(stamp.slot.get());
@@ -1458,8 +1631,12 @@ impl PatternWorkspace {
                             });
                         }
                         self.mark_dirty(index);
+                        true
                     }
-                    Err(_) => self.held_keys[key] = None,
+                    Err(_) => {
+                        self.held_keys[key] = None;
+                        false
+                    }
                 }
             }
             LiveAckKind::Release => {
@@ -1467,16 +1644,16 @@ impl PatternWorkspace {
                     (entry.event_id, entry.trigger_absolute_frame)
                 else {
                     self.held_keys[key] = None;
-                    return;
+                    return false;
                 };
                 let elapsed = ack.frame.saturating_sub(trigger_absolute_frame);
                 let duration = elapsed.min(stamp.loop_frames);
                 let index = usize::from(stamp.slot.get());
-                if duration != 0
+                let committed = duration != 0
                     && self.patterns[index]
                         .set_duration(event_id, Some(duration))
-                        .is_ok()
-                {
+                        .is_ok();
+                if committed {
                     if stamp.slot == self.selected_slot {
                         self.selected_event = Some(SelectedEvent {
                             slot: stamp.slot,
@@ -1486,6 +1663,7 @@ impl PatternWorkspace {
                     self.mark_dirty(index);
                 }
                 self.held_keys[key] = None;
+                committed
             }
         }
     }
@@ -1600,13 +1778,26 @@ impl PatternWorkspace {
         audio: &mut dyn AudioPort,
         telemetry: Telemetry,
     ) -> PatternMaintenance {
+        self.maintain_with_recording_budget(audio, telemetry, usize::MAX)
+    }
+
+    pub(crate) fn maintain_with_recording_budget(
+        &mut self,
+        audio: &mut dyn AudioPort,
+        telemetry: Telemetry,
+        recording_mutation_budget: usize,
+    ) -> PatternMaintenance {
         let mut result = PatternMaintenance::empty();
         result.reclaimed_snapshots = audio.reclaim_retired_patterns();
 
         let mut acks = [LiveAck::EMPTY; MAX_ACKS_PER_MAINTENANCE];
         result.drained_acks = audio.drain_live_acks(&mut acks).min(acks.len());
         for ack in acks.into_iter().take(result.drained_acks) {
-            self.apply_ack(ack);
+            if result.committed_mutations < recording_mutation_budget {
+                result.committed_mutations += usize::from(self.apply_ack(ack));
+            } else if let Some(key) = self.matching_held_key(ack) {
+                self.held_keys[key] = None;
+            }
         }
 
         self.playing = telemetry.pattern_playing;

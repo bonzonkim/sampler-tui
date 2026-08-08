@@ -7,6 +7,7 @@ pub mod input;
 pub mod loader;
 pub mod palette;
 pub mod pattern;
+pub mod project_session;
 pub mod project_store;
 pub mod sample_editor;
 pub mod terminal;
@@ -30,7 +31,12 @@ pub use loader::{
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{
     MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCaptureState, PatternCursor,
-    PatternMaintenance, PatternStatus, PatternWorkspace, WorkspaceView,
+    PatternMaintenance, PatternStatus, PatternWorkspace, ProjectPatternWorkspaceError,
+    WorkspaceView,
+};
+pub use project_session::{
+    AutosaveDescriptor, MAX_PROJECT_REVISION, ProjectMutationError, ProjectOperationDescriptor,
+    ProjectSession, ProjectSnapshotError, ProjectStatus,
 };
 pub use project_store::{
     AtomicWritePoint, AtomicWriteVisibility, ProjectAssetMapping, ProjectProbe, ProjectSavePad,

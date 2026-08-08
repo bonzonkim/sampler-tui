@@ -17,7 +17,7 @@ use sampler_core::{
     PatternSnapshot, PlaybackMode, Resolution, Tempo, Transport,
 };
 use sampler_tui::{
-    App, AudioPort, KeyboardCapabilities, LoadSampleError, LoadedSample, PREVIEW_COLUMNS,
+    App, AudioPort, EDIT_PREVIEW_COLUMNS, KeyboardCapabilities, LoadSampleError, LoadedSample,
     PreviewColumn, WorkerRequest, WorkerResult,
 };
 
@@ -231,17 +231,19 @@ impl PatternHarness {
         else {
             panic!("load request");
         };
-        let buffer = Arc::new(SampleBuffer::new(48_000, vec![0.25; 1024]).expect("sample"));
+        let rendered = Arc::new(SampleBuffer::new(48_000, vec![0.25; 1024]).expect("sample"));
         assert!(self.app.apply_worker_result(WorkerResult::Loaded {
             pad,
             generation,
             path,
             result: Ok(LoadedSample {
-                buffer,
+                base: Arc::clone(&rendered),
+                rendered,
+                recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 512,
                 duration: std::time::Duration::from_millis(11),
-                preview: [PreviewColumn { min: -1, max: 1 }; PREVIEW_COLUMNS],
+                preview: Arc::new([PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }));
     }

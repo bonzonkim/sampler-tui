@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
-use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PlaybackMode};
+use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, SampleEditRecipe};
 
 use crate::PatternSwitch;
 use crate::audio::{AudioPort, open_default_audio};
@@ -19,6 +19,8 @@ use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
 
 pub const PAD_VIEW_COUNT: usize = 160;
+/// Fixed worker-generated waveform resolution. Perform uses a bounded 64-column projection.
+pub const EDIT_PREVIEW_COLUMNS: usize = 1_024;
 pub const PREVIEW_COLUMNS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -508,7 +510,9 @@ impl App {
             } if self.file_picker.pending_directory() == Some(path.as_path()) => self
                 .file_picker
                 .apply_scan(request_id, Err(message.clone())),
-            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => false,
+            WorkerRequest::EditSample { .. }
+            | WorkerRequest::ScanDirectory { .. }
+            | WorkerRequest::Shutdown => false,
         };
         if applied {
             self.status = message;
@@ -599,6 +603,7 @@ impl App {
                 generation,
                 path,
                 engine_rate,
+                recipe: SampleEditRecipe::identity(),
             })
         } else {
             self.pending_loads[offset] = Some(Box::new(PendingLoad {
@@ -625,7 +630,7 @@ impl App {
                 result,
             } = result
             else {
-                unreachable!()
+                return false;
             };
             if self.file_picker.pending_directory() != Some(path.as_path()) {
                 return false;
@@ -676,7 +681,7 @@ impl App {
             .pending_load_slot(offset, kind)
             .as_ref()
             .and_then(|pending| match &pending.phase {
-                PendingLoadPhase::Ready(loaded) => Some(loaded.buffer.sample_rate()),
+                PendingLoadPhase::Ready(loaded) => Some(loaded.rendered.sample_rate()),
                 _ => None,
             })
             != Some(sample_rate)
@@ -1528,7 +1533,7 @@ impl App {
                     && matches!(
                         &pending.phase,
                         PendingLoadPhase::Ready(loaded)
-                            if loaded.buffer.sample_rate() != sample_rate
+                            if loaded.rendered.sample_rate() != sample_rate
                     )
                 {
                     pending.phase = PendingLoadPhase::AwaitingWorker;
@@ -1576,7 +1581,7 @@ impl App {
                 if matches!(
                     &pending.phase,
                     PendingLoadPhase::Ready(loaded)
-                        if loaded.buffer.sample_rate() != sample_rate
+                        if loaded.rendered.sample_rate() != sample_rate
                 ) {
                     pending.phase = PendingLoadPhase::AwaitingWorker;
                 }
@@ -1588,6 +1593,7 @@ impl App {
                             generation: self.recovery_generations[offset],
                             path: pending.path.clone(),
                             engine_rate: sample_rate,
+                            recipe: SampleEditRecipe::identity(),
                         };
                         pending.phase = PendingLoadPhase::WorkerQueued;
                         self.pads[offset].state = PadLoadState::Loading;
@@ -1609,7 +1615,7 @@ impl App {
                 if matches!(
                     &pending.phase,
                     PendingLoadPhase::Ready(loaded)
-                        if loaded.buffer.sample_rate() != sample_rate
+                        if loaded.rendered.sample_rate() != sample_rate
                 ) {
                     pending.phase = PendingLoadPhase::AwaitingWorker;
                 }
@@ -1621,6 +1627,7 @@ impl App {
                             generation: self.pads[offset].generation,
                             path: pending.path.clone(),
                             engine_rate: sample_rate,
+                            recipe: SampleEditRecipe::identity(),
                         };
                         pending.phase = PendingLoadPhase::WorkerQueued;
                         self.pads[offset].state = PadLoadState::Loading;
@@ -1699,7 +1706,7 @@ impl App {
             self.pads[offset].state = PadLoadState::WaitingForDevice;
             return;
         };
-        if loaded.buffer.sample_rate() != audio.sample_rate() {
+        if loaded.rendered.sample_rate() != audio.sample_rate() {
             pending.phase = PendingLoadPhase::AwaitingWorker;
             *self.pending_load_slot_mut(offset, kind) = Some(pending);
             self.pads[offset].state = PadLoadState::Loading;
@@ -1710,9 +1717,9 @@ impl App {
         let pad = pad_from_offset(offset);
         let settings = self.pads[offset].settings;
         let install_result = match pending.kind {
-            PendingLoadKind::User => audio.install(pad, Arc::clone(&loaded.buffer), settings),
+            PendingLoadKind::User => audio.install(pad, Arc::clone(&loaded.rendered), settings),
             PendingLoadKind::Recovery => {
-                audio.install_recovery(pad, Arc::clone(&loaded.buffer), settings)
+                audio.install_recovery(pad, Arc::clone(&loaded.rendered), settings)
             }
         };
         if let Err(error) = install_result {
@@ -1733,8 +1740,8 @@ impl App {
         let view = &mut self.pads[offset];
         view.label = label.clone();
         view.source = Some(pending.path);
-        view.sample = Some(loaded.buffer);
-        view.preview = loaded.preview;
+        view.sample = Some(loaded.rendered);
+        view.preview = crate::loader::downsample_preview(&loaded.preview);
         view.state = PadLoadState::Ready;
         self.reinstall_pending[offset] = false;
         self.current_session_bound[offset] = true;
@@ -1899,7 +1906,9 @@ mod tests {
         PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
         audio_channels_with_test_capacities,
     };
-    use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode};
+    use sampler_core::{
+        BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SampleEditRecipe,
+    };
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
@@ -1909,7 +1918,7 @@ mod tests {
         LoadSampleError, LoadedSample, WorkerRequest, WorkerResult, WorkerSendError,
     };
 
-    use super::{App, PadLoadState, PreviewColumn};
+    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn};
 
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
@@ -2367,6 +2376,7 @@ mod tests {
                 generation: generation.wrapping_add(1),
                 path: "kick.wav".into(),
                 engine_rate: 44_100,
+                recipe: SampleEditRecipe::identity(),
             })
         );
     }
@@ -2540,17 +2550,19 @@ mod tests {
     }
 
     fn loaded_at_rate(pad: PadId, generation: u64, source: &str, sample_rate: u32) -> WorkerResult {
-        let buffer = Arc::new(SampleBuffer::new(sample_rate, vec![0.25, -0.25]).unwrap());
+        let rendered = Arc::new(SampleBuffer::new(sample_rate, vec![0.25, -0.25]).unwrap());
         WorkerResult::Loaded {
             pad,
             generation,
             path: source.into(),
             result: Ok(LoadedSample {
-                buffer,
+                base: Arc::clone(&rendered),
+                rendered,
+                recipe: SampleEditRecipe::identity(),
                 source_rate: sample_rate,
                 source_frames: 1,
                 duration: std::time::Duration::from_secs_f64(1.0 / f64::from(sample_rate)),
-                preview: [PreviewColumn { min: -2, max: 2 }; 64],
+                preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }
     }
@@ -2857,6 +2869,7 @@ mod tests {
                 generation,
                 path: "kick.wav".into(),
                 engine_rate: 44_100,
+                recipe: SampleEditRecipe::identity(),
             }]
         );
         assert_eq!(app.pad(pad(0, 0)).source, None);

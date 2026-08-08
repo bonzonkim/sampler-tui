@@ -22,8 +22,7 @@ use sampler_tui::terminal::{
 };
 use sampler_tui::{
     App, AudioPort, DirectoryEntry, DirectoryEntryKind, DirectoryScan, KeyboardCapabilities,
-    LoadedSample, PAD_KEYS, PREVIEW_COLUMNS, PreviewColumn, WorkerRequest, WorkerResult,
-    WorkerSendError,
+    LoadedSample, PAD_KEYS, PreviewColumn, WorkerRequest, WorkerResult, WorkerSendError,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -604,6 +603,7 @@ impl EventLoopWorker for HarnessWorker {
                 generation,
                 path,
                 engine_rate,
+                ..
             } => {
                 assert_eq!(
                     path.file_name().and_then(|name| name.to_str()),
@@ -616,14 +616,19 @@ impl EventLoopWorker for HarnessWorker {
                     generation,
                     path,
                     result: Ok(LoadedSample {
-                        buffer,
+                        base: Arc::clone(&buffer),
+                        rendered: buffer,
+                        recipe: sampler_core::SampleEditRecipe::identity(),
                         source_rate: engine_rate,
                         source_frames: frames,
                         duration: Duration::from_secs_f64(frames as f64 / f64::from(engine_rate)),
-                        preview: [PreviewColumn::default(); PREVIEW_COLUMNS],
+                        preview: Arc::new(
+                            [PreviewColumn::default(); sampler_tui::EDIT_PREVIEW_COLUMNS],
+                        ),
                     }),
                 });
             }
+            WorkerRequest::EditSample { .. } => panic!("event loop must not send edit sample"),
             WorkerRequest::Shutdown => panic!("event loop must not send worker shutdown"),
         }
         Ok(())

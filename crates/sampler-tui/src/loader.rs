@@ -11,9 +11,9 @@ use std::time::Duration;
 use sampler_audio::{
     DecodeLimits, SampleBuffer, decode_path_with_limits, prepare_sample_with_frame_limit,
 };
-use sampler_core::PadId;
+use sampler_core::{PadId, SampleEditRecipe, apply_sample_edit};
 
-use crate::app::{PREVIEW_COLUMNS, PreviewColumn};
+use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
@@ -23,7 +23,7 @@ pub const MAX_DECODED_FRAMES: usize = 8_388_608;
 pub const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PREPARED_FRAMES: usize = 8_388_608;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerRequest {
     ScanDirectory {
         request_id: u64,
@@ -35,6 +35,13 @@ pub enum WorkerRequest {
         generation: u64,
         path: PathBuf,
         engine_rate: u32,
+        recipe: SampleEditRecipe,
+    },
+    EditSample {
+        pad: PadId,
+        generation: u64,
+        base: Arc<SampleBuffer>,
+        recipe: SampleEditRecipe,
     },
     Shutdown,
 }
@@ -52,15 +59,32 @@ pub enum WorkerResult {
         path: PathBuf,
         result: Result<LoadedSample, LoadSampleError>,
     },
+    Edited {
+        pad: PadId,
+        generation: u64,
+        recipe: SampleEditRecipe,
+        result: Result<RenderedSample, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedSample {
-    pub buffer: Arc<SampleBuffer>,
+    pub base: Arc<SampleBuffer>,
+    pub rendered: Arc<SampleBuffer>,
+    pub recipe: SampleEditRecipe,
     pub source_rate: u32,
     pub source_frames: usize,
     pub duration: Duration,
-    pub preview: [PreviewColumn; PREVIEW_COLUMNS],
+    pub preview: EditPreview,
+}
+
+/// Fixed-resolution waveform data shared by a worker result and the owning pad tuple.
+pub type EditPreview = Arc<[PreviewColumn; EDIT_PREVIEW_COLUMNS]>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedSample {
+    pub rendered: Arc<SampleBuffer>,
+    pub preview: EditPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,11 +236,23 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
                 generation,
                 path,
                 engine_rate,
+                recipe,
             } => WorkerResult::Loaded {
                 pad,
                 generation,
-                result: load_sample(&path, engine_rate),
+                result: load_sample(&path, engine_rate, recipe),
                 path,
+            },
+            WorkerRequest::EditSample {
+                pad,
+                generation,
+                base,
+                recipe,
+            } => WorkerResult::Edited {
+                pad,
+                generation,
+                recipe,
+                result: render_sample_edit(&base, recipe),
             },
             WorkerRequest::Shutdown => break,
         };
@@ -273,7 +309,11 @@ fn hidden_name(name: &std::ffi::OsStr) -> bool {
     }
 }
 
-fn load_sample(path: &Path, engine_rate: u32) -> Result<LoadedSample, LoadSampleError> {
+fn load_sample(
+    path: &Path,
+    engine_rate: u32,
+    recipe: SampleEditRecipe,
+) -> Result<LoadedSample, LoadSampleError> {
     let encoded_bytes = fs::metadata(path)
         .map_err(|error| LoadSampleError::Metadata(format_error(&error)))?
         .len();
@@ -294,17 +334,42 @@ fn load_sample(path: &Path, engine_rate: u32) -> Result<LoadedSample, LoadSample
     let source_rate = decoded.sample_rate;
     let source_frames = decoded.frames();
     let duration = source_duration(source_frames, source_rate);
-    let buffer = Arc::new(
+    let base = Arc::new(
         prepare_sample_with_frame_limit(decoded, engine_rate, MAX_PREPARED_FRAMES)
             .map_err(|error| LoadSampleError::Prepare(format_error(&error)))?,
     );
-    let preview = build_preview(&buffer);
+    let rendered = render_sample_edit(&base, recipe).map_err(LoadSampleError::Prepare)?;
     Ok(LoadedSample {
-        buffer,
+        base,
+        rendered: rendered.rendered,
+        recipe,
         source_rate,
         source_frames,
         duration,
-        preview,
+        preview: rendered.preview,
+    })
+}
+
+fn render_sample_edit(
+    base: &Arc<SampleBuffer>,
+    recipe: SampleEditRecipe,
+) -> Result<RenderedSample, String> {
+    recipe.validate().map_err(|error| error.to_string())?;
+    if recipe == SampleEditRecipe::identity() {
+        return Ok(RenderedSample {
+            rendered: Arc::clone(base),
+            preview: build_preview(base),
+        });
+    }
+    let plan = apply_sample_edit(base.sample_rate(), base.data(), recipe)
+        .map_err(|error| error.to_string())?;
+    let rendered = Arc::new(
+        SampleBuffer::new(plan.sample_rate(), plan.into_stereo())
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(RenderedSample {
+        preview: build_preview(&rendered),
+        rendered,
     })
 }
 
@@ -329,16 +394,51 @@ fn frame_duration(frames: u128, sample_rate: u32) -> Duration {
     }
 }
 
-fn build_preview(buffer: &SampleBuffer) -> [PreviewColumn; PREVIEW_COLUMNS] {
-    std::array::from_fn(|column| {
-        let frames = buffer.frames();
-        let columns = PREVIEW_COLUMNS as u128;
-        let start = ((column as u128) * (frames as u128)).div_ceil(columns) as usize;
-        let end = (((column + 1) as u128) * (frames as u128)).div_ceil(columns) as usize;
+fn build_preview(buffer: &SampleBuffer) -> EditPreview {
+    Arc::new(std::array::from_fn(|column| {
+        let Some((start, end)) = preview_bin_bounds(buffer.frames(), EDIT_PREVIEW_COLUMNS, column)
+        else {
+            return PreviewColumn::default();
+        };
         if start == end {
             return PreviewColumn::default();
         }
         preview_column(&buffer.data()[start * 2..end * 2])
+    }))
+}
+
+/// Returns half-open, gap-free frame bounds using checked wide arithmetic.
+fn preview_bin_bounds(frames: usize, columns: usize, column: usize) -> Option<(usize, usize)> {
+    if columns == 0 || column >= columns {
+        return None;
+    }
+    let frames = u128::try_from(frames).ok()?;
+    let columns = u128::try_from(columns).ok()?;
+    let start = u128::try_from(column)
+        .ok()?
+        .checked_mul(frames)?
+        .div_ceil(columns);
+    let end = u128::try_from(column.checked_add(1)?)
+        .ok()?
+        .checked_mul(frames)?
+        .div_ceil(columns);
+    Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
+}
+
+/// Reduces the fixed edit preview to the existing bounded Perform waveform width.
+pub fn downsample_preview(preview: &EditPreview) -> [PreviewColumn; PREVIEW_COLUMNS] {
+    std::array::from_fn(|column| {
+        let Some((start, end)) = preview_bin_bounds(EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, column)
+        else {
+            return PreviewColumn::default();
+        };
+        preview[start..end]
+            .iter()
+            .copied()
+            .fold(PreviewColumn::default(), |combined, item| PreviewColumn {
+                min: combined.min.min(item.min),
+                max: combined.max.max(item.max),
+            })
     })
 }
 
@@ -389,17 +489,20 @@ fn format_error(error: &dyn Error) -> String {
 mod tests {
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
-    use sampler_core::{BankId, PadId};
+    use sampler_audio::SampleBuffer;
+    use sampler_core::{BankId, PadId, SampleEditRecipe};
 
     use super::{
-        MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES, WorkerHandle, WorkerPanicked, WorkerRequest,
-        WorkerResult, WorkerSendError, frame_duration, load_sample, preview_column, scan_directory,
-        try_send_request, worker_loop,
+        EDIT_PREVIEW_COLUMNS, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
+        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
+        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
+        preview_column, scan_directory, try_send_request, worker_loop,
     };
     use crate::DirectoryEntry;
 
@@ -501,6 +604,7 @@ mod tests {
                 generation: 7,
                 path: fixture.path().to_owned(),
                 engine_rate: 48_000,
+                recipe: SampleEditRecipe::identity(),
             })
             .unwrap();
         let result = worker.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -514,11 +618,126 @@ mod tests {
         };
 
         assert_eq!(generation, 7);
-        assert_eq!(sample.buffer.sample_rate(), 48_000);
-        assert_eq!(sample.preview.len(), 64);
+        assert_eq!(sample.rendered.sample_rate(), 48_000);
+        assert_eq!(sample.preview.len(), EDIT_PREVIEW_COLUMNS);
         assert!(sample.preview.iter().any(|column| column.max > 0));
         assert!(sample.preview.iter().any(|column| column.min < 0));
         worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn identity_load_shares_the_base_and_rendered_owner() {
+        let fixture = wav_fixture(48_000, &[0, i16::MAX]);
+
+        let loaded = load_sample(fixture.path(), 48_000, SampleEditRecipe::identity()).unwrap();
+
+        assert!(Arc::ptr_eq(&loaded.base, &loaded.rendered));
+        assert_eq!(loaded.recipe, SampleEditRecipe::identity());
+        assert_eq!(loaded.preview.len(), EDIT_PREVIEW_COLUMNS);
+    }
+
+    #[test]
+    fn edit_request_renders_the_base_not_a_previous_render() {
+        let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25, 0.5, -0.5]).unwrap());
+        let stale_rendered = Arc::new(SampleBuffer::new(48_000, vec![0.9, 0.9]).unwrap());
+        let recipe =
+            SampleEditRecipe::new(0, sampler_core::SAMPLE_PHASE_SCALE / 2, false, false).unwrap();
+        let mut worker = WorkerHandle::spawn();
+
+        worker
+            .try_send(WorkerRequest::EditSample {
+                pad: pad(0, 3),
+                generation: 91,
+                base: Arc::clone(&base),
+                recipe,
+            })
+            .unwrap();
+        let WorkerResult::Edited {
+            pad: result_pad,
+            generation,
+            recipe: result_recipe,
+            result: Ok(rendered),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result")
+        };
+
+        assert_eq!(result_pad, pad(0, 3));
+        assert_eq!(generation, 91);
+        assert_eq!(result_recipe, recipe);
+        assert_eq!(rendered.rendered.data(), &base.data()[..2]);
+        assert_ne!(rendered.rendered.data(), stale_rendered.data());
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn edit_preview_has_fixed_columns_and_perform_downsample_is_bounded() {
+        let buffer =
+            SampleBuffer::new(48_000, vec![-1.0, 1.0, -0.5, 0.5, 0.25, -0.25, 0.75, -0.75])
+                .unwrap();
+
+        let preview = build_preview(&buffer);
+        let perform = downsample_preview(&preview);
+
+        assert_eq!(preview.len(), EDIT_PREVIEW_COLUMNS);
+        assert_eq!(perform.len(), crate::PREVIEW_COLUMNS);
+        assert!(preview.iter().all(|column| column.min <= column.max));
+        assert!(perform.iter().all(|column| column.min <= column.max));
+        assert_eq!(perform[0], crate::PreviewColumn { min: -8, max: 8 });
+    }
+
+    #[test]
+    fn worker_channel_capacity_is_exactly_eight() {
+        assert_eq!(WORKER_CHANNEL_CAPACITY, 8);
+    }
+
+    #[test]
+    fn saturated_edit_result_is_released_while_the_application_keeps_the_base_owner() {
+        let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        let weak = Arc::downgrade(&base);
+        let mut worker = worker_with_capacities(WORKER_CHANNEL_CAPACITY, 0);
+
+        worker
+            .try_send(WorkerRequest::EditSample {
+                pad: pad(0, 0),
+                generation: 1,
+                base: Arc::clone(&base),
+                recipe: SampleEditRecipe::identity(),
+            })
+            .unwrap();
+        worker.shutdown().unwrap();
+
+        // The application owner survives worker/result-lane teardown; it performs the final drop.
+        assert_eq!(Arc::strong_count(&base), 1);
+        assert!(weak.upgrade().is_some());
+        drop(base);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn failed_edit_result_delivery_leaves_the_final_base_drop_to_the_application_owner() {
+        let (request_sender, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let (result_sender, result_receiver) = mpsc::sync_channel(0);
+        drop(result_receiver);
+        let worker = thread::spawn(move || worker_loop(request_receiver, result_sender));
+        let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        let weak = Arc::downgrade(&base);
+
+        request_sender
+            .send(WorkerRequest::EditSample {
+                pad: pad(0, 0),
+                generation: 2,
+                base: Arc::clone(&base),
+                recipe: SampleEditRecipe::identity(),
+            })
+            .unwrap();
+        drop(request_sender);
+        worker.join().unwrap();
+
+        // Delivery failure drops the worker-owned result, never the retained application owner.
+        assert_eq!(Arc::strong_count(&base), 1);
+        drop(base);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -560,7 +779,7 @@ mod tests {
         let file = File::create(&path).unwrap();
         file.set_len(MAX_ENCODED_FILE_BYTES + 1).unwrap();
 
-        let error = load_sample(&path, 48_000).unwrap_err();
+        let error = load_sample(&path, 48_000, SampleEditRecipe::identity()).unwrap_err();
 
         assert!(
             error
@@ -579,6 +798,7 @@ mod tests {
                 generation: 1,
                 path: fixture.path().to_owned(),
                 engine_rate: 48_000,
+                recipe: SampleEditRecipe::identity(),
             })
             .unwrap();
         let WorkerResult::Loaded {

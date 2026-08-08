@@ -12,15 +12,16 @@ pub mod ui;
 mod ui_pattern;
 
 pub use app::{
-    App, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView, PreviewColumn,
+    App, EDIT_PREVIEW_COLUMNS, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView,
+    PreviewColumn,
 };
 pub use audio::AudioPort;
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};
 pub use loader::{
-    LoadSampleError, LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES, MAX_DIRECTORY_ENTRIES,
-    MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, WorkerHandle, WorkerPanicked, WorkerRequest,
-    WorkerResult, WorkerSendError,
+    EditPreview, LoadSampleError, LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES,
+    MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, RenderedSample,
+    WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, downsample_preview,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{

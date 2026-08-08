@@ -702,7 +702,9 @@ mod tests {
     use crate::audio::AudioPort;
     use crate::input::InputAction;
     use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
-    use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
+    use crate::{
+        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, Overlay, PreviewColumn,
+    };
 
     use super::{render, transport_bar_index};
 
@@ -829,11 +831,13 @@ mod tests {
         let request = app.begin_load(kick, path.clone()).unwrap();
         let generation = match request {
             crate::WorkerRequest::LoadSample { generation, .. } => generation,
-            crate::WorkerRequest::ScanDirectory { .. } | crate::WorkerRequest::Shutdown => {
+            crate::WorkerRequest::EditSample { .. }
+            | crate::WorkerRequest::ScanDirectory { .. }
+            | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
         };
-        let mut preview = [PreviewColumn::default(); PREVIEW_COLUMNS];
+        let mut preview = [PreviewColumn::default(); EDIT_PREVIEW_COLUMNS];
         for (index, column) in preview.iter_mut().enumerate() {
             let height = i8::try_from(index % 9).unwrap();
             *column = PreviewColumn {
@@ -841,24 +845,29 @@ mod tests {
                 max: height,
             };
         }
-        app.apply_worker_result(WorkerResult::Loaded {
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
             pad: kick,
             generation,
             path,
             result: Ok(LoadedSample {
-                buffer: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                rendered: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 128,
                 duration: Duration::from_secs_f64(128.0 / 48_000.0),
-                preview,
+                preview: Arc::new(preview),
             }),
-        });
+        }));
+        assert_eq!(app.pad(kick).preview[0], PreviewColumn { min: -8, max: 8 });
         app.begin_load(pad(4), "/samples/HAT.wav");
         let error_path = std::path::PathBuf::from("/samples/CLAP.wav");
         let request = app.begin_load(pad(5), error_path.clone()).unwrap();
         let generation = match request {
             crate::WorkerRequest::LoadSample { generation, .. } => generation,
-            crate::WorkerRequest::ScanDirectory { .. } | crate::WorkerRequest::Shutdown => {
+            crate::WorkerRequest::EditSample { .. }
+            | crate::WorkerRequest::ScanDirectory { .. }
+            | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
         };
@@ -1251,7 +1260,7 @@ mod tests {
         assert!(snapshot[4].contains("PADS"));
         assert!(snapshot[4].contains("PERFORMANCE"));
         assert!(snapshot[2].contains("WAVE"));
-        assert!(snapshot[2].contains('▇'));
+        assert!(snapshot[2].contains('█'));
         assert!(snapshot[6].contains("[1 KICK"));
         assert!(snapshot[7].contains("[Q HAT"));
         assert!(snapshot[8].contains("[A ----"));
@@ -1336,11 +1345,13 @@ mod tests {
             generation,
             path: sample_path,
             result: Ok(LoadedSample {
-                buffer: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                base: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                rendered: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 64,
                 duration: Duration::from_secs_f64(64.0 / 48_000.0),
-                preview: [PreviewColumn { min: -8, max: 8 }; PREVIEW_COLUMNS],
+                preview: Arc::new([PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }));
 

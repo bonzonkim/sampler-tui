@@ -96,7 +96,6 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy)]
 struct PendingPatternTransport {
     playing: bool,
-    submitted_frame: u64,
 }
 
 pub struct App {
@@ -1175,10 +1174,7 @@ impl App {
     }
 
     fn note_pattern_transport_intent(&mut self, playing: bool) {
-        self.pending_pattern_transport = Some(PendingPatternTransport {
-            playing,
-            submitted_frame: self.telemetry.rendered_frame,
-        });
+        self.pending_pattern_transport = Some(PendingPatternTransport { playing });
     }
 
     fn apply_pattern_edit(
@@ -1358,7 +1354,7 @@ impl App {
         let changed = self.telemetry != telemetry;
         if self
             .pending_pattern_transport
-            .is_some_and(|intent| telemetry.rendered_frame > intent.submitted_frame)
+            .is_some_and(|intent| telemetry.pattern_playing == intent.playing)
         {
             self.pending_pattern_transport = None;
         }
@@ -2984,6 +2980,74 @@ mod tests {
 
     fn key(character: char, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
         KeyEvent::new_with_kind(KeyCode::Char(character), modifiers, kind)
+    }
+
+    fn transport_telemetry(rendered_frame: Frame, playing: bool) -> Telemetry {
+        Telemetry {
+            active_pads: [0; 3],
+            rendered_frame,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(0),
+            pattern_playing: playing,
+            pattern_recording: false,
+            pattern_origin: playing.then_some(100),
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        }
+    }
+
+    #[test]
+    fn stale_stopped_telemetry_does_not_cancel_an_accepted_play_intent() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.apply_telemetry(transport_telemetry(100, false));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_telemetry(transport_telemetry(101, false));
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+                AudioCall::SelectPattern(
+                    PatternSlotId::new(1).unwrap(),
+                    PatternSwitch::NextBoundary,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_playing_telemetry_does_not_cancel_an_accepted_stop_intent() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.apply_telemetry(transport_telemetry(100, true));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_telemetry(transport_telemetry(101, true));
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SetRecordCapture(None),
+                AudioCall::StopPattern,
+                AudioCall::SelectPattern(PatternSlotId::new(1).unwrap(), PatternSwitch::Immediate),
+            ]
+        );
     }
 
     #[test]

@@ -797,7 +797,12 @@ impl ProjectStore {
     where
         F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
     {
-        let directory = prepare_project_directory(&request.directory, request.save_as, &mut hook)?;
+        let directory = prepare_project_directory(
+            &request.directory,
+            request.save_as,
+            request.snapshot.project_id,
+            &mut hook,
+        )?;
         if request.save_as {
             checkpoint(
                 &mut hook,
@@ -809,7 +814,7 @@ impl ProjectStore {
         let project = ProjectDirectory::open_existing(&directory)?;
         let _lock = project.lock_exclusive()?;
         if request.save_as {
-            recheck_save_as_target(&project)?;
+            claim_or_validate_save_as_target(&project, request.snapshot.project_id)?;
         }
         let directory = project.path.clone();
         let audio_directory = project.ensure_audio_directory()?;
@@ -877,6 +882,9 @@ impl ProjectStore {
             SaveKind::Recovery => ".sampler-tui-recovery.toml",
         });
         atomic_replace(&destination, canonical_toml.as_bytes(), &project, &mut hook)?;
+        if request.save_as {
+            remove_save_as_owner(&project)?;
+        }
 
         Ok(SaveReceipt {
             directory,
@@ -1050,6 +1058,7 @@ fn validate_directory(path: &Path) -> Result<(), ProjectStoreError> {
 fn prepare_project_directory<F>(
     path: &Path,
     save_as: bool,
+    project_id: ProjectId,
     hook: &mut F,
 ) -> Result<PathBuf, ProjectStoreError>
 where
@@ -1057,7 +1066,7 @@ where
 {
     if save_as {
         match fs::symlink_metadata(path) {
-            Ok(_) => validate_empty_save_as_target(path)?,
+            Ok(_) => validate_save_as_target(path, project_id)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
                 Ok(()) => {
                     checkpoint(
@@ -1082,8 +1091,7 @@ where
                         })?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    validate_empty_save_as_target(path)?;
-                    drop(ProjectDirectory::open_existing(path)?);
+                    validate_save_as_target(path, project_id)?;
                 }
                 Err(error) => {
                     return Err(filesystem_error("create save-as target", path, error));
@@ -1097,7 +1105,7 @@ where
     fs::canonicalize(path).map_err(|error| filesystem_error("canonicalize directory", path, error))
 }
 
-fn validate_empty_save_as_target(path: &Path) -> Result<(), ProjectStoreError> {
+fn validate_save_as_target(path: &Path, project_id: ProjectId) -> Result<(), ProjectStoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| filesystem_error("inspect save-as target", path, error))?;
     if metadata.file_type().is_symlink() {
@@ -1110,42 +1118,107 @@ fn validate_empty_save_as_target(path: &Path) -> Result<(), ProjectStoreError> {
             path: path.to_path_buf(),
         });
     }
-    let mut entries =
-        fs::read_dir(path).map_err(|error| filesystem_error("read save-as target", path, error))?;
-    if entries
-        .next()
-        .transpose()
-        .map_err(|error| filesystem_error("read save-as target", path, error))?
-        .is_some()
-    {
-        return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+    let project = ProjectDirectory::open_existing(path)?;
+    inspect_save_as_target(&project, project_id).map(|_| ())
 }
 
-fn recheck_save_as_target(project: &ProjectDirectory) -> Result<(), ProjectStoreError> {
+const SAVE_AS_OWNER: &str = ".sampler-tui-save-as-owner";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveAsTargetState {
+    Empty,
+    Owned,
+}
+
+fn inspect_save_as_target(
+    project: &ProjectDirectory,
+    project_id: ProjectId,
+) -> Result<SaveAsTargetState, ProjectStoreError> {
     let entries = fs::read_dir(&project.path)
         .map_err(|error| filesystem_error("recheck save-as target", &project.path, error))?;
+    let mut owner = None;
+    let mut has_audio = false;
     for entry in entries {
         let entry = entry
             .map_err(|error| filesystem_error("recheck save-as target", &project.path, error))?;
-        if entry.file_name() != ".sampler-tui.lock" {
-            return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-                path: project.path.clone(),
-            });
-        }
-        let lock_path = project.path.join(".sampler-tui.lock");
-        if open_optional_regular_at(&project.file, Path::new(".sampler-tui.lock"), &lock_path)?
-            .is_none()
-        {
-            return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-                path: project.path.clone(),
-            });
+        match entry.file_name().to_str() {
+            Some(".sampler-tui.lock") => {
+                let path = project.path.join(".sampler-tui.lock");
+                if open_optional_regular_at(&project.file, Path::new(".sampler-tui.lock"), &path)?
+                    .is_none()
+                {
+                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                        path: project.path.clone(),
+                    });
+                }
+            }
+            Some(SAVE_AS_OWNER) => {
+                let path = project.path.join(SAVE_AS_OWNER);
+                let Some(mut file) =
+                    open_optional_regular_at(&project.file, Path::new(SAVE_AS_OWNER), &path)?
+                else {
+                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                        path: project.path.clone(),
+                    });
+                };
+                let mut value = String::new();
+                file.read_to_string(&mut value)
+                    .map_err(|error| filesystem_error("read save-as owner", &path, error))?;
+                owner = value.trim().parse::<ProjectId>().ok();
+            }
+            Some("audio") => {
+                project.open_audio_directory()?;
+                has_audio = true;
+            }
+            _ => {
+                return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                    path: project.path.clone(),
+                });
+            }
         }
     }
-    Ok(())
+    match owner {
+        Some(owner) if owner == project_id => Ok(SaveAsTargetState::Owned),
+        None if !has_audio => Ok(SaveAsTargetState::Empty),
+        _ => Err(ProjectStoreError::SaveAsTargetNotEmpty {
+            path: project.path.clone(),
+        }),
+    }
+}
+
+fn claim_or_validate_save_as_target(
+    project: &ProjectDirectory,
+    project_id: ProjectId,
+) -> Result<(), ProjectStoreError> {
+    if inspect_save_as_target(project, project_id)? == SaveAsTargetState::Owned {
+        return Ok(());
+    }
+    let path = project.path.join(SAVE_AS_OWNER);
+    let owned = rustix::fs::openat(
+        &project.file,
+        SAVE_AS_OWNER,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| filesystem_error("claim save-as target", &path, io::Error::from(error)))?;
+    let mut file = File::from(owned);
+    file.write_all(project_id.to_string().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| filesystem_error("write save-as owner", &path, error))?;
+    project
+        .file
+        .sync_all()
+        .map_err(|error| filesystem_error("sync save-as owner", &project.path, error))
+}
+
+fn remove_save_as_owner(project: &ProjectDirectory) -> Result<(), ProjectStoreError> {
+    let path = project.path.join(SAVE_AS_OWNER);
+    rustix::fs::unlinkat(&project.file, SAVE_AS_OWNER, rustix::fs::AtFlags::empty())
+        .map_err(|error| filesystem_error("remove save-as owner", &path, io::Error::from(error)))?;
+    project
+        .file
+        .sync_all()
+        .map_err(|error| filesystem_error("sync save-as owner removal", &project.path, error))
 }
 
 fn create_anchored_temp(
@@ -2309,6 +2382,47 @@ pitch_semitones = 0.0
         );
         let parsed = ProjectDocument::from_toml(&read(&target.join("project.toml"))).unwrap();
         assert_eq!(parsed.current().unwrap().project_id, winner.project_id);
+    }
+
+    #[test]
+    fn failed_first_save_as_retries_with_the_same_project_identity_only() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("retry-save-as");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.project_id = ProjectId::from_bytes([0x61; 16]);
+
+        let error = ProjectStore
+            .save_with_hook(request.clone(), |point| {
+                (point == AtomicWritePoint::BeforeRename).then_some(io::ErrorKind::Other)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::AtomicWrite {
+                point: AtomicWritePoint::BeforeRename,
+                visibility: AtomicWriteVisibility::PreviousDestinationPreserved,
+                ..
+            }
+        ));
+
+        let mut other_identity = request.clone();
+        other_identity.snapshot.project_id = ProjectId::from_bytes([0x62; 16]);
+        assert!(matches!(
+            ProjectStore.save(other_identity),
+            Err(ProjectStoreError::SaveAsTargetNotEmpty { .. })
+        ));
+        let receipt = ProjectStore.save(request).unwrap();
+        assert_eq!(receipt.project_id, ProjectId::from_bytes([0x61; 16]));
+        assert_eq!(
+            ProjectDocument::from_toml(&read(&target.join("project.toml")))
+                .unwrap()
+                .current()
+                .unwrap()
+                .project_id,
+            receipt.project_id
+        );
     }
 
     #[test]

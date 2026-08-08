@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::input::PAD_KEYS;
+use crate::pattern::WorkspaceView;
+use crate::ui_pattern::render_pattern;
 use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 
 const MIN_WIDTH: u16 = 80;
@@ -28,7 +30,9 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_resize_message(frame: &mut Frame, area: Rect) {
     let current = format!("Terminal too small: {}x{}", area.width, area.height);
-    let required = format!("Required: {MIN_WIDTH}x{MIN_HEIGHT}");
+    let required = format!(
+        "Resize terminal to at least {MIN_WIDTH}x{MIN_HEIGHT} (Required: {MIN_WIDTH}x{MIN_HEIGHT})"
+    );
     let width = display_width(&current)
         .max(display_width(&required))
         .min(usize::from(area.width));
@@ -41,6 +45,10 @@ fn render_resize_message(frame: &mut Frame, area: Rect) {
 }
 
 fn render_base(frame: &mut Frame, area: Rect, app: &App) {
+    if app.workspace_view() == WorkspaceView::Pattern {
+        render_pattern(frame, area, app);
+        return;
+    }
     let bank = char::from(b'A'.saturating_add(u8::from(app.active_bank())));
     let (format, state) = match app.audio_format() {
         Some((rate, channels)) => (format!("{}kHz/{channels}ch", rate / 1_000), "RUN"),
@@ -272,7 +280,7 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
         format!("Frame {}", telemetry.rendered_frame),
         format!("Release keys: {release}"),
         format!("Device {rate}Hz/{channels}ch"),
-        "Pattern: next slice".to_owned(),
+        perform_pattern_summary(app),
     ];
     for (index, row) in rows.iter().enumerate() {
         let y = inner
@@ -287,6 +295,32 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
+}
+
+fn perform_pattern_summary(app: &App) -> String {
+    let patterns = app.patterns();
+    let telemetry = app.telemetry();
+    let state = if patterns.is_recording() || telemetry.pattern_recording {
+        "REC"
+    } else if patterns.is_playing() || telemetry.pattern_playing {
+        "PLAY"
+    } else {
+        "STOP"
+    };
+    let transport = patterns.selected_pattern().transport();
+    let bar = if telemetry.pattern_playing && transport.loop_frames() != 0 {
+        let frames_per_bar = transport.loop_frames() / u64::from(transport.bars());
+        (telemetry.pattern_playhead / frames_per_bar.max(1))
+            .saturating_add(1)
+            .min(u64::from(transport.bars()))
+    } else {
+        1
+    };
+    format!(
+        "P{:02} {state} {bar}/{}",
+        patterns.selected_slot().get() + 1,
+        transport.bars()
+    )
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -331,15 +365,17 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             58,
             15,
             [
-                "PERFORM",
-                "1 2 3 4 / Q W E R / A S D F / Z X C V  play pads",
-                "Shift + pad                                stop pad",
-                "[ / ]                                      previous / next bank",
-                "Arrow keys                                 select pad",
-                "Enter                                      trigger selected pad",
-                "l                                          load sample",
-                ":                                          command palette",
-                "Shift+Esc                                  stop all",
+                "GLOBAL (Ctrl+R retries audio first when device is unavailable)",
+                "Tab                                        Perform / Pattern workspace",
+                "Space                                      play / stop selected pattern",
+                "Ctrl+R                                     overdub record selected pattern",
+                ", / .                                     previous / next pattern (1..16)",
+                "PATTERN",
+                "Arrows / PgUp / PgDn                       cursor / visible bar",
+                "Enter / Delete                             toggle / remove event",
+                "+ / - / u / Ctrl+Delete                   velocity / undo / clear",
+                "PERFORM: pads 1-4/Q-R/A-F/Z-V · Shift+pad stop · [/] bank",
+                "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
                 "Ctrl+Q / Ctrl+C                            quit",
                 "Esc or ?                                   close help",
             ],
@@ -366,6 +402,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             6,
             [
                 format!("Clear pattern {} ({event_count} events)?", slot.get() + 1),
+                "This removes events; one undo is available.".to_owned(),
                 "Enter confirms · Esc cancels".to_owned(),
             ],
         ),
@@ -906,6 +943,88 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("Required: 80x24")));
         assert!(!lines.iter().any(|line| line.contains("PADS")));
+    }
+
+    #[test]
+    fn exact_eighty_by_twenty_four_pattern_view_contains_full_grid_and_transport() {
+        let mut app = ready_app();
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+
+        assert!(screen.contains("PATTERN 01"));
+        assert!(screen.contains("120.0 BPM"));
+        assert!(screen.contains("REC"));
+        assert!(screen.contains("01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16"));
+        for label in [
+            "01 1", "02 2", "03 3", "04 4", "05 Q", "06 W", "07 E", "08 R", "09 A", "10 S", "11 D",
+            "12 F", "13 Z", "14 X", "15 C", "16 V",
+        ] {
+            assert!(screen.contains(label), "missing {label}");
+        }
+    }
+
+    #[test]
+    fn pattern_view_below_minimum_only_renders_resize_message() {
+        let mut app = ready_app();
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let screen = render_lines(79, 23, &app).join("\n");
+
+        assert!(screen.contains("Resize terminal to at least 80x24"));
+        assert!(!screen.contains("PATTERN 01"));
+        assert!(!screen.contains("01 02 03 04"));
+    }
+
+    #[test]
+    fn pattern_playhead_and_cursor_are_distinct_fixed_width_cells() {
+        let mut app = ready_app();
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        let playhead_x = 6;
+        let cursor_x = 7;
+        assert_eq!(playhead_x + 15, 21);
+        assert_ne!(
+            render_style(109, 30, &app, playhead_x, 4),
+            render_style(109, 30, &app, cursor_x, 4),
+        );
+        assert_eq!(render_symbol(109, 30, &app, playhead_x, 4), ">");
+        assert_eq!(render_symbol(109, 30, &app, cursor_x, 4), ".");
+    }
+
+    #[test]
+    fn perform_view_summarizes_the_playing_pattern_bar() {
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 96_000,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: None,
+            pattern_generation: None,
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 96_000,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("bars 4".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.tick();
+
+        assert!(
+            render_lines(80, 24, &app)
+                .join("\n")
+                .contains("P01 PLAY 2/4")
+        );
     }
 
     #[test]

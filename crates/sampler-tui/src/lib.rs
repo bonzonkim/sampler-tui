@@ -9,6 +9,7 @@ pub mod palette;
 pub mod pattern;
 pub mod terminal;
 pub mod ui;
+mod ui_pattern;
 
 pub use app::{
     App, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView, PreviewColumn,

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
-use crate::ui_pattern::{bar_index, live_identity, live_pattern, render_pattern};
+use crate::ui_pattern::{live_identity, live_pattern, render_pattern, transport_bar_index};
 use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 
 const MIN_WIDTH: u16 = 80;
@@ -316,11 +316,7 @@ fn perform_pattern_summary(app: &App) -> String {
         return format!("P{:02} {state}", identity.slot.get() + 1);
     };
     let transport = pattern.transport();
-    let bar = bar_index(
-        telemetry.pattern_playhead,
-        transport.loop_frames(),
-        transport.bars(),
-    );
+    let bar = transport_bar_index(transport, telemetry.pattern_playhead);
     format!(
         "P{:02} {state} {bar}/{}",
         identity.slot.get() + 1,
@@ -708,7 +704,7 @@ mod tests {
     use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
     use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
 
-    use super::{bar_index, render};
+    use super::{render, transport_bar_index};
 
     struct FakeAudio {
         stop_error: Option<String>,
@@ -1088,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn rational_bar_boundary_handles_non_divisible_three_bar_loops() {
+    fn transport_grid_bar_boundary_handles_non_divisible_three_bar_loops() {
         let transport = sampler_core::Transport::new(
             48_000,
             sampler_core::Tempo::new(20.1).unwrap(),
@@ -1097,10 +1093,10 @@ mod tests {
             sampler_core::Resolution::Sixteenth,
         )
         .unwrap();
-        let boundary = transport.loop_frames().div_ceil(3);
+        let boundary = transport.step_frame(16);
 
-        assert_eq!(bar_index(boundary - 1, transport.loop_frames(), 3), 1);
-        assert_eq!(bar_index(boundary, transport.loop_frames(), 3), 2);
+        assert_eq!(transport_bar_index(transport, boundary - 1), 1);
+        assert_eq!(transport_bar_index(transport, boundary), 2);
     }
 
     #[test]
@@ -1196,6 +1192,54 @@ mod tests {
         let pattern = render_lines(80, 24, &app).join("\n");
         assert!(pattern.contains("P01 PLAY"));
         assert_eq!(render_symbol(80, 24, &app, 6, 4), ".");
+    }
+
+    #[test]
+    fn logical_transport_bar_boundary_keeps_pgdn_cursor_toggle_and_summary_together() {
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 573_134,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(3),
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 573_134,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        for command in ["tempo 20.1", "bars 3", "resolution 1/16"] {
+            app.open_palette();
+            app.apply_terminal_event(Event::Paste(command.to_owned()));
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        app.tick();
+        assert!(
+            render_lines(80, 24, &app)
+                .join("\n")
+                .contains("P01 PLAY 2/3")
+        );
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(render_lines(80, 24, &app).join("\n").contains("BAR 2/3"));
+        assert!(
+            render_style(80, 24, &app, 6, 4)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(render_symbol(80, 24, &app, 6, 4), "O");
     }
 
     #[test]

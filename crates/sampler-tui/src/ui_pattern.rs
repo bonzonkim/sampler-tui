@@ -27,26 +27,35 @@ pub(crate) struct BarBounds {
     pub(crate) end: u64,
 }
 
-pub(crate) fn bar_bounds(loop_frames: u64, bars: u16, bar: u16) -> BarBounds {
-    let bars = bars.max(1);
-    let bar = bar.min(bars);
-    let boundary = |index: u16| {
-        let numerator = u128::from(loop_frames) * u128::from(index);
-        let divisor = u128::from(bars);
-        u64::try_from(numerator.div_ceil(divisor)).expect("bar boundary fits in u64")
-    };
+pub(crate) fn transport_bar_bounds(transport: Transport, bar: u16) -> BarBounds {
+    let bars = transport.bars().max(1);
+    let bar = bar.min(bars.saturating_sub(1));
+    let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
+    let start_step = u32::from(bar) * steps_per_bar;
+    let next_step = start_step.saturating_add(steps_per_bar);
     BarBounds {
-        start: boundary(bar),
-        end: boundary(bar.saturating_add(1).min(bars)),
+        start: transport.step_frame(start_step),
+        end: if bar.saturating_add(1) == bars {
+            transport.loop_frames()
+        } else {
+            transport.step_frame(next_step)
+        },
     }
 }
 
-pub(crate) fn bar_index(playhead: u64, loop_frames: u64, bars: u16) -> u64 {
-    if loop_frames == 0 || bars == 0 {
+pub(crate) fn transport_bar_index(transport: Transport, playhead: u64) -> u64 {
+    let loop_frames = transport.loop_frames();
+    if loop_frames == 0 || transport.bars() == 0 {
         return 1;
     }
-    (u128::from(playhead % loop_frames) * u128::from(bars) / u128::from(loop_frames) + 1)
-        .min(u128::from(bars)) as u64
+    let playhead = playhead % loop_frames;
+    for bar in 0..transport.bars() {
+        let bounds = transport_bar_bounds(transport, bar);
+        if playhead >= bounds.start && playhead < bounds.end {
+            return u64::from(bar) + 1;
+        }
+    }
+    u64::from(transport.bars())
 }
 
 impl GridProjection {
@@ -54,8 +63,7 @@ impl GridProjection {
         let bars = transport.bars().max(1);
         let bar = bar.min(bars.saturating_sub(1));
         let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
-        let loop_frames = transport.loop_frames();
-        let bounds = bar_bounds(loop_frames, bars, bar);
+        let bounds = transport_bar_bounds(transport, bar);
         Self {
             transport,
             bar,
@@ -344,7 +352,7 @@ fn metadata(events: &[PatternEvent], projection: GridProjection, pad: PadId) -> 
 mod tests {
     use sampler_core::{BankId, EventId, Meter, PadId, PatternEvent, Resolution, Tempo, Transport};
 
-    use super::{GridProjection, bar_bounds, bar_index, event_glyph};
+    use super::{GridProjection, event_glyph, transport_bar_bounds, transport_bar_index};
 
     fn transport(resolution: Resolution) -> Transport {
         Transport::new(
@@ -427,14 +435,28 @@ mod tests {
     }
 
     #[test]
-    fn half_open_bar_bounds_use_ceil_at_non_divisible_boundaries() {
-        let bounds = bar_bounds(1_719_403, 3, 0);
-        let next = bar_bounds(1_719_403, 3, 1);
+    fn transport_grid_boundaries_are_half_open_and_nonoverlapping_at_every_resolution() {
+        for resolution in [
+            Resolution::Quarter,
+            Resolution::Eighth,
+            Resolution::Sixteenth,
+            Resolution::ThirtySecond,
+        ] {
+            let transport = Transport::new(
+                48_000,
+                Tempo::new(20.1).unwrap(),
+                Meter::new(4, 4).unwrap(),
+                3,
+                resolution,
+            )
+            .unwrap();
+            let first = transport_bar_bounds(transport, 0);
+            let next = transport_bar_bounds(transport, 1);
 
-        assert_eq!((bounds.start, bounds.end), (0, 573_135));
-        assert_eq!(next.start, 573_135);
-        assert_eq!(bounds.end, next.start);
-        assert_eq!(bar_index(573_134, 1_719_403, 3), 1);
-        assert_eq!(bar_index(573_135, 1_719_403, 3), 2);
+            assert_eq!(first.end, next.start);
+            assert_eq!(next.start, transport.step_frame(transport.step_count() / 3));
+            assert_eq!(transport_bar_index(transport, next.start - 1), 1);
+            assert_eq!(transport_bar_index(transport, next.start), 2);
+        }
     }
 }

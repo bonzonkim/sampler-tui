@@ -2,10 +2,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use rustix::fs::{FileType as RustixFileType, FlockOperation, Mode, OFlags};
@@ -799,6 +796,8 @@ pub enum ProjectStoreError {
     Migration { message: String },
     #[error("OS entropy failed while generating a project id: {message}")]
     Entropy { message: String },
+    #[error("could not allocate a unique temporary name for {path} after {attempts} attempts")]
+    TempNameExhausted { path: PathBuf, attempts: usize },
     #[error("recovery identity or revision does not match: {path}")]
     RecoveryMismatch { path: PathBuf },
 }
@@ -1115,7 +1114,7 @@ fn migrate_legacy(
     .map_err(ProjectStoreError::from)
 }
 
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
 
 struct AnchoredTemp {
     directory: File,
@@ -1172,6 +1171,32 @@ impl AnchoredTemp {
             |error| filesystem_error("remove temporary file", &self.path, io::Error::from(error)),
         )?;
         self.disarm();
+        Ok(())
+    }
+
+    fn verify_destination_identity(
+        &self,
+        directory: &File,
+        leaf: &Path,
+        destination: &Path,
+        point: AtomicWritePoint,
+    ) -> Result<(), ProjectStoreError> {
+        let current = rustix::fs::openat(
+            directory,
+            leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| atomic_error(destination, point, io::Error::from(error).kind(), true))?;
+        let expected = rustix::fs::fstat(&self.identity).map_err(|error| {
+            atomic_error(destination, point, io::Error::from(error).kind(), true)
+        })?;
+        let actual = rustix::fs::fstat(&current).map_err(|error| {
+            atomic_error(destination, point, io::Error::from(error).kind(), true)
+        })?;
+        if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
+            return Err(atomic_error(destination, point, io::ErrorKind::Other, true));
+        }
         Ok(())
     }
 }
@@ -1392,6 +1417,12 @@ where
     }
     let _ = temporary.unlink_owned();
     checkpoint(hook, AtomicWritePoint::OwnerAfterPublish, &path, true)?;
+    temporary.verify_destination_identity(
+        &project.file,
+        Path::new(SAVE_AS_OWNER),
+        &path,
+        AtomicWritePoint::OwnerAfterPublish,
+    )?;
     project
         .file
         .sync_all()
@@ -1413,16 +1444,35 @@ fn create_anchored_temp(
     directory_path: &Path,
     destination: &Path,
 ) -> Result<(File, AnchoredTemp), ProjectStoreError> {
+    create_anchored_temp_with_entropy(directory, directory_path, destination, |bytes| {
+        getrandom::fill(bytes).map_err(|error| ProjectStoreError::Entropy {
+            message: error.to_string(),
+        })
+    })
+}
+
+fn create_anchored_temp_with_entropy<F>(
+    directory: &File,
+    directory_path: &Path,
+    destination: &Path,
+    mut fill_entropy: F,
+) -> Result<(File, AnchoredTemp), ProjectStoreError>
+where
+    F: FnMut(&mut [u8; 32]) -> Result<(), ProjectStoreError>,
+{
     let base = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("asset");
-    loop {
-        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let leaf = std::ffi::OsString::from(format!(
-            ".{base}.sampler-tui-tmp-{}-{nonce}",
-            std::process::id()
-        ));
+    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
+        let mut entropy = [0_u8; 32];
+        fill_entropy(&mut entropy)?;
+        let mut nonce = String::with_capacity(64);
+        for byte in entropy {
+            use std::fmt::Write as _;
+            write!(&mut nonce, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        let leaf = std::ffi::OsString::from(format!(".{base}.sampler-tui-tmp-{nonce}"));
         match rustix::fs::openat(
             directory,
             &leaf,
@@ -1459,6 +1509,10 @@ fn create_anchored_temp(
             }
         }
     }
+    Err(ProjectStoreError::TempNameExhausted {
+        path: destination.to_path_buf(),
+        attempts: MAX_TEMP_CREATE_ATTEMPTS,
+    })
 }
 
 fn atomic_error(
@@ -1595,6 +1649,12 @@ where
         AtomicWritePoint::BeforeDirectorySync,
         destination,
         true,
+    )?;
+    temporary.verify_destination_identity(
+        &project.file,
+        leaf,
+        destination,
+        AtomicWritePoint::BeforeDirectorySync,
     )?;
     project.file.sync_all().map_err(|error| {
         atomic_error(
@@ -1756,6 +1816,12 @@ where
         AtomicWritePoint::BeforeDirectorySync,
         destination,
         true,
+    )?;
+    temporary.verify_destination_identity(
+        &audio.file,
+        leaf,
+        destination,
+        AtomicWritePoint::BeforeDirectorySync,
     )?;
     audio.file.sync_all().map_err(|error| {
         atomic_error(
@@ -2117,6 +2183,92 @@ mod tests {
     }
 
     #[test]
+    fn temporary_leaf_uses_256_bit_lower_hex_entropy_without_process_identity() {
+        let fixture = ProjectFixture::new();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        let destination = fixture.directory.join("project.toml");
+        let (_file, temporary) =
+            create_anchored_temp(&project.file, &project.path, &destination).unwrap();
+        let leaf = temporary.leaf.to_string_lossy();
+        let suffix = leaf.strip_prefix(".project.toml.sampler-tui-tmp-").unwrap();
+
+        assert_eq!(suffix.len(), 64);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(suffix, suffix.to_ascii_lowercase());
+        assert!(!suffix.contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn temporary_name_collisions_retry_to_a_distinct_entropy_value() {
+        use std::cell::Cell;
+
+        let fixture = ProjectFixture::new();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        let destination = fixture.directory.join("project.toml");
+        let collision = fixture
+            .directory
+            .join(format!(".project.toml.sampler-tui-tmp-{}", "00".repeat(32)));
+        fs::write(&collision, b"foreign collision").unwrap();
+        let attempts = Cell::new(0_u8);
+
+        let (_file, temporary) = create_anchored_temp_with_entropy(
+            &project.file,
+            &project.path,
+            &destination,
+            |entropy| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                entropy.fill(attempt);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_ne!(temporary.path, collision);
+        assert_eq!(fs::read(collision).unwrap(), b"foreign collision");
+    }
+
+    #[test]
+    fn temporary_name_collision_exhaustion_is_bounded_and_preserves_foreign_entry() {
+        use std::cell::Cell;
+
+        let fixture = ProjectFixture::new();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        let destination = fixture.directory.join("project.toml");
+        let collision = fixture
+            .directory
+            .join(format!(".project.toml.sampler-tui-tmp-{}", "00".repeat(32)));
+        fs::write(&collision, b"foreign collision").unwrap();
+        let attempts = Cell::new(0_usize);
+
+        let result = create_anchored_temp_with_entropy(
+            &project.file,
+            &project.path,
+            &destination,
+            |entropy| {
+                attempts.set(attempts.get() + 1);
+                entropy.fill(0);
+                Ok(())
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("collisions must exhaust the bounded retry budget"),
+        };
+
+        assert_eq!(attempts.get(), MAX_TEMP_CREATE_ATTEMPTS);
+        assert!(matches!(
+            error,
+            ProjectStoreError::TempNameExhausted {
+                attempts: MAX_TEMP_CREATE_ATTEMPTS,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(collision).unwrap(), b"foreign collision");
+    }
+
+    #[test]
     fn asset_publication_rejects_replaced_temp_without_deleting_foreign_replacement() {
         use std::cell::RefCell;
 
@@ -2151,6 +2303,62 @@ mod tests {
         assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
         assert!(!final_asset.exists());
         assert_eq!(fs::read(replaced.into_inner().unwrap()).unwrap(), foreign);
+    }
+
+    #[test]
+    fn metadata_postpublication_swap_never_reports_success() {
+        let fixture = ProjectFixture::new();
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.snapshot.pads.clear();
+        let destination = fixture.directory.join("project.toml");
+        let foreign = b"foreign postpublication metadata";
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::BeforeDirectorySync {
+                fs::remove_file(&destination).unwrap();
+                fs::write(&destination, foreign).unwrap();
+            }
+            None
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::AtomicWrite {
+                visibility: AtomicWriteVisibility::NewDestinationVisibleDurabilityUnconfirmed,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(destination).unwrap(), foreign);
+    }
+
+    #[test]
+    fn asset_postpublication_swap_never_reports_success() {
+        let fixture = ProjectFixture::new();
+        let request = fixture.request(1, SaveKind::Explicit);
+        let fingerprint = request.snapshot.pads[0].fingerprint;
+        let destination = fixture.directory.join(format!(
+            "audio/{}.{}",
+            fingerprint.digest,
+            fingerprint.extension.as_str()
+        ));
+        let foreign = b"foreign postpublication asset";
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::BeforeDirectorySync {
+                fs::remove_file(&destination).unwrap();
+                fs::write(&destination, foreign).unwrap();
+            }
+            None
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::AtomicWrite {
+                visibility: AtomicWriteVisibility::NewDestinationVisibleDurabilityUnconfirmed,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(destination).unwrap(), foreign);
     }
 
     #[test]
@@ -2992,6 +3200,35 @@ pitch_semitones = 0.0
                 .is_symlink()
         );
         assert_eq!(fs::read(outside).unwrap(), b"attacker bytes");
+    }
+
+    #[test]
+    fn owner_postpublication_swap_never_reports_success() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("owner-postpublication-swap");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.pads.clear();
+        let destination = target.join(SAVE_AS_OWNER);
+        let foreign = b"foreign postpublication owner";
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::OwnerAfterPublish {
+                fs::remove_file(&destination).unwrap();
+                fs::write(&destination, foreign).unwrap();
+            }
+            None
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::AtomicWrite {
+                visibility: AtomicWriteVisibility::NewDestinationVisibleDurabilityUnconfirmed,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(destination).unwrap(), foreign);
     }
 
     #[test]

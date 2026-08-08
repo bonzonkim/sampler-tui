@@ -510,12 +510,19 @@ impl App {
         let mut pads = Vec::with_capacity(PAD_VIEW_COUNT);
         for offset in 0..PAD_VIEW_COUNT {
             let pad = pad_from_offset(offset);
-            if self.pending_loads[offset].is_some()
-                || self.committed_recovery_loads[offset].is_some()
+            if self.pending_loads[offset]
+                .as_ref()
+                .is_some_and(|pending| !matches!(pending.phase, PendingLoadPhase::Failed))
+                || self.committed_recovery_loads[offset]
+                    .as_ref()
+                    .is_some_and(|pending| !matches!(pending.phase, PendingLoadPhase::Failed))
             {
                 return Err(ProjectSnapshotError::PendingSampleLoad(pad));
             }
-            if self.sample_editor.pending[offset].is_some() {
+            if self.sample_editor.pending[offset]
+                .as_ref()
+                .is_some_and(|pending| !matches!(pending.phase, PendingEditPhase::Failed))
+            {
                 return Err(ProjectSnapshotError::PendingSampleEdit(pad));
             }
             if self.pads[offset].sample.is_none() {
@@ -823,11 +830,14 @@ impl App {
             self.pads[offset].settings = settings;
             return Ok(());
         }
-        self.ensure_project_mutation_available()?;
-        let bound_in_current_session = self.current_session_bound[offset];
-        if bound_in_current_session && let Some(audio) = self.audio.as_mut() {
-            audio.update_pad(pad, settings)?;
+        if !self.current_session_bound[offset] || self.audio.is_none() {
+            return Err("loaded sample is not admitted to the current audio session".to_owned());
         }
+        self.ensure_project_mutation_available()?;
+        self.audio
+            .as_mut()
+            .expect("current session binding requires an audio controller")
+            .update_pad(pad, settings)?;
         self.pads[offset].settings = settings;
         self.commit_project_mutation();
         Ok(())
@@ -7312,6 +7322,171 @@ mod tests {
                 .event
                 .duration,
             Some(120)
+        );
+    }
+
+    #[test]
+    fn disconnected_loaded_pad_rejects_settings_without_changing_snapshot_or_revision() {
+        let mut app = project_app();
+        let pad = pad(0, 0);
+        let before = app.project_snapshot().unwrap();
+        let before_revision = app.project_revision();
+        let before_settings = app.pad(pad).settings;
+        app.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
+        ));
+        assert!(app.maintain_audio());
+        assert!(!app.current_session_bound[0]);
+
+        let requested = PadSettings {
+            gain_db: -8.0,
+            ..before_settings
+        };
+        assert_eq!(
+            app.update_pad_settings(pad, requested),
+            Err("loaded sample is not admitted to the current audio session".to_owned())
+        );
+
+        assert_eq!(app.pad(pad).settings, before_settings);
+        assert_eq!(app.project_revision(), before_revision);
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn replacement_decode_failure_restores_the_pre_request_snapshot() {
+        let mut app = project_app();
+        let pad = pad(0, 0);
+        let before = app.project_snapshot().unwrap();
+        let before_revision = app.project_revision();
+        let WorkerRequest::LoadSample {
+            generation,
+            purpose,
+            path,
+            ..
+        } = app.begin_load(pad, "broken.wav").unwrap()
+        else {
+            panic!("expected replacement load request");
+        };
+        assert_eq!(
+            app.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleLoad(pad))
+        );
+
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
+            pad,
+            generation,
+            purpose,
+            path,
+            result: Err(LoadSampleError::Decode(
+                "replacement decode failed".to_owned()
+            )),
+        }));
+
+        assert!(app.status().contains("replacement decode failed"));
+        assert_eq!(app.project_revision(), before_revision);
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn apply_render_failure_restores_the_pre_request_snapshot() {
+        let mut app = project_app();
+        let pad = pad(0, 0);
+        let before = app.project_snapshot().unwrap();
+        let before_revision = app.project_revision();
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe).unwrap();
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::EditSample { generation, .. }] = requests.as_slice() else {
+            panic!("expected edit request");
+        };
+        assert_eq!(
+            app.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleEdit(pad))
+        );
+
+        assert!(app.apply_worker_result(WorkerResult::Edited {
+            pad,
+            generation: *generation,
+            recipe,
+            result: Err("apply render failed".to_owned()),
+        }));
+
+        assert!(app.status().contains("apply render failed"));
+        assert_eq!(app.project_revision(), before_revision);
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_still_refuses_every_active_sample_operation_phase() {
+        let pad = pad(0, 0);
+
+        let mut awaiting_load = project_app();
+        awaiting_load.audio = None;
+        assert!(awaiting_load.begin_load(pad, "awaiting.wav").is_none());
+        assert_eq!(
+            awaiting_load.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleLoad(pad))
+        );
+
+        let mut ready_load = project_app();
+        let WorkerRequest::LoadSample {
+            generation,
+            purpose,
+            path,
+            ..
+        } = ready_load.begin_load(pad, "ready.wav").unwrap()
+        else {
+            panic!("expected ready load request");
+        };
+        ready_load.audio = None;
+        assert!(ready_load.apply_worker_result(WorkerResult::Loaded {
+            pad,
+            generation,
+            purpose,
+            path,
+            result: match loaded(pad, generation, "ready.wav") {
+                WorkerResult::Loaded { result, .. } => result,
+                _ => unreachable!(),
+            },
+        }));
+        assert_eq!(
+            ready_load.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleLoad(pad))
+        );
+
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        let mut awaiting_edit = project_app();
+        awaiting_edit.request_sample_edit(pad, recipe).unwrap();
+        let [request] = awaiting_edit.take_worker_requests().try_into().unwrap();
+        assert!(awaiting_edit.apply_worker_send_error(request, WorkerSendError::WorkerBusy));
+        assert_eq!(
+            awaiting_edit.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleEdit(pad))
+        );
+
+        let mut ready_edit = project_app();
+        ready_edit.request_sample_edit(pad, recipe).unwrap();
+        let requests = ready_edit.take_worker_requests();
+        let [WorkerRequest::EditSample { generation, .. }] = requests.as_slice() else {
+            panic!("expected ready edit request");
+        };
+        assert!(ready_edit.apply_worker_result(edited(
+            &ready_edit,
+            pad,
+            *generation,
+            recipe,
+            48_000,
+            vec![-0.5, 0.5],
+        )));
+        assert_eq!(
+            ready_edit.project_snapshot(),
+            Err(ProjectSnapshotError::PendingSampleEdit(pad))
         );
     }
 }

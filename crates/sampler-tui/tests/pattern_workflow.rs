@@ -599,9 +599,14 @@ fn retrying_pad_settings_wait_for_their_current_session_binding() {
     harness.controller = retry_controller;
     harness.runtime_failure = retry_failure;
     let calls = harness.update_calls.get();
+    let b_before = harness.app.pad(pad(1)).settings;
     let b_settings = PadSettings::new(PlaybackMode::Gate, -6.0, 0.0, 0.0, None).unwrap();
-    harness.app.update_pad_settings(pad(1), b_settings).unwrap();
+    assert_eq!(
+        harness.app.update_pad_settings(pad(1), b_settings),
+        Err("loaded sample is not admitted to the current audio session".to_owned())
+    );
     assert_eq!(harness.update_calls.get(), calls);
+    assert_eq!(harness.app.pad(pad(1)).settings, b_before);
     let a_settings = PadSettings::new(PlaybackMode::Gate, -3.0, 0.0, 0.0, None).unwrap();
     harness.app.update_pad_settings(pad(0), a_settings).unwrap();
     assert_eq!(harness.update_calls.get(), calls + 1);
@@ -609,11 +614,8 @@ fn retrying_pad_settings_wait_for_their_current_session_binding() {
         harness.app.maintain_audio();
         harness.callback(0);
     }
-    assert_eq!(harness.app.pad(pad(1)).settings, b_settings);
-    assert_eq!(
-        harness.installed_settings.borrow().last(),
-        Some(&b_settings)
-    );
+    assert_eq!(harness.app.pad(pad(1)).settings, b_before);
+    assert_eq!(harness.installed_settings.borrow().last(), Some(&b_before));
     assert_eq!(harness.engine.invalid_commands(), 0);
 }
 

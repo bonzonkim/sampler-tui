@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use sampler_core::{EditablePattern, PadId, PatternEvent, PatternSlotId, Resolution, Transport};
 
 use crate::App;
+use crate::pattern::{displayed_cell_for_step, displayed_column_for_frame};
 
 const PAD_KEYS: [char; 16] = [
     '1', '2', '3', '4', 'Q', 'W', 'E', 'R', 'A', 'S', 'D', 'F', 'Z', 'X', 'C', 'V',
@@ -18,7 +19,6 @@ struct GridProjection {
     bar: u16,
     steps_per_bar: u32,
     start_step: u32,
-    bounds: BarBounds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,13 +63,11 @@ impl GridProjection {
         let bars = transport.bars().max(1);
         let bar = bar.min(bars.saturating_sub(1));
         let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
-        let bounds = transport_bar_bounds(transport, bar);
         Self {
             transport,
             bar,
             steps_per_bar,
             start_step: u32::from(bar) * steps_per_bar,
-            bounds,
         }
     }
 
@@ -80,22 +78,16 @@ impl GridProjection {
 
     #[cfg(test)]
     fn bar_start_frame(self) -> u64 {
-        self.bounds.start
+        transport_bar_bounds(self.transport, self.bar).start
     }
 
     fn column_for_step(self, step: u32) -> Option<u32> {
         (step >= self.start_step && step < self.start_step + self.steps_per_bar)
-            .then(|| self.column_for_frame(self.transport.step_frame(step)))
-            .flatten()
+            .then(|| displayed_cell_for_step(self.transport, step).column)
     }
 
     fn column_for_frame(self, frame: u64) -> Option<u32> {
-        let local = frame.checked_sub(self.bounds.start)?;
-        let length = self.bounds.end.saturating_sub(self.bounds.start);
-        (local < length && length != 0).then(|| {
-            u32::try_from(u128::from(local) * u128::from(STEPS_PER_BAR) / u128::from(length))
-                .expect("sixteen-column projection fits in u32")
-        })
+        displayed_column_for_frame(self.transport, self.bar, frame)
     }
 }
 
@@ -212,7 +204,7 @@ pub(crate) fn render_pattern(frame: &mut Frame, area: Rect, app: &App) {
             pattern.events().len(),
             telemetry.pattern_overflows,
             telemetry.live_ack_overflows,
-            if workspace.has_pending_snapshot(workspace.selected_slot()) {
+            if workspace.updates_pending(workspace.selected_slot()) {
                 "pending"
             } else {
                 "current"
@@ -405,7 +397,7 @@ mod tests {
             Resolution::ThirtySecond,
         ] {
             let projection = GridProjection::new(transport(resolution), 1);
-            let frame = projection.bounds.end - 1;
+            let frame = transport_bar_bounds(projection.transport, projection.bar).end - 1;
             let event = PatternEvent::new(EventId(1), pad, frame, 1.0, None).unwrap();
             let column = projection.column_for_frame(frame).unwrap();
 

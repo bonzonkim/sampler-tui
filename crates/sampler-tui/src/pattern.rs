@@ -219,6 +219,41 @@ mod tests {
     }
 
     #[test]
+    fn toggle_removes_an_event_in_the_same_swung_display_cell() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.move_cursor_to(pad(), 1);
+        workspace.toggle_step().unwrap();
+        workspace.set_swing(0.60).unwrap();
+        workspace.set_quantize(1.0).unwrap();
+
+        workspace.toggle_step().unwrap();
+
+        assert!(workspace.selected_pattern().events().is_empty());
+    }
+
+    #[test]
+    fn delete_removes_the_selected_event_in_a_partially_quantized_display_cell() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.move_cursor_to(pad(), 1);
+        workspace.toggle_step().unwrap();
+        workspace.set_swing(0.60).unwrap();
+        workspace.set_quantize(0.5).unwrap();
+
+        workspace.delete_step().unwrap();
+
+        assert!(workspace.selected_pattern().events().is_empty());
+    }
+
+    #[test]
+    fn an_edit_is_pending_until_its_current_generation_is_admitted() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.move_cursor_to(pad(), 0);
+        workspace.toggle_step().unwrap();
+
+        assert!(workspace.updates_pending(slot()));
+    }
+
+    #[test]
     fn trigger_and_release_acks_record_exact_wrapped_duration() {
         let mut workspace = recording_workspace();
         workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
@@ -227,6 +262,16 @@ mod tests {
         workspace.apply_ack(release_ack(8, 1_013));
         let event = workspace.selected_pattern().events()[0];
         assert_eq!((event.frame, event.duration), (8, Some(5)));
+    }
+
+    #[test]
+    fn one_shot_ack_records_no_duration_and_drops_its_release_correlation() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger_with_duration(key(0), command(7), pad(), 1.0, false);
+        workspace.apply_ack(trigger_ack(7, 1_008));
+
+        assert_eq!(workspace.selected_pattern().events()[0].duration, None);
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
     }
 
     #[test]
@@ -562,6 +607,79 @@ impl PatternCursor {
     }
 }
 
+/// The bounded sixteen-column cell that the Pattern view shows for one transport step.
+/// Keeping this projection beside editing prevents the renderer and reducer from disagreeing
+/// when swing, resolution, or partial quantization move an effective event frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisplayCell {
+    pub(crate) bar: u16,
+    pub(crate) column: u32,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+pub(crate) fn displayed_cell_for_step(transport: Transport, step: u32) -> DisplayCell {
+    let bars = transport.bars().max(1);
+    let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
+    let bar = u16::try_from(step / steps_per_bar)
+        .unwrap_or(u16::MAX)
+        .min(bars.saturating_sub(1));
+    let first_step = u32::from(bar).saturating_mul(steps_per_bar);
+    let bar_start = transport.step_frame(first_step);
+    let bar_end = if bar.saturating_add(1) == bars {
+        transport.loop_frames()
+    } else {
+        transport.step_frame(first_step.saturating_add(steps_per_bar))
+    };
+    let length = bar_end.saturating_sub(bar_start).max(1);
+    let frame = transport.step_frame(step.min(transport.step_count().saturating_sub(1)));
+    let local = frame
+        .saturating_sub(bar_start)
+        .min(length.saturating_sub(1));
+    let column = u32::try_from(u128::from(local) * 16 / u128::from(length))
+        .expect("sixteen-column projection fits in u32");
+    let start = bar_start.saturating_add(
+        u64::try_from((u128::from(column) * u128::from(length)).div_ceil(16))
+            .expect("display cell start fits in u64"),
+    );
+    let end = bar_start.saturating_add(
+        u64::try_from((u128::from(column + 1) * u128::from(length)).div_ceil(16))
+            .expect("display cell end fits in u64"),
+    );
+    DisplayCell {
+        bar,
+        column,
+        start,
+        end: end.max(start.saturating_add(1)).min(bar_end),
+    }
+}
+
+pub(crate) fn displayed_column_for_frame(
+    transport: Transport,
+    bar: u16,
+    frame: u64,
+) -> Option<u32> {
+    let bars = transport.bars().max(1);
+    let bar = bar.min(bars.saturating_sub(1));
+    let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
+    let start = transport.step_frame(u32::from(bar).saturating_mul(steps_per_bar));
+    let end = if bar.saturating_add(1) == bars {
+        transport.loop_frames()
+    } else {
+        transport.step_frame(
+            u32::from(bar)
+                .saturating_add(1)
+                .saturating_mul(steps_per_bar),
+        )
+    };
+    let length = end.saturating_sub(start);
+    let local = frame.checked_sub(start)?;
+    (length != 0 && local < length).then(|| {
+        u32::try_from(u128::from(local) * 16 / u128::from(length))
+            .expect("sixteen-column projection fits in u32")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternStatus {
     UpdatePending { slot: PatternSlotId },
@@ -639,6 +757,7 @@ struct HeldRecordingKey {
     event_id: Option<EventId>,
     trigger_frame: Option<u64>,
     trigger_absolute_frame: Option<u64>,
+    record_duration: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -815,22 +934,28 @@ impl PatternWorkspace {
     }
 
     pub fn toggle_step(&mut self) -> Result<(), PatternEditError> {
-        let raw_frame = self
-            .selected_pattern()
-            .transport()
-            .step_frame(self.cursor.step);
         let index = self.slot_index();
-        let event = self.patterns[index].toggle_at(self.cursor.pad, raw_frame, 1.0)?;
-        self.selected_event = event.map(|event_id| SelectedEvent {
-            slot: self.selected_slot,
-            event_id,
-        });
+        let selected = self.event_in_cursor_cell();
+        if let Some(event_id) = selected {
+            self.patterns[index].remove(event_id)?;
+            self.selected_event = None;
+        } else {
+            let raw_frame = self.patterns[index]
+                .transport()
+                .step_frame(self.cursor.step);
+            let event_id =
+                self.patterns[index].insert_new(self.cursor.pad, raw_frame, 1.0, None)?;
+            self.selected_event = Some(SelectedEvent {
+                slot: self.selected_slot,
+                event_id,
+            });
+        }
         self.mark_dirty(index);
         Ok(())
     }
 
     pub fn delete_step(&mut self) -> Result<(), PatternEditError> {
-        let Some(event_id) = self.selected_event_id() else {
+        let Some(event_id) = self.event_in_cursor_cell() else {
             return Ok(());
         };
         let index = self.slot_index();
@@ -958,6 +1083,17 @@ impl PatternWorkspace {
         pad: PadId,
         velocity: f32,
     ) {
+        self.note_live_trigger_with_duration(key, command, pad, velocity, true);
+    }
+
+    pub fn note_live_trigger_with_duration(
+        &mut self,
+        key: usize,
+        command: LiveCommandId,
+        pad: PadId,
+        velocity: f32,
+        record_duration: bool,
+    ) {
         let Some(entry) = self.held_keys.get_mut(key) else {
             return;
         };
@@ -969,6 +1105,7 @@ impl PatternWorkspace {
             event_id: None,
             trigger_frame: None,
             trigger_absolute_frame: None,
+            record_duration,
         });
     }
 
@@ -1042,7 +1179,7 @@ impl PatternWorkspace {
                         entry.event_id = Some(event_id);
                         entry.trigger_frame = Some(frame);
                         entry.trigger_absolute_frame = Some(ack.frame);
-                        self.held_keys[key] = Some(entry);
+                        self.held_keys[key] = entry.record_duration.then_some(entry);
                         if stamp.slot == self.selected_slot {
                             self.selected_event = Some(SelectedEvent {
                                 slot: stamp.slot,
@@ -1143,6 +1280,12 @@ impl PatternWorkspace {
         self.pending_snapshots[usize::from(slot.get())].is_some()
     }
 
+    /// Includes an uncompiled dirty edit and a submitted-but-not-current snapshot, so status
+    /// never briefly claims an edited slot is current between UI maintenance passes.
+    pub fn updates_pending(&self, slot: PatternSlotId) -> bool {
+        !self.is_slot_ready(slot)
+    }
+
     pub fn needs_reinstall(&self, slot: PatternSlotId) -> bool {
         self.reinstall_pending[usize::from(slot.get())]
     }
@@ -1212,7 +1355,8 @@ impl PatternWorkspace {
             let pending = self.pending_snapshots[index]
                 .as_ref()
                 .expect("selected pending slot holds a snapshot");
-            if self.patterns[index].generation() != pending.generation {
+            let pending_generation = pending.generation;
+            if self.patterns[index].generation() != pending_generation {
                 self.pending_snapshots[index] = None;
                 self.mark_dirty(index);
                 let status = PatternStatus::UpdatePending { slot };
@@ -1222,11 +1366,23 @@ impl PatternWorkspace {
             }
             match audio.install_pattern(Arc::clone(&pending.snapshot)) {
                 Ok(_) => {
-                    self.installed_generations[index] = Some(pending.generation);
+                    self.installed_generations[index] = Some(pending_generation);
                     self.pending_snapshots[index] = None;
                     self.reinstall_pending[index] = false;
+                    // The callback replaces an active slot immediately. Re-arm capture with
+                    // that exact admitted identity before the next tracked live command can be
+                    // acknowledged against it; origin stays causal across a replacement.
+                    if self.rebind_recording_to_admitted_generation(slot, pending_generation)
+                        && let Err(error) = audio.set_record_capture(self.record_capture())
+                    {
+                        let status = PatternStatus::AudioCommandFailed { slot, error };
+                        self.last_status = Some(status.clone());
+                        result.status = Some(status);
+                    }
                     result.submitted_slot = Some(slot);
-                    self.last_status = None;
+                    if result.status.is_none() {
+                        self.last_status = None;
+                    }
                 }
                 Err(error) => {
                     let status = if error.contains("queue") || error.contains("full") {
@@ -1309,6 +1465,36 @@ impl PatternWorkspace {
         self.pending_snapshots.iter().position(Option::is_some)
     }
 
+    fn rebind_recording_to_admitted_generation(
+        &mut self,
+        slot: PatternSlotId,
+        generation: u64,
+    ) -> bool {
+        let Some(state) = self.recording else {
+            return false;
+        };
+        if !state.accepts_acks() || state.intent().stamp.slot != slot {
+            return false;
+        }
+        let intent = state.intent();
+        if intent.stamp.generation == generation {
+            return false;
+        }
+        let stamp = TransportStamp {
+            generation,
+            loop_frames: self.patterns[usize::from(slot.get())]
+                .transport()
+                .loop_frames(),
+            ..intent.stamp
+        };
+        self.recording = Some(match state {
+            RecordingState::Pending(_) => RecordingState::Pending(RecordingIntent { stamp }),
+            RecordingState::Confirmed(_) => RecordingState::Confirmed(RecordingIntent { stamp }),
+            RecordingState::Disarming(_) => RecordingState::Disarming(RecordingIntent { stamp }),
+        });
+        true
+    }
+
     fn clamp_cursor(&mut self) {
         let transport = self.selected_pattern().transport();
         self.cursor.step = self
@@ -1325,16 +1511,22 @@ impl PatternWorkspace {
     }
 
     fn refresh_selected_event(&mut self) {
-        let raw_frame = self
-            .selected_pattern()
-            .transport()
-            .step_frame(self.cursor.step);
-        self.selected_event = self.selected_pattern().events().iter().find_map(|event| {
-            (event.pad == self.cursor.pad && event.frame == raw_frame).then_some(SelectedEvent {
-                slot: self.selected_slot,
-                event_id: event.id,
-            })
+        self.selected_event = self.event_in_cursor_cell().map(|event_id| SelectedEvent {
+            slot: self.selected_slot,
+            event_id,
         });
+    }
+
+    fn event_in_cursor_cell(&self) -> Option<EventId> {
+        let cell = displayed_cell_for_step(self.selected_pattern().transport(), self.cursor.step);
+        self.selected_pattern()
+            .events()
+            .iter()
+            .filter(|event| {
+                event.pad == self.cursor.pad && event.frame >= cell.start && event.frame < cell.end
+            })
+            .map(|event| event.id)
+            .min()
     }
 }
 

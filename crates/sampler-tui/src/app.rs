@@ -713,6 +713,7 @@ impl App {
             return;
         };
         let recording = self.patterns.is_recording();
+        let records_duration = self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot;
         let result = if recording {
             audio.trigger_live_tracked(pad, 1.0).map(Some)
         } else {
@@ -726,12 +727,24 @@ impl App {
             {
                 self.held_pad_by_key[index] = Some(pad);
                 if let Some(command) = command {
-                    self.patterns.note_live_trigger(index, command, pad, 1.0);
+                    self.patterns.note_live_trigger_with_duration(
+                        index,
+                        command,
+                        pad,
+                        1.0,
+                        records_duration,
+                    );
                 }
             }
             Ok(command) => {
                 if let Some(command) = command {
-                    self.patterns.note_live_trigger(index, command, pad, 1.0);
+                    self.patterns.note_live_trigger_with_duration(
+                        index,
+                        command,
+                        pad,
+                        1.0,
+                        records_duration,
+                    );
                 }
             }
             Err(error) => self.status = error,
@@ -1293,7 +1306,10 @@ impl App {
         let Some(pad) = self.held_pad_by_key[index] else {
             return;
         };
-        if self.pads[pad_offset(pad)].settings.mode == PlaybackMode::Loop {
+        if self.pads[pad_offset(pad)].settings.mode == PlaybackMode::OneShot
+            && self.patterns.is_recording()
+        {
+            self.held_pad_by_key[index] = None;
             return;
         }
         let Some(audio) = self.audio.as_mut() else {
@@ -2930,6 +2946,45 @@ mod tests {
                 AudioCall::Release(pad(0, 0), 64),
             ]
         );
+    }
+
+    #[test]
+    fn recording_pad_lifecycle_tracks_gate_and_loop_releases_but_not_one_shot() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        let stamp = sampler_audio::TransportStamp {
+            slot: PatternSlotId::new(0).unwrap(),
+            generation: 0,
+            origin: 0,
+            loop_frames: 96_000,
+        };
+
+        for (index, mode, expect_release) in [
+            (0, PlaybackMode::OneShot, false),
+            (1, PlaybackMode::Gate, true),
+            (2, PlaybackMode::Loop, true),
+        ] {
+            app.patterns.start_recording(stamp).unwrap();
+            app.pads[index].settings = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
+            app.apply(InputAction::PadPress(index));
+            app.apply(InputAction::PadRelease(index));
+            assert!(!app.is_pad_held(index));
+            assert_eq!(
+                calls
+                    .snapshot()
+                    .iter()
+                    .filter(|call| matches!(call, AudioCall::TrackedRelease(tracked) if *tracked == pad(0, index as u8)))
+                    .count(),
+                usize::from(expect_release),
+                "{mode:?} release semantics",
+            );
+            calls.clear();
+            app.patterns.stop_recording();
+        }
     }
 
     #[test]

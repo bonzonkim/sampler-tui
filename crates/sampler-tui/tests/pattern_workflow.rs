@@ -400,6 +400,48 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
 }
 
 #[test]
+fn recording_rebinds_to_the_admitted_generation_after_each_overdub_snapshot() {
+    let mut harness = PatternHarness::new(48_000);
+    harness.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    harness.callback(1);
+
+    harness.key(KeyCode::Char('1'), KeyModifiers::NONE);
+    harness.callback(65);
+    harness.release(KeyCode::Char('1'));
+    harness.callback(65);
+    harness.ui_iteration();
+    harness.callback(1_600); // installs the first recorded generation and publishes telemetry
+    harness.ui_iteration();
+    assert_eq!(
+        harness.app.patterns().record_capture(),
+        Some((PatternSlotId::new(0).unwrap(), 2)),
+        "workspace rebinding follows the admitted snapshot"
+    );
+
+    harness.key(KeyCode::Char('1'), KeyModifiers::NONE);
+    harness.callback(65);
+    harness.release(KeyCode::Char('1'));
+    harness.callback(65);
+    harness.ui_iteration();
+
+    let events = harness
+        .app
+        .patterns()
+        .pattern(PatternSlotId::new(0).unwrap())
+        .events();
+    assert_eq!(
+        events.len(),
+        2,
+        "both separated overdubs are retained: capture={:?} telemetry={:?} submissions={} acks={}",
+        harness.app.patterns().capture_state(),
+        harness.app.telemetry(),
+        harness.app.maintain_audio_pattern_submissions(),
+        harness.observed_acks.borrow().len(),
+    );
+    assert!(harness.app.patterns().is_recording());
+}
+
+#[test]
 fn device_rate_retry_rebuilds_all_slots_round_robin_and_keeps_edits() {
     let mut harness = PatternHarness::new(48_000);
     harness.key(KeyCode::Tab, KeyModifiers::NONE);

@@ -1482,7 +1482,7 @@ impl AudioEngine {
                 } else if let ActionSource::Pattern(id) = source {
                     self.release_pattern_voice(id);
                 } else {
-                    self.release_gate_voices(pad);
+                    self.release_sustained_live_voices(pad);
                 }
                 if valid && let ActionSource::Live(id) = source {
                     self.emit_live_ack(id, pad, LiveAckKind::Release);
@@ -1583,9 +1583,9 @@ impl AudioEngine {
         }
     }
 
-    fn release_gate_voices(&mut self, pad: PadId) {
+    fn release_sustained_live_voices(&mut self, pad: PadId) {
         for voice in self.voices.iter_mut().flatten() {
-            if voice.pad == pad && voice.mode == PlaybackMode::Gate {
+            if voice.pad == pad && matches!(voice.mode, PlaybackMode::Gate | PlaybackMode::Loop) {
                 voice.envelope.begin_release();
             }
         }
@@ -2141,6 +2141,29 @@ mod tests {
                 .envelope
                 .release_frame,
             Some(1)
+        );
+    }
+
+    #[test]
+    fn live_release_releases_a_loop_voice_without_leaving_it_stuck() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        install_ready_sample(&mut controller, &mut engine, 100, pad, looping, 128);
+
+        controller.trigger_live(pad, 1.0).unwrap();
+        engine.render_frames(65, |_| {});
+        controller.release_live(pad).unwrap();
+        engine.render_frames(65, |_| {});
+
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .filter(|voice| voice.pad == pad)
+                .all(|voice| voice.envelope.release_frame.is_some())
         );
     }
 

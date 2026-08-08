@@ -1422,6 +1422,7 @@ where
     })?;
     drop(file);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
+    project.revalidate_path_identity()?;
     rustix::fs::renameat(&project.file, &temporary.leaf, &project.file, leaf).map_err(|error| {
         atomic_error(
             destination,
@@ -2241,6 +2242,34 @@ pitch_semitones = 0.0
         assert!(!fixture.directory.join("project.toml").exists());
         assert!(!fixture.directory.join("audio").exists());
         assert!(!opened_directory.join("project.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_project_swap_before_metadata_commit_preserves_both_directories() {
+        let fixture = ProjectFixture::new();
+        let opened_directory = fixture.root.join("opened-empty-project");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.snapshot.pads.clear();
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::BeforeRename {
+                fs::rename(&fixture.directory, &opened_directory).unwrap();
+                fs::create_dir(&fixture.directory).unwrap();
+            }
+            None
+        });
+
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        assert!(!fixture.directory.join("project.toml").exists());
+        assert!(!opened_directory.join("project.toml").exists());
+        assert!(
+            fs::read_dir(&opened_directory).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("tmp"))
+        );
     }
 
     #[cfg(unix)]

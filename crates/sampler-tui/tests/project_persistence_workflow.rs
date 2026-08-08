@@ -1,7 +1,7 @@
 //! Cross-layer persistence evidence using the real filesystem worker and audio engine. Physical
 //! device I/O is the only substituted boundary.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use sampler_audio::{
-    AudioController, AudioEngine, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
-    PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+    AudioController, AudioEngine, ControlError, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
+    PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels_with_test_capacities,
 };
 use sampler_core::{
     BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SAMPLE_PHASE_SCALE,
@@ -110,16 +110,9 @@ impl Drop for FixtureTree {
     }
 }
 
-#[derive(Default)]
-struct AudioProbe {
-    reject_install: Cell<bool>,
-    runtime_failure: Cell<bool>,
-}
-
 struct ControllerPort {
     sample_rate: u32,
     controller: Rc<RefCell<AudioController>>,
-    probe: Rc<AudioProbe>,
 }
 
 impl ControllerPort {
@@ -147,9 +140,6 @@ impl AudioPort for ControllerPort {
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, String> {
-        if self.probe.reject_install.get() {
-            return Err("test install backpressure".to_owned());
-        }
         self.controller()
             .install(pad, sample, settings)
             .map_err(|error| error.to_string())
@@ -268,10 +258,7 @@ impl AudioPort for ControllerPort {
     }
 
     fn poll_runtime_error(&mut self) -> Option<String> {
-        self.probe
-            .runtime_failure
-            .replace(false)
-            .then_some("test device disconnected".to_owned())
+        None
     }
 }
 
@@ -279,19 +266,17 @@ struct Harness {
     app: App,
     engine: AudioEngine,
     worker: WorkerHandle,
-    probe: Rc<AudioProbe>,
+    controller: Rc<RefCell<AudioController>>,
 }
 
 impl Harness {
     fn new() -> Self {
-        let (controller, ports) = audio_channels();
+        let (controller, ports) = audio_channels_with_test_capacities(8, 256, 8);
         let controller = Rc::new(RefCell::new(controller));
-        let probe = Rc::new(AudioProbe::default());
         let engine = AudioEngine::new(48_000, ports).unwrap();
         let mut app = App::with_audio(Box::new(ControllerPort {
             sample_rate: 48_000,
-            controller,
-            probe: Rc::clone(&probe),
+            controller: Rc::clone(&controller),
         }));
         app.set_keyboard_capabilities(KeyboardCapabilities {
             release_events: true,
@@ -300,7 +285,7 @@ impl Harness {
             app,
             engine,
             worker: WorkerHandle::spawn(),
-            probe,
+            controller,
         };
         for _ in 0..40 {
             harness.app.maintain_audio();
@@ -489,6 +474,36 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     let recipe_b = SampleEditRecipe::new(0, SAMPLE_PHASE_SCALE / 2, false, true).unwrap();
     source.edit(pad(0), recipe_a);
     source.edit(pad(7), recipe_b);
+    let rendered_a = source.app.pad(pad(0)).sample.as_ref().unwrap();
+    let rendered_b = source.app.pad(pad(7)).sample.as_ref().unwrap();
+    assert_ne!(
+        rendered_a.data(),
+        source.app.base_sample(pad(0)).unwrap().data(),
+        "the WAV evidence must be nonidentity rendered PCM"
+    );
+    assert_ne!(
+        rendered_b.data(),
+        source.app.base_sample(pad(7)).unwrap().data(),
+        "the FLAC evidence must be nonidentity rendered PCM"
+    );
+    let rendered_a_data = rendered_a.data().to_vec();
+    let rendered_b_data = rendered_b.data().to_vec();
+    let rendered_a_endpoints = [
+        [rendered_a_data[0], rendered_a_data[1]],
+        [
+            rendered_a_data[rendered_a_data.len() - 2],
+            rendered_a_data[rendered_a_data.len() - 1],
+        ],
+    ];
+    let rendered_b_endpoints = [
+        [rendered_b_data[0], rendered_b_data[1]],
+        [
+            rendered_b_data[rendered_b_data.len() - 2],
+            rendered_b_data[rendered_b_data.len() - 1],
+        ],
+    ];
+    let preview_a = source.app.pad(pad(0)).preview;
+    let preview_b = source.app.pad(pad(7)).preview;
     let settings_a = PadSettings::new(PlaybackMode::Gate, -3.0, -0.25, -7.0, None).unwrap();
     let settings_b = PadSettings::new(PlaybackMode::Loop, -6.0, 0.5, 12.0, None).unwrap();
     source.app.update_pad_settings(pad(0), settings_a).unwrap();
@@ -504,6 +519,18 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     source.palette("resolution 1/32");
     source.record_hit(7);
     let editable_before_save = source.app.project_snapshot().unwrap();
+    let fingerprint_a = editable_before_save
+        .pads
+        .iter()
+        .find(|saved_pad| saved_pad.pad == pad(0))
+        .unwrap()
+        .fingerprint;
+    let fingerprint_b = editable_before_save
+        .pads
+        .iter()
+        .find(|saved_pad| saved_pad.pad == pad(7))
+        .unwrap()
+        .fingerprint;
 
     source.save_as(&project, now);
     let saved_snapshot = source.app.project_snapshot().unwrap();
@@ -553,14 +580,76 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     assert_eq!(reopened.app.pad(pad(7)).settings, settings_b);
     assert_eq!(reopened.app.committed_sample_recipe(pad(0)), Some(recipe_a));
     assert_eq!(reopened.app.committed_sample_recipe(pad(7)), Some(recipe_b));
+    let reopened_a = reopened.app.pad(pad(0)).sample.as_ref().unwrap();
+    let reopened_b = reopened.app.pad(pad(7)).sample.as_ref().unwrap();
+    assert_eq!(reopened_a.data(), rendered_a_data);
+    assert_eq!(reopened_b.data(), rendered_b_data);
+    assert_eq!(
+        [
+            [reopened_a.data()[0], reopened_a.data()[1]],
+            [
+                reopened_a.data()[reopened_a.data().len() - 2],
+                reopened_a.data()[reopened_a.data().len() - 1],
+            ],
+        ],
+        rendered_a_endpoints
+    );
+    assert_eq!(
+        [
+            [reopened_b.data()[0], reopened_b.data()[1]],
+            [
+                reopened_b.data()[reopened_b.data().len() - 2],
+                reopened_b.data()[reopened_b.data().len() - 1],
+            ],
+        ],
+        rendered_b_endpoints
+    );
+    assert_eq!(reopened.app.pad(pad(0)).preview, preview_a);
+    assert_eq!(reopened.app.pad(pad(7)).preview, preview_b);
+    assert_eq!(
+        after_open
+            .pads
+            .iter()
+            .find(|saved_pad| saved_pad.pad == pad(0))
+            .unwrap()
+            .fingerprint,
+        fingerprint_a
+    );
+    assert_eq!(
+        after_open
+            .pads
+            .iter()
+            .find(|saved_pad| saved_pad.pad == pad(7))
+            .unwrap()
+            .fingerprint,
+        fingerprint_b
+    );
     assert!(reopened.app.pad(pad(15)).sample.is_none());
     reopened.app.apply(InputAction::PadPress(15));
     reopened.engine.render_frames(65, |_| {});
     assert_eq!(reopened.engine.active_voices(), 0);
     let triggers = reopened.engine.executed_triggers();
     reopened.app.apply(InputAction::PadPress(0));
-    reopened.engine.render_frames(65, |_| {});
+    let mut wav_output = [0.0; 2];
+    reopened
+        .engine
+        .render_frames(65, |frame| wav_output = frame);
     assert!(reopened.engine.executed_triggers() > triggers);
+    assert!(wav_output[0] < 0.0 && wav_output[1] > 0.0);
+    reopened.app.apply(InputAction::PadRelease(0));
+    reopened.engine.render_frames(65, |_| {});
+    let triggers = reopened.engine.executed_triggers();
+    reopened.app.apply(InputAction::PadPress(7));
+    let mut flac_peak = [0.0_f32; 2];
+    reopened.engine.render_frames(512, |frame| {
+        flac_peak[0] = flac_peak[0].max(frame[0].abs());
+        flac_peak[1] = flac_peak[1].max(frame[1].abs());
+    });
+    assert!(reopened.engine.executed_triggers() > triggers);
+    assert!(
+        flac_peak[0] > 1.0e-4 && flac_peak[1] > flac_peak[0],
+        "rendered FLAC trigger must be audible with rightward pan: {flac_peak:?}"
+    );
     assert_eq!(fs::read(&wav).unwrap(), wav_before);
     assert_eq!(fs::read(&flac).unwrap(), flac_before);
 }
@@ -674,15 +763,34 @@ fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
         target.app.maintain_project(now);
         target.dispatch_queued();
     }
-    target.probe.reject_install.set(true);
+    let blocked_progress = target.app.project_open_stage().unwrap().clone();
+    assert_eq!(
+        blocked_progress.admitted_actions, 1,
+        "StopAll admitted first"
+    );
+    let mut saturated_commands = 0;
+    loop {
+        match target.controller.borrow_mut().stop_pad(pad(15)) {
+            Ok(()) => saturated_commands += 1,
+            Err(ControlError::CommandQueueFull) => break,
+            Err(error) => panic!("unexpected controller saturation error: {error}"),
+        }
+    }
+    assert_eq!(saturated_commands, 8);
     target.app.maintain_project(now);
-    target.engine.render_frames(0, |_| {});
-    target.app.maintain_project(now);
-    assert!(target.app.status().contains("backpressure"));
+    assert!(target.app.status().contains("queue is full"));
+    assert_eq!(target.app.project_open_stage().unwrap(), &blocked_progress);
     assert_eq!(target.app.project_snapshot().unwrap(), old);
     assert!(target.app.pad(pad(0)).sample.is_none());
 
-    target.probe.reject_install.set(false);
+    target.engine.render_frames(0, |_| {});
+    target.app.maintain_audio();
+    assert!(target.app.maintain_project(now));
+    assert_eq!(
+        target.app.project_open_stage().unwrap().admitted_actions,
+        blocked_progress.admitted_actions + 1,
+        "the exact blocked pad install advances once after queue drain"
+    );
     target.finish_open(now);
     assert!(target.app.pad(pad(0)).sample.is_some());
     assert_ne!(

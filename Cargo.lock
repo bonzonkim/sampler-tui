@@ -1612,6 +1612,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hound",
  "ratatui",
+ "rustix",
  "sampler-audio",
  "sampler-core",
  "sha2",

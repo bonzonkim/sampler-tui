@@ -1,10 +1,11 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, File},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use rustix::fs::{FileType as RustixFileType, FlockOperation, Mode, OFlags};
 use sampler_core::{
     AssetDigest, LegacyProjectDocument, PadId, PadSettings, ParsedProjectDocument, ProjectDocument,
     ProjectId, ProjectPattern, SampleEditRecipe,
@@ -62,82 +63,408 @@ pub struct SourceFingerprint {
 
 impl SourceFingerprint {
     pub fn from_path(path: &Path) -> Result<Self, ProjectStoreError> {
+        ValidatedSource::open(path).map(|source| source.fingerprint)
+    }
+}
+
+struct ValidatedSource {
+    file: File,
+    fingerprint: SourceFingerprint,
+    path: PathBuf,
+}
+
+impl ValidatedSource {
+    fn open(path: &Path) -> Result<Self, ProjectStoreError> {
         let extension = SupportedAudioExtension::from_path(path)?;
-        let metadata =
-            fs::symlink_metadata(path).map_err(|error| ProjectStoreError::SourceRead {
+        let (parent, leaf) = open_anchored_parent(path, true)?;
+        let owned = rustix::fs::openat(
+            &parent,
+            &leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| open_source_error(path, error))?;
+        ensure_fd_type(&owned, path, RustixFileType::RegularFile)?;
+        let mut file = File::from(owned);
+        let fingerprint = hash_validated_handle(&mut file, path, extension)?;
+        Ok(Self {
+            file,
+            fingerprint,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn rewind(&mut self) -> Result<(), ProjectStoreError> {
+        self.file
+            .rewind()
+            .map_err(|error| ProjectStoreError::SourceRead {
+                path: self.path.clone(),
+                kind: error.kind(),
+            })
+    }
+}
+
+struct ProjectDirectory {
+    path: PathBuf,
+    file: File,
+}
+
+impl ProjectDirectory {
+    fn open_existing(path: &Path) -> Result<Self, ProjectStoreError> {
+        let (parent, leaf) = open_anchored_parent(path, false)?;
+        let owned = rustix::fs::openat(
+            &parent,
+            &leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| open_path_error(path, error))?;
+        ensure_fd_type(&owned, path, RustixFileType::Directory)?;
+        let path = fs::canonicalize(path)
+            .map_err(|error| filesystem_error("canonicalize directory", path, error))?;
+        Ok(Self {
+            path,
+            file: File::from(owned),
+        })
+    }
+
+    fn open_audio_directory(&self) -> Result<AudioDirectory, ProjectStoreError> {
+        let path = self.path.join("audio");
+        let owned = rustix::fs::openat(
+            &self.file,
+            "audio",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| open_path_error(&path, error))?;
+        ensure_fd_type(&owned, &path, RustixFileType::Directory)?;
+        Ok(AudioDirectory {
+            path,
+            file: File::from(owned),
+        })
+    }
+
+    fn ensure_audio_directory(&self) -> Result<AudioDirectory, ProjectStoreError> {
+        match self.open_audio_directory() {
+            Ok(audio) => Ok(audio),
+            Err(ProjectStoreError::Filesystem {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => {
+                rustix::fs::mkdirat(&self.file, "audio", Mode::from_raw_mode(0o755)).map_err(
+                    |error| {
+                        filesystem_error(
+                            "create audio directory",
+                            &self.path.join("audio"),
+                            io::Error::from(error),
+                        )
+                    },
+                )?;
+                self.file.sync_all().map_err(|error| {
+                    filesystem_error("sync project directory", &self.path, error)
+                })?;
+                self.open_audio_directory()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_asset(&self, relative: &str) -> Result<ValidatedSource, ProjectStoreError> {
+        use std::path::Component;
+
+        let relative = Path::new(relative);
+        let components = relative.components().collect::<Vec<_>>();
+        if components.len() < 2
+            || !matches!(components[0], Component::Normal(first) if first == "audio")
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ProjectStoreError::DocumentInvalid {
+                path: self.path.join(relative),
+                message: "asset path escapes the project directory".to_owned(),
+            });
+        }
+        let mut directory = self.open_audio_directory()?;
+        for component in &components[1..components.len() - 1] {
+            let Component::Normal(component) = component else {
+                unreachable!()
+            };
+            directory = directory.open_directory(component)?;
+        }
+        let Component::Normal(leaf) = components[components.len() - 1] else {
+            unreachable!()
+        };
+        let display = self.path.join(relative);
+        directory.open_leaf(Path::new(leaf), &display)
+    }
+
+    fn lock_exclusive(&self) -> Result<ProjectLock, ProjectStoreError> {
+        let path = self.path.join(".sampler-tui.lock");
+        let owned = rustix::fs::openat(
+            &self.file,
+            ".sampler-tui.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| open_path_error(&path, error))?;
+        ensure_fd_type(&owned, &path, RustixFileType::RegularFile)?;
+        let file = File::from(owned);
+        rustix::fs::flock(&file, FlockOperation::LockExclusive)
+            .map_err(|error| filesystem_error("lock project", &path, io::Error::from(error)))?;
+        self.file
+            .sync_all()
+            .map_err(|error| filesystem_error("sync project lock", &self.path, error))?;
+        Ok(ProjectLock { _file: file })
+    }
+}
+
+fn open_anchored_parent(
+    path: &Path,
+    source_error: bool,
+) -> Result<(File, std::ffi::OsString), ProjectStoreError> {
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| ProjectStoreError::NonRegularFile {
+            path: path.to_path_buf(),
+        })?
+        .to_os_string();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical = fs::canonicalize(parent).map_err(|error| {
+        if source_error {
+            ProjectStoreError::SourceRead {
                 path: path.to_path_buf(),
                 kind: error.kind(),
-            })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ProjectStoreError::SymlinkRejected {
-                path: path.to_path_buf(),
-            });
+            }
+        } else {
+            filesystem_error("canonicalize parent", path, error)
         }
-        if !metadata.file_type().is_file() {
-            return Err(ProjectStoreError::NonRegularFile {
-                path: path.to_path_buf(),
-            });
+    })?;
+    let root = rustix::fs::openat(
+        rustix::fs::CWD,
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| open_path_error(Path::new("/"), error))?;
+    let mut directory = File::from(root);
+    for component in canonical.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(component) => {
+                let display = Path::new("/").join(component);
+                let owned = rustix::fs::openat(
+                    &directory,
+                    component,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| open_path_error(&display, error))?;
+                ensure_fd_type(&owned, &display, RustixFileType::Directory)?;
+                directory = File::from(owned);
+            }
+            _ => {
+                return Err(ProjectStoreError::DocumentInvalid {
+                    path: path.to_path_buf(),
+                    message: "canonical parent contains unsupported components".to_owned(),
+                });
+            }
         }
-        if metadata.len() > MAX_ENCODED_FILE_BYTES {
-            return Err(ProjectStoreError::SourceTooLarge {
-                path: path.to_path_buf(),
-                bytes: metadata.len(),
-                max_bytes: MAX_ENCODED_FILE_BYTES,
-            });
-        }
+    }
+    Ok((directory, leaf))
+}
 
-        let mut file = File::open(path).map_err(|error| ProjectStoreError::SourceRead {
+struct ProjectLock {
+    _file: File,
+}
+
+struct AudioDirectory {
+    path: PathBuf,
+    file: File,
+}
+
+impl AudioDirectory {
+    fn open_directory(&self, leaf: &std::ffi::OsStr) -> Result<Self, ProjectStoreError> {
+        let path = self.path.join(leaf);
+        let owned = rustix::fs::openat(
+            &self.file,
+            leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| open_path_error(&path, error))?;
+        ensure_fd_type(&owned, &path, RustixFileType::Directory)?;
+        Ok(Self {
+            path,
+            file: File::from(owned),
+        })
+    }
+
+    fn open_leaf(
+        &self,
+        leaf: &Path,
+        display_path: &Path,
+    ) -> Result<ValidatedSource, ProjectStoreError> {
+        if leaf.components().count() != 1
+            || !matches!(
+                leaf.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(ProjectStoreError::DocumentInvalid {
+                path: display_path.to_path_buf(),
+                message: "asset leaf is not a single normal component".to_owned(),
+            });
+        }
+        let extension = SupportedAudioExtension::from_path(leaf)?;
+        let owned = rustix::fs::openat(
+            &self.file,
+            leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| open_source_error(display_path, error))?;
+        ensure_fd_type(&owned, display_path, RustixFileType::RegularFile)?;
+        let mut file = File::from(owned);
+        let fingerprint = hash_validated_handle(&mut file, display_path, extension)?;
+        Ok(ValidatedSource {
+            file,
+            fingerprint,
+            path: display_path.to_path_buf(),
+        })
+    }
+
+    fn try_open_leaf(
+        &self,
+        leaf: &Path,
+        display_path: &Path,
+    ) -> Result<Option<ValidatedSource>, ProjectStoreError> {
+        let extension = SupportedAudioExtension::from_path(leaf)?;
+        let owned = match rustix::fs::openat(
+            &self.file,
+            leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(owned) => owned,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(open_source_error(display_path, error)),
+        };
+        ensure_fd_type(&owned, display_path, RustixFileType::RegularFile)?;
+        let mut file = File::from(owned);
+        let fingerprint = hash_validated_handle(&mut file, display_path, extension)?;
+        Ok(Some(ValidatedSource {
+            file,
+            fingerprint,
+            path: display_path.to_path_buf(),
+        }))
+    }
+}
+
+fn open_source_error(path: &Path, error: rustix::io::Errno) -> ProjectStoreError {
+    if error == rustix::io::Errno::LOOP {
+        ProjectStoreError::SymlinkRejected {
             path: path.to_path_buf(),
-            kind: error.kind(),
-        })?;
-        let opened = file
-            .metadata()
+        }
+    } else {
+        ProjectStoreError::SourceRead {
+            path: path.to_path_buf(),
+            kind: io::Error::from(error).kind(),
+        }
+    }
+}
+
+fn open_path_error(path: &Path, error: rustix::io::Errno) -> ProjectStoreError {
+    if error == rustix::io::Errno::LOOP {
+        ProjectStoreError::SymlinkRejected {
+            path: path.to_path_buf(),
+        }
+    } else {
+        filesystem_error("open no-follow path", path, io::Error::from(error))
+    }
+}
+
+fn open_optional_regular_at(
+    directory: &File,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<File>, ProjectStoreError> {
+    let owned = match rustix::fs::openat(
+        directory,
+        relative,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(owned) => owned,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(open_path_error(display_path, error)),
+    };
+    ensure_fd_type(&owned, display_path, RustixFileType::RegularFile)?;
+    Ok(Some(File::from(owned)))
+}
+
+fn ensure_fd_type(
+    fd: &impl std::os::fd::AsFd,
+    path: &Path,
+    expected: RustixFileType,
+) -> Result<(), ProjectStoreError> {
+    let stat = rustix::fs::fstat(fd)
+        .map_err(|error| filesystem_error("fstat", path, io::Error::from(error)))?;
+    if RustixFileType::from_raw_mode(stat.st_mode) != expected {
+        return Err(ProjectStoreError::NonRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn hash_validated_handle(
+    file: &mut File,
+    path: &Path,
+    extension: SupportedAudioExtension,
+) -> Result<SourceFingerprint, ProjectStoreError> {
+    let mut hasher = Sha256::new();
+    let mut encoded_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
             .map_err(|error| ProjectStoreError::SourceRead {
                 path: path.to_path_buf(),
                 kind: error.kind(),
             })?;
-        if !opened.is_file() {
-            return Err(ProjectStoreError::NonRegularFile {
+        if read == 0 {
+            break;
+        }
+        encoded_bytes = encoded_bytes.checked_add(read as u64).ok_or_else(|| {
+            ProjectStoreError::SourceTooLarge {
                 path: path.to_path_buf(),
+                bytes: u64::MAX,
+                max_bytes: MAX_ENCODED_FILE_BYTES,
+            }
+        })?;
+        if encoded_bytes > MAX_ENCODED_FILE_BYTES {
+            return Err(ProjectStoreError::SourceTooLarge {
+                path: path.to_path_buf(),
+                bytes: encoded_bytes,
+                max_bytes: MAX_ENCODED_FILE_BYTES,
             });
         }
-
-        let mut hasher = Sha256::new();
-        let mut encoded_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| ProjectStoreError::SourceRead {
-                    path: path.to_path_buf(),
-                    kind: error.kind(),
-                })?;
-            if read == 0 {
-                break;
-            }
-            encoded_bytes = encoded_bytes.checked_add(read as u64).ok_or_else(|| {
-                ProjectStoreError::SourceTooLarge {
-                    path: path.to_path_buf(),
-                    bytes: u64::MAX,
-                    max_bytes: MAX_ENCODED_FILE_BYTES,
-                }
-            })?;
-            if encoded_bytes > MAX_ENCODED_FILE_BYTES {
-                return Err(ProjectStoreError::SourceTooLarge {
-                    path: path.to_path_buf(),
-                    bytes: encoded_bytes,
-                    max_bytes: MAX_ENCODED_FILE_BYTES,
-                });
-            }
-            hasher.update(&buffer[..read]);
-        }
-
-        Ok(Self {
-            digest: AssetDigest::from_bytes(hasher.finalize().into()),
-            encoded_bytes,
-            extension,
-        })
+        hasher.update(&buffer[..read]);
     }
+    file.rewind()
+        .map_err(|error| ProjectStoreError::SourceRead {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+    Ok(SourceFingerprint {
+        digest: AssetDigest::from_bytes(hasher.finalize().into()),
+        encoded_bytes,
+        extension,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,6 +527,8 @@ pub struct ProjectProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicWritePoint {
+    AfterSourceFingerprint,
+    BeforeParentDirectorySync,
     AfterCreate,
     BeforeFlush,
     BeforeFileSync,
@@ -270,12 +599,12 @@ impl ProjectStore {
     }
 
     pub fn probe(&self, directory: &Path) -> Result<ProjectProbe, ProjectStoreError> {
-        validate_directory(directory)?;
-        let directory = fs::canonicalize(directory)
-            .map_err(|error| filesystem_error("canonicalize directory", directory, error))?;
+        let project = ProjectDirectory::open_existing(directory)?;
+        let _lock = project.lock_exclusive()?;
+        let directory = project.path.clone();
         Ok(ProjectProbe {
-            explicit: probe_document(&directory, "project.toml"),
-            recovery: probe_document(&directory, ".sampler-tui-recovery.toml"),
+            explicit: probe_document(&project, "project.toml"),
+            recovery: probe_document(&project, ".sampler-tui-recovery.toml"),
             directory,
         })
     }
@@ -286,25 +615,37 @@ impl ProjectStore {
         project_id: ProjectId,
         revision: u64,
     ) -> Result<(), ProjectStoreError> {
-        validate_directory(directory)?;
-        let directory = fs::canonicalize(directory)
-            .map_err(|error| filesystem_error("canonicalize directory", directory, error))?;
+        self.discard_recovery_with_hook(directory, project_id, revision, || {})
+    }
+
+    fn discard_recovery_with_hook<F>(
+        &self,
+        directory: &Path,
+        project_id: ProjectId,
+        revision: u64,
+        hook: F,
+    ) -> Result<(), ProjectStoreError>
+    where
+        F: FnOnce(),
+    {
+        let project = ProjectDirectory::open_existing(directory)?;
+        let _lock = project.lock_exclusive()?;
+        let directory = project.path.clone();
         let recovery = directory.join(".sampler-tui-recovery.toml");
-        match fs::symlink_metadata(&recovery) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(filesystem_error("inspect recovery", &recovery, error)),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ProjectStoreError::SymlinkRejected { path: recovery });
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(ProjectStoreError::RecoveryInvalid { path: recovery });
-            }
-            Ok(_) => {}
-        }
-        let source =
-            fs::read_to_string(&recovery).map_err(|_| ProjectStoreError::RecoveryInvalid {
+        let Some(mut recovery_file) = open_optional_regular_at(
+            &project.file,
+            Path::new(".sampler-tui-recovery.toml"),
+            &recovery,
+        )?
+        else {
+            return Ok(());
+        };
+        let mut source = String::new();
+        recovery_file.read_to_string(&mut source).map_err(|_| {
+            ProjectStoreError::RecoveryInvalid {
                 path: recovery.clone(),
-            })?;
+            }
+        })?;
         let ParsedProjectDocument::Current(document) = ProjectDocument::from_toml(&source)
             .map_err(|_| ProjectStoreError::RecoveryInvalid {
                 path: recovery.clone(),
@@ -315,9 +656,17 @@ impl ProjectStore {
         if document.project_id != project_id || document.revision != revision {
             return Err(ProjectStoreError::RecoveryMismatch { path: recovery });
         }
-        fs::remove_file(&recovery)
-            .map_err(|error| filesystem_error("delete recovery", &recovery, error))?;
-        sync_directory(&directory)
+        hook();
+        rustix::fs::unlinkat(
+            &project.file,
+            ".sampler-tui-recovery.toml",
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|error| filesystem_error("delete recovery", &recovery, io::Error::from(error)))?;
+        project
+            .file
+            .sync_all()
+            .map_err(|error| filesystem_error("sync directory", &directory, error))
     }
 
     fn save_with_hook<F>(
@@ -328,18 +677,27 @@ impl ProjectStore {
     where
         F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
     {
-        let directory = prepare_project_directory(&request.directory, request.save_as)?;
-        let audio_directory = ensure_audio_directory(&directory)?;
+        let directory = prepare_project_directory(&request.directory, request.save_as, &mut hook)?;
+        let project = ProjectDirectory::open_existing(&directory)?;
+        let _lock = project.lock_exclusive()?;
+        let directory = project.path.clone();
+        let audio_directory = project.ensure_audio_directory()?;
         let mut document_pads = Vec::with_capacity(request.snapshot.pads.len());
         let mut mappings = Vec::with_capacity(request.snapshot.pads.len());
 
         for pad in &request.snapshot.pads {
-            let actual = SourceFingerprint::from_path(&pad.source_path)?;
-            if actual != pad.fingerprint {
+            let mut source = ValidatedSource::open(&pad.source_path)?;
+            if source.fingerprint != pad.fingerprint {
                 return Err(ProjectStoreError::SourceChanged {
                     path: pad.source_path.clone(),
                 });
             }
+            checkpoint(
+                &mut hook,
+                AtomicWritePoint::AfterSourceFingerprint,
+                &pad.source_path,
+                false,
+            )?;
             let relative_path = format!(
                 "audio/{}.{}",
                 pad.fingerprint.digest,
@@ -347,7 +705,7 @@ impl ProjectStore {
             );
             let project_path = directory.join(&relative_path);
             stage_immutable_asset(
-                &pad.source_path,
+                &mut source,
                 &project_path,
                 pad.fingerprint,
                 &audio_directory,
@@ -380,12 +738,7 @@ impl ProjectStore {
             SaveKind::Explicit => "project.toml",
             SaveKind::Recovery => ".sampler-tui-recovery.toml",
         });
-        atomic_replace(
-            &destination,
-            canonical_toml.as_bytes(),
-            &directory,
-            &mut hook,
-        )?;
+        atomic_replace(&destination, canonical_toml.as_bytes(), &project, &mut hook)?;
 
         Ok(SaveReceipt {
             directory,
@@ -399,30 +752,26 @@ impl ProjectStore {
 }
 
 fn probe_document(
-    directory: &Path,
+    project: &ProjectDirectory,
     file_name: &str,
 ) -> Option<Result<ProjectDocument, ProjectStoreError>> {
-    let path = directory.join(file_name);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-        Err(error) => return Some(Err(filesystem_error("inspect metadata", &path, error))),
+    let path = project.path.join(file_name);
+    let mut file = match open_optional_regular_at(&project.file, Path::new(file_name), &path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
     };
-    if metadata.file_type().is_symlink() {
-        return Some(Err(ProjectStoreError::SymlinkRejected { path }));
-    }
-    if !metadata.is_file() {
-        return Some(Err(ProjectStoreError::NonRegularFile { path }));
-    }
-    Some(read_and_upgrade_document(directory, &path))
+    Some(read_and_upgrade_document(project, &mut file, &path))
 }
 
 fn read_and_upgrade_document(
-    directory: &Path,
+    project: &ProjectDirectory,
+    file: &mut File,
     path: &Path,
 ) -> Result<ProjectDocument, ProjectStoreError> {
-    let source =
-        fs::read_to_string(path).map_err(|error| filesystem_error("read metadata", path, error))?;
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .map_err(|error| filesystem_error("read metadata", path, error))?;
     let parsed = ProjectDocument::from_toml(&source).map_err(|error| {
         ProjectStoreError::DocumentInvalid {
             path: path.to_path_buf(),
@@ -431,87 +780,52 @@ fn read_and_upgrade_document(
     })?;
     match parsed {
         ParsedProjectDocument::Current(document) => {
-            verify_current_assets(directory, &document)?;
+            verify_current_assets(project, &document)?;
             Ok(document)
         }
-        ParsedProjectDocument::Legacy(document) => migrate_legacy(directory, &document),
+        ParsedProjectDocument::Legacy(document) => migrate_legacy(project, &document),
     }
-}
-
-fn safe_project_asset(directory: &Path, relative: &str) -> Result<PathBuf, ProjectStoreError> {
-    use std::path::Component;
-
-    let relative = Path::new(relative);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ProjectStoreError::DocumentInvalid {
-            path: directory.join(relative),
-            message: "asset path escapes the project directory".to_owned(),
-        });
-    }
-    let mut current = directory.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            unreachable!()
-        };
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ProjectStoreError::SymlinkRejected { path: current });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(filesystem_error("inspect asset path", &current, error));
-            }
-        }
-    }
-    Ok(directory.join(relative))
 }
 
 fn verify_current_assets(
-    directory: &Path,
+    project: &ProjectDirectory,
     document: &ProjectDocument,
 ) -> Result<(), ProjectStoreError> {
     for pad in &document.pads {
-        let path = safe_project_asset(directory, &pad.audio_path)?;
-        let fingerprint = SourceFingerprint::from_path(&path)?;
-        if fingerprint.digest != pad.asset_digest {
-            return Err(ProjectStoreError::AssetIntegrity { path });
+        let source = project.open_asset(&pad.audio_path)?;
+        if source.fingerprint.digest != pad.asset_digest {
+            return Err(ProjectStoreError::AssetIntegrity { path: source.path });
         }
     }
     Ok(())
 }
 
 fn migrate_legacy(
-    directory: &Path,
+    project: &ProjectDirectory,
     legacy: &LegacyProjectDocument,
 ) -> Result<ProjectDocument, ProjectStoreError> {
     let mut sources = Vec::with_capacity(legacy.pads().len());
     for pad in legacy.pads() {
-        let source = safe_project_asset(directory, pad.audio_path())?;
-        let fingerprint = SourceFingerprint::from_path(&source)?;
-        sources.push((pad.clone(), source, fingerprint));
+        let source = project.open_asset(pad.audio_path())?;
+        sources.push((pad.clone(), source));
     }
 
     let mut project_id = [0_u8; 16];
     getrandom::fill(&mut project_id).map_err(|error| ProjectStoreError::Entropy {
         message: error.to_string(),
     })?;
-    let audio_directory = ensure_audio_directory(directory)?;
+    let audio_directory = project.ensure_audio_directory()?;
     let mut pads = Vec::with_capacity(sources.len());
-    for (pad, source, fingerprint) in sources {
+    for (pad, mut source) in sources {
+        let fingerprint = source.fingerprint;
         let relative = format!(
             "audio/{}.{}",
             fingerprint.digest,
             fingerprint.extension.as_str()
         );
-        let destination = directory.join(&relative);
+        let destination = project.path.join(&relative);
         stage_immutable_asset(
-            &source,
+            &mut source,
             &destination,
             fingerprint,
             &audio_directory,
@@ -551,21 +865,22 @@ fn migrate_legacy(
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-struct TempPath {
-    path: PathBuf,
+struct AnchoredTemp {
+    directory: File,
+    leaf: std::ffi::OsString,
     armed: bool,
 }
 
-impl TempPath {
+impl AnchoredTemp {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for TempPath {
+impl Drop for AnchoredTemp {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::remove_file(&self.path);
+            let _ = rustix::fs::unlinkat(&self.directory, &self.leaf, rustix::fs::AtFlags::empty());
         }
     }
 }
@@ -594,7 +909,14 @@ fn validate_directory(path: &Path) -> Result<(), ProjectStoreError> {
     Ok(())
 }
 
-fn prepare_project_directory(path: &Path, save_as: bool) -> Result<PathBuf, ProjectStoreError> {
+fn prepare_project_directory<F>(
+    path: &Path,
+    save_as: bool,
+    hook: &mut F,
+) -> Result<PathBuf, ProjectStoreError>
+where
+    F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
+{
     if save_as {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
@@ -624,6 +946,26 @@ fn prepare_project_directory(path: &Path, save_as: bool) -> Result<PathBuf, Proj
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(path)
                     .map_err(|error| filesystem_error("create save-as target", path, error))?;
+                checkpoint(
+                    hook,
+                    AtomicWritePoint::BeforeParentDirectorySync,
+                    path,
+                    true,
+                )?;
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        atomic_error(
+                            path,
+                            AtomicWritePoint::BeforeParentDirectorySync,
+                            error.kind(),
+                            true,
+                        )
+                    })?;
             }
             Err(error) => return Err(filesystem_error("inspect save-as target", path, error)),
         }
@@ -633,86 +975,48 @@ fn prepare_project_directory(path: &Path, save_as: bool) -> Result<PathBuf, Proj
     fs::canonicalize(path).map_err(|error| filesystem_error("canonicalize directory", path, error))
 }
 
-fn sync_directory(path: &Path) -> Result<(), ProjectStoreError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| filesystem_error("sync directory", path, error))
-}
-
-fn ensure_audio_directory(directory: &Path) -> Result<PathBuf, ProjectStoreError> {
-    let audio = directory.join("audio");
-    match fs::symlink_metadata(&audio) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(ProjectStoreError::SymlinkRejected { path: audio });
-            }
-            if !metadata.is_dir() {
-                return Err(ProjectStoreError::NonRegularFile { path: audio });
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(&audio)
-                .map_err(|error| filesystem_error("create audio directory", &audio, error))?;
-            sync_directory(directory)?;
-        }
-        Err(error) => return Err(filesystem_error("inspect audio directory", &audio, error)),
-    }
-    Ok(audio)
-}
-
-fn validate_regular_destination(path: &Path) -> Result<bool, ProjectStoreError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(ProjectStoreError::SymlinkRejected {
-                    path: path.to_path_buf(),
-                });
-            }
-            if !metadata.is_file() {
-                return Err(ProjectStoreError::NonRegularFile {
-                    path: path.to_path_buf(),
-                });
-            }
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(filesystem_error("inspect destination", path, error)),
-    }
-}
-
-fn create_sibling_temp(destination: &Path) -> Result<(File, TempPath), ProjectStoreError> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| ProjectStoreError::Filesystem {
-            operation: "resolve temporary parent",
-            path: destination.to_path_buf(),
-            kind: io::ErrorKind::InvalidInput,
-        })?;
+fn create_anchored_temp(
+    directory: &File,
+    directory_path: &Path,
+    destination: &Path,
+) -> Result<(File, AnchoredTemp), ProjectStoreError> {
     let base = destination
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("project");
+        .unwrap_or("asset");
     loop {
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
+        let leaf = std::ffi::OsString::from(format!(
             ".{base}.sampler-tui-tmp-{}-{nonce}",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((file, TempPath { path, armed: true })),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+        match rustix::fs::openat(
+            directory,
+            &leaf,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(owned) => {
+                let directory = directory.try_clone().map_err(|error| {
+                    filesystem_error("clone directory handle", directory_path, error)
+                })?;
+                return Ok((
+                    File::from(owned),
+                    AnchoredTemp {
+                        directory,
+                        leaf,
+                        armed: true,
+                    },
+                ));
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => {
-                return Err(ProjectStoreError::AtomicWrite {
-                    path: destination.to_path_buf(),
-                    point: AtomicWritePoint::AfterCreate,
-                    kind: error.kind(),
-                    visibility: AtomicWriteVisibility::PreviousDestinationPreserved,
-                });
+                return Err(atomic_error(
+                    destination,
+                    AtomicWritePoint::AfterCreate,
+                    io::Error::from(error).kind(),
+                    false,
+                ));
             }
         }
     }
@@ -754,14 +1058,21 @@ where
 fn atomic_replace<F>(
     destination: &Path,
     bytes: &[u8],
-    directory: &Path,
+    project: &ProjectDirectory,
     hook: &mut F,
 ) -> Result<(), ProjectStoreError>
 where
     F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
 {
-    validate_regular_destination(destination)?;
-    let (mut file, mut temporary) = create_sibling_temp(destination)?;
+    let leaf = destination.file_name().map(Path::new).ok_or_else(|| {
+        ProjectStoreError::DocumentInvalid {
+            path: destination.to_path_buf(),
+            message: "metadata destination has no leaf".to_owned(),
+        }
+    })?;
+    let _ = open_optional_regular_at(&project.file, leaf, destination)?;
+    let (mut file, mut temporary) =
+        create_anchored_temp(&project.file, &project.path, destination)?;
     checkpoint(hook, AtomicWritePoint::AfterCreate, destination, false)?;
     file.write_all(bytes).map_err(|error| {
         atomic_error(
@@ -791,11 +1102,11 @@ where
     })?;
     drop(file);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
-    fs::rename(&temporary.path, destination).map_err(|error| {
+    rustix::fs::renameat(&project.file, &temporary.leaf, &project.file, leaf).map_err(|error| {
         atomic_error(
             destination,
             AtomicWritePoint::BeforeRename,
-            error.kind(),
+            io::Error::from(error).kind(),
             false,
         )
     })?;
@@ -806,24 +1117,29 @@ where
         destination,
         true,
     )?;
-    File::open(directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| {
-            atomic_error(
-                destination,
-                AtomicWritePoint::BeforeDirectorySync,
-                error.kind(),
-                true,
-            )
-        })
+    project.file.sync_all().map_err(|error| {
+        atomic_error(
+            destination,
+            AtomicWritePoint::BeforeDirectorySync,
+            error.kind(),
+            true,
+        )
+    })
 }
 
 fn verify_existing_asset(
+    audio: &AudioDirectory,
+    leaf: &Path,
     path: &Path,
     expected: SourceFingerprint,
 ) -> Result<(), ProjectStoreError> {
-    let actual = SourceFingerprint::from_path(path)?;
-    if actual != expected {
+    let Some(actual) = audio.try_open_leaf(leaf, path)? else {
+        return Err(ProjectStoreError::SourceRead {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::NotFound,
+        });
+    };
+    if actual.fingerprint != expected {
         return Err(ProjectStoreError::AssetIntegrity {
             path: path.to_path_buf(),
         });
@@ -832,46 +1148,56 @@ fn verify_existing_asset(
 }
 
 fn stage_immutable_asset<F>(
-    source: &Path,
+    source: &mut ValidatedSource,
     destination: &Path,
     expected: SourceFingerprint,
-    audio_directory: &Path,
+    audio: &AudioDirectory,
     hook: &mut F,
 ) -> Result<(), ProjectStoreError>
 where
     F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
 {
-    if validate_regular_destination(destination)? {
-        return verify_existing_asset(destination, expected);
+    let leaf = destination.file_name().map(Path::new).ok_or_else(|| {
+        ProjectStoreError::DocumentInvalid {
+            path: destination.to_path_buf(),
+            message: "asset destination has no leaf".to_owned(),
+        }
+    })?;
+    if let Some(actual) = audio.try_open_leaf(leaf, destination)? {
+        if actual.fingerprint != expected {
+            return Err(ProjectStoreError::AssetIntegrity {
+                path: destination.to_path_buf(),
+            });
+        }
+        return Ok(());
     }
 
-    let mut input = File::open(source).map_err(|error| ProjectStoreError::SourceRead {
-        path: source.to_path_buf(),
-        kind: error.kind(),
-    })?;
-    let (mut output, mut temporary) = create_sibling_temp(destination)?;
+    source.rewind()?;
+    let (mut output, mut temporary) = create_anchored_temp(&audio.file, &audio.path, destination)?;
     checkpoint(hook, AtomicWritePoint::AfterCreate, destination, false)?;
     let mut hasher = Sha256::new();
     let mut encoded_bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|error| ProjectStoreError::SourceRead {
-                path: source.to_path_buf(),
-                kind: error.kind(),
-            })?;
+        let read =
+            source
+                .file
+                .read(&mut buffer)
+                .map_err(|error| ProjectStoreError::SourceRead {
+                    path: source.path.clone(),
+                    kind: error.kind(),
+                })?;
         if read == 0 {
             break;
         }
         encoded_bytes = encoded_bytes.checked_add(read as u64).ok_or_else(|| {
             ProjectStoreError::SourceChanged {
-                path: source.to_path_buf(),
+                path: source.path.clone(),
             }
         })?;
         if encoded_bytes > MAX_ENCODED_FILE_BYTES {
             return Err(ProjectStoreError::SourceTooLarge {
-                path: source.to_path_buf(),
+                path: source.path.clone(),
                 bytes: encoded_bytes,
                 max_bytes: MAX_ENCODED_FILE_BYTES,
             });
@@ -893,7 +1219,7 @@ where
     };
     if copied != expected {
         return Err(ProjectStoreError::SourceChanged {
-            path: source.to_path_buf(),
+            path: source.path.clone(),
         });
     }
     checkpoint(hook, AtomicWritePoint::BeforeFlush, destination, false)?;
@@ -916,27 +1242,34 @@ where
     })?;
     drop(output);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
-    match fs::hard_link(&temporary.path, destination) {
+    match rustix::fs::linkat(
+        &audio.file,
+        &temporary.leaf,
+        &audio.file,
+        leaf,
+        rustix::fs::AtFlags::empty(),
+    ) {
         Ok(()) => {
-            fs::remove_file(&temporary.path).map_err(|error| {
-                atomic_error(
-                    destination,
-                    AtomicWritePoint::BeforeDirectorySync,
-                    error.kind(),
-                    true,
-                )
-            })?;
+            rustix::fs::unlinkat(&audio.file, &temporary.leaf, rustix::fs::AtFlags::empty())
+                .map_err(|error| {
+                    atomic_error(
+                        destination,
+                        AtomicWritePoint::BeforeDirectorySync,
+                        io::Error::from(error).kind(),
+                        true,
+                    )
+                })?;
             temporary.disarm();
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_existing_asset(destination, expected)?;
+        Err(rustix::io::Errno::EXIST) => {
+            verify_existing_asset(audio, leaf, destination, expected)?;
             return Ok(());
         }
         Err(error) => {
             return Err(atomic_error(
                 destination,
                 AtomicWritePoint::BeforeRename,
-                error.kind(),
+                io::Error::from(error).kind(),
                 false,
             ));
         }
@@ -947,16 +1280,14 @@ where
         destination,
         true,
     )?;
-    File::open(audio_directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| {
-            atomic_error(
-                destination,
-                AtomicWritePoint::BeforeDirectorySync,
-                error.kind(),
-                true,
-            )
-        })
+    audio.file.sync_all().map_err(|error| {
+        atomic_error(
+            destination,
+            AtomicWritePoint::BeforeDirectorySync,
+            error.kind(),
+            true,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1028,8 +1359,14 @@ mod tests {
         }
 
         fn temp_entries(&self) -> Vec<PathBuf> {
-            fs::read_dir(&self.directory)
-                .unwrap()
+            let mut directories = vec![self.directory.clone()];
+            let audio = self.directory.join("audio");
+            if audio.is_dir() {
+                directories.push(audio);
+            }
+            directories
+                .into_iter()
+                .flat_map(|directory| fs::read_dir(directory).unwrap())
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
                     path.file_name()
@@ -1276,6 +1613,181 @@ mod tests {
         assert!(target.join("project.toml").is_file());
     }
 
+    #[test]
+    fn save_as_parent_sync_failure_reports_visible_directory_with_unconfirmed_durability() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("new-project-parent-sync-fault");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        let error = fixture
+            .store
+            .save_with_hook(request, |point| {
+                (point == AtomicWritePoint::BeforeParentDirectorySync)
+                    .then_some(io::ErrorKind::Other)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::AtomicWrite {
+                point: AtomicWritePoint::BeforeParentDirectorySync,
+                visibility: AtomicWriteVisibility::NewDestinationVisibleDurabilityUnconfirmed,
+                ..
+            }
+        ));
+        assert!(target.is_dir());
+        assert!(!target.join("project.toml").exists());
+    }
+
+    #[test]
+    fn save_as_accepts_an_existing_empty_directory() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("existing-empty-project");
+        fs::create_dir(&target).unwrap();
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        fixture.store.save(request).unwrap();
+        assert!(target.join("project.toml").is_file());
+    }
+
+    #[test]
+    fn committed_source_length_and_extension_must_match_before_copy() {
+        let fixture = ProjectFixture::new();
+        let mut wrong_length = fixture.request(1, SaveKind::Explicit);
+        wrong_length.snapshot.pads[0].fingerprint.encoded_bytes += 1;
+        assert!(matches!(
+            fixture.store.save(wrong_length),
+            Err(ProjectStoreError::SourceChanged { .. })
+        ));
+        let mut wrong_extension = fixture.request(1, SaveKind::Explicit);
+        wrong_extension.snapshot.pads[0].fingerprint.extension = SupportedAudioExtension::Aiff;
+        assert!(matches!(
+            fixture.store.save(wrong_extension),
+            Err(ProjectStoreError::SourceChanged { .. })
+        ));
+        assert!(!fixture.directory.join("project.toml").exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+    }
+
+    #[test]
+    fn asset_temp_failures_clean_up_without_creating_metadata() {
+        for point in [
+            AtomicWritePoint::AfterCreate,
+            AtomicWritePoint::BeforeFlush,
+            AtomicWritePoint::BeforeFileSync,
+            AtomicWritePoint::BeforeRename,
+        ] {
+            let fixture = ProjectFixture::new();
+            let error = fixture
+                .store
+                .save_with_hook(fixture.request(1, SaveKind::Explicit), |candidate| {
+                    (candidate == point).then_some(io::ErrorKind::Other)
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ProjectStoreError::AtomicWrite {
+                    visibility: AtomicWriteVisibility::PreviousDestinationPreserved,
+                    ..
+                }
+            ));
+            assert!(!fixture.directory.join("project.toml").exists());
+            assert!(fixture.temp_entries().is_empty());
+            assert_eq!(fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+        }
+    }
+
+    #[test]
+    fn v1_probe_hashes_real_asset_generates_id_and_never_rewrites_metadata() {
+        let fixture = ProjectFixture::new();
+        let audio = fixture.directory.join("audio");
+        fs::create_dir(&audio).unwrap();
+        let legacy_asset = audio.join("legacy.WAV");
+        fs::write(&legacy_asset, &fixture.source_bytes).unwrap();
+        let legacy = r#"schema_version = 1
+name = "legacy"
+
+[[pads]]
+audio_path = "audio/legacy.WAV"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+"#;
+        fs::write(fixture.directory.join("project.toml"), legacy).unwrap();
+        let before = read(&fixture.directory.join("project.toml"));
+
+        let probe = fixture.store.probe(&fixture.directory).unwrap();
+        let migrated = probe.explicit.unwrap().unwrap();
+        assert_ne!(migrated.project_id, ProjectId::from_bytes([0; 16]));
+        assert_eq!(migrated.revision, 0);
+        assert_eq!(migrated.pads.len(), 1);
+        let canonical = fixture.directory.join(&migrated.pads[0].audio_path);
+        assert_eq!(fs::read(&canonical).unwrap(), fixture.source_bytes);
+        assert_eq!(
+            SourceFingerprint::from_path(&canonical).unwrap().digest,
+            migrated.pads[0].asset_digest
+        );
+        assert_eq!(read(&fixture.directory.join("project.toml")), before);
+    }
+
+    #[test]
+    fn current_probe_rejects_missing_and_nonregular_assets() {
+        for nonregular in [false, true] {
+            let fixture = ProjectFixture::new();
+            let receipt = fixture
+                .store
+                .save(fixture.request(1, SaveKind::Explicit))
+                .unwrap();
+            let asset = &receipt.mappings[0].project_path;
+            fs::remove_file(asset).unwrap();
+            if nonregular {
+                fs::create_dir(asset).unwrap();
+            }
+            let probe = fixture.store.probe(&fixture.directory).unwrap();
+            assert!(probe.explicit.unwrap().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_probe_rejects_symlink_assets() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ProjectFixture::new();
+        let receipt = fixture
+            .store
+            .save(fixture.request(1, SaveKind::Explicit))
+            .unwrap();
+        let asset = &receipt.mappings[0].project_path;
+        fs::remove_file(asset).unwrap();
+        symlink(&fixture.source, asset).unwrap();
+        let probe = fixture.store.probe(&fixture.directory).unwrap();
+        assert!(matches!(
+            probe.explicit.unwrap(),
+            Err(ProjectStoreError::SymlinkRejected { .. })
+        ));
+    }
+
+    #[test]
+    fn filesystem_asset_resolver_rejects_parent_traversal() {
+        let fixture = ProjectFixture::new();
+        fs::create_dir(fixture.directory.join("audio")).unwrap();
+        fs::write(fixture.directory.join("outside.wav"), b"outside").unwrap();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        assert!(matches!(
+            project.open_asset("audio/../outside.wav"),
+            Err(ProjectStoreError::DocumentInvalid { .. })
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_external_paths_work_when_the_filesystem_permits_them() {
@@ -1307,6 +1819,106 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validated_source_handle_survives_path_substitution() {
+        use std::{io::Read as _, os::unix::fs::symlink};
+
+        let fixture = ProjectFixture::new();
+        let mut opened = ValidatedSource::open(&fixture.source).unwrap();
+        let original = fixture.root.join("original.wav");
+        let replacement = fixture.root.join("replacement.wav");
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        fs::rename(&fixture.source, &original).unwrap();
+        symlink(&replacement, &fixture.source).unwrap();
+
+        opened.rewind().unwrap();
+        let mut actual = Vec::new();
+        opened.file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, fixture.source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_copies_the_validated_handle_after_source_path_substitution() {
+        use std::{cell::Cell, os::unix::fs::symlink};
+
+        let fixture = ProjectFixture::new();
+        let original = fixture.root.join("opened-source.wav");
+        let replacement = fixture.root.join("replacement.wav");
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        let substituted = Cell::new(false);
+        let receipt = fixture
+            .store
+            .save_with_hook(fixture.request(1, SaveKind::Explicit), |point| {
+                if point == AtomicWritePoint::AfterSourceFingerprint {
+                    fs::rename(&fixture.source, &original).unwrap();
+                    symlink(&replacement, &fixture.source).unwrap();
+                    substituted.set(true);
+                }
+                None
+            })
+            .unwrap();
+        assert!(substituted.get());
+        assert_eq!(
+            fs::read(&receipt.mappings[0].project_path).unwrap(),
+            fixture.source_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_source_is_rejected_without_blocking() {
+        use std::{
+            process::Command,
+            time::{Duration, Instant},
+        };
+
+        let fixture = ProjectFixture::new();
+        let fifo = fixture.root.join("source.wav");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            ValidatedSource::open(&fifo),
+            Err(ProjectStoreError::NonRegularFile { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_asset_leaf_remains_anchored_to_open_audio_directory() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ProjectFixture::new();
+        fixture
+            .store
+            .save(fixture.request(1, SaveKind::Explicit))
+            .unwrap();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        let audio = project.open_audio_directory().unwrap();
+        let mapping = fixture.request(1, SaveKind::Explicit).snapshot.pads[0].fingerprint;
+        let leaf = format!("{}.{}", mapping.digest, mapping.extension.as_str());
+
+        let held = fixture.root.join("held-audio");
+        let external = fixture.root.join("external-audio");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join(&leaf), b"replacement bytes").unwrap();
+        fs::rename(fixture.directory.join("audio"), &held).unwrap();
+        symlink(&external, fixture.directory.join("audio")).unwrap();
+
+        let opened = audio
+            .open_leaf(Path::new(&leaf), &held.join(&leaf))
+            .unwrap();
+        assert_eq!(opened.fingerprint, mapping);
+    }
+
     #[test]
     fn path_escape_is_rejected_and_recovery_deletion_never_deletes_explicit() {
         let fixture = ProjectFixture::new();
@@ -1330,5 +1942,95 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ProjectStoreError::RecoveryInvalid { .. }));
         assert_eq!(read(&fixture.directory.join("project.toml")), explicit);
+    }
+
+    #[test]
+    fn recovery_discard_requires_exact_identity_and_revision() {
+        let fixture = ProjectFixture::new();
+        fixture
+            .store
+            .save(fixture.request(4, SaveKind::Recovery))
+            .unwrap();
+        let recovery = fixture.directory.join(".sampler-tui-recovery.toml");
+        let before = read(&recovery);
+        assert!(matches!(
+            fixture.store.discard_recovery(
+                &fixture.directory,
+                ProjectId::from_bytes([0x42; 16]),
+                4,
+            ),
+            Err(ProjectStoreError::RecoveryMismatch { .. })
+        ));
+        assert_eq!(read(&recovery), before);
+        fixture
+            .store
+            .discard_recovery(&fixture.directory, ProjectId::from_bytes([0x41; 16]), 4)
+            .unwrap();
+        assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn discard_revision_n_cannot_delete_concurrent_recovery_n_plus_one() {
+        use std::{
+            sync::mpsc::{self, RecvTimeoutError},
+            time::Duration,
+        };
+
+        let fixture = ProjectFixture::new();
+        fixture
+            .store
+            .save(fixture.request(1, SaveKind::Recovery))
+            .unwrap();
+        let directory = fixture.directory.clone();
+        let newer = fixture.request(2, SaveKind::Recovery);
+        let (validated_tx, validated_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (saved_tx, saved_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let discard_directory = directory.clone();
+            let discard = scope.spawn(move || {
+                ProjectStore.discard_recovery_with_hook(
+                    &discard_directory,
+                    ProjectId::from_bytes([0x41; 16]),
+                    1,
+                    || {
+                        validated_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            });
+            validated_rx.recv().unwrap();
+            let save = scope.spawn(move || {
+                let result = ProjectStore.save(newer);
+                saved_tx.send(()).unwrap();
+                result
+            });
+            assert_eq!(
+                saved_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout),
+                "save must wait for discard's project lock"
+            );
+            release_tx.send(()).unwrap();
+            discard.join().unwrap().unwrap();
+            save.join().unwrap().unwrap();
+        });
+        let probe = fixture.store.probe(&directory).unwrap();
+        assert_eq!(probe.recovery.unwrap().unwrap().revision, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_lock_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ProjectFixture::new();
+        let outside = fixture.root.join("outside-lock");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, fixture.directory.join(".sampler-tui.lock")).unwrap();
+        assert!(matches!(
+            fixture.store.save(fixture.request(1, SaveKind::Explicit)),
+            Err(ProjectStoreError::SymlinkRejected { .. })
+        ));
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
     }
 }

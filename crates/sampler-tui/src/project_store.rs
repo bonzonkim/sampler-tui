@@ -201,13 +201,33 @@ impl ProjectDirectory {
 
     fn lock_exclusive(&self) -> Result<ProjectLock, ProjectStoreError> {
         let path = self.path.join(".sampler-tui.lock");
-        let owned = rustix::fs::openat(
-            &self.file,
-            ".sampler-tui.lock",
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|error| open_path_error(&path, error))?;
+        let mut create_attempts = 0;
+        let owned = loop {
+            create_attempts += 1;
+            match rustix::fs::openat(
+                &self.file,
+                ".sampler-tui.lock",
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            ) {
+                Ok(owned) => break owned,
+                Err(error) if error == rustix::io::Errno::EXIST => {
+                    match rustix::fs::openat(
+                        &self.file,
+                        ".sampler-tui.lock",
+                        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(owned) => break owned,
+                        Err(error) if error == rustix::io::Errno::NOENT && create_attempts < 4 => {
+                            continue;
+                        }
+                        Err(error) => return Err(open_path_error(&path, error)),
+                    }
+                }
+                Err(error) => return Err(open_path_error(&path, error)),
+            }
+        };
         ensure_fd_type(&owned, &path, RustixFileType::RegularFile)?;
         let file = File::from(owned);
         rustix::fs::flock(&file, FlockOperation::LockExclusive)
@@ -527,6 +547,7 @@ pub struct ProjectProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicWritePoint {
+    AfterSaveAsPreflight,
     AfterSourceFingerprint,
     BeforeParentDirectorySync,
     AfterCreate,
@@ -678,8 +699,19 @@ impl ProjectStore {
         F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
     {
         let directory = prepare_project_directory(&request.directory, request.save_as, &mut hook)?;
+        if request.save_as {
+            checkpoint(
+                &mut hook,
+                AtomicWritePoint::AfterSaveAsPreflight,
+                &directory,
+                false,
+            )?;
+        }
         let project = ProjectDirectory::open_existing(&directory)?;
         let _lock = project.lock_exclusive()?;
+        if request.save_as {
+            recheck_save_as_target(&project)?;
+        }
         let directory = project.path.clone();
         let audio_directory = project.ensure_audio_directory()?;
         let mut document_pads = Vec::with_capacity(request.snapshot.pads.len());
@@ -919,60 +951,95 @@ where
 {
     if save_as {
         match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(ProjectStoreError::SymlinkRejected {
-                        path: path.to_path_buf(),
-                    });
+            Ok(_) => validate_empty_save_as_target(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+                Ok(()) => {
+                    checkpoint(
+                        hook,
+                        AtomicWritePoint::BeforeParentDirectorySync,
+                        path,
+                        true,
+                    )?;
+                    let parent = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            atomic_error(
+                                path,
+                                AtomicWritePoint::BeforeParentDirectorySync,
+                                error.kind(),
+                                true,
+                            )
+                        })?;
                 }
-                if !metadata.is_dir() {
-                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-                        path: path.to_path_buf(),
-                    });
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    validate_empty_save_as_target(path)?;
+                    drop(ProjectDirectory::open_existing(path)?);
                 }
-                let mut entries = fs::read_dir(path)
-                    .map_err(|error| filesystem_error("read save-as target", path, error))?;
-                if entries
-                    .next()
-                    .transpose()
-                    .map_err(|error| filesystem_error("read save-as target", path, error))?
-                    .is_some()
-                {
-                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-                        path: path.to_path_buf(),
-                    });
+                Err(error) => {
+                    return Err(filesystem_error("create save-as target", path, error));
                 }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(path)
-                    .map_err(|error| filesystem_error("create save-as target", path, error))?;
-                checkpoint(
-                    hook,
-                    AtomicWritePoint::BeforeParentDirectorySync,
-                    path,
-                    true,
-                )?;
-                let parent = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-                File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        atomic_error(
-                            path,
-                            AtomicWritePoint::BeforeParentDirectorySync,
-                            error.kind(),
-                            true,
-                        )
-                    })?;
-            }
+            },
             Err(error) => return Err(filesystem_error("inspect save-as target", path, error)),
         }
     } else {
         validate_directory(path)?;
     }
     fs::canonicalize(path).map_err(|error| filesystem_error("canonicalize directory", path, error))
+}
+
+fn validate_empty_save_as_target(path: &Path) -> Result<(), ProjectStoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| filesystem_error("inspect save-as target", path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(ProjectStoreError::SymlinkRejected {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut entries =
+        fs::read_dir(path).map_err(|error| filesystem_error("read save-as target", path, error))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| filesystem_error("read save-as target", path, error))?
+        .is_some()
+    {
+        return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn recheck_save_as_target(project: &ProjectDirectory) -> Result<(), ProjectStoreError> {
+    let entries = fs::read_dir(&project.path)
+        .map_err(|error| filesystem_error("recheck save-as target", &project.path, error))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| filesystem_error("recheck save-as target", &project.path, error))?;
+        if entry.file_name() != ".sampler-tui.lock" {
+            return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                path: project.path.clone(),
+            });
+        }
+        let lock_path = project.path.join(".sampler-tui.lock");
+        if open_optional_regular_at(&project.file, Path::new(".sampler-tui.lock"), &lock_path)?
+            .is_none()
+        {
+            return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                path: project.path.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn create_anchored_temp(
@@ -1949,10 +2016,16 @@ pitch_semitones = 0.0
         let fixture = ProjectFixture::new();
         fixture
             .store
+            .save(fixture.request(3, SaveKind::Explicit))
+            .unwrap();
+        fixture
+            .store
             .save(fixture.request(4, SaveKind::Recovery))
             .unwrap();
         let recovery = fixture.directory.join(".sampler-tui-recovery.toml");
+        let explicit = fixture.directory.join("project.toml");
         let before = read(&recovery);
+        let explicit_before = read(&explicit);
         assert!(matches!(
             fixture.store.discard_recovery(
                 &fixture.directory,
@@ -1962,11 +2035,71 @@ pitch_semitones = 0.0
             Err(ProjectStoreError::RecoveryMismatch { .. })
         ));
         assert_eq!(read(&recovery), before);
+        assert_eq!(read(&explicit), explicit_before);
+        assert!(matches!(
+            fixture.store.discard_recovery(
+                &fixture.directory,
+                ProjectId::from_bytes([0x41; 16]),
+                5,
+            ),
+            Err(ProjectStoreError::RecoveryMismatch { .. })
+        ));
+        assert_eq!(read(&recovery), before);
+        assert_eq!(read(&explicit), explicit_before);
         fixture
             .store
             .discard_recovery(&fixture.directory, ProjectId::from_bytes([0x41; 16]), 4)
             .unwrap();
         assert!(!recovery.exists());
+        assert_eq!(read(&explicit), explicit_before);
+    }
+
+    #[test]
+    fn concurrent_save_as_requests_cannot_overwrite_the_first_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("contended-save-as");
+        let mut first = fixture.request(1, SaveKind::Explicit);
+        first.directory = target.clone();
+        first.save_as = true;
+        first.snapshot.project_id = ProjectId::from_bytes([0x51; 16]);
+        let mut second = first.clone();
+        second.snapshot.project_id = ProjectId::from_bytes([0x52; 16]);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first_thread = scope.spawn(move || {
+                ProjectStore.save_with_hook(first, |point| {
+                    if point == AtomicWritePoint::AfterSaveAsPreflight {
+                        first_barrier.wait();
+                    }
+                    None
+                })
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second_thread = scope.spawn(move || {
+                ProjectStore.save_with_hook(second, |point| {
+                    if point == AtomicWritePoint::AfterSaveAsPreflight {
+                        second_barrier.wait();
+                    }
+                    None
+                })
+            });
+            (first_thread.join().unwrap(), second_thread.join().unwrap())
+        });
+
+        let (winner, loser) = match (first_result, second_result) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            outcomes => panic!("expected exactly one winner, got {outcomes:?}"),
+        };
+        assert!(
+            matches!(&loser, ProjectStoreError::SaveAsTargetNotEmpty { .. }),
+            "unexpected loser: {loser:?}"
+        );
+        let parsed = ProjectDocument::from_toml(&read(&target.join("project.toml"))).unwrap();
+        assert_eq!(parsed.current().unwrap().project_id, winner.project_id);
     }
 
     #[test]

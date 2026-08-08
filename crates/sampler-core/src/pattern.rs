@@ -585,18 +585,30 @@ impl EditablePattern {
                 .then(action_kind_order(left.kind).cmp(&action_kind_order(right.kind)))
         });
         let mut first_loop_valid = [0_u64; FIRST_LOOP_VALID_MASK_WORDS];
+        let mut first_loop_valid_prefix = Vec::with_capacity(actions.len() + 1);
+        first_loop_valid_prefix.push(0_u16);
         for (index, action) in actions.iter().enumerate() {
             if action.trigger_loop_delta == 0 {
                 first_loop_valid[index / u64::BITS as usize] |=
                     1_u64 << (index % u64::BITS as usize);
             }
+            let next = first_loop_valid_prefix[index]
+                .saturating_add(u16::from(action.trigger_loop_delta == 0));
+            first_loop_valid_prefix.push(next);
         }
+        let action_frames = actions
+            .iter()
+            .map(|action| action.frame)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(PatternSnapshot {
             slot: self.slot,
             generation: self.generation,
             loop_frames,
             actions: actions.into_boxed_slice(),
             first_loop_valid,
+            first_loop_valid_prefix: first_loop_valid_prefix.into_boxed_slice(),
+            action_frames,
         })
     }
 
@@ -654,6 +666,8 @@ pub struct PatternSnapshot {
     loop_frames: Frame,
     actions: Box<[PatternAction]>,
     first_loop_valid: [u64; FIRST_LOOP_VALID_MASK_WORDS],
+    first_loop_valid_prefix: Box<[u16]>,
+    action_frames: Box<[Frame]>,
 }
 
 impl PatternSnapshot {
@@ -683,20 +697,12 @@ impl PatternSnapshot {
         if start >= end {
             return 0;
         }
-        let first_word = start / u64::BITS as usize;
-        let last_word = (end - 1) / u64::BITS as usize;
-        (first_word..=last_word)
-            .map(|word_index| {
-                let mut word = self.first_loop_valid[word_index];
-                if word_index == first_word {
-                    word &= u64::MAX << (start % u64::BITS as usize);
-                }
-                if word_index == last_word && !end.is_multiple_of(u64::BITS as usize) {
-                    word &= (1_u64 << (end % u64::BITS as usize)) - 1;
-                }
-                word.count_ones() as usize
-            })
-            .sum()
+        usize::from(self.first_loop_valid_prefix[end] - self.first_loop_valid_prefix[start])
+    }
+
+    pub fn action_index_at_or_after(&self, frame: Frame) -> usize {
+        self.action_frames
+            .partition_point(|action_frame| *action_frame < frame)
     }
 }
 
@@ -980,6 +986,21 @@ mod tests {
         assert_eq!(
             snapshot.first_loop_valid_word(FIRST_LOOP_VALID_MASK_WORDS),
             0
+        );
+        assert_eq!(snapshot.action_index_at_or_after(0), 0);
+        assert_eq!(snapshot.action_index_at_or_after(1), MAX_PATTERN_EVENTS);
+        assert_eq!(
+            snapshot.action_index_at_or_after(loop_frames - 1),
+            MAX_PATTERN_EVENTS
+        );
+        assert_eq!(
+            snapshot.action_index_at_or_after(loop_frames),
+            MAX_PATTERN_ACTIONS
+        );
+        assert_eq!(snapshot.first_loop_valid_count(0, MAX_PATTERN_EVENTS), 0);
+        assert_eq!(
+            snapshot.first_loop_valid_count(0, MAX_PATTERN_ACTIONS),
+            MAX_PATTERN_EVENTS
         );
     }
 

@@ -359,87 +359,242 @@ struct PatternInterval {
     end: Frame,
 }
 
-struct PatternIntervalCursor {
-    origin: Frame,
-    start: Frame,
-    end: Frame,
+#[derive(Clone, Copy)]
+struct PatternIntervalPlan {
+    interval: PatternInterval,
     loop_frames: Frame,
-    loop_index: u128,
-    action_index: usize,
-    first_loop_word: usize,
-    first_loop_bits: u64,
+    action_len: usize,
+    first_loop: u128,
+    end_loop: u128,
+    first_index: usize,
+    end_index: usize,
+    first_loop_valid: usize,
+    total: u128,
 }
 
-impl PatternIntervalCursor {
+impl PatternIntervalPlan {
     fn new(snapshot: &PatternSnapshot, interval: PatternInterval) -> Option<Self> {
         let start = interval.start.max(interval.origin);
         let loop_frames = snapshot.loop_frames();
-        if loop_frames == 0 || start >= interval.end || snapshot.actions().is_empty() {
+        let action_len = snapshot.actions().len();
+        if loop_frames == 0 || action_len == 0 || start >= interval.end {
             return None;
         }
-        let relative_start = start - interval.origin;
-        let loop_index = u128::from(relative_start / loop_frames);
-        let start_phase = relative_start % loop_frames;
-        let action_index = snapshot
-            .actions()
-            .partition_point(|action| action.frame < start_phase);
-        let first_loop_word = action_index / u64::BITS as usize;
-        let first_loop_bits = if loop_index == 0 && first_loop_word < FIRST_LOOP_VALID_MASK_WORDS {
-            snapshot.first_loop_valid_word(first_loop_word)
-                & (u64::MAX << (action_index % u64::BITS as usize))
+        let relative_start = start.checked_sub(interval.origin)?;
+        let relative_end = interval.end.checked_sub(interval.origin)?;
+        let first_loop = u128::from(relative_start / loop_frames);
+        let end_loop = u128::from(relative_end / loop_frames);
+        let first_index = snapshot.action_index_at_or_after(relative_start % loop_frames);
+        let end_index = snapshot.action_index_at_or_after(relative_end % loop_frames);
+        let first_segment_end = if first_loop == end_loop {
+            end_index
         } else {
-            0
+            action_len
+        };
+        let first_loop_valid = if first_loop == 0 {
+            snapshot.first_loop_valid_count(first_index, first_segment_end)
+        } else {
+            first_segment_end.saturating_sub(first_index)
+        };
+        let total = if first_loop == end_loop {
+            first_loop_valid as u128
+        } else {
+            let middle_loops = end_loop.saturating_sub(first_loop).saturating_sub(1);
+            let middle_count = middle_loops.saturating_mul(action_len as u128);
+            (first_loop_valid as u128)
+                .saturating_add(middle_count)
+                .saturating_add(end_index as u128)
         };
         Some(Self {
-            origin: interval.origin,
-            start,
-            end: interval.end,
+            interval,
             loop_frames,
-            loop_index,
-            action_index,
-            first_loop_word,
-            first_loop_bits,
+            action_len,
+            first_loop,
+            end_loop,
+            first_index,
+            end_index,
+            first_loop_valid,
+            total,
         })
     }
+}
 
-    fn next(&mut self, snapshot: &PatternSnapshot) -> Option<(PatternAction, Frame, u128)> {
-        let actions = snapshot.actions();
+struct PatternWorkBudget {
+    mask_words_remaining: usize,
+    action_reads_remaining: usize,
+    #[cfg(test)]
+    mask_word_loads: usize,
+    #[cfg(test)]
+    action_reads: usize,
+}
+
+impl PatternWorkBudget {
+    fn new() -> Self {
+        Self {
+            mask_words_remaining: FIRST_LOOP_VALID_MASK_WORDS,
+            action_reads_remaining: MAX_PATTERN_ACTIONS_PER_CALLBACK,
+            #[cfg(test)]
+            mask_word_loads: 0,
+            #[cfg(test)]
+            action_reads: 0,
+        }
+    }
+
+    fn load_mask_word(&mut self, snapshot: &PatternSnapshot, word_index: usize) -> Option<u64> {
+        if self.mask_words_remaining == 0 {
+            return None;
+        }
+        self.mask_words_remaining -= 1;
+        #[cfg(test)]
+        {
+            self.mask_word_loads += 1;
+        }
+        Some(snapshot.first_loop_valid_word(word_index))
+    }
+
+    fn read_action(
+        &mut self,
+        snapshot: &PatternSnapshot,
+        action_index: usize,
+    ) -> Option<PatternAction> {
+        if self.action_reads_remaining == 0 {
+            return None;
+        }
+        self.action_reads_remaining -= 1;
+        #[cfg(test)]
+        {
+            self.action_reads += 1;
+        }
+        snapshot.actions().get(action_index).copied()
+    }
+}
+
+enum PatternCursorStep {
+    Action(PatternAction, Frame, u128),
+    Finished,
+    BudgetExhausted,
+}
+
+struct PatternIntervalCursor {
+    plan: PatternIntervalPlan,
+    loop_index: u128,
+    action_index: usize,
+    first_loop_valid_remaining: usize,
+    cached_mask_word: Option<(usize, u64)>,
+    remaining: u128,
+}
+
+impl PatternIntervalCursor {
+    fn new(plan: PatternIntervalPlan) -> Self {
+        Self {
+            plan,
+            loop_index: plan.first_loop,
+            action_index: plan.first_index,
+            first_loop_valid_remaining: plan.first_loop_valid,
+            cached_mask_word: None,
+            remaining: plan.total,
+        }
+    }
+
+    fn next(
+        &mut self,
+        snapshot: &PatternSnapshot,
+        budget: &mut PatternWorkBudget,
+    ) -> PatternCursorStep {
+        if self.remaining == 0 {
+            return PatternCursorStep::Finished;
+        }
         loop {
             if self.loop_index == 0 {
-                while self.first_loop_bits == 0 {
-                    self.first_loop_word += 1;
-                    if self.first_loop_word >= FIRST_LOOP_VALID_MASK_WORDS
-                        || self.first_loop_word * u64::BITS as usize >= actions.len()
-                    {
-                        self.loop_index = 1;
-                        self.action_index = 0;
-                        break;
+                if self.first_loop_valid_remaining == 0 {
+                    self.loop_index = 1;
+                    self.action_index = 0;
+                    self.cached_mask_word = None;
+                    continue;
+                }
+                let first_loop_end = if self.plan.end_loop == 0 {
+                    self.plan.end_index
+                } else {
+                    self.plan.action_len
+                };
+                let word_index = self.action_index / u64::BITS as usize;
+                let mut bits = match self.cached_mask_word {
+                    Some((cached_index, cached_bits)) if cached_index == word_index => cached_bits,
+                    _ => {
+                        let Some(word) = budget.load_mask_word(snapshot, word_index) else {
+                            return PatternCursorStep::BudgetExhausted;
+                        };
+                        word
                     }
-                    self.first_loop_bits = snapshot.first_loop_valid_word(self.first_loop_word);
+                };
+                bits &= u64::MAX << (self.action_index % u64::BITS as usize);
+                let word_start = word_index * u64::BITS as usize;
+                if first_loop_end < word_start + u64::BITS as usize {
+                    let retained = first_loop_end.saturating_sub(word_start);
+                    bits &= if retained == u64::BITS as usize {
+                        u64::MAX
+                    } else {
+                        (1_u64 << retained) - 1
+                    };
                 }
-                if self.loop_index == 0 {
-                    let bit = self.first_loop_bits.trailing_zeros() as usize;
-                    self.first_loop_bits &= self.first_loop_bits - 1;
-                    self.action_index = self.first_loop_word * u64::BITS as usize + bit;
+                if bits == 0 {
+                    self.action_index = (word_start + u64::BITS as usize).min(first_loop_end);
+                    self.cached_mask_word = None;
+                    continue;
                 }
-            } else if self.action_index == actions.len() {
-                self.loop_index = self.loop_index.checked_add(1)?;
-                self.action_index = 0;
+                let bit = bits.trailing_zeros() as usize;
+                let selected = word_start + bit;
+                bits &= bits - 1;
+                self.cached_mask_word = Some((word_index, bits));
+                self.action_index = selected + 1;
+                self.first_loop_valid_remaining -= 1;
+                let Some(action) = budget.read_action(snapshot, selected) else {
+                    return PatternCursorStep::BudgetExhausted;
+                };
+                return self.action_step(action);
             }
 
-            let action = *actions.get(self.action_index)?;
-            self.action_index += 1;
-            let absolute = u128::from(self.origin)
-                .checked_add(self.loop_index.checked_mul(u128::from(self.loop_frames))?)?
-                .checked_add(u128::from(action.frame))?;
-            if absolute >= u128::from(self.end) {
-                return None;
+            if self.loop_index > self.plan.end_loop
+                || (self.loop_index == self.plan.end_loop
+                    && self.action_index >= self.plan.end_index)
+            {
+                return PatternCursorStep::Finished;
             }
-            if absolute < u128::from(self.start) {
+            if self.action_index == self.plan.action_len {
+                let Some(next_loop) = self.loop_index.checked_add(1) else {
+                    return PatternCursorStep::Finished;
+                };
+                self.loop_index = next_loop;
+                self.action_index = 0;
                 continue;
             }
-            return Some((action, Frame::try_from(absolute).ok()?, self.loop_index));
+            let selected = self.action_index;
+            self.action_index += 1;
+            let Some(action) = budget.read_action(snapshot, selected) else {
+                return PatternCursorStep::BudgetExhausted;
+            };
+            return self.action_step(action);
         }
+    }
+
+    fn action_step(&mut self, action: PatternAction) -> PatternCursorStep {
+        let Some(loop_offset) = self
+            .loop_index
+            .checked_mul(u128::from(self.plan.loop_frames))
+        else {
+            return PatternCursorStep::Finished;
+        };
+        let Some(absolute) = u128::from(self.plan.interval.origin)
+            .checked_add(loop_offset)
+            .and_then(|base| base.checked_add(u128::from(action.frame)))
+        else {
+            return PatternCursorStep::Finished;
+        };
+        let Ok(at_frame) = Frame::try_from(absolute) else {
+            return PatternCursorStep::Finished;
+        };
+        self.remaining -= 1;
+        PatternCursorStep::Action(action, at_frame, self.loop_index)
     }
 }
 
@@ -1109,6 +1264,11 @@ impl AudioEngine {
     }
 
     fn schedule_pattern_actions(&mut self, horizon: Frame) {
+        #[cfg(test)]
+        {
+            self.pattern_action_reads = 0;
+            self.pattern_mask_word_reads = 0;
+        }
         let start = self.rendered_frame;
         if !self.pattern_player.playing || start >= horizon {
             return;
@@ -1141,19 +1301,16 @@ impl AudioEngine {
             end: current_end,
         });
 
+        let mut plans = [None; 2];
         let mut total = 0_u128;
-        for interval in intervals.iter().take(interval_len).flatten() {
+        for (index, interval) in intervals.iter().take(interval_len).flatten().enumerate() {
             let Some(pattern) = self.pattern_player.installed(interval.slot) else {
                 continue;
             };
-            #[cfg(test)]
-            {
-                self.pattern_mask_word_reads = self.pattern_mask_word_reads.saturating_add(
-                    pattern_interval_first_loop_mask_words(&pattern.snapshot, *interval),
-                );
+            if let Some(plan) = PatternIntervalPlan::new(&pattern.snapshot, *interval) {
+                total = total.saturating_add(plan.total);
+                plans[index] = Some(plan);
             }
-            total =
-                total.saturating_add(pattern_interval_action_count(&pattern.snapshot, *interval));
         }
 
         let free_entries = PENDING_COUNT
@@ -1165,41 +1322,44 @@ impl AudioEngine {
             .min(free_entries);
         let mut admitted_len = 0;
         let sequence = self.pattern_player.play_sequence;
-        for interval in intervals.iter().take(interval_len).flatten() {
+        let mut budget = PatternWorkBudget::new();
+        'plans: for plan in plans.into_iter().take(interval_len).flatten() {
             if admitted_len == admitted_limit {
                 break;
             }
-            let Some((slot, generation, loop_frames, mut cursor)) = self
+            let Some((slot, generation, loop_frames)) = self
                 .pattern_player
-                .installed(interval.slot)
-                .and_then(|pattern| {
-                    Some((
+                .installed(plan.interval.slot)
+                .map(|pattern| {
+                    (
                         pattern.snapshot.slot(),
                         pattern.snapshot.generation(),
                         pattern.snapshot.loop_frames(),
-                        PatternIntervalCursor::new(&pattern.snapshot, *interval)?,
-                    ))
+                    )
                 })
             else {
                 continue;
             };
+            let mut cursor = PatternIntervalCursor::new(plan);
             while admitted_len < admitted_limit {
-                let next = self
+                let step = self
                     .pattern_player
-                    .installed(interval.slot)
-                    .and_then(|pattern| cursor.next(&pattern.snapshot));
-                let Some((action, at_frame, loop_index)) = next else {
-                    break;
+                    .installed(plan.interval.slot)
+                    .map_or(PatternCursorStep::Finished, |pattern| {
+                        cursor.next(&pattern.snapshot, &mut budget)
+                    });
+                let (action, at_frame, loop_index) = match step {
+                    PatternCursorStep::Action(action, at_frame, loop_index) => {
+                        (action, at_frame, loop_index)
+                    }
+                    PatternCursorStep::Finished => break,
+                    PatternCursorStep::BudgetExhausted => break 'plans,
                 };
-                #[cfg(test)]
-                {
-                    self.pattern_action_reads = self.pattern_action_reads.saturating_add(1);
-                }
                 let Some(id) = pattern_voice_id(
                     slot,
                     generation,
                     loop_frames,
-                    interval.origin,
+                    plan.interval.origin,
                     action,
                     loop_index,
                 ) else {
@@ -1208,6 +1368,12 @@ impl AudioEngine {
                 self.insert_pending(scheduled_pattern_action(action, at_frame, sequence, id));
                 admitted_len += 1;
             }
+        }
+
+        #[cfg(test)]
+        {
+            self.pattern_action_reads = budget.action_reads;
+            self.pattern_mask_word_reads = budget.mask_word_loads;
         }
 
         let dropped = total.saturating_sub(admitted_len as u128);
@@ -1640,83 +1806,6 @@ impl AudioEngine {
     }
 }
 
-fn pattern_interval_action_count(snapshot: &PatternSnapshot, interval: PatternInterval) -> u128 {
-    let start = interval.start.max(interval.origin);
-    if start >= interval.end {
-        return 0;
-    }
-    let actions = snapshot.actions();
-    if actions.is_empty() {
-        return 0;
-    }
-
-    let loop_frames = snapshot.loop_frames();
-    if loop_frames == 0 {
-        return 0;
-    }
-    let relative_start = start - interval.origin;
-    let relative_end = interval.end - interval.origin;
-    let first_loop = relative_start / loop_frames;
-    let end_loop = relative_end / loop_frames;
-    let start_phase = relative_start % loop_frames;
-    let end_phase = relative_end % loop_frames;
-    let first_index = actions.partition_point(|action| action.frame < start_phase);
-
-    if first_loop == end_loop {
-        let end_index = actions.partition_point(|action| action.frame < end_phase);
-        return if first_loop == 0 {
-            snapshot.first_loop_valid_count(first_index, end_index) as u128
-        } else {
-            end_index.saturating_sub(first_index) as u128
-        };
-    }
-
-    let first_count = if first_loop == 0 {
-        snapshot.first_loop_valid_count(first_index, actions.len()) as u128
-    } else {
-        actions.len().saturating_sub(first_index) as u128
-    };
-    let middle_loops = end_loop.saturating_sub(first_loop).saturating_sub(1);
-    let middle_count = u128::from(middle_loops).saturating_mul(actions.len() as u128);
-    let last_count = actions.partition_point(|action| action.frame < end_phase) as u128;
-    first_count
-        .saturating_add(middle_count)
-        .saturating_add(last_count)
-}
-
-#[cfg(test)]
-fn pattern_interval_first_loop_mask_words(
-    snapshot: &PatternSnapshot,
-    interval: PatternInterval,
-) -> usize {
-    let start = interval.start.max(interval.origin);
-    let actions = snapshot.actions();
-    let loop_frames = snapshot.loop_frames();
-    if actions.is_empty() || loop_frames == 0 || start >= interval.end {
-        return 0;
-    }
-    let relative_start = start - interval.origin;
-    if relative_start / loop_frames != 0 {
-        return 0;
-    }
-    let relative_end = interval.end - interval.origin;
-    let start_phase = relative_start % loop_frames;
-    let end_phase = relative_end % loop_frames;
-    let first = actions.partition_point(|action| action.frame < start_phase);
-    let last = if relative_end / loop_frames == 0 {
-        actions.partition_point(|action| action.frame < end_phase)
-    } else {
-        actions.len()
-    };
-    if first >= last {
-        0
-    } else {
-        let first_word = first / u64::BITS as usize;
-        let last_word = (last - 1) / u64::BITS as usize;
-        last_word - first_word + 1
-    }
-}
-
 fn scheduled_pattern_action(
     action: PatternAction,
     at_frame: Frame,
@@ -1904,6 +1993,37 @@ mod tests {
                 )
                 .unwrap();
         }
+        Arc::new(pattern.compile().unwrap())
+    }
+
+    fn sparse_first_loop_snapshot(slot: u8) -> Arc<sampler_core::PatternSnapshot> {
+        let transport = Transport::new(
+            100,
+            Tempo::new(300.0).unwrap(),
+            Meter::new(1, 8).unwrap(),
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap();
+        let mut pattern =
+            EditablePattern::new(PatternSlotId::new(slot).unwrap(), "Sparse", transport).unwrap();
+        for id in 1..sampler_core::MAX_PATTERN_EVENTS as u64 {
+            pattern
+                .insert(PatternEvent::new(EventId(id), PadId::first(), 9, 1.0, Some(3)).unwrap())
+                .unwrap();
+        }
+        pattern
+            .insert(
+                PatternEvent::new(
+                    EventId(sampler_core::MAX_PATTERN_EVENTS as u64),
+                    PadId::first(),
+                    5,
+                    1.0,
+                    Some(10),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         Arc::new(pattern.compile().unwrap())
     }
 
@@ -2134,8 +2254,44 @@ mod tests {
             .filter_map(|action| action.pattern_voice_id().map(|id| id.event_id.0))
             .collect::<Vec<_>>();
         assert_eq!(event_ids, (1..=64).collect::<Vec<_>>());
-        assert!(engine.pattern_action_reads <= MAX_PATTERN_ACTIONS_PER_CALLBACK);
-        assert!(engine.pattern_mask_word_reads <= sampler_core::FIRST_LOOP_VALID_MASK_WORDS);
+        assert_eq!(engine.pattern_action_reads, 64);
+        assert_eq!(engine.pattern_mask_word_reads, 17);
+        assert_eq!(engine.pattern_overflows(), 960);
+    }
+
+    #[test]
+    fn boundary_intervals_share_one_actual_pattern_work_budget() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        controller
+            .install_pattern(sparse_first_loop_snapshot(0))
+            .unwrap();
+        controller
+            .install_pattern(sparse_first_loop_snapshot(1))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(0, |_| {});
+        engine.pattern_player.pending_switch = Some(PendingPatternSwitch {
+            slot: PatternSlotId::new(1).unwrap(),
+            at_frame: 6,
+        });
+
+        engine.schedule_pattern_actions(12);
+
+        let scheduled_slots = engine
+            .pending
+            .iter()
+            .take(engine.pending_len)
+            .flatten()
+            .filter_map(|action| action.pattern_voice_id().map(|id| id.slot))
+            .collect::<Vec<_>>();
+        assert_eq!(scheduled_slots, vec![PatternSlotId::new(0).unwrap()]);
+        assert_eq!(engine.pattern_action_reads, 1);
+        assert_eq!(engine.pattern_mask_word_reads, 32);
+        assert_eq!(engine.pattern_overflows(), 1);
     }
 
     #[test]

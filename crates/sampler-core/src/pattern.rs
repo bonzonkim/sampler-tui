@@ -348,6 +348,32 @@ impl EditablePattern {
         Ok(())
     }
 
+    /// Changes an event's held duration without reconstructing its position from a quantized
+    /// frame. This preserves the raw-frame ledger used by reversible quantization.
+    pub fn set_duration(
+        &mut self,
+        id: EventId,
+        duration: Option<Frame>,
+    ) -> Result<(), PatternEditError> {
+        if duration == Some(0)
+            || duration.is_some_and(|duration| duration > self.transport.loop_frames())
+        {
+            return Err(PatternEditError::Model(ModelError::InvalidEvent));
+        }
+        let index = self
+            .events
+            .events
+            .iter()
+            .position(|event| event.id == id)
+            .ok_or(PatternEditError::EventNotFound(id))?;
+        let generation = self.next_generation()?;
+        let mut events = self.events.clone();
+        events.events[index].duration = duration;
+        self.events = events;
+        self.generation = generation;
+        Ok(())
+    }
+
     pub fn toggle_at(
         &mut self,
         pad: PadId,
@@ -1128,6 +1154,34 @@ mod tests {
             ),
             (6_800, 0.35)
         );
+    }
+
+    #[test]
+    fn duration_update_preserves_raw_frames_and_is_failure_atomic() {
+        let mut pattern = editable(48_000, 1);
+        let id = pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        pattern.set_swing(0.60).unwrap();
+        pattern.set_quantize_strength(1.0).unwrap();
+        assert_eq!(pattern.event(id).unwrap().frame, 7_200);
+
+        pattern.set_duration(id, Some(4_000)).unwrap();
+        pattern.set_quantize_strength(0.0).unwrap();
+        assert_eq!(
+            (
+                pattern.event(id).unwrap().frame,
+                pattern.event(id).unwrap().duration
+            ),
+            (6_800, Some(4_000))
+        );
+
+        let before_event = *pattern.event(id).unwrap();
+        let before_generation = pattern.generation();
+        assert_eq!(
+            pattern.set_duration(id, Some(pattern.transport().loop_frames() + 1)),
+            Err(PatternEditError::Model(ModelError::InvalidEvent))
+        );
+        assert_eq!(pattern.event(id), Some(&before_event));
+        assert_eq!(pattern.generation(), before_generation);
     }
 
     #[test]

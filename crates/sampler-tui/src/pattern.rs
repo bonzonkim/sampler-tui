@@ -338,6 +338,29 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_capture_clears_on_current_false_or_replacement_telemetry() {
+        let stamp = origin(1_000);
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = FakeAudio::default();
+        workspace.start_recording(stamp).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(stamp));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+
+        workspace.maintain(&mut audio, telemetry());
+        assert_eq!(workspace.capture_state(), None);
+
+        workspace.start_recording(stamp).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(stamp));
+        let mut replacement = recording_telemetry(stamp);
+        replacement.pattern_origin = Some(stamp.origin + 100);
+        workspace.maintain(&mut audio, replacement);
+        assert_eq!(workspace.capture_state(), None);
+    }
+
+    #[test]
     fn moving_bar_keeps_the_local_column_and_updates_absolute_step() {
         let mut workspace = PatternWorkspace::new(48_000);
         workspace.set_bars(2).unwrap();
@@ -369,6 +392,32 @@ mod tests {
         let maintenance = workspace.maintain(&mut audio, telemetry());
 
         assert_eq!(maintenance.compiled_slot, Some(second));
+    }
+
+    #[test]
+    fn dirty_ticket_renormalizes_at_max_without_starving_an_older_slot() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.dirty_patterns.fill(None);
+        workspace.next_dirty_ticket = u64::MAX - 1;
+        let first = PatternSlotId::new(0).unwrap();
+        let second = PatternSlotId::new(1).unwrap();
+        workspace.select_slot(first);
+        workspace.toggle_step().unwrap();
+        workspace.select_slot(second);
+        workspace.toggle_step().unwrap();
+        let mut audio = FakeAudio {
+            backpressured: true,
+            ..FakeAudio::default()
+        };
+
+        assert_eq!(
+            workspace.maintain(&mut audio, telemetry()).compiled_slot,
+            Some(second)
+        );
+        assert_eq!(
+            workspace.maintain(&mut audio, telemetry()).compiled_slot,
+            Some(first)
+        );
     }
 
     #[test]
@@ -924,30 +973,18 @@ impl PatternWorkspace {
                 let elapsed = ack.frame.saturating_sub(trigger_absolute_frame);
                 let duration = elapsed.min(stamp.loop_frames);
                 let index = usize::from(stamp.slot.get());
-                let Some(event) = self.patterns[index].event(event_id).copied() else {
-                    self.held_keys[key] = None;
-                    return;
-                };
-                if duration != 0 {
-                    let replacement = PatternEvent::new(
-                        event_id,
-                        event.pad,
-                        event.frame,
-                        event.velocity,
-                        Some(duration),
-                    );
-                    if let Ok(replacement) = replacement
-                        && self.patterns[index].remove(event_id).is_ok()
-                        && self.patterns[index].insert(replacement).is_ok()
-                    {
-                        if stamp.slot == self.selected_slot {
-                            self.selected_event = Some(SelectedEvent {
-                                slot: stamp.slot,
-                                event_id,
-                            });
-                        }
-                        self.mark_dirty(index);
+                if duration != 0
+                    && self.patterns[index]
+                        .set_duration(event_id, Some(duration))
+                        .is_ok()
+                {
+                    if stamp.slot == self.selected_slot {
+                        self.selected_event = Some(SelectedEvent {
+                            slot: stamp.slot,
+                            event_id,
+                        });
                     }
+                    self.mark_dirty(index);
                 }
                 self.held_keys[key] = None;
             }
@@ -976,7 +1013,8 @@ impl PatternWorkspace {
             RecordingState::Pending(intent) if matches_capture => {
                 Some(RecordingState::Confirmed(intent))
             }
-            RecordingState::Disarming(_) if !telemetry.pattern_recording => None,
+            RecordingState::Confirmed(_) if !matches_capture => None,
+            RecordingState::Disarming(_) if !matches_capture => None,
             _ => Some(state),
         };
     }
@@ -1103,7 +1141,10 @@ impl PatternWorkspace {
 
     fn mark_dirty(&mut self, index: usize) {
         let generation = self.patterns[index].generation();
-        self.next_dirty_ticket = self.next_dirty_ticket.saturating_add(1);
+        if self.next_dirty_ticket == u64::MAX {
+            self.renormalize_dirty_tickets();
+        }
+        self.next_dirty_ticket += 1;
         self.dirty_patterns[index] = Some(DirtyPattern {
             generation,
             ticket: self.next_dirty_ticket,
@@ -1115,6 +1156,23 @@ impl PatternWorkspace {
         {
             self.pending_snapshots[index] = None;
         }
+    }
+
+    fn renormalize_dirty_tickets(&mut self) {
+        let mut indexes: [usize; PATTERN_SLOT_COUNT] = array::from_fn(|index| index);
+        indexes.sort_by_key(|index| {
+            self.dirty_patterns[*index]
+                .map(|dirty| (0_u8, dirty.ticket, *index))
+                .unwrap_or((1_u8, 0, *index))
+        });
+        let mut ticket = 0_u64;
+        for index in indexes {
+            if let Some(dirty) = self.dirty_patterns[index].as_mut() {
+                ticket += 1;
+                dirty.ticket = ticket;
+            }
+        }
+        self.next_dirty_ticket = ticket;
     }
 
     fn next_dirty_slot(&self) -> Option<(usize, DirtyPattern)> {

@@ -601,6 +601,7 @@ impl EventLoopWorker for HarnessWorker {
             WorkerRequest::LoadSample {
                 pad,
                 generation,
+                purpose,
                 path,
                 engine_rate,
                 ..
@@ -614,6 +615,7 @@ impl EventLoopWorker for HarnessWorker {
                 state.results.push_back(WorkerResult::Loaded {
                     pad,
                     generation,
+                    purpose,
                     path,
                     result: Ok(LoadedSample {
                         base: Arc::clone(&buffer),

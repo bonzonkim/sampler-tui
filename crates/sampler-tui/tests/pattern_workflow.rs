@@ -226,7 +226,10 @@ impl PatternHarness {
             .begin_load(pad, format!("pad-{index}.wav"))
             .expect("audio available");
         let WorkerRequest::LoadSample {
-            generation, path, ..
+            generation,
+            purpose,
+            path,
+            ..
         } = request
         else {
             panic!("load request");
@@ -235,6 +238,7 @@ impl PatternHarness {
         assert!(self.app.apply_worker_result(WorkerResult::Loaded {
             pad,
             generation,
+            purpose,
             path,
             result: Ok(LoadedSample {
                 base: Arc::clone(&rendered),
@@ -609,7 +613,10 @@ fn replacement_loading_and_error_keep_the_current_session_pad_bound() {
     let mut harness = PatternHarness::new(48_000);
     let request = harness.app.begin_load(pad(0), "replacement.wav").unwrap();
     let WorkerRequest::LoadSample {
-        generation, path, ..
+        generation,
+        purpose,
+        path,
+        ..
     } = request
     else {
         panic!("load request");
@@ -621,6 +628,7 @@ fn replacement_loading_and_error_keep_the_current_session_pad_bound() {
     assert!(harness.app.apply_worker_result(WorkerResult::Loaded {
         pad: pad(0),
         generation,
+        purpose,
         path,
         result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
     }));

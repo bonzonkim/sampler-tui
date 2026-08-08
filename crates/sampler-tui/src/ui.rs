@@ -736,7 +736,7 @@ mod tests {
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
-    use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
+    use crate::loader::{LoadPurpose, LoadSampleError, LoadedSample, WorkerResult};
     use crate::{
         App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, Overlay, PreviewColumn,
     };
@@ -883,6 +883,7 @@ mod tests {
         assert!(app.apply_worker_result(WorkerResult::Loaded {
             pad: kick,
             generation,
+            purpose: LoadPurpose::User,
             path,
             result: Ok(LoadedSample {
                 base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
@@ -910,6 +911,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(5),
             generation,
+            purpose: LoadPurpose::User,
             path: error_path,
             result: Err(LoadSampleError::Decode("decode failed".to_owned())),
         });
@@ -1533,6 +1535,7 @@ mod tests {
         assert!(app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0),
             generation,
+            purpose: LoadPurpose::User,
             path: sample_path,
             result: Ok(LoadedSample {
                 base: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),

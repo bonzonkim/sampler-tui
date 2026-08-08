@@ -14,8 +14,8 @@ use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{
-    EditPreview, MAX_DIRECTORY_ENTRIES, RenderedSample, WORKER_CHANNEL_CAPACITY, WorkerRequest,
-    WorkerResult, WorkerSendError,
+    EditPreview, LoadPurpose, MAX_DIRECTORY_ENTRIES, RenderedSample, WORKER_CHANNEL_CAPACITY,
+    WorkerRequest, WorkerResult, WorkerSendError,
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
@@ -80,6 +80,15 @@ enum PendingLoadPhase {
 enum PendingLoadKind {
     User,
     Recovery,
+}
+
+impl PendingLoadKind {
+    fn purpose(self) -> LoadPurpose {
+        match self {
+            Self::User => LoadPurpose::User,
+            Self::Recovery => LoadPurpose::Recovery,
+        }
+    }
 }
 
 struct PendingLoad {
@@ -817,11 +826,12 @@ impl App {
             WorkerRequest::LoadSample {
                 pad,
                 generation,
+                purpose,
                 path,
                 ..
             } => {
                 let offset = pad_offset(pad);
-                if let Some(kind) = self.matching_pending_load(offset, generation, &path) {
+                if let Some(kind) = self.matching_pending_load(offset, generation, purpose, &path) {
                     if error == WorkerSendError::WorkerBusy {
                         if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
                             pending.phase = PendingLoadPhase::AwaitingWorker;
@@ -960,6 +970,7 @@ impl App {
             Some(WorkerRequest::LoadSample {
                 pad,
                 generation,
+                purpose: LoadPurpose::User,
                 path,
                 engine_rate,
                 recipe: SampleEditRecipe::identity(),
@@ -1199,6 +1210,7 @@ impl App {
         let WorkerResult::Loaded {
             pad,
             generation,
+            purpose,
             path,
             result,
         } = result
@@ -1229,7 +1241,7 @@ impl App {
             return applied;
         };
         let offset = pad_offset(pad);
-        let Some(kind) = self.matching_pending_load(offset, generation, &path) else {
+        let Some(kind) = self.matching_pending_load(offset, generation, purpose, &path) else {
             return false;
         };
 
@@ -2624,6 +2636,7 @@ impl App {
                         let request = WorkerRequest::LoadSample {
                             pad: pad_from_offset(offset),
                             generation: self.recovery_generations[offset],
+                            purpose: LoadPurpose::Recovery,
                             path: pending.path.clone(),
                             engine_rate: sample_rate,
                             recipe: self.sample_editor.commits[offset].recipe,
@@ -2658,6 +2671,7 @@ impl App {
                         let request = WorkerRequest::LoadSample {
                             pad: pad_from_offset(offset),
                             generation: self.pads[offset].generation,
+                            purpose: LoadPurpose::User,
                             path: pending.path.clone(),
                             engine_rate: sample_rate,
                             recipe: SampleEditRecipe::identity(),
@@ -2705,24 +2719,27 @@ impl App {
         &self,
         offset: usize,
         generation: u64,
+        purpose: LoadPurpose,
         path: &Path,
     ) -> Option<PendingLoadKind> {
-        [PendingLoadKind::User, PendingLoadKind::Recovery]
-            .into_iter()
-            .find(|kind| {
-                let expected_generation = match kind {
-                    PendingLoadKind::User => self.pads[offset].generation,
-                    PendingLoadKind::Recovery => self.recovery_generations[offset],
-                };
-                expected_generation == generation
-                    && self
-                        .pending_load_slot(offset, *kind)
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            pending.path == path
-                                && matches!(pending.phase, PendingLoadPhase::WorkerQueued)
-                        })
-            })
+        let kind = match purpose {
+            LoadPurpose::User => PendingLoadKind::User,
+            LoadPurpose::Recovery => PendingLoadKind::Recovery,
+        };
+        let expected_generation = match kind {
+            PendingLoadKind::User => self.pads[offset].generation,
+            PendingLoadKind::Recovery => self.recovery_generations[offset],
+        };
+        (expected_generation == generation
+            && self
+                .pending_load_slot(offset, kind)
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.kind.purpose() == purpose
+                        && pending.path == path
+                        && matches!(pending.phase, PendingLoadPhase::WorkerQueued)
+                }))
+        .then_some(kind)
     }
 
     fn install_pending_load(&mut self, offset: usize, kind: PendingLoadKind) {
@@ -2980,8 +2997,8 @@ mod tests {
 
     use crate::DirectoryScan;
     use crate::loader::{
-        LoadSampleError, LoadedSample, RenderedSample, WorkerHandle, WorkerRequest, WorkerResult,
-        WorkerSendError,
+        LoadPurpose, LoadSampleError, LoadedSample, RenderedSample, WorkerHandle, WorkerRequest,
+        WorkerResult, WorkerSendError,
     };
 
     use super::{
@@ -3454,6 +3471,7 @@ mod tests {
             Some(&WorkerRequest::LoadSample {
                 pad: pad(0, 0),
                 generation: generation.wrapping_add(1),
+                purpose: LoadPurpose::Recovery,
                 path: "kick.wav".into(),
                 engine_rate: 44_100,
                 recipe: SampleEditRecipe::identity(),
@@ -3478,6 +3496,7 @@ mod tests {
         let stale_request = app.take_worker_requests().pop().unwrap();
         let WorkerRequest::LoadSample {
             generation: stale_generation,
+            purpose: stale_purpose,
             ..
         } = stale_request
         else {
@@ -3490,12 +3509,17 @@ mod tests {
         app.retry_default_device_with(|| Ok(Box::new(original_rate)));
 
         assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
-        assert!(!app.apply_worker_result(loaded_at_rate(
-            pad(0, 0),
-            stale_generation,
-            "kick.wav",
-            44_100,
-        )));
+        assert!(
+            !app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad(0, 0),
+                stale_generation,
+                stale_purpose,
+                "kick.wav",
+                44_100,
+                1,
+                SampleEditRecipe::identity(),
+            ))
+        );
         assert!(Arc::ptr_eq(
             app.pad(pad(0, 0)).sample.as_ref().unwrap(),
             &retained
@@ -3542,6 +3566,7 @@ mod tests {
             let WorkerRequest::LoadSample {
                 pad: pad_id,
                 generation,
+                purpose,
                 path,
                 ..
             } = request
@@ -3553,16 +3578,20 @@ mod tests {
                 app.apply_worker_result(WorkerResult::Loaded {
                     pad: pad_id,
                     generation,
+                    purpose,
                     path,
                     result: Err(LoadSampleError::Decode("unreadable early pad".to_owned())),
                 });
             } else {
                 completed.push(pad_id);
-                app.apply_worker_result(loaded_at_rate(
+                app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
                     pad_id,
                     generation,
+                    purpose,
                     path.to_str().unwrap(),
                     44_100,
+                    1,
+                    SampleEditRecipe::identity(),
                 ));
             }
 
@@ -3595,6 +3624,7 @@ mod tests {
         let WorkerRequest::LoadSample {
             pad: pad_id,
             generation,
+            purpose,
             path,
             ..
         } = request
@@ -3604,6 +3634,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad_id,
             generation,
+            purpose,
             path,
             result: Err(LoadSampleError::Decode("loader busy".to_owned())),
         });
@@ -3629,10 +3660,6 @@ mod tests {
         loaded_with_frames(pad, generation, source, 48_000, 1)
     }
 
-    fn loaded_at_rate(pad: PadId, generation: u64, source: &str, sample_rate: u32) -> WorkerResult {
-        loaded_with_frames(pad, generation, source, sample_rate, 1)
-    }
-
     fn loaded_with_frames(
         pad: PadId,
         generation: u64,
@@ -3640,11 +3667,50 @@ mod tests {
         sample_rate: u32,
         frames: usize,
     ) -> WorkerResult {
+        loaded_with_recipe_and_frames(
+            pad,
+            generation,
+            source,
+            sample_rate,
+            frames,
+            SampleEditRecipe::identity(),
+        )
+    }
+
+    fn loaded_with_recipe_and_frames(
+        pad: PadId,
+        generation: u64,
+        source: &str,
+        sample_rate: u32,
+        frames: usize,
+        recipe: SampleEditRecipe,
+    ) -> WorkerResult {
+        loaded_with_purpose_recipe_and_frames(
+            pad,
+            generation,
+            LoadPurpose::User,
+            source,
+            sample_rate,
+            frames,
+            recipe,
+        )
+    }
+
+    fn loaded_with_purpose_recipe_and_frames(
+        pad: PadId,
+        generation: u64,
+        purpose: LoadPurpose,
+        source: &str,
+        sample_rate: u32,
+        frames: usize,
+        recipe: SampleEditRecipe,
+    ) -> WorkerResult {
         let rendered =
             Arc::new(SampleBuffer::new(sample_rate, [0.25, -0.25].repeat(frames)).unwrap());
         WorkerResult::Loaded {
             pad,
             generation,
+            purpose,
             path: source.into(),
             result: Ok(LoadedSample {
                 base: Arc::clone(&rendered),
@@ -3653,7 +3719,7 @@ mod tests {
                 rendered_preview: Arc::new(
                     [PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS],
                 ),
-                recipe: SampleEditRecipe::identity(),
+                recipe,
                 source_rate: sample_rate,
                 source_frames: frames,
                 duration: std::time::Duration::from_secs_f64(
@@ -3661,6 +3727,59 @@ mod tests {
                 ),
             }),
         }
+    }
+
+    fn changed_rate_recovery_colliding_with_same_path_user_load() -> (
+        App,
+        PadId,
+        SampleEditRecipe,
+        u64,
+        WorkerRequest,
+        WorkerRequest,
+    ) {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "same.wav").unwrap()
+        else {
+            panic!("expected initial load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "same.wav")));
+
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe).unwrap();
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::EditSample {
+                generation: edit_generation,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected edit request");
+        };
+        assert!(app.apply_worker_result(edited(
+            &app,
+            pad,
+            *edit_generation,
+            recipe,
+            48_000,
+            vec![-0.4, 0.4],
+        )));
+        assert!(app.maintain_audio());
+        assert_eq!(app.sample_editor.commits[0].recipe, recipe);
+        let source_generation = app.sample_editor_context(pad).source_generation;
+
+        app.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
+        ));
+        assert!(app.maintain_audio());
+        app.retry_with(Box::new(FakeAudio::ready(44_100, 2)));
+        let [recovery] = app.take_worker_requests().try_into().unwrap();
+        let user = app.begin_load(pad, "same.wav").unwrap();
+        (app, pad, recipe, source_generation, recovery, user)
     }
 
     fn edited(
@@ -4317,6 +4436,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0, 0),
             generation: replacement_generation,
+            purpose: LoadPurpose::User,
             path: result_path,
             result: Err(LoadSampleError::Decode(
                 "replacement decode failed".to_owned(),
@@ -4352,6 +4472,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0, 0),
             generation,
+            purpose: LoadPurpose::User,
             path: result_path,
             result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
         });
@@ -4394,6 +4515,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0, 0),
             generation,
+            purpose: LoadPurpose::User,
             path: result_path,
             result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
         });
@@ -4436,6 +4558,7 @@ mod tests {
         assert!(app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0, 1),
             generation,
+            purpose: LoadPurpose::User,
             path: replacement_path,
             result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
         }));
@@ -4472,6 +4595,7 @@ mod tests {
         let [recovery] = app.take_worker_requests().try_into().unwrap();
         let WorkerRequest::LoadSample {
             generation,
+            purpose,
             path: recovery_path,
             ..
         } = recovery
@@ -4479,7 +4603,15 @@ mod tests {
             panic!("wrong request")
         };
         assert_eq!(recovery_path, path("old.wav"));
-        app.apply_worker_result(loaded_at_rate(pad(0, 0), generation, "old.wav", 44_100));
+        app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+            pad(0, 0),
+            generation,
+            purpose,
+            "old.wav",
+            44_100,
+            1,
+            SampleEditRecipe::identity(),
+        ));
         assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
 
         let WorkerRequest::LoadSample {
@@ -4493,6 +4625,7 @@ mod tests {
         app.apply_worker_result(WorkerResult::Loaded {
             pad: pad(0, 0),
             generation,
+            purpose: LoadPurpose::User,
             path: result_path,
             result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
         });
@@ -4572,6 +4705,7 @@ mod tests {
             [WorkerRequest::LoadSample {
                 pad: pad(0, 0),
                 generation,
+                purpose: LoadPurpose::User,
                 path: "kick.wav".into(),
                 engine_rate: 44_100,
                 recipe: SampleEditRecipe::identity(),
@@ -6036,6 +6170,7 @@ mod tests {
         assert!(decode_failed.apply_worker_result(WorkerResult::Loaded {
             pad,
             generation,
+            purpose: LoadPurpose::User,
             path: "decode-failed.wav".into(),
             result: Err(LoadSampleError::Decode("bad payload".to_owned())),
         }));
@@ -6086,19 +6221,300 @@ mod tests {
         app.retry_with(Box::new(FakeAudio::ready(44_100, 2)));
         let request = app.take_worker_requests().pop().unwrap();
         let WorkerRequest::LoadSample {
-            generation, path, ..
+            generation,
+            purpose,
+            path,
+            ..
         } = request
         else {
             panic!("expected recovery load");
         };
-        assert!(app.apply_worker_result(loaded_at_rate(
-            pad,
-            generation,
-            path.to_str().unwrap(),
-            44_100,
-        )));
+        assert!(
+            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                generation,
+                purpose,
+                path.to_str().unwrap(),
+                44_100,
+                1,
+                SampleEditRecipe::identity(),
+            ))
+        );
 
         assert_eq!(app.sample_editor_context(pad).source_generation, identity);
+    }
+
+    #[test]
+    fn recovery_result_precedes_same_path_user_result_without_consuming_the_user_slot() {
+        let (mut app, pad, recipe, source_generation, recovery, user) =
+            changed_rate_recovery_colliding_with_same_path_user_load();
+        let WorkerRequest::LoadSample {
+            generation: recovery_generation,
+            purpose: recovery_purpose,
+            path: recovery_path,
+            ..
+        } = recovery
+        else {
+            panic!("expected recovery load");
+        };
+        let WorkerRequest::LoadSample {
+            generation: user_generation,
+            purpose: user_purpose,
+            path: user_path,
+            ..
+        } = user
+        else {
+            panic!("expected user load");
+        };
+        assert_eq!(recovery_generation, user_generation);
+        assert_eq!(recovery_path, user_path);
+        assert_eq!(recovery_purpose, LoadPurpose::Recovery);
+        assert_eq!(user_purpose, LoadPurpose::User);
+
+        assert!(
+            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                recovery_generation,
+                recovery_purpose,
+                "same.wav",
+                44_100,
+                2,
+                recipe,
+            ))
+        );
+
+        assert!(app.committed_recovery_loads[0].is_none());
+        assert!(matches!(
+            app.pending_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::WorkerQueued)
+        ));
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            source_generation
+        );
+        assert_eq!(app.sample_editor.commits[0].recipe, recipe);
+        assert_eq!(app.base_sample(pad).unwrap().frames(), 2);
+
+        assert!(
+            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                user_generation,
+                user_purpose,
+                "same.wav",
+                44_100,
+                3,
+                SampleEditRecipe::identity(),
+            ))
+        );
+        assert!(app.pending_loads[0].is_none());
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            user_generation
+        );
+        assert_eq!(
+            app.sample_editor.commits[0].recipe,
+            SampleEditRecipe::identity()
+        );
+        assert_eq!(app.base_sample(pad).unwrap().frames(), 3);
+    }
+
+    #[test]
+    fn same_path_user_result_precedes_recovery_without_restoring_the_old_recipe() {
+        let (mut app, pad, recipe, _source_generation, recovery, user) =
+            changed_rate_recovery_colliding_with_same_path_user_load();
+        let WorkerRequest::LoadSample {
+            generation: recovery_generation,
+            purpose: recovery_purpose,
+            ..
+        } = recovery
+        else {
+            panic!("expected recovery load");
+        };
+        let WorkerRequest::LoadSample {
+            generation: user_generation,
+            purpose: user_purpose,
+            ..
+        } = user
+        else {
+            panic!("expected user load");
+        };
+
+        assert_eq!(recovery_purpose, LoadPurpose::Recovery);
+        assert_eq!(user_purpose, LoadPurpose::User);
+        assert!(
+            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                user_generation,
+                user_purpose,
+                "same.wav",
+                44_100,
+                3,
+                SampleEditRecipe::identity(),
+            ))
+        );
+        let committed = Arc::clone(app.base_sample(pad).unwrap());
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            user_generation
+        );
+        assert_eq!(
+            app.sample_editor.commits[0].recipe,
+            SampleEditRecipe::identity()
+        );
+        assert!(app.committed_recovery_loads[0].is_none());
+
+        assert!(
+            !app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                recovery_generation,
+                recovery_purpose,
+                "same.wav",
+                44_100,
+                2,
+                recipe,
+            ))
+        );
+        assert!(Arc::ptr_eq(app.base_sample(pad).unwrap(), &committed));
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            user_generation
+        );
+        assert_eq!(
+            app.sample_editor.commits[0].recipe,
+            SampleEditRecipe::identity()
+        );
+    }
+
+    #[test]
+    fn recovery_decode_error_does_not_fail_the_colliding_user_load() {
+        let (mut app, pad, recipe, source_generation, recovery, user) =
+            changed_rate_recovery_colliding_with_same_path_user_load();
+        let WorkerRequest::LoadSample {
+            generation: recovery_generation,
+            purpose: recovery_purpose,
+            path,
+            ..
+        } = recovery
+        else {
+            panic!("expected recovery load");
+        };
+        let WorkerRequest::LoadSample {
+            generation: user_generation,
+            purpose: user_purpose,
+            ..
+        } = user
+        else {
+            panic!("expected user load");
+        };
+
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
+            pad,
+            generation: recovery_generation,
+            purpose: recovery_purpose,
+            path,
+            result: Err(LoadSampleError::Decode("recovery decode failed".to_owned())),
+        }));
+
+        assert!(matches!(
+            app.committed_recovery_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::Failed)
+        ));
+        assert!(matches!(
+            app.pending_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::WorkerQueued)
+        ));
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            source_generation
+        );
+        assert_eq!(app.sample_editor.commits[0].recipe, recipe);
+
+        assert_eq!(recovery_purpose, LoadPurpose::Recovery);
+        assert_eq!(user_purpose, LoadPurpose::User);
+        assert!(
+            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
+                pad,
+                user_generation,
+                user_purpose,
+                "same.wav",
+                44_100,
+                3,
+                SampleEditRecipe::identity(),
+            ))
+        );
+        assert_eq!(
+            app.sample_editor_context(pad).source_generation,
+            user_generation
+        );
+        assert_eq!(
+            app.sample_editor.commits[0].recipe,
+            SampleEditRecipe::identity()
+        );
+    }
+
+    #[test]
+    fn load_send_errors_mutate_only_the_colliding_request_slot() {
+        let (mut busy_app, _pad, _recipe, source_generation, recovery, user) =
+            changed_rate_recovery_colliding_with_same_path_user_load();
+        assert!(busy_app.apply_worker_send_error(recovery, WorkerSendError::WorkerBusy));
+        assert!(matches!(
+            busy_app.committed_recovery_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::AwaitingWorker)
+        ));
+        assert!(matches!(
+            busy_app.pending_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::WorkerQueued)
+        ));
+        assert!(busy_app.apply_worker_send_error(user, WorkerSendError::WorkerClosed));
+        assert!(matches!(
+            busy_app.committed_recovery_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::AwaitingWorker)
+        ));
+        assert!(matches!(
+            busy_app.pending_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::Failed)
+        ));
+        assert_eq!(
+            busy_app.sample_editor_context(pad(0, 0)).source_generation,
+            source_generation
+        );
+
+        let (mut closed_app, _pad, recipe, source_generation, recovery, _user) =
+            changed_rate_recovery_colliding_with_same_path_user_load();
+        assert!(closed_app.apply_worker_send_error(recovery, WorkerSendError::WorkerClosed));
+        assert!(matches!(
+            closed_app.committed_recovery_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::Failed)
+        ));
+        assert!(matches!(
+            closed_app.pending_loads[0]
+                .as_deref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingLoadPhase::WorkerQueued)
+        ));
+        assert_eq!(
+            closed_app
+                .sample_editor_context(pad(0, 0))
+                .source_generation,
+            source_generation
+        );
+        assert_eq!(closed_app.sample_editor.commits[0].recipe, recipe);
     }
 
     #[test]

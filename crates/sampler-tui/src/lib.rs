@@ -21,7 +21,7 @@ pub use audio::AudioPort;
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};
 pub use loader::{
-    EditPreview, LoadSampleError, LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES,
+    EditPreview, LoadPurpose, LoadSampleError, LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES,
     MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, RenderedSample,
     WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, downsample_preview,
 };

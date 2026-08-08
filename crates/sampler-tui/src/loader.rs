@@ -23,6 +23,12 @@ pub const MAX_DECODED_FRAMES: usize = 8_388_608;
 pub const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PREPARED_FRAMES: usize = 8_388_608;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPurpose {
+    User,
+    Recovery,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerRequest {
     ScanDirectory {
@@ -33,6 +39,7 @@ pub enum WorkerRequest {
     LoadSample {
         pad: PadId,
         generation: u64,
+        purpose: LoadPurpose,
         path: PathBuf,
         engine_rate: u32,
         recipe: SampleEditRecipe,
@@ -57,6 +64,7 @@ pub enum WorkerResult {
     Loaded {
         pad: PadId,
         generation: u64,
+        purpose: LoadPurpose,
         path: PathBuf,
         result: Result<LoadedSample, LoadSampleError>,
     },
@@ -241,12 +249,14 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
             WorkerRequest::LoadSample {
                 pad,
                 generation,
+                purpose,
                 path,
                 engine_rate,
                 recipe,
             } => WorkerResult::Loaded {
                 pad,
                 generation,
+                purpose,
                 result: load_sample(&path, engine_rate, recipe),
                 path,
             },
@@ -515,7 +525,7 @@ mod tests {
     use sampler_core::{BankId, PadId, SampleEditRecipe};
 
     use super::{
-        EDIT_PREVIEW_COLUMNS, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
+        EDIT_PREVIEW_COLUMNS, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
         WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
         WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
         preview_column, scan_directory, try_send_request, worker_loop,
@@ -618,6 +628,7 @@ mod tests {
             .try_send(WorkerRequest::LoadSample {
                 pad: pad(0, 0),
                 generation: 7,
+                purpose: LoadPurpose::Recovery,
                 path: fixture.path().to_owned(),
                 engine_rate: 48_000,
                 recipe: SampleEditRecipe::identity(),
@@ -626,6 +637,7 @@ mod tests {
         let result = worker.recv_timeout(Duration::from_secs(2)).unwrap();
         let WorkerResult::Loaded {
             generation,
+            purpose,
             result: Ok(sample),
             ..
         } = result
@@ -634,11 +646,48 @@ mod tests {
         };
 
         assert_eq!(generation, 7);
+        assert_eq!(purpose, LoadPurpose::Recovery);
         assert_eq!(sample.rendered.sample_rate(), 48_000);
         assert_eq!(sample.base_preview.len(), EDIT_PREVIEW_COLUMNS);
         assert!(sample.base_preview.iter().any(|column| column.max > 0));
         assert!(sample.base_preview.iter().any(|column| column.min < 0));
         assert!(Arc::ptr_eq(&sample.base_preview, &sample.rendered_preview));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worker_preserves_user_purpose_on_load_error() {
+        let mut worker = WorkerHandle::spawn();
+        let path = std::env::temp_dir().join(format!(
+            "sampler-tui-missing-{}-{}.wav",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        worker
+            .try_send(WorkerRequest::LoadSample {
+                pad: pad(0, 1),
+                generation: 8,
+                purpose: LoadPurpose::User,
+                path: path.clone(),
+                engine_rate: 48_000,
+                recipe: SampleEditRecipe::identity(),
+            })
+            .unwrap();
+
+        let WorkerResult::Loaded {
+            pad: result_pad,
+            generation,
+            purpose,
+            path: result_path,
+            result: Err(_),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result");
+        };
+        assert_eq!(result_pad, pad(0, 1));
+        assert_eq!(generation, 8);
+        assert_eq!(purpose, LoadPurpose::User);
+        assert_eq!(result_path, path);
         worker.shutdown().unwrap();
     }
 
@@ -871,6 +920,7 @@ mod tests {
             .try_send(WorkerRequest::LoadSample {
                 pad: pad(0, 0),
                 generation: 1,
+                purpose: LoadPurpose::User,
                 path: fixture.path().to_owned(),
                 engine_rate: 48_000,
                 recipe: SampleEditRecipe::identity(),

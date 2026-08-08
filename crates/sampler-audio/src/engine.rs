@@ -105,6 +105,21 @@ enum ScheduledAction {
     },
 }
 
+#[derive(Clone, Copy)]
+enum CommandLane {
+    Immediate,
+    Timed,
+}
+
+impl CommandLane {
+    fn other(self) -> Self {
+        match self {
+            Self::Immediate => Self::Timed,
+            Self::Timed => Self::Immediate,
+        }
+    }
+}
+
 impl ScheduledAction {
     fn at_frame(self) -> Frame {
         match self {
@@ -128,6 +143,7 @@ pub struct AudioEngine {
     voices: [Option<AudioVoice>; VOICE_COUNT],
     pending: [Option<ScheduledAction>; PENDING_COUNT],
     pending_len: usize,
+    next_command_lane: CommandLane,
     active_stop_fence: Option<u64>,
     deferred_retirement: Option<CriticalEvent>,
     rendered_frame: Frame,
@@ -163,6 +179,7 @@ impl AudioEngine {
             voices: [None; VOICE_COUNT],
             pending: [None; PENDING_COUNT],
             pending_len: 0,
+            next_command_lane: CommandLane::Immediate,
             active_stop_fence: None,
             deferred_retirement: None,
             rendered_frame: 0,
@@ -198,7 +215,7 @@ impl AudioEngine {
     pub fn render_frames(&mut self, frame_count: usize, mut write_frame: impl FnMut([f32; 2])) {
         let frame_count_as_frame = Frame::try_from(frame_count).unwrap_or(Frame::MAX);
         let horizon = self.rendered_frame.saturating_add(frame_count_as_frame);
-        self.ports.shared.publish_render_horizon(horizon);
+        self.ports.publish_render_horizon(horizon);
 
         self.flush_deferred_retirement();
         self.apply_stop_fence();
@@ -242,7 +259,7 @@ impl AudioEngine {
     }
 
     pub fn queued_commands(&self) -> usize {
-        self.ports.shared.queued_commands()
+        self.ports.queued_commands()
     }
 
     #[cfg(test)]
@@ -260,117 +277,124 @@ impl AudioEngine {
     }
 
     fn drain_commands(&mut self) {
-        let mut processed = 0;
-        self.drain_immediate_commands(&mut processed);
-        self.drain_timed_commands(&mut processed);
-    }
-
-    fn drain_immediate_commands(&mut self, processed: &mut usize) {
-        while *processed < MAX_COMMANDS_PER_RENDER {
-            let live_action = match self.ports.immediate_commands.peek() {
-                Ok(AudioCommand::TriggerLive {
-                    pad,
-                    velocity,
-                    sequence,
-                }) => Some(ScheduledAction::Trigger {
-                    pad: *pad,
-                    at_frame: self.rendered_frame,
-                    velocity: *velocity,
-                    sequence: *sequence,
-                }),
-                Ok(AudioCommand::ReleaseLive { pad, sequence }) => Some(ScheduledAction::Release {
-                    pad: *pad,
-                    at_frame: self.rendered_frame,
-                    sequence: *sequence,
-                }),
-                Ok(AudioCommand::InstallSample {
-                    slot,
-                    buffer,
-                    settings,
-                    ..
-                }) if self.install_is_invalid(*slot, buffer, *settings)
-                    && self.deferred_retirement.is_some() =>
-                {
-                    break;
-                }
-                Ok(_) => None,
-                Err(_) => break,
-            };
-            if live_action.is_some() {
-                self.apply_stop_fence();
+        for _ in 0..MAX_COMMANDS_PER_RENDER {
+            let preferred = self.next_command_lane;
+            if self.drain_one_command(preferred) {
+                self.next_command_lane = preferred.other();
+                continue;
             }
-
-            let Ok(command) = self.ports.immediate_commands.pop() else {
-                break;
-            };
-            self.ports.shared.complete_command();
-            if let Some(action) = live_action {
-                if !self.action_is_stopped(action) {
-                    self.execute_action(action);
-                }
-            } else {
-                self.execute_immediate(command);
+            let fallback = preferred.other();
+            if self.drain_one_command(fallback) {
+                self.next_command_lane = preferred;
+                continue;
             }
-            *processed += 1;
+            break;
         }
     }
 
-    fn drain_timed_commands(&mut self, processed: &mut usize) {
-        while *processed < MAX_COMMANDS_PER_RENDER {
-            let timed_action = match self.ports.commands.peek() {
-                Ok(AudioCommand::Trigger {
-                    pad,
-                    at_frame,
-                    velocity,
-                    sequence,
-                }) => Some(ScheduledAction::Trigger {
-                    pad: *pad,
-                    at_frame: *at_frame,
-                    velocity: *velocity,
-                    sequence: *sequence,
-                }),
-                Ok(AudioCommand::Release {
-                    pad,
-                    at_frame,
-                    sequence,
-                }) => Some(ScheduledAction::Release {
-                    pad: *pad,
-                    at_frame: *at_frame,
-                    sequence: *sequence,
-                }),
-                Ok(_) => None,
-                Err(_) => break,
-            };
-            if timed_action.is_some() {
-                self.apply_stop_fence();
-            }
-
-            if let Some(action) = timed_action {
-                if !self.action_is_stopped(action) && self.pending_len == PENDING_COUNT {
-                    break;
-                }
-                if self.ports.commands.pop().is_err() {
-                    break;
-                }
-                self.ports.shared.complete_command();
-                if !self.action_is_stopped(action) {
-                    self.insert_pending(action);
-                }
-            } else {
-                let Ok(command) = self.ports.commands.pop() else {
-                    break;
-                };
-                self.ports.shared.complete_command();
-                self.execute_immediate(command);
-            }
-            *processed += 1;
+    fn drain_one_command(&mut self, lane: CommandLane) -> bool {
+        match lane {
+            CommandLane::Immediate => self.drain_one_immediate_command(),
+            CommandLane::Timed => self.drain_one_timed_command(),
         }
+    }
+
+    fn drain_one_immediate_command(&mut self) -> bool {
+        let live_action = match self.ports.immediate_commands.peek() {
+            Ok(AudioCommand::TriggerLive {
+                pad,
+                velocity,
+                sequence,
+            }) => Some(ScheduledAction::Trigger {
+                pad: *pad,
+                at_frame: self.rendered_frame,
+                velocity: *velocity,
+                sequence: *sequence,
+            }),
+            Ok(AudioCommand::ReleaseLive { pad, sequence }) => Some(ScheduledAction::Release {
+                pad: *pad,
+                at_frame: self.rendered_frame,
+                sequence: *sequence,
+            }),
+            Ok(AudioCommand::InstallSample {
+                slot,
+                buffer,
+                settings,
+                ..
+            }) if self.install_is_invalid(*slot, buffer, *settings)
+                && self.deferred_retirement.is_some() =>
+            {
+                return false;
+            }
+            Ok(_) => None,
+            Err(_) => return false,
+        };
+        if live_action.is_some() {
+            self.apply_stop_fence();
+        }
+
+        let Ok(command) = self.ports.immediate_commands.pop() else {
+            return false;
+        };
+        if let Some(action) = live_action {
+            if !self.action_is_stopped(action) {
+                self.execute_action(action);
+            }
+        } else {
+            self.execute_immediate(command);
+        }
+        true
+    }
+
+    fn drain_one_timed_command(&mut self) -> bool {
+        let timed_action = match self.ports.commands.peek() {
+            Ok(AudioCommand::Trigger {
+                pad,
+                at_frame,
+                velocity,
+                sequence,
+            }) => Some(ScheduledAction::Trigger {
+                pad: *pad,
+                at_frame: *at_frame,
+                velocity: *velocity,
+                sequence: *sequence,
+            }),
+            Ok(AudioCommand::Release {
+                pad,
+                at_frame,
+                sequence,
+            }) => Some(ScheduledAction::Release {
+                pad: *pad,
+                at_frame: *at_frame,
+                sequence: *sequence,
+            }),
+            Ok(_) => None,
+            Err(_) => return false,
+        };
+        if timed_action.is_some() {
+            self.apply_stop_fence();
+        }
+
+        if let Some(action) = timed_action {
+            if !self.action_is_stopped(action) && self.pending_len == PENDING_COUNT {
+                return false;
+            }
+            if self.ports.commands.pop().is_err() {
+                return false;
+            }
+            if !self.action_is_stopped(action) {
+                self.insert_pending(action);
+            }
+        } else {
+            let Ok(command) = self.ports.commands.pop() else {
+                return false;
+            };
+            self.execute_immediate(command);
+        }
+        true
     }
 
     fn execute_immediate(&mut self, command: AudioCommand) {
-        if matches!(&command, AudioCommand::InstallSample { recovery: true, .. }) {
-            self.ports.shared.complete_recovery_command();
-        }
         match command {
             AudioCommand::InstallSample {
                 pad,
@@ -457,7 +481,7 @@ impl AudioEngine {
     }
 
     fn apply_stop_fence(&mut self) {
-        let Some(fence_sequence) = self.ports.shared.take_stop_fence() else {
+        let Some(fence_sequence) = self.ports.take_stop_fence() else {
             return;
         };
 
@@ -685,7 +709,7 @@ impl AudioEngine {
             active_voices: self.allocator.active_voices(),
             late_commands: self.late_commands,
             invalid_commands: self.invalid_commands,
-            command_overflows: self.ports.shared.command_overflows(),
+            command_overflows: self.ports.command_overflows(),
         };
         let _ = self.ports.telemetry.push(telemetry);
         self.telemetry_peak_left = 0.0;
@@ -939,6 +963,50 @@ mod tests {
         assert_eq!(engine.voices_for_pad(second), 0);
         assert_eq!(engine.pending_actions(), PENDING_COUNT);
         assert_eq!(engine.queued_commands(), 2);
+        assert_eq!(engine.late_commands(), 0);
+    }
+
+    #[test]
+    fn sustained_immediate_traffic_does_not_starve_absolute_timed_action() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        controller
+            .install(pad, constant_sample(1_024, 0.25), PadSettings::default())
+            .unwrap();
+        engine.render_frames(1, |_| {});
+        let at_frame = engine.rendered_frame() + 1;
+        controller.trigger(pad, at_frame, 1.0).unwrap();
+
+        for _ in 0..3 {
+            for _ in 0..MAX_COMMANDS_PER_RENDER {
+                controller.update_pad(pad, PadSettings::default()).unwrap();
+            }
+            engine.render_frames(1, |_| {});
+        }
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.last_triggered_frame, Some(at_frame));
+        assert_eq!(engine.late_commands(), 0);
+    }
+
+    #[test]
+    fn sustained_timed_traffic_does_not_starve_live_input() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        controller
+            .install(pad, constant_sample(1_024, 0.25), PadSettings::default())
+            .unwrap();
+        engine.render_frames(1, |_| {});
+        for _ in 0..MAX_COMMANDS_PER_RENDER {
+            controller.trigger(pad, 10_000, 1.0).unwrap();
+        }
+        controller.trigger_live(pad, 1.0).unwrap();
+
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.last_triggered_frame, Some(1));
+        assert_eq!(engine.queued_commands(), 1);
         assert_eq!(engine.late_commands(), 0);
     }
 

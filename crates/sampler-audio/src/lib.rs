@@ -9,7 +9,7 @@ mod resample;
 mod sample;
 
 pub use command::{
-    AudioCommand, AudioController, COMMAND_CAPACITY, CriticalEvent, EnginePorts,
+    AudioCommand, AudioController, COMMAND_CAPACITY, CommandConsumer, CriticalEvent, EnginePorts,
     RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, audio_channels,
     audio_channels_with_test_capacities,
 };

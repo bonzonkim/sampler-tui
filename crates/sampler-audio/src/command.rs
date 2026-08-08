@@ -18,7 +18,6 @@ mod tests {
             ports.commands.pop().unwrap(),
             AudioCommand::Trigger { at_frame: 10, .. }
         ));
-        ports.shared.complete_command();
     }
 
     #[test]
@@ -29,7 +28,6 @@ mod tests {
             .install(PadId::first(), sample, PadSettings::default())
             .unwrap();
         let installed = ports.immediate_commands.pop().unwrap();
-        ports.shared.complete_command();
         let buffer = installed.into_installed_buffer().unwrap();
         ports
             .retirements
@@ -61,9 +59,7 @@ mod tests {
         );
         assert_eq!(controller.command_overflows(), 1);
         assert!(ports.commands.pop().is_ok());
-        ports.shared.complete_command();
         assert!(ports.commands.pop().is_ok());
-        ports.shared.complete_command();
     }
 
     #[test]
@@ -133,7 +129,6 @@ mod tests {
             );
         }
         ports.immediate_commands.pop().unwrap();
-        ports.shared.complete_command();
 
         controller
             .install_recovery(
@@ -157,7 +152,6 @@ mod tests {
         );
         for _ in 0..COMMAND_CAPACITY {
             assert!(ports.commands.pop().is_ok());
-            ports.shared.complete_command();
         }
     }
 
@@ -222,7 +216,7 @@ mod tests {
         assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
         assert_eq!(ports.commands.slots(), 0);
         assert_eq!(ports.immediate_commands.slots(), 0);
-        assert_eq!(ports.shared.queued_commands(), 0);
+        assert_eq!(ports.queued_commands(), 0);
     }
 
     #[test]
@@ -236,13 +230,13 @@ mod tests {
 
         controller.stop_all().unwrap();
 
-        assert_eq!(ports.shared.take_stop_fence(), Some(1));
+        assert_eq!(ports.take_stop_fence(), Some(1));
     }
 }
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Consumer, PeekError, PopError, Producer, RingBuffer};
 use sampler_core::{Frame, PadId, PadSettings};
 
 use crate::{ControlError, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
@@ -341,12 +335,59 @@ pub struct AudioController {
     next_timed_sequence: u64,
 }
 
+/// A command lane that returns controller admission credit when a command is consumed.
+pub struct CommandConsumer {
+    inner: Consumer<AudioCommand>,
+    shared: Arc<SharedControlState>,
+}
+
+impl CommandConsumer {
+    fn new(inner: Consumer<AudioCommand>, shared: Arc<SharedControlState>) -> Self {
+        Self { inner, shared }
+    }
+
+    pub fn pop(&mut self) -> Result<AudioCommand, PopError> {
+        let command = self.inner.pop()?;
+        self.shared.complete_command();
+        if matches!(&command, AudioCommand::InstallSample { recovery: true, .. }) {
+            self.shared.complete_recovery_command();
+        }
+        Ok(command)
+    }
+
+    pub fn peek(&self) -> Result<&AudioCommand, PeekError> {
+        self.inner.peek()
+    }
+
+    pub fn slots(&self) -> usize {
+        self.inner.slots()
+    }
+}
+
 pub struct EnginePorts {
-    pub commands: Consumer<AudioCommand>,
-    pub(crate) immediate_commands: Consumer<AudioCommand>,
+    pub commands: CommandConsumer,
+    pub immediate_commands: CommandConsumer,
     pub retirements: Producer<CriticalEvent>,
     pub telemetry: Producer<Telemetry>,
     pub(crate) shared: Arc<SharedControlState>,
+}
+
+impl EnginePorts {
+    pub fn publish_render_horizon(&self, frame: Frame) {
+        self.shared.publish_render_horizon(frame);
+    }
+
+    pub fn take_stop_fence(&self) -> Option<u64> {
+        self.shared.take_stop_fence()
+    }
+
+    pub fn queued_commands(&self) -> usize {
+        self.shared.queued_commands()
+    }
+
+    pub fn command_overflows(&self) -> u64 {
+        self.shared.command_overflows()
+    }
 }
 
 pub(crate) struct SharedControlState {
@@ -492,8 +533,11 @@ fn audio_channels_with_capacity_values(
             next_timed_sequence: 1,
         },
         EnginePorts {
-            commands: command_consumer,
-            immediate_commands: immediate_command_consumer,
+            commands: CommandConsumer::new(command_consumer, Arc::clone(&shared)),
+            immediate_commands: CommandConsumer::new(
+                immediate_command_consumer,
+                Arc::clone(&shared),
+            ),
             retirements: retirement_producer,
             telemetry: telemetry_producer,
             shared,

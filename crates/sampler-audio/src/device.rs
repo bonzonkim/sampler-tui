@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub struct AudioSession {
-    _stream: Stream,
+    _stream: Option<Stream>,
     controller: AudioController,
     errors: Receiver<cpal::Error>,
     sample_rate: u32,
@@ -92,7 +92,7 @@ impl AudioSession {
         stream.play().map_err(DeviceError::PlayStream)?;
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
             controller,
             errors,
             sample_rate,
@@ -115,6 +115,16 @@ impl AudioSession {
     pub fn poll_error(&self) -> Option<DeviceError> {
         self.errors.try_recv().ok().map(DeviceError::Runtime)
     }
+}
+
+impl Drop for AudioSession {
+    fn drop(&mut self) {
+        drop_stream_before_controller(&mut self._stream);
+    }
+}
+
+fn drop_stream_before_controller<T>(stream: &mut Option<T>) {
+    drop(stream.take());
 }
 
 fn build_stream<T>(
@@ -227,6 +237,9 @@ fn sanitize(sample: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::{ControlError, PadId};
 
@@ -300,5 +313,44 @@ mod tests {
             controller.trigger(PadId::first(), 0, 1.0),
             Err(ControlError::ClosedSession)
         );
+    }
+
+    #[test]
+    fn stream_owner_teardown_drops_stream_before_controller() {
+        struct Probe {
+            name: &'static str,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.name);
+            }
+        }
+
+        struct Harness {
+            stream: Option<Probe>,
+            _controller: Probe,
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                drop_stream_before_controller(&mut self.stream);
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        drop(Harness {
+            stream: Some(Probe {
+                name: "stream",
+                events: Rc::clone(&events),
+            }),
+            _controller: Probe {
+                name: "controller",
+                events: Rc::clone(&events),
+            },
+        });
+
+        assert_eq!(&*events.borrow(), &["stream", "controller"]);
     }
 }

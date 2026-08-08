@@ -173,6 +173,48 @@ mod tests {
     }
 
     #[test]
+    fn controller_owner_keeps_queued_pattern_alive_without_caller_or_command_arc() {
+        let (mut controller, mut ports) = audio_channels();
+        let input = snapshot(0);
+        let weak = Arc::downgrade(&input);
+        controller.install_pattern(input).unwrap();
+        let (_, command_snapshot) = pop_pattern_install(&mut ports);
+
+        drop(command_snapshot);
+
+        assert!(weak.upgrade().is_some());
+        drop(controller);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn exact_pattern_retirement_is_the_only_operation_that_clears_controller_owner() {
+        let (mut controller, mut ports) = audio_channels();
+        let input = snapshot(0);
+        let weak = Arc::downgrade(&input);
+        let owner_slot = controller.install_pattern(input).unwrap();
+        let (_, command_snapshot) = pop_pattern_install(&mut ports);
+        ports
+            .pattern_retirements
+            .push(PatternRetirement::new(owner_slot, snapshot(0)))
+            .unwrap();
+
+        assert_eq!(controller.reclaim_retired_pattern(), None);
+        assert!(weak.upgrade().is_some());
+
+        ports
+            .pattern_retirements
+            .push(PatternRetirement::new(
+                owner_slot,
+                Arc::clone(&command_snapshot),
+            ))
+            .unwrap();
+        drop(command_snapshot);
+        assert_eq!(controller.reclaim_retired_pattern(), Some(owner_slot));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn mismatched_pattern_arc_does_not_release_an_active_owner_slot() {
         let (mut controller, mut ports) = audio_channels();
         let (owner_slot, installed_snapshot) =
@@ -677,10 +719,10 @@ impl PatternRetirement {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PatternSnapshotOwner {
     token: PatternSnapshotSlot,
-    snapshot_identity: usize,
+    snapshot: Arc<PatternSnapshot>,
 }
 
 #[derive(Debug)]
@@ -1019,7 +1061,7 @@ fn audio_channels_with_capacity_values(
             free_slots: [true; SAMPLE_SLOT_COUNT],
             next_timed_sequence: 1,
             next_live_id: Some(NonZeroU64::MIN),
-            pattern_owners: [None; PATTERN_SNAPSHOT_SLOT_COUNT],
+            pattern_owners: std::array::from_fn(|_| None),
             pattern_generations: [0; PATTERN_SNAPSHOT_SLOT_COUNT],
         },
         EnginePorts {
@@ -1083,7 +1125,7 @@ impl AudioController {
         let sequence = self.next_timed_sequence;
         self.pattern_owners[index] = Some(PatternSnapshotOwner {
             token: owner_slot,
-            snapshot_identity: Arc::as_ptr(&snapshot) as usize,
+            snapshot: Arc::clone(&snapshot),
         });
         if let Err(error) = self.push_immediate_command(AudioCommand::InstallPattern {
             owner_slot,
@@ -1318,10 +1360,11 @@ impl AudioController {
             snapshot,
         }) = self.pattern_retirements.pop()
         {
-            let snapshot_identity = Arc::as_ptr(&snapshot) as usize;
-            let is_current_owner = self.pattern_owners[owner_slot.index()].is_some_and(|owner| {
-                owner.token == owner_slot && owner.snapshot_identity == snapshot_identity
-            });
+            let is_current_owner = self.pattern_owners[owner_slot.index()]
+                .as_ref()
+                .is_some_and(|owner| {
+                    owner.token == owner_slot && Arc::ptr_eq(&owner.snapshot, &snapshot)
+                });
             if !is_current_owner {
                 continue;
             }

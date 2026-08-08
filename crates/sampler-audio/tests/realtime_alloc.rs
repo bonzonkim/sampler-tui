@@ -161,7 +161,9 @@ fn measure_live_and_recovery_command_ingestion() {
     controller.release_live(PadId::first()).unwrap();
 
     assert_zero_callback_activity("live and recovery command ingestion", || {
-        engine.render_frames(65, |_| {});
+        engine.render_frames(32, |_| {});
+        engine.render_frames(32, |_| {});
+        engine.render_frames(1, |_| {});
     });
     assert_eq!(engine.executed_triggers(), 1);
 
@@ -177,7 +179,7 @@ fn measure_live_and_recovery_command_ingestion() {
     drop(keepalive);
 }
 
-fn measure_live_input_behind_a_full_future_action_array() {
+fn measure_single_action_store_source_quotas() {
     let (mut controller, ports) = audio_channels();
     let mut engine = AudioEngine::new(48_000, ports).unwrap();
     let pad = PadId::first();
@@ -189,18 +191,23 @@ fn measure_live_input_behind_a_full_future_action_array() {
         )
         .unwrap();
     engine.render_frames(1, |_| {});
-    for _ in 0..128 {
+    for _ in 0..64 {
         controller.trigger(pad, 10_000, 1.0).unwrap();
     }
     engine.render_frames(0, |_| {});
-    engine.render_frames(0, |_| {});
-    controller.trigger(pad, 20_000, 1.0).unwrap();
-    controller.trigger_live(pad, 1.0).unwrap();
+    for _ in 0..64 {
+        controller.trigger_live(pad, 1.0).unwrap();
+    }
 
-    assert_zero_callback_activity("live input behind full future actions", || {
+    assert_zero_callback_activity("64 non-live plus 64 live admissions", || {
+        engine.render_frames(0, |_| {});
+    });
+    assert_eq!(engine.pending_actions(), 128);
+    assert_zero_callback_activity("single 128-action execution", || {
         engine.render_frames(65, |_| {});
     });
-    assert_eq!(engine.executed_triggers(), 1);
+    assert_eq!(engine.executed_triggers(), 64);
+    assert_eq!(engine.pending_actions(), 64);
 }
 
 fn measure_invalid_command_handling() {
@@ -338,16 +345,16 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
     let initial = pattern_snapshot(0, 100, &[2, 8]);
     let replacement = pattern_snapshot(0, 100, &[1, 7, 9]);
     let boundary_target = pattern_snapshot(1, 100, &[0, 6]);
-    let initial_owner = controller.install_pattern(Arc::clone(&initial)).unwrap();
-    controller
-        .install_pattern(Arc::clone(&boundary_target))
-        .unwrap();
+    let initial_generation = initial.generation();
+    let boundary_generation = boundary_target.generation();
+    let initial_owner = controller.install_pattern(initial).unwrap();
+    controller.install_pattern(boundary_target).unwrap();
     controller
         .select_pattern(slot_zero, PatternSwitch::Immediate)
         .unwrap();
     controller.play_pattern().unwrap();
     controller
-        .set_record_capture(Some((slot_zero, initial.generation())))
+        .set_record_capture(Some((slot_zero, initial_generation)))
         .unwrap();
     controller
         .trigger_live_tracked(PadId::first(), 0.75)
@@ -357,11 +364,12 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
         "pattern playback, ack, switch, stop, and retirement",
         || {
             engine.render_frames(75, |_| {});
-            controller
-                .install_pattern(Arc::clone(&replacement))
-                .unwrap();
+            controller.install_pattern(replacement).unwrap();
             controller
                 .select_pattern(slot_one, PatternSwitch::NextBoundary)
+                .unwrap();
+            controller
+                .set_record_capture(Some((slot_one, boundary_generation)))
                 .unwrap();
             controller.release_live_tracked(PadId::first()).unwrap();
             engine.render_frames(128, |_| {});
@@ -380,7 +388,7 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
     measure_timed_and_immediate_command_ingestion();
     measure_live_and_recovery_command_ingestion();
-    measure_live_input_behind_a_full_future_action_array();
+    measure_single_action_store_source_quotas();
     measure_invalid_command_handling();
     measure_voice_completion_without_final_arc_drop();
     measure_sample_remap_retirement();

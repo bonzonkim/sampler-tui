@@ -10,7 +10,9 @@ mod sample;
 
 pub use command::{
     AudioCommand, AudioController, COMMAND_CAPACITY, CommandConsumer, CriticalEvent, EnginePorts,
-    RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, audio_channels,
+    LIVE_ACK_CAPACITY, LiveAck, LiveAckKind, LiveCommandId, PATTERN_RETIREMENT_CAPACITY,
+    PATTERN_SNAPSHOT_SLOT_COUNT, PatternRetirement, PatternSnapshotSlot, PatternSwitch,
+    RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, TransportStamp, audio_channels,
     audio_channels_with_test_capacities,
 };
 pub use decode::{DecodeLimits, DecodedAudio, decode_path, decode_path_with_limits};

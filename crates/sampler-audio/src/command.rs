@@ -4,6 +4,182 @@ mod tests {
 
     use super::*;
     use crate::{PadId, PadSettings, SampleBuffer};
+    use sampler_core::{EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport};
+
+    fn snapshot(slot: u8) -> Arc<sampler_core::PatternSnapshot> {
+        let transport = Transport::new(
+            48_000,
+            Tempo::new(120.0).unwrap(),
+            Meter::new(4, 4).unwrap(),
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap();
+        Arc::new(
+            EditablePattern::new(
+                PatternSlotId::new(slot % sampler_core::PATTERN_SLOT_COUNT as u8).unwrap(),
+                "Pattern",
+                transport,
+            )
+            .unwrap()
+            .compile()
+            .unwrap(),
+        )
+    }
+
+    fn ack(id: u64) -> LiveAck {
+        LiveAck {
+            id: LiveCommandId(id),
+            pad: PadId::first(),
+            kind: LiveAckKind::Release,
+            frame: 0,
+            transport: None,
+        }
+    }
+
+    fn retired_pattern(index: u8) -> PatternRetirement {
+        PatternRetirement {
+            owner_slot: PatternSnapshotSlot(index),
+            snapshot: snapshot(index),
+        }
+    }
+
+    #[test]
+    fn tracked_live_ids_advance_only_after_successful_admission() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 1, 1);
+        let pad = PadId::first();
+        let first = controller.trigger_live_tracked(pad, 1.0).unwrap();
+        assert_eq!(
+            controller.release_live_tracked(pad),
+            Err(ControlError::CommandQueueFull)
+        );
+        assert_eq!(
+            ports.immediate_commands.pop().unwrap().live_id(),
+            Some(first)
+        );
+        let second = controller.release_live_tracked(pad).unwrap();
+        assert_eq!(second.0, first.0 + 1);
+    }
+
+    #[test]
+    fn acknowledgements_and_pattern_retirements_have_independent_bounds() {
+        let (mut controller, mut ports) = audio_channels();
+        ports.live_acks.push(ack(1)).unwrap();
+        ports.pattern_retirements.push(retired_pattern(0)).unwrap();
+        assert_eq!(controller.drain_live_acks(&mut [LiveAck::EMPTY; 1]), 1);
+        assert_eq!(controller.reclaim_retired_pattern().unwrap().index(), 0);
+    }
+
+    #[test]
+    fn auxiliary_lanes_accept_their_exact_fixed_capacities() {
+        let (_controller, mut ports) = audio_channels();
+        for id in 0..256 {
+            ports.live_acks.push(ack(id as u64)).unwrap();
+        }
+        assert!(ports.live_acks.push(ack(u64::MAX)).is_err());
+
+        for index in 0..32 {
+            ports
+                .pattern_retirements
+                .push(retired_pattern(index as u8))
+                .unwrap();
+        }
+        assert!(ports.pattern_retirements.push(retired_pattern(0)).is_err());
+    }
+
+    #[test]
+    fn thirty_two_pattern_snapshots_are_bounded_and_reclaimed_by_slot() {
+        let (mut controller, mut ports) = audio_channels();
+        let slots = (0..32)
+            .map(|generation| {
+                controller
+                    .install_pattern(snapshot(generation as u8))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controller.install_pattern(snapshot(99)),
+            Err(ControlError::NoFreePatternSlot)
+        );
+        ports
+            .pattern_retirements
+            .push(PatternRetirement {
+                owner_slot: slots[0],
+                snapshot: snapshot(0),
+            })
+            .unwrap();
+        assert_eq!(controller.reclaim_retired_pattern(), Some(slots[0]));
+        assert_eq!(controller.install_pattern(snapshot(100)), Ok(slots[0]));
+    }
+
+    #[test]
+    fn rejected_pattern_install_returns_its_exact_owner_slot() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 1, 1);
+        controller.stop_pad(PadId::first()).unwrap();
+        assert_eq!(
+            controller.install_pattern(snapshot(0)),
+            Err(ControlError::CommandQueueFull)
+        );
+        ports.immediate_commands.pop().unwrap();
+        assert_eq!(controller.install_pattern(snapshot(0)).unwrap().index(), 0);
+    }
+
+    #[test]
+    fn pattern_install_command_carries_the_returned_owner_and_snapshot() {
+        let (mut controller, mut ports) = audio_channels();
+        let snapshot = snapshot(4);
+        let expected_snapshot = Arc::clone(&snapshot);
+        let owner_slot = controller.install_pattern(snapshot).unwrap();
+
+        match ports.immediate_commands.pop().unwrap() {
+            AudioCommand::InstallPattern {
+                owner_slot: command_owner,
+                snapshot: command_snapshot,
+            } => {
+                assert_eq!(command_owner, owner_slot);
+                assert!(Arc::ptr_eq(&command_snapshot, &expected_snapshot));
+            }
+            command => panic!("expected pattern install, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_controls_use_shared_command_admission() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(4, 1, 1);
+        let slot = PatternSlotId::new(3).unwrap();
+        controller
+            .select_pattern(slot, PatternSwitch::NextBoundary)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        controller.stop_pattern().unwrap();
+        controller.set_record_capture(Some((slot, 7))).unwrap();
+        assert_eq!(
+            controller.set_record_capture(None),
+            Err(ControlError::CommandQueueFull)
+        );
+
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::SelectPattern {
+                slot: selected,
+                switch_at: PatternSwitch::NextBoundary,
+            } if selected == slot
+        ));
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::PatternPlay
+        ));
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::PatternStop
+        ));
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::SetRecordCapture(Some((captured, 7))) if captured == slot
+        ));
+
+        controller.set_record_capture(None).unwrap();
+    }
 
     #[test]
     fn controller_never_silently_drops_a_trigger() {
@@ -237,7 +413,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, PeekError, PopError, Producer, RingBuffer};
-use sampler_core::{Frame, PadId, PadSettings};
+use sampler_core::{Frame, PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
 use crate::{ControlError, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
 
@@ -245,6 +421,72 @@ pub const COMMAND_CAPACITY: usize = 1024;
 pub const RECOVERY_COMMAND_CAPACITY: usize = 32;
 pub const RETIREMENT_CAPACITY: usize = 256;
 pub const TELEMETRY_CAPACITY: usize = 64;
+pub const LIVE_ACK_CAPACITY: usize = 256;
+pub const PATTERN_SNAPSHOT_SLOT_COUNT: usize = 32;
+pub const PATTERN_RETIREMENT_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LiveCommandId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LiveAckKind {
+    Trigger { velocity: f32 },
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportStamp {
+    pub slot: PatternSlotId,
+    pub generation: u64,
+    pub origin: Frame,
+    pub loop_frames: Frame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveAck {
+    pub id: LiveCommandId,
+    pub pad: PadId,
+    pub kind: LiveAckKind,
+    pub frame: Frame,
+    pub transport: Option<TransportStamp>,
+}
+
+impl LiveAck {
+    pub const EMPTY: Self = Self {
+        id: LiveCommandId(0),
+        pad: PadId::first(),
+        kind: LiveAckKind::Release,
+        frame: 0,
+        transport: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PatternSnapshotSlot(u8);
+
+impl PatternSnapshotSlot {
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternSwitch {
+    Immediate,
+    NextBoundary,
+}
+
+#[derive(Debug)]
+pub struct PatternRetirement {
+    pub owner_slot: PatternSnapshotSlot,
+    pub snapshot: Arc<PatternSnapshot>,
+}
+
+impl PatternRetirement {
+    pub fn owner_slot(&self) -> PatternSnapshotSlot {
+        self.owner_slot
+    }
+}
 
 #[derive(Debug)]
 pub enum AudioCommand {
@@ -255,6 +497,17 @@ pub enum AudioCommand {
         settings: PadSettings,
         recovery: bool,
     },
+    InstallPattern {
+        owner_slot: PatternSnapshotSlot,
+        snapshot: Arc<PatternSnapshot>,
+    },
+    SelectPattern {
+        slot: PatternSlotId,
+        switch_at: PatternSwitch,
+    },
+    PatternPlay,
+    PatternStop,
+    SetRecordCapture(Option<(PatternSlotId, u64)>),
     Trigger {
         pad: PadId,
         at_frame: Frame,
@@ -262,6 +515,7 @@ pub enum AudioCommand {
         sequence: u64,
     },
     TriggerLive {
+        id: LiveCommandId,
         pad: PadId,
         velocity: f32,
         sequence: u64,
@@ -272,6 +526,7 @@ pub enum AudioCommand {
         sequence: u64,
     },
     ReleaseLive {
+        id: LiveCommandId,
         pad: PadId,
         sequence: u64,
     },
@@ -288,6 +543,13 @@ impl AudioCommand {
     pub fn into_installed_buffer(self) -> Option<Arc<SampleBuffer>> {
         match self {
             Self::InstallSample { buffer, .. } => Some(buffer),
+            _ => None,
+        }
+    }
+
+    pub fn live_id(&self) -> Option<LiveCommandId> {
+        match self {
+            Self::TriggerLive { id, .. } | Self::ReleaseLive { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -329,10 +591,14 @@ pub struct AudioController {
     commands: Producer<AudioCommand>,
     immediate_commands: Producer<AudioCommand>,
     retirements: Consumer<CriticalEvent>,
+    live_acks: Consumer<LiveAck>,
+    pattern_retirements: Consumer<PatternRetirement>,
     telemetry: Consumer<Telemetry>,
     shared: Arc<SharedControlState>,
     free_slots: [bool; SAMPLE_SLOT_COUNT],
     next_timed_sequence: u64,
+    next_live_id: u64,
+    free_pattern_slots: [bool; PATTERN_SNAPSHOT_SLOT_COUNT],
 }
 
 /// A command lane that returns controller admission credit when a command is consumed.
@@ -368,6 +634,8 @@ pub struct EnginePorts {
     pub commands: CommandConsumer,
     pub immediate_commands: CommandConsumer,
     pub retirements: Producer<CriticalEvent>,
+    pub live_acks: Producer<LiveAck>,
+    pub pattern_retirements: Producer<PatternRetirement>,
     pub telemetry: Producer<Telemetry>,
     pub(crate) shared: Arc<SharedControlState>,
 }
@@ -519,6 +787,9 @@ fn audio_channels_with_capacity_values(
     let (immediate_command_producer, immediate_command_consumer) =
         RingBuffer::new(command_capacity);
     let (retirement_producer, retirement_consumer) = RingBuffer::new(retirement_capacity);
+    let (live_ack_producer, live_ack_consumer) = RingBuffer::new(LIVE_ACK_CAPACITY);
+    let (pattern_retirement_producer, pattern_retirement_consumer) =
+        RingBuffer::new(PATTERN_RETIREMENT_CAPACITY);
     let (telemetry_producer, telemetry_consumer) = RingBuffer::new(telemetry_capacity);
     let shared = Arc::new(SharedControlState::new(command_capacity));
 
@@ -527,10 +798,14 @@ fn audio_channels_with_capacity_values(
             commands: command_producer,
             immediate_commands: immediate_command_producer,
             retirements: retirement_consumer,
+            live_acks: live_ack_consumer,
+            pattern_retirements: pattern_retirement_consumer,
             telemetry: telemetry_consumer,
             shared: Arc::clone(&shared),
             free_slots: [true; SAMPLE_SLOT_COUNT],
             next_timed_sequence: 1,
+            next_live_id: 1,
+            free_pattern_slots: [true; PATTERN_SNAPSHOT_SLOT_COUNT],
         },
         EnginePorts {
             commands: CommandConsumer::new(command_consumer, Arc::clone(&shared)),
@@ -539,6 +814,8 @@ fn audio_channels_with_capacity_values(
                 Arc::clone(&shared),
             ),
             retirements: retirement_producer,
+            live_acks: live_ack_producer,
+            pattern_retirements: pattern_retirement_producer,
             telemetry: telemetry_producer,
             shared,
         },
@@ -566,6 +843,51 @@ impl AudioController {
         settings: PadSettings,
     ) -> Result<SampleSlot, ControlError> {
         self.install_inner(pad, buffer, settings, true)
+    }
+
+    pub fn install_pattern(
+        &mut self,
+        snapshot: Arc<PatternSnapshot>,
+    ) -> Result<PatternSnapshotSlot, ControlError> {
+        self.ensure_open()?;
+        let Some(index) = self.free_pattern_slots.iter().position(|is_free| *is_free) else {
+            return Err(ControlError::NoFreePatternSlot);
+        };
+        let owner_slot = PatternSnapshotSlot(
+            u8::try_from(index).expect("pattern owner-slot map fits in its slot identifier"),
+        );
+        self.free_pattern_slots[index] = false;
+        if let Err(error) = self.push_immediate_command(AudioCommand::InstallPattern {
+            owner_slot,
+            snapshot,
+        }) {
+            self.free_pattern_slots[index] = true;
+            return Err(error);
+        }
+        Ok(owner_slot)
+    }
+
+    pub fn select_pattern(
+        &mut self,
+        slot: PatternSlotId,
+        switch_at: PatternSwitch,
+    ) -> Result<(), ControlError> {
+        self.push_immediate_command(AudioCommand::SelectPattern { slot, switch_at })
+    }
+
+    pub fn play_pattern(&mut self) -> Result<(), ControlError> {
+        self.push_immediate_command(AudioCommand::PatternPlay)
+    }
+
+    pub fn stop_pattern(&mut self) -> Result<(), ControlError> {
+        self.push_immediate_command(AudioCommand::PatternStop)
+    }
+
+    pub fn set_record_capture(
+        &mut self,
+        capture: Option<(PatternSlotId, u64)>,
+    ) -> Result<(), ControlError> {
+        self.push_immediate_command(AudioCommand::SetRecordCapture(capture))
     }
 
     fn install_inner(
@@ -630,20 +952,31 @@ impl AudioController {
     }
 
     pub fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), ControlError> {
+        self.trigger_live_tracked(pad, velocity).map(|_| ())
+    }
+
+    pub fn trigger_live_tracked(
+        &mut self,
+        pad: PadId,
+        velocity: f32,
+    ) -> Result<LiveCommandId, ControlError> {
         self.ensure_open()?;
         if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
             return Err(ControlError::InvalidVelocity);
         }
         let sequence = self.next_timed_sequence;
+        let live_id = LiveCommandId(self.next_live_id);
         let result = self.push_immediate_command(AudioCommand::TriggerLive {
+            id: live_id,
             pad,
             velocity,
             sequence,
         });
         if result.is_ok() {
             self.advance_timed_sequence();
+            self.advance_live_id();
         }
-        result
+        result.map(|()| live_id)
     }
 
     pub fn release(&mut self, pad: PadId, at_frame: Frame) -> Result<(), ControlError> {
@@ -661,13 +994,23 @@ impl AudioController {
     }
 
     pub fn release_live(&mut self, pad: PadId) -> Result<(), ControlError> {
+        self.release_live_tracked(pad).map(|_| ())
+    }
+
+    pub fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, ControlError> {
         self.ensure_open()?;
         let sequence = self.next_timed_sequence;
-        let result = self.push_immediate_command(AudioCommand::ReleaseLive { pad, sequence });
+        let live_id = LiveCommandId(self.next_live_id);
+        let result = self.push_immediate_command(AudioCommand::ReleaseLive {
+            id: live_id,
+            pad,
+            sequence,
+        });
         if result.is_ok() {
             self.advance_timed_sequence();
+            self.advance_live_id();
         }
-        result
+        result.map(|()| live_id)
     }
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
@@ -693,6 +1036,28 @@ impl AudioController {
             latest = Some(telemetry);
         }
         latest
+    }
+
+    pub fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
+        let mut drained = 0;
+        while let Some(slot) = output.get_mut(drained) {
+            let Ok(ack) = self.live_acks.pop() else {
+                break;
+            };
+            *slot = ack;
+            drained += 1;
+        }
+        drained
+    }
+
+    pub fn reclaim_retired_pattern(&mut self) -> Option<PatternSnapshotSlot> {
+        let PatternRetirement {
+            owner_slot,
+            snapshot,
+        } = self.pattern_retirements.pop().ok()?;
+        drop(snapshot);
+        self.free_pattern_slots[owner_slot.index()] = true;
+        Some(owner_slot)
     }
 
     pub fn reclaim_retired(&mut self) -> usize {
@@ -748,6 +1113,10 @@ impl AudioController {
 
     fn advance_timed_sequence(&mut self) {
         self.next_timed_sequence = self.next_timed_sequence.wrapping_add(1);
+    }
+
+    fn advance_live_id(&mut self) {
+        self.next_live_id = self.next_live_id.wrapping_add(1);
     }
 
     fn ensure_open(&self) -> Result<(), ControlError> {

@@ -76,6 +76,8 @@ pub enum ControlError {
     CommandQueueFull,
     #[error("no free sample slot is available")]
     NoFreeSampleSlot,
+    #[error("no free pattern snapshot slot is available")]
+    NoFreePatternSlot,
     #[error("trigger velocity must be finite and in 0.0..=1.0")]
     InvalidVelocity,
 }

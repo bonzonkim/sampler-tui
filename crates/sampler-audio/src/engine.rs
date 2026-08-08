@@ -305,13 +305,14 @@ impl AudioEngine {
                 pad,
                 velocity,
                 sequence,
+                ..
             }) => Some(ScheduledAction::Trigger {
                 pad: *pad,
                 at_frame: self.rendered_frame,
                 velocity: *velocity,
                 sequence: *sequence,
             }),
-            Ok(AudioCommand::ReleaseLive { pad, sequence }) => Some(ScheduledAction::Release {
+            Ok(AudioCommand::ReleaseLive { pad, sequence, .. }) => Some(ScheduledAction::Release {
                 pad: *pad,
                 at_frame: self.rendered_frame,
                 sequence: *sequence,
@@ -411,6 +412,13 @@ impl AudioEngine {
                 }
             }
             AudioCommand::StopPad { pad } => self.stop_pad(pad),
+            AudioCommand::InstallPattern { .. }
+            | AudioCommand::SelectPattern { .. }
+            | AudioCommand::PatternPlay
+            | AudioCommand::PatternStop
+            | AudioCommand::SetRecordCapture(_) => {
+                self.invalid_commands = self.invalid_commands.saturating_add(1);
+            }
             AudioCommand::Trigger { .. }
             | AudioCommand::TriggerLive { .. }
             | AudioCommand::Release { .. }

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sampler_audio::{
-    AudioController, AudioEngine, LiveAck, PadId, PadSettings, PatternSwitch, SampleBuffer,
-    audio_channels, audio_channels_with_test_capacities, write_frames,
+    AudioController, AudioEngine, CaptureBuffer, CaptureOutcome, CaptureSource, CaptureState,
+    LiveAck, MAX_CAPTURE_FRAMES, PadId, PadSettings, PatternSwitch, SampleBuffer, audio_channels,
+    audio_channels_with_test_capacities, write_frames,
 };
 use sampler_core::{
     BankId, EditablePattern, EventId, Meter, PatternEvent, PatternSlotId, PlaybackMode, Resolution,
@@ -433,6 +434,132 @@ fn measure_exact_duration_pattern_releases() {
     }
 }
 
+fn measure_bounded_capture_ownership() {
+    let (mut controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(100, ports).unwrap();
+    let pattern_pad = PadId::first();
+    let live_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+    let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+    controller
+        .install(
+            pattern_pad,
+            Arc::new(SampleBuffer::new(100, vec![0.5; 256]).unwrap()),
+            looping,
+        )
+        .unwrap();
+    controller
+        .install(
+            live_pad,
+            Arc::new(SampleBuffer::new(100, vec![0.25; 256]).unwrap()),
+            looping,
+        )
+        .unwrap();
+    engine.render_frames(0, |_| {});
+    controller
+        .install_pattern(pattern_snapshot(0, 100, &[2]))
+        .unwrap();
+    controller
+        .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+        .unwrap();
+    controller.play_pattern().unwrap();
+    controller.trigger_live(live_pad, 1.0).unwrap();
+    engine.render_frames(75, |_| {});
+    assert!(
+        engine.active_voices() >= 2,
+        "active={}, triggers={}",
+        engine.active_voices(),
+        engine.executed_triggers()
+    );
+
+    let saturation =
+        CaptureBuffer::try_new(700, live_pad, CaptureSource::Resample, 100, 1).unwrap();
+    let saturation_allocation = saturation.stereo().as_ptr();
+    let first = CaptureBuffer::try_new(
+        701,
+        live_pad,
+        CaptureSource::Resample,
+        100,
+        MAX_CAPTURE_FRAMES,
+    )
+    .unwrap();
+    let first_allocation = first.stereo().as_ptr();
+    let second = CaptureBuffer::try_new(
+        702,
+        live_pad,
+        CaptureSource::Resample,
+        100,
+        MAX_CAPTURE_FRAMES,
+    )
+    .unwrap();
+    let second_allocation = second.stereo().as_ptr();
+    controller.arm_capture(saturation).unwrap();
+    engine.render_frames(0, |_| {});
+    controller.start_capture(700).unwrap();
+    engine.render_frames(0, |_| {});
+
+    let mut saturated_outcome = None;
+    let mut stopped_outcome = None;
+    let mut cancelled_outcome = None;
+    let mut rendered = [[0.0_f32; 2]; 16];
+    let mut rendered_len = 0;
+    assert_zero_callback_activity("bounded capture ownership", || {
+        engine.render_frames(1, |_| {});
+
+        controller.arm_capture(first).unwrap();
+        engine.render_frames(0, |_| {});
+        controller.start_capture(701).unwrap();
+        engine.render_frames(16, |frame| {
+            rendered[rendered_len] = frame;
+            rendered_len += 1;
+        });
+        controller.stop_capture(701).unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(
+            controller.capture_status().unwrap().state,
+            CaptureState::CompletionPending
+        );
+
+        saturated_outcome = controller.try_capture_completion();
+        engine.render_frames(0, |_| {});
+        stopped_outcome = controller.try_capture_completion();
+
+        controller.arm_capture(second).unwrap();
+        engine.render_frames(0, |_| {});
+        controller.start_capture(702).unwrap();
+        engine.render_frames(1, |_| {});
+        controller.cancel_capture(702).unwrap();
+        engine.render_frames(1, |_| {});
+        cancelled_outcome = controller.try_capture_completion();
+    });
+
+    let Some(CaptureOutcome::Completed(saturated)) = saturated_outcome else {
+        panic!("hard-limit outcome must saturate the completion ring");
+    };
+    assert_eq!(saturated.token, 700);
+    assert_eq!(saturated.stereo.as_ptr(), saturation_allocation);
+    assert_eq!(saturated.stereo.len(), 2);
+    assert!(saturated.hard_limit);
+
+    let Some(CaptureOutcome::Completed(stopped)) = stopped_outcome else {
+        panic!("stopped capture must be reclaimed after backpressure");
+    };
+    assert_eq!(stopped.token, 701);
+    assert_eq!(stopped.stereo.as_ptr(), first_allocation);
+    assert_eq!(stopped.stereo.len(), 32);
+    assert!(!stopped.hard_limit);
+    assert_eq!(rendered_len, rendered.len());
+    for (captured, expected) in stopped.stereo.chunks_exact(2).zip(rendered) {
+        assert_eq!(captured, expected);
+    }
+
+    let Some(CaptureOutcome::Cancelled(cancelled)) = cancelled_outcome else {
+        panic!("cancelled capture must return its original buffer");
+    };
+    assert_eq!(cancelled.token(), 702);
+    assert_eq!(cancelled.stereo().as_ptr(), second_allocation);
+    assert_eq!(cancelled.stereo().len(), 2);
+}
+
 #[test]
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
@@ -448,4 +575,5 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_render_horizon_publication();
     measure_pattern_playback_acknowledgement_and_retirement();
     measure_exact_duration_pattern_releases();
+    measure_bounded_capture_ownership();
 }

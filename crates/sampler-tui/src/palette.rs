@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sampler_core::BankId;
+use sampler_core::{BankId, Resolution};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
@@ -70,7 +70,7 @@ impl LineEditor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PaletteCommand {
     OpenPicker,
     LoadPath(PathBuf),
@@ -79,6 +79,16 @@ pub enum PaletteCommand {
     StopAll,
     Help,
     Quit,
+    Pattern(u8),
+    Tempo(f64),
+    Bars(u16),
+    Resolution(Resolution),
+    Swing(f64),
+    Quantize(f32),
+    Record,
+    Play,
+    Stop,
+    ClearPattern,
 }
 
 pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
@@ -99,8 +109,67 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "stop-all" => no_arguments(remainder, "stop-all", PaletteCommand::StopAll),
         "help" => no_arguments(remainder, "help", PaletteCommand::Help),
         "quit" => no_arguments(remainder, "quit", PaletteCommand::Quit),
+        "pattern" => parse_pattern(remainder).map(PaletteCommand::Pattern),
+        "tempo" => parse_finite_range(remainder, 20.0, 300.0, "tempo must be 20..300")
+            .map(PaletteCommand::Tempo),
+        "bars" => parse_bars(remainder).map(PaletteCommand::Bars),
+        "resolution" => parse_resolution(remainder).map(PaletteCommand::Resolution),
+        "swing" => parse_finite_range(remainder, 50.0, 75.0, "swing must be 50..75")
+            .map(|percent| PaletteCommand::Swing(percent / 100.0)),
+        "quantize" => parse_finite_range(remainder, 0.0, 100.0, "quantize must be 0..100")
+            .map(|percent| PaletteCommand::Quantize((percent / 100.0) as f32)),
+        "record" => no_arguments(remainder, "record", PaletteCommand::Record),
+        "play" => no_arguments(remainder, "play", PaletteCommand::Play),
+        "stop" => no_arguments(remainder, "stop", PaletteCommand::Stop),
+        "clear-pattern" => no_arguments(remainder, "clear-pattern", PaletteCommand::ClearPattern),
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_pattern(input: &str) -> Result<u8, String> {
+    let value = single_token(input, "pattern must be 1..16")?
+        .parse::<u8>()
+        .ok()
+        .filter(|value| (1..=16).contains(value))
+        .ok_or_else(|| "pattern must be 1..16".to_owned())?;
+    Ok(value - 1)
+}
+
+fn parse_bars(input: &str) -> Result<u16, String> {
+    single_token(input, "bars must be 1..64")?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| (1..=64).contains(value))
+        .ok_or_else(|| "bars must be 1..64".to_owned())
+}
+
+fn parse_resolution(input: &str) -> Result<Resolution, String> {
+    match single_token(input, "resolution must be 1/4, 1/8, 1/16, or 1/32")? {
+        "1/4" => Ok(Resolution::Quarter),
+        "1/8" => Ok(Resolution::Eighth),
+        "1/16" => Ok(Resolution::Sixteenth),
+        "1/32" => Ok(Resolution::ThirtySecond),
+        _ => Err("resolution must be 1/4, 1/8, 1/16, or 1/32".to_owned()),
+    }
+}
+
+fn parse_finite_range(input: &str, minimum: f64, maximum: f64, error: &str) -> Result<f64, String> {
+    single_token(input, error)?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (minimum..=maximum).contains(value))
+        .ok_or_else(|| error.to_owned())
+}
+
+fn single_token<'a>(input: &'a str, error: &str) -> Result<&'a str, String> {
+    let mut tokens = input.split_whitespace();
+    let Some(token) = tokens.next() else {
+        return Err(error.to_owned());
+    };
+    if tokens.next().is_some() {
+        return Err(error.to_owned());
+    }
+    Ok(token)
 }
 
 fn parse_bank(input: &str) -> Result<BankId, String> {
@@ -145,7 +214,7 @@ fn no_arguments(
 mod tests {
     use std::path::PathBuf;
 
-    use sampler_core::BankId;
+    use sampler_core::{BankId, Resolution};
 
     use super::{LineEditor, PaletteCommand, parse_palette};
 
@@ -216,6 +285,39 @@ mod tests {
         assert_eq!(
             parse_palette("SELECT 1"),
             Err("unknown command: SELECT".into())
+        );
+    }
+
+    #[test]
+    fn pattern_commands_are_strict_and_ranges_are_typed() {
+        assert_eq!(parse_palette("pattern 16"), Ok(PaletteCommand::Pattern(15)));
+        assert_eq!(
+            parse_palette("tempo 120.5"),
+            Ok(PaletteCommand::Tempo(120.5))
+        );
+        assert_eq!(
+            parse_palette("resolution 1/16"),
+            Ok(PaletteCommand::Resolution(Resolution::Sixteenth))
+        );
+        assert_eq!(
+            parse_palette("swing 76"),
+            Err("swing must be 50..75".into())
+        );
+        assert_eq!(
+            parse_palette("quantize NaN"),
+            Err("quantize must be 0..100".into())
+        );
+    }
+
+    #[test]
+    fn pattern_commands_reject_trailing_and_non_finite_values() {
+        assert_eq!(
+            parse_palette("tempo inf"),
+            Err("tempo must be 20..300".into())
+        );
+        assert_eq!(
+            parse_palette("pattern 1 now"),
+            Err("pattern must be 1..16".into())
         );
     }
 }

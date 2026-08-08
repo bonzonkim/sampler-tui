@@ -724,6 +724,18 @@ impl App {
                 self.should_quit = true;
                 self.overlay = None;
             }
+            PaletteCommand::Pattern(_)
+            | PaletteCommand::Tempo(_)
+            | PaletteCommand::Bars(_)
+            | PaletteCommand::Resolution(_)
+            | PaletteCommand::Swing(_)
+            | PaletteCommand::Quantize(_)
+            | PaletteCommand::Record
+            | PaletteCommand::Play
+            | PaletteCommand::Stop
+            | PaletteCommand::ClearPattern => {
+                self.palette_error = Some("pattern commands are not available yet".to_owned());
+            }
         }
     }
 

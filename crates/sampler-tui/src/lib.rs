@@ -6,6 +6,7 @@ pub mod file_picker;
 pub mod input;
 pub mod loader;
 pub mod palette;
+pub mod pattern;
 pub mod terminal;
 pub mod ui;
 
@@ -21,6 +22,10 @@ pub use loader::{
     WorkerResult, WorkerSendError,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
+pub use pattern::{
+    MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCursor, PatternMaintenance, PatternStatus,
+    PatternWorkspace, WorkspaceView,
+};
 pub use sampler_audio::{LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch};
 pub use sampler_core::{PatternSlotId, PatternSnapshot};
 pub use terminal::{

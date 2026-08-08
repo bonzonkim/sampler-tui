@@ -933,6 +933,12 @@ impl AudioEngine {
                 }
                 None
             }
+            Ok(AudioCommand::RemoveSample { pad })
+                if self.remove_needs_retirement_capacity(*pad)
+                    && self.ports.retirements.slots() == 0 =>
+            {
+                return false;
+            }
             Ok(_) => None,
             Err(_) => return false,
         };
@@ -1023,6 +1029,7 @@ impl AudioEngine {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
                 }
             }
+            AudioCommand::RemoveSample { pad } => self.remove_sample(pad),
             AudioCommand::StopPad { pad } => self.stop_pad(pad),
             AudioCommand::InstallPattern {
                 owner_slot,
@@ -1165,6 +1172,29 @@ impl AudioEngine {
             || entry.retiring
             || buffer.sample_rate() != self.sample_rate
             || !settings_are_valid(settings)
+    }
+
+    fn remove_needs_retirement_capacity(&self, pad: PadId) -> bool {
+        let Some(slot) = self.pad_binding(pad).slot else {
+            return false;
+        };
+        let entry = &self.samples[slot.index()];
+        entry.buffer.is_some()
+            && entry.pad_references == 1
+            && !self.sample_has_active_voice(slot.index())
+    }
+
+    fn remove_sample(&mut self, pad: PadId) {
+        let pad_index = pad_index(pad);
+        let Some(slot) = self.pads[pad_index].slot.take() else {
+            return;
+        };
+
+        let entry = &mut self.samples[slot.index()];
+        entry.pad_references = entry.pad_references.saturating_sub(1);
+        entry.retiring = true;
+        self.release_sustained_live_voices(pad);
+        self.retire_sample_if_unused(slot.index());
     }
 
     fn return_rejected_buffer(&mut self, slot: SampleSlot, buffer: Arc<SampleBuffer>) {
@@ -1791,38 +1821,45 @@ impl AudioEngine {
         bits
     }
 
+    fn sample_has_active_voice(&self, index: usize) -> bool {
+        self.voices
+            .iter()
+            .flatten()
+            .any(|voice| voice.slot.index() == index)
+    }
+
+    fn retire_sample_if_unused(&mut self, index: usize) {
+        let entry = &self.samples[index];
+        if !entry.retiring
+            || entry.pad_references != 0
+            || self.sample_has_active_voice(index)
+            || self.ports.retirements.slots() == 0
+        {
+            return;
+        }
+
+        let Some(buffer) = self.samples[index].buffer.take() else {
+            self.samples[index].retiring = false;
+            self.invalid_commands = self.invalid_commands.saturating_add(1);
+            return;
+        };
+        let Ok(slot) = SampleSlot::new(index) else {
+            self.samples[index].buffer = Some(buffer);
+            self.invalid_commands = self.invalid_commands.saturating_add(1);
+            return;
+        };
+        let event = CriticalEvent::RetiredSample { slot, buffer };
+        match self.ports.retirements.push(event) {
+            Ok(()) => self.samples[index].retiring = false,
+            Err(PushError::Full(CriticalEvent::RetiredSample { buffer, .. })) => {
+                self.samples[index].buffer = Some(buffer);
+            }
+        }
+    }
+
     fn retire_unused_samples(&mut self) {
         for index in 0..SAMPLE_SLOT_COUNT {
-            let entry = &self.samples[index];
-            if !entry.retiring
-                || entry.pad_references != 0
-                || self
-                    .voices
-                    .iter()
-                    .flatten()
-                    .any(|voice| voice.slot.index() == index)
-                || self.ports.retirements.slots() == 0
-            {
-                continue;
-            }
-
-            let Some(buffer) = self.samples[index].buffer.take() else {
-                self.samples[index].retiring = false;
-                self.invalid_commands = self.invalid_commands.saturating_add(1);
-                continue;
-            };
-            let Ok(slot) = SampleSlot::new(index) else {
-                self.samples[index].buffer = Some(buffer);
-                self.invalid_commands = self.invalid_commands.saturating_add(1);
-                continue;
-            };
-            let event = CriticalEvent::RetiredSample { slot, buffer };
-            match self.ports.retirements.push(event) {
-                Ok(()) => self.samples[index].retiring = false,
-                Err(PushError::Full(CriticalEvent::RetiredSample { buffer, .. })) => {
-                    self.samples[index].buffer = Some(buffer);
-                }
-            }
+            self.retire_sample_if_unused(index);
         }
     }
 
@@ -4466,5 +4503,125 @@ mod tests {
         engine.render_stereo(&mut []);
         assert_eq!(controller.reclaim_retired(), 1);
         assert!(retired_weak[1].as_ref().unwrap().upgrade().is_none());
+    }
+
+    #[test]
+    fn remove_sample_preserves_one_shot_tail_and_silences_new_triggers() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        let sample = constant_sample(128, 0.5);
+        let weak = Arc::downgrade(&sample);
+        controller
+            .install(pad, Arc::clone(&sample), PadSettings::default())
+            .unwrap();
+        drop(sample);
+        controller.trigger(pad, 0, 1.0).unwrap();
+        engine.render_frames(1, |_| {});
+
+        controller.remove_sample(pad).unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pad_binding(pad).slot.is_none());
+        let voice = engine
+            .voices
+            .iter()
+            .flatten()
+            .find(|voice| voice.pad == pad)
+            .unwrap();
+        assert_eq!(voice.mode, PlaybackMode::OneShot);
+        assert_eq!(voice.envelope.release_frame, None);
+
+        controller
+            .trigger(pad, engine.rendered_frame(), 1.0)
+            .unwrap();
+        engine.render_frames(1, |_| {});
+        assert_eq!(engine.voices_for_pad(pad), 1);
+        assert!(weak.upgrade().is_some());
+        engine.render_frames(128, |_| {});
+        assert!(weak.upgrade().is_some());
+        assert_eq!(controller.reclaim_retired(), 1);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn remove_sample_releases_only_sustained_voices_for_the_removed_pad() {
+        for mode in [PlaybackMode::Gate, PlaybackMode::Loop] {
+            let (mut controller, mut engine) = harness();
+            let removed = PadId::first();
+            let preserved = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+            let settings = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
+            for pad in [removed, preserved] {
+                controller
+                    .install(pad, constant_sample(256, 0.5), settings)
+                    .unwrap();
+                controller.trigger(pad, 0, 1.0).unwrap();
+            }
+            engine.render_frames(1, |_| {});
+
+            controller.remove_sample(removed).unwrap();
+            engine.render_frames(0, |_| {});
+
+            assert!(
+                engine.voices.iter().flatten().any(|voice| {
+                    voice.pad == removed && voice.envelope.release_frame.is_some()
+                })
+            );
+            assert!(
+                engine.voices.iter().flatten().any(|voice| {
+                    voice.pad == preserved && voice.envelope.release_frame.is_none()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn remove_sample_waits_at_command_head_for_immediate_retirement_capacity() {
+        let (mut controller, ports) = audio_channels_with_capacities(8, 1, 1);
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let pad = PadId::first();
+        controller
+            .install(pad, constant_sample(8, 0.5), PadSettings::default())
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        engine
+            .ports
+            .retirements
+            .push(CriticalEvent::RetiredSample {
+                slot: SampleSlot::new(SAMPLE_SLOT_COUNT - 1).unwrap(),
+                buffer: constant_sample(1, 0.0),
+            })
+            .unwrap();
+
+        controller.remove_sample(pad).unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.queued_commands(), 1);
+        assert!(engine.pad_binding(pad).slot.is_some());
+
+        assert_eq!(controller.reclaim_retired(), 1);
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.queued_commands(), 0);
+        assert!(engine.pad_binding(pad).slot.is_none());
+        assert_eq!(controller.reclaim_retired(), 1);
+    }
+
+    #[test]
+    fn remove_sample_of_absent_pad_is_deterministic_with_full_retirement_queue() {
+        let (mut controller, ports) = audio_channels_with_capacities(8, 1, 1);
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        engine
+            .ports
+            .retirements
+            .push(CriticalEvent::RetiredSample {
+                slot: SampleSlot::new(SAMPLE_SLOT_COUNT - 1).unwrap(),
+                buffer: constant_sample(1, 0.0),
+            })
+            .unwrap();
+        let invalid_before = engine.invalid_commands();
+
+        controller.remove_sample(PadId::first()).unwrap();
+        engine.render_frames(0, |_| {});
+
+        assert_eq!(engine.queued_commands(), 0);
+        assert_eq!(engine.invalid_commands(), invalid_before);
+        assert_eq!(controller.reclaim_retired(), 1);
     }
 }

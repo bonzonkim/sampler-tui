@@ -7,7 +7,9 @@ mod tests {
         PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, TransportStamp,
         audio_channels_with_test_capacities,
     };
-    use sampler_core::{PATTERN_SLOT_COUNT, PadId, PadSettings, PatternSlotId, PatternSnapshot};
+    use sampler_core::{
+        PATTERN_SLOT_COUNT, PadId, PadSettings, PatternSlotId, PatternSnapshot, Tempo,
+    };
 
     use crate::AudioPort;
 
@@ -849,6 +851,62 @@ mod tests {
     }
 
     #[test]
+    fn pattern_project_restore_preserves_all_slots_and_submits_in_slot_order() {
+        let mut source = PatternWorkspace::new(44_100);
+        for index in 0..PATTERN_SLOT_COUNT {
+            let slot = PatternSlotId::new(index as u8).unwrap();
+            source.select_slot(slot);
+            source.cursor.step = index as u32;
+            source
+                .set_tempo(Tempo::new(90.0 + index as f64).unwrap())
+                .unwrap();
+            source.set_bars(1 + (index % 4) as u16).unwrap();
+            source.set_swing(0.50 + index as f64 / 100.0).unwrap();
+            source.set_quantize(index as f32 / 20.0).unwrap();
+            source.toggle_step().unwrap();
+        }
+        let mut replacement = source.export_project_patterns().unwrap();
+        for (index, pattern) in replacement.iter_mut().enumerate() {
+            pattern.name = format!("Restored {:02}", index + 1);
+        }
+
+        let mut restored = PatternWorkspace::new(48_000);
+        restored
+            .replace_project_patterns(replacement.clone())
+            .unwrap();
+
+        let exported = restored.export_project_patterns().unwrap();
+        assert_eq!(exported, replacement);
+        for (index, pattern) in exported.iter().enumerate() {
+            assert_eq!(pattern.slot, PatternSlotId::new(index as u8).unwrap());
+            assert_eq!(pattern.sample_rate, 44_100);
+            assert_eq!(pattern.events.len(), 1);
+            assert_eq!(
+                pattern.events[0].raw_frame,
+                replacement[index].events[0].raw_frame
+            );
+            if index > 0 {
+                assert!(pattern.events[0].raw_frame > 0);
+            }
+            assert_eq!(pattern.tempo, Tempo::new(90.0 + index as f64).unwrap());
+        }
+
+        let mut audio = OneSlotAudio::new();
+        let mut submitted = Vec::new();
+        for _ in 0..PATTERN_SLOT_COUNT {
+            let maintenance = restored.maintain(&mut audio, telemetry());
+            submitted.push(maintenance.submitted_slot.unwrap());
+            audio.callback();
+        }
+        assert_eq!(
+            submitted,
+            (0..PATTERN_SLOT_COUNT)
+                .map(|index| PatternSlotId::new(index as u8).unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn record_ack_mutations_are_counted_and_revision_budgeted() {
         let mut accepted = recording_workspace();
         let stamp = origin(1_000);
@@ -1281,10 +1339,10 @@ impl PatternWorkspace {
         self.dirty_patterns = array::from_fn(|index| {
             Some(DirtyPattern {
                 generation: self.patterns[index].generation(),
-                ticket: index as u64,
+                ticket: 0,
             })
         });
-        self.next_dirty_ticket = PATTERN_SLOT_COUNT as u64;
+        self.next_dirty_ticket = 0;
         self.pending_snapshots = array::from_fn(|_| None);
         self.reinstall_pending.fill(true);
         self.installed_generations.fill(None);

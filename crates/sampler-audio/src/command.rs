@@ -356,6 +356,28 @@ mod tests {
     }
 
     #[test]
+    fn sample_removal_uses_shared_command_admission() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 256, 8);
+        let pad = PadId::first();
+
+        controller.stop_pad(pad).unwrap();
+        assert_eq!(
+            controller.remove_sample(pad),
+            Err(ControlError::CommandQueueFull)
+        );
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::StopPad { pad: stopped } if stopped == pad
+        ));
+
+        controller.remove_sample(pad).unwrap();
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::RemoveSample { pad: removed } if removed == pad
+        ));
+    }
+
+    #[test]
     fn pattern_play_sequences_are_ordered_across_the_stop_fence() {
         let (mut controller, mut ports) = audio_channels();
         controller.play_pattern().unwrap();
@@ -592,6 +614,10 @@ mod tests {
             controller.update_pad(pad, PadSettings::default()),
             Err(ControlError::ClosedSession)
         );
+        assert_eq!(
+            controller.remove_sample(pad),
+            Err(ControlError::ClosedSession)
+        );
         assert_eq!(controller.stop_pad(pad), Err(ControlError::ClosedSession));
         assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
         assert_eq!(ports.commands.slots(), 0);
@@ -779,6 +805,9 @@ pub enum AudioCommand {
     UpdatePad {
         pad: PadId,
         settings: PadSettings,
+    },
+    RemoveSample {
+        pad: PadId,
     },
     StopPad {
         pad: PadId,
@@ -1320,6 +1349,11 @@ impl AudioController {
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
         self.ensure_open()?;
         self.push_immediate_command(AudioCommand::UpdatePad { pad, settings })
+    }
+
+    pub fn remove_sample(&mut self, pad: PadId) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        self.push_immediate_command(AudioCommand::RemoveSample { pad })
     }
 
     pub fn stop_pad(&mut self, pad: PadId) -> Result<(), ControlError> {

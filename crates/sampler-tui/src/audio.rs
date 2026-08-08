@@ -76,6 +76,9 @@ pub trait AudioPort {
     fn reclaim_retired_patterns(&mut self) -> usize {
         0
     }
+    fn remove_sample(&mut self, _pad: PadId) -> Result<(), String> {
+        Err("sample removal is unsupported".into())
+    }
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String>;
     fn stop_all(&mut self) -> Result<(), String>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String>;
@@ -144,6 +147,7 @@ trait SessionLike {
         reason = "the count-only controller boundary is retained for SessionLike parity"
     )]
     fn reclaim_retired_patterns(&mut self) -> usize;
+    fn remove_sample(&mut self, pad: PadId) -> Result<(), Self::CommandError>;
     fn stop_pad(&mut self, pad: PadId) -> Result<(), Self::CommandError>;
     fn stop_all(&mut self) -> Result<(), Self::CommandError>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), Self::CommandError>;
@@ -262,6 +266,10 @@ impl SessionLike for AudioSession {
             reclaimed += 1;
         }
         reclaimed
+    }
+
+    fn remove_sample(&mut self, pad: PadId) -> Result<(), Self::CommandError> {
+        self.controller_mut().remove_sample(pad)
     }
 
     fn stop_pad(&mut self, pad: PadId) -> Result<(), Self::CommandError> {
@@ -470,6 +478,12 @@ where
         reclaimed
     }
 
+    fn remove_sample(&mut self, pad: PadId) -> Result<(), String> {
+        self.session_mut()
+            .remove_sample(pad)
+            .map_err(|error| error.to_string())
+    }
+
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String> {
         self.session_mut()
             .stop_pad(pad)
@@ -551,6 +565,7 @@ mod tests {
         snapshot_ownership: Option<SnapshotOwnershipProbe>,
         next_pattern_slot: Option<PatternSnapshotSlot>,
         retired_pattern_slots: VecDeque<PatternSnapshotSlot>,
+        removed_pads: Vec<PadId>,
     }
 
     #[derive(Clone)]
@@ -587,6 +602,7 @@ mod tests {
                 snapshot_ownership: None,
                 next_pattern_slot: None,
                 retired_pattern_slots: VecDeque::new(),
+                removed_pads: Vec::new(),
             }
         }
 
@@ -784,6 +800,11 @@ mod tests {
 
         fn reclaim_retired_pattern(&mut self) -> Option<PatternSnapshotSlot> {
             self.retired_pattern_slots.pop_front()
+        }
+
+        fn remove_sample(&mut self, pad: PadId) -> Result<(), Self::CommandError> {
+            self.removed_pads.push(pad);
+            Ok(())
         }
 
         fn stop_pad(&mut self, _pad: PadId) -> Result<(), Self::CommandError> {
@@ -1037,6 +1058,10 @@ mod tests {
         port.install(PadId::first(), Arc::clone(&sample), PadSettings::default())
             .unwrap();
         drop(sample);
+        assert!(weak.upgrade().is_some());
+
+        port.remove_sample(PadId::first()).unwrap();
+        assert_eq!(port.session().borrow().removed_pads, vec![PadId::first()]);
         assert!(weak.upgrade().is_some());
 
         assert_eq!(port.reclaim_retired(), 1);

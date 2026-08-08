@@ -211,10 +211,37 @@ impl ProjectDirectory {
         ensure_fd_type(&owned, path, RustixFileType::Directory)?;
         let path = fs::canonicalize(path)
             .map_err(|error| filesystem_error("canonicalize directory", path, error))?;
-        Ok(Self {
+        let project = Self {
             path,
             file: File::from(owned),
-        })
+        };
+        project.revalidate_path_identity()?;
+        Ok(project)
+    }
+
+    fn revalidate_path_identity(&self) -> Result<(), ProjectStoreError> {
+        let opened = rustix::fs::fstat(&self.file).map_err(|error| {
+            filesystem_error(
+                "inspect opened project directory",
+                &self.path,
+                io::Error::from(error),
+            )
+        })?;
+        let current = rustix::fs::stat(&self.path).map_err(|error| {
+            filesystem_error(
+                "inspect project directory path",
+                &self.path,
+                io::Error::from(error),
+            )
+        })?;
+        if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
+            return Err(ProjectStoreError::Filesystem {
+                operation: "verify project directory identity",
+                path: self.path.clone(),
+                kind: io::ErrorKind::Other,
+            });
+        }
+        Ok(())
     }
 
     fn open_audio_directory(&self) -> Result<AudioDirectory, ProjectStoreError> {
@@ -925,10 +952,13 @@ impl ProjectStore {
             SaveKind::Explicit => "project.toml",
             SaveKind::Recovery => ".sampler-tui-recovery.toml",
         });
+        project.revalidate_path_identity()?;
         atomic_replace(&destination, canonical_toml.as_bytes(), &project, &mut hook)?;
+        project.revalidate_path_identity()?;
         if request.save_as {
             remove_save_as_owner(&project)?;
         }
+        project.revalidate_path_identity()?;
 
         Ok(SaveReceipt {
             directory,
@@ -2183,6 +2213,34 @@ pitch_semitones = 0.0
             fs::read(&receipt.mappings[0].project_path).unwrap(),
             fixture.source_bytes
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_fails_closed_when_project_path_is_replaced_after_open() {
+        use std::cell::Cell;
+
+        let fixture = ProjectFixture::new();
+        let opened_directory = fixture.root.join("opened-project");
+        let substituted = Cell::new(false);
+        let result =
+            fixture
+                .store
+                .save_with_hook(fixture.request(1, SaveKind::Explicit), |point| {
+                    if point == AtomicWritePoint::AfterSourceFingerprint
+                        && !substituted.replace(true)
+                    {
+                        fs::rename(&fixture.directory, &opened_directory).unwrap();
+                        fs::create_dir(&fixture.directory).unwrap();
+                    }
+                    None
+                });
+
+        assert!(substituted.get());
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        assert!(!fixture.directory.join("project.toml").exists());
+        assert!(!fixture.directory.join("audio").exists());
+        assert!(!opened_directory.join("project.toml").exists());
     }
 
     #[cfg(unix)]

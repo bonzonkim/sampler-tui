@@ -65,6 +65,60 @@ impl SourceFingerprint {
     pub fn from_path(path: &Path) -> Result<Self, ProjectStoreError> {
         ValidatedSource::open(path).map(|source| source.fingerprint)
     }
+
+    /// Fingerprints bytes already read by the loader without reopening `path`.
+    pub fn from_encoded_bytes(path: &Path, encoded: &[u8]) -> Result<Self, ProjectStoreError> {
+        let extension = SupportedAudioExtension::from_path(path)?;
+        let mut builder = SourceFingerprintBuilder::new(path, extension);
+        builder.update(encoded)?;
+        Ok(builder.finish())
+    }
+}
+
+struct SourceFingerprintBuilder<'a> {
+    path: &'a Path,
+    extension: SupportedAudioExtension,
+    hasher: Sha256,
+    encoded_bytes: u64,
+}
+
+impl<'a> SourceFingerprintBuilder<'a> {
+    fn new(path: &'a Path, extension: SupportedAudioExtension) -> Self {
+        Self {
+            path,
+            extension,
+            hasher: Sha256::new(),
+            encoded_bytes: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Result<(), ProjectStoreError> {
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| ProjectStoreError::SourceTooLarge {
+                path: self.path.to_path_buf(),
+                bytes: u64::MAX,
+                max_bytes: MAX_ENCODED_FILE_BYTES,
+            })?;
+        if self.encoded_bytes > MAX_ENCODED_FILE_BYTES {
+            return Err(ProjectStoreError::SourceTooLarge {
+                path: self.path.to_path_buf(),
+                bytes: self.encoded_bytes,
+                max_bytes: MAX_ENCODED_FILE_BYTES,
+            });
+        }
+        self.hasher.update(bytes);
+        Ok(())
+    }
+
+    fn finish(self) -> SourceFingerprint {
+        SourceFingerprint {
+            digest: AssetDigest::from_bytes(self.hasher.finalize().into()),
+            encoded_bytes: self.encoded_bytes,
+            extension: self.extension,
+        }
+    }
 }
 
 struct ValidatedSource {
@@ -446,8 +500,7 @@ fn hash_validated_handle(
     path: &Path,
     extension: SupportedAudioExtension,
 ) -> Result<SourceFingerprint, ProjectStoreError> {
-    let mut hasher = Sha256::new();
-    let mut encoded_bytes = 0_u64;
+    let mut builder = SourceFingerprintBuilder::new(path, extension);
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file
@@ -459,32 +512,14 @@ fn hash_validated_handle(
         if read == 0 {
             break;
         }
-        encoded_bytes = encoded_bytes.checked_add(read as u64).ok_or_else(|| {
-            ProjectStoreError::SourceTooLarge {
-                path: path.to_path_buf(),
-                bytes: u64::MAX,
-                max_bytes: MAX_ENCODED_FILE_BYTES,
-            }
-        })?;
-        if encoded_bytes > MAX_ENCODED_FILE_BYTES {
-            return Err(ProjectStoreError::SourceTooLarge {
-                path: path.to_path_buf(),
-                bytes: encoded_bytes,
-                max_bytes: MAX_ENCODED_FILE_BYTES,
-            });
-        }
-        hasher.update(&buffer[..read]);
+        builder.update(&buffer[..read])?;
     }
     file.rewind()
         .map_err(|error| ProjectStoreError::SourceRead {
             path: path.to_path_buf(),
             kind: error.kind(),
         })?;
-    Ok(SourceFingerprint {
-        digest: AssetDigest::from_bytes(hasher.finalize().into()),
-        encoded_bytes,
-        extension,
-    })
+    Ok(builder.finish())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,7 +573,7 @@ pub struct SaveReceipt {
     pub mappings: Vec<ProjectAssetMapping>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectProbe {
     pub directory: PathBuf,
     pub explicit: Option<Result<ProjectDocument, ProjectStoreError>>,
@@ -563,7 +598,7 @@ pub enum AtomicWriteVisibility {
     NewDestinationVisibleDurabilityUnconfirmed,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProjectStoreError {
     #[error("could not read source {path}: {kind:?}")]
     SourceRead { path: PathBuf, kind: io::ErrorKind },

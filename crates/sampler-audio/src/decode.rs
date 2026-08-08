@@ -1,11 +1,11 @@
-use std::{fs::File, path::Path};
+use std::{fs::File, io::Cursor, path::Path};
 
 use symphonia::{
     core::{
         codecs::audio::AudioDecoderOptions,
         errors::Error as SymphoniaError,
         formats::{FormatOptions, TrackType, probe::Hint},
-        io::MediaSourceStream,
+        io::{MediaSource, MediaSourceStream},
         meta::MetadataOptions,
     },
     default::{get_codecs, get_probe},
@@ -65,25 +65,42 @@ impl DecodedAudio {
 }
 
 pub fn decode_path(path: &Path) -> Result<DecodedAudio, DecodeError> {
-    decode_path_inner(path, None)
+    let source = open_path(path)?;
+    decode_source_inner(path, source, None)
 }
 
 pub fn decode_path_with_limits(
     path: &Path,
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
-    decode_path_inner(path, Some(limits))
+    let source = open_path(path)?;
+    decode_source_inner(path, source, Some(limits))
 }
 
-fn decode_path_inner(
+/// Decodes an already-read encoded payload using `path` only as a format/error hint.
+pub fn decode_bytes_with_limits(
     path: &Path,
+    encoded: Vec<u8>,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    decode_source_inner(path, Box::new(Cursor::new(encoded)), Some(limits))
+}
+
+fn open_path(path: &Path) -> Result<Box<dyn MediaSource>, DecodeError> {
+    File::open(path)
+        .map(|source| Box::new(source) as Box<dyn MediaSource>)
+        .map_err(|error| DecodeError::Open {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+fn decode_source_inner(
+    path: &Path,
+    source: Box<dyn MediaSource>,
     limits: Option<DecodeLimits>,
 ) -> Result<DecodedAudio, DecodeError> {
-    let source = File::open(path).map_err(|error| DecodeError::Open {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
         hint.with_extension(&extension.to_ascii_lowercase());
@@ -219,8 +236,29 @@ fn validate_payload_limits(
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeLimits, DecodedAudio};
+    use std::io::Cursor;
+    use std::path::Path;
+
+    use super::{DecodeLimits, DecodedAudio, decode_bytes_with_limits};
     use crate::DecodeError;
+
+    fn wav_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let cursor = Cursor::new(&mut bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).unwrap();
+            writer.write_sample(0_i16).unwrap();
+            writer.write_sample(i16::MAX).unwrap();
+            writer.finalize().unwrap();
+        }
+        bytes
+    }
 
     #[test]
     fn validates_decoded_audio_shape() {
@@ -255,5 +293,32 @@ mod tests {
             },
         );
         assert!(over_bytes.is_err());
+    }
+
+    #[test]
+    fn encoded_bytes_use_the_logical_path_hint_and_preserve_decode_limits() {
+        let encoded = wav_bytes();
+        let decoded = decode_bytes_with_limits(
+            Path::new("loaded-from-memory.wav"),
+            encoded.clone(),
+            DecodeLimits {
+                max_frames: 2,
+                max_bytes: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.frames(), 2);
+
+        let error = decode_bytes_with_limits(
+            Path::new("loaded-from-memory.wav"),
+            encoded,
+            DecodeLimits {
+                max_frames: 1,
+                max_bytes: 8,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, DecodeError::FrameLimitExceeded { .. }));
     }
 }

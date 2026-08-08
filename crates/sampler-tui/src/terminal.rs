@@ -17,7 +17,9 @@ use crossterm::terminal::{
 
 use crate::audio::{AudioPort, open_default_audio};
 use crate::input::KeyboardCapabilities;
-use crate::loader::{WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError};
+use crate::loader::{
+    WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError, WorkerSendFailure,
+};
 use crate::{App, ui};
 
 pub const MAX_EVENTS_PER_ITERATION: usize = 64;
@@ -239,7 +241,7 @@ impl EventLoopApp for App {
 
 pub trait EventLoopWorker {
     fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError>;
-    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendError>;
+    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure>;
 }
 
 impl EventLoopWorker for WorkerHandle {
@@ -247,7 +249,7 @@ impl EventLoopWorker for WorkerHandle {
         WorkerHandle::try_recv(self)
     }
 
-    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendError> {
+    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
         WorkerHandle::try_send(self, request)
     }
 }
@@ -344,9 +346,10 @@ where
 
     let mut requests = app.take_worker_requests().into_iter();
     while let Some(request) = requests.next() {
-        match worker.try_send(request.clone()) {
+        match worker.try_send(request) {
             Ok(()) => {}
-            Err(WorkerSendError::WorkerBusy) => {
+            Err(failure) if failure.kind() == WorkerSendError::WorkerBusy => {
+                let request = failure.into_request();
                 state.dirty |= app.apply_worker_send_error(request, WorkerSendError::WorkerBusy);
                 for request in requests {
                     state.dirty |=
@@ -354,7 +357,8 @@ where
                 }
                 break;
             }
-            Err(WorkerSendError::WorkerClosed) => {
+            Err(failure) => {
+                debug_assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "loader worker closed",
@@ -881,9 +885,9 @@ mod tests {
                 .ok_or(std::sync::mpsc::TryRecvError::Empty)
         }
 
-        fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendError> {
+        fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
             if let Some(error) = self.send_error {
-                return Err(error);
+                return Err(WorkerSendFailure::new(error, request));
             }
             self.sent += 1;
             Ok(())

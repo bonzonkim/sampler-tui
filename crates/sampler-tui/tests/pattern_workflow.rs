@@ -235,24 +235,33 @@ impl PatternHarness {
             panic!("load request");
         };
         let rendered = Arc::new(SampleBuffer::new(48_000, vec![0.25; 1024]).expect("sample"));
-        assert!(self.app.apply_worker_result(WorkerResult::Loaded {
-            pad,
-            generation,
-            purpose,
-            path,
-            result: Ok(LoadedSample {
-                base: Arc::clone(&rendered),
-                base_preview: Arc::new([PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],),
-                rendered,
-                rendered_preview: Arc::new(
-                    [PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],
-                ),
-                recipe: sampler_core::SampleEditRecipe::identity(),
-                source_rate: 48_000,
-                source_frames: 512,
-                duration: std::time::Duration::from_millis(11),
-            }),
-        }));
+        assert!(
+            self.app.apply_worker_result(WorkerResult::Loaded {
+                pad,
+                generation,
+                purpose,
+                path,
+                result: Ok(LoadedSample {
+                    fingerprint: sampler_tui::SourceFingerprint::from_encoded_bytes(
+                        std::path::Path::new("fixture.wav"),
+                        &[],
+                    )
+                    .expect("fixture fingerprint"),
+                    base: Arc::clone(&rendered),
+                    base_preview: Arc::new(
+                        [PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],
+                    ),
+                    rendered,
+                    rendered_preview: Arc::new(
+                        [PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],
+                    ),
+                    recipe: sampler_core::SampleEditRecipe::identity(),
+                    source_rate: 48_000,
+                    source_frames: 512,
+                    duration: std::time::Duration::from_millis(11),
+                }),
+            })
+        );
     }
 
     fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) {

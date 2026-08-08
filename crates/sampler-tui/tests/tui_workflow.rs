@@ -23,6 +23,7 @@ use sampler_tui::terminal::{
 use sampler_tui::{
     App, AudioPort, DirectoryEntry, DirectoryEntryKind, DirectoryScan, KeyboardCapabilities,
     LoadedSample, PAD_KEYS, PreviewColumn, WorkerRequest, WorkerResult, WorkerSendError,
+    WorkerSendFailure,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -566,12 +567,12 @@ impl EventLoopWorker for HarnessWorker {
         Ok(result)
     }
 
-    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendError> {
+    fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
         const RESULT_CAPACITY: usize = 8;
 
         let mut state = self.state.borrow_mut();
         if state.results.len() >= RESULT_CAPACITY {
-            return Err(WorkerSendError::WorkerBusy);
+            return Err(WorkerSendFailure::new(WorkerSendError::WorkerBusy, request));
         }
         state.requests_sent = state.requests_sent.saturating_add(1);
         let script = state
@@ -618,6 +619,11 @@ impl EventLoopWorker for HarnessWorker {
                     purpose,
                     path,
                     result: Ok(LoadedSample {
+                        fingerprint: sampler_tui::SourceFingerprint::from_encoded_bytes(
+                            std::path::Path::new("fixture.wav"),
+                            &[],
+                        )
+                        .expect("fixture fingerprint"),
                         base: Arc::clone(&buffer),
                         base_preview: Arc::new(
                             [PreviewColumn::default(); sampler_tui::EDIT_PREVIEW_COLUMNS],
@@ -634,6 +640,12 @@ impl EventLoopWorker for HarnessWorker {
                 });
             }
             WorkerRequest::EditSample { .. } => panic!("event loop must not send edit sample"),
+            WorkerRequest::SaveProject(_)
+            | WorkerRequest::ProbeProject { .. }
+            | WorkerRequest::DiscardRecovery { .. }
+            | WorkerRequest::StageProjectSample(_) => {
+                panic!("event loop must not send project requests yet")
+            }
             WorkerRequest::Shutdown => panic!("event loop must not send worker shutdown"),
         }
         Ok(())
@@ -807,7 +819,7 @@ impl EventLoopWorker for FakeWorker {
         Err(TryRecvError::Empty)
     }
 
-    fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendError> {
+    fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendFailure> {
         Ok(())
     }
 }

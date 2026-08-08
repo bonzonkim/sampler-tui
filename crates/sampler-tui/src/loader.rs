@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -9,12 +10,16 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sampler_audio::{
-    DecodeLimits, SampleBuffer, decode_path_with_limits, prepare_sample_with_frame_limit,
+    DecodeLimits, SampleBuffer, decode_bytes_with_limits, prepare_sample_with_frame_limit,
 };
-use sampler_core::{PadId, SampleEditRecipe, apply_sample_edit};
+use sampler_core::{PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
+use crate::project_store::{
+    ProjectProbe, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind, SaveReceipt,
+    SourceFingerprint,
+};
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
 pub const MAX_DIRECTORY_ENTRIES: usize = 4_096;
@@ -27,6 +32,29 @@ pub const MAX_PREPARED_FRAMES: usize = 8_388_608;
 pub enum LoadPurpose {
     User,
     Recovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProjectToken(u64);
+
+impl ProjectToken {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageProjectSampleRequest {
+    pub token: ProjectToken,
+    pub pad: PadId,
+    pub revision: u64,
+    pub path: PathBuf,
+    pub engine_rate: u32,
+    pub recipe: SampleEditRecipe,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +79,18 @@ pub enum WorkerRequest {
         base_preview: EditPreview,
         recipe: SampleEditRecipe,
     },
+    SaveProject(Box<ProjectSaveRequest>),
+    ProbeProject {
+        token: ProjectToken,
+        directory: PathBuf,
+    },
+    DiscardRecovery {
+        token: ProjectToken,
+        directory: PathBuf,
+        project_id: ProjectId,
+        revision: u64,
+    },
+    StageProjectSample(Box<StageProjectSampleRequest>),
     Shutdown,
 }
 
@@ -74,10 +114,36 @@ pub enum WorkerResult {
         recipe: SampleEditRecipe,
         result: Result<RenderedSample, String>,
     },
+    ProjectSaved {
+        kind: SaveKind,
+        revision: u64,
+        result: Result<SaveReceipt, ProjectStoreError>,
+    },
+    ProjectProbed {
+        token: ProjectToken,
+        directory: PathBuf,
+        result: Result<ProjectProbe, ProjectStoreError>,
+    },
+    RecoveryDiscarded {
+        token: ProjectToken,
+        directory: PathBuf,
+        project_id: ProjectId,
+        revision: u64,
+        result: Result<(), ProjectStoreError>,
+    },
+    ProjectSampleStaged {
+        token: ProjectToken,
+        pad: PadId,
+        revision: u64,
+        path: PathBuf,
+        recipe: SampleEditRecipe,
+        result: Result<LoadedSample, LoadSampleError>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedSample {
+    pub fingerprint: SourceFingerprint,
     pub base: Arc<SampleBuffer>,
     /// Fixed preview of the immutable base PCM used by the Sample editor.
     pub base_preview: EditPreview,
@@ -106,6 +172,7 @@ pub struct RenderedSample {
 pub enum LoadSampleError {
     Metadata(String),
     EncodedFileTooLarge { bytes: u64, max_bytes: u64 },
+    Fingerprint(String),
     Decode(String),
     Prepare(String),
 }
@@ -118,6 +185,7 @@ impl fmt::Display for LoadSampleError {
                 formatter,
                 "encoded sample payload {bytes} bytes exceeds the {max_bytes}-byte encoded input limit"
             ),
+            Self::Fingerprint(error) => formatter.write_str(error),
             Self::Decode(error) => formatter.write_str(error),
             Self::Prepare(error) => formatter.write_str(error),
         }
@@ -142,6 +210,38 @@ impl fmt::Display for WorkerSendError {
 }
 
 impl Error for WorkerSendError {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerSendFailure {
+    kind: WorkerSendError,
+    request: WorkerRequest,
+}
+
+impl WorkerSendFailure {
+    pub fn new(kind: WorkerSendError, request: WorkerRequest) -> Self {
+        Self { kind, request }
+    }
+
+    pub const fn kind(&self) -> WorkerSendError {
+        self.kind
+    }
+
+    pub fn request(&self) -> &WorkerRequest {
+        &self.request
+    }
+
+    pub fn into_request(self) -> WorkerRequest {
+        self.request
+    }
+}
+
+impl fmt::Display for WorkerSendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl Error for WorkerSendFailure {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerPanicked;
@@ -175,7 +275,7 @@ impl WorkerHandle {
         }
     }
 
-    pub fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendError> {
+    pub fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
         try_send_request(self.requests.as_ref(), request)
     }
 
@@ -218,13 +318,18 @@ impl WorkerHandle {
 fn try_send_request(
     sender: Option<&SyncSender<WorkerRequest>>,
     request: WorkerRequest,
-) -> Result<(), WorkerSendError> {
+) -> Result<(), WorkerSendFailure> {
     let Some(sender) = sender else {
-        return Err(WorkerSendError::WorkerClosed);
+        return Err(WorkerSendFailure::new(
+            WorkerSendError::WorkerClosed,
+            request,
+        ));
     };
     sender.try_send(request).map_err(|error| match error {
-        TrySendError::Full(_) => WorkerSendError::WorkerBusy,
-        TrySendError::Disconnected(_) => WorkerSendError::WorkerClosed,
+        TrySendError::Full(request) => WorkerSendFailure::new(WorkerSendError::WorkerBusy, request),
+        TrySendError::Disconnected(request) => {
+            WorkerSendFailure::new(WorkerSendError::WorkerClosed, request)
+        }
     })
 }
 
@@ -235,6 +340,44 @@ impl Drop for WorkerHandle {
 }
 
 fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResult>) {
+    worker_loop_with_store(requests, results, Box::new(ProjectStore));
+}
+
+trait ProjectStoreBackend: Send {
+    fn save(&self, request: ProjectSaveRequest) -> Result<SaveReceipt, ProjectStoreError>;
+    fn probe(&self, directory: &Path) -> Result<ProjectProbe, ProjectStoreError>;
+    fn discard_recovery(
+        &self,
+        directory: &Path,
+        project_id: ProjectId,
+        revision: u64,
+    ) -> Result<(), ProjectStoreError>;
+}
+
+impl ProjectStoreBackend for ProjectStore {
+    fn save(&self, request: ProjectSaveRequest) -> Result<SaveReceipt, ProjectStoreError> {
+        ProjectStore::save(self, request)
+    }
+
+    fn probe(&self, directory: &Path) -> Result<ProjectProbe, ProjectStoreError> {
+        ProjectStore::probe(self, directory)
+    }
+
+    fn discard_recovery(
+        &self,
+        directory: &Path,
+        project_id: ProjectId,
+        revision: u64,
+    ) -> Result<(), ProjectStoreError> {
+        ProjectStore::discard_recovery(self, directory, project_id, revision)
+    }
+}
+
+fn worker_loop_with_store(
+    requests: Receiver<WorkerRequest>,
+    results: SyncSender<WorkerResult>,
+    store: Box<dyn ProjectStoreBackend>,
+) {
     while let Ok(request) = requests.recv() {
         let result = match request {
             WorkerRequest::ScanDirectory {
@@ -272,6 +415,50 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
                 recipe,
                 result: render_sample_edit(&base, base_preview, recipe),
             },
+            WorkerRequest::SaveProject(request) => {
+                let kind = request.kind;
+                let revision = request.snapshot.revision;
+                WorkerResult::ProjectSaved {
+                    kind,
+                    revision,
+                    result: store.save(*request),
+                }
+            }
+            WorkerRequest::ProbeProject { token, directory } => WorkerResult::ProjectProbed {
+                token,
+                result: store.probe(&directory),
+                directory,
+            },
+            WorkerRequest::DiscardRecovery {
+                token,
+                directory,
+                project_id,
+                revision,
+            } => WorkerResult::RecoveryDiscarded {
+                token,
+                result: store.discard_recovery(&directory, project_id, revision),
+                directory,
+                project_id,
+                revision,
+            },
+            WorkerRequest::StageProjectSample(request) => {
+                let StageProjectSampleRequest {
+                    token,
+                    pad,
+                    revision,
+                    path,
+                    engine_rate,
+                    recipe,
+                } = *request;
+                WorkerResult::ProjectSampleStaged {
+                    token,
+                    pad,
+                    revision,
+                    result: load_sample(&path, engine_rate, recipe),
+                    path,
+                    recipe,
+                }
+            }
             WorkerRequest::Shutdown => break,
         };
         if results.send(result).is_err() {
@@ -332,17 +519,24 @@ fn load_sample(
     engine_rate: u32,
     recipe: SampleEditRecipe,
 ) -> Result<LoadedSample, LoadSampleError> {
-    let encoded_bytes = fs::metadata(path)
-        .map_err(|error| LoadSampleError::Metadata(format_error(&error)))?
-        .len();
+    let file =
+        fs::File::open(path).map_err(|error| LoadSampleError::Metadata(format_error(&error)))?;
+    let mut encoded = Vec::new();
+    file.take(MAX_ENCODED_FILE_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|error| LoadSampleError::Metadata(format_error(&error)))?;
+    let encoded_bytes = encoded.len() as u64;
     if encoded_bytes > MAX_ENCODED_FILE_BYTES {
         return Err(LoadSampleError::EncodedFileTooLarge {
             bytes: encoded_bytes,
             max_bytes: MAX_ENCODED_FILE_BYTES,
         });
     }
-    let decoded = decode_path_with_limits(
+    let fingerprint = SourceFingerprint::from_encoded_bytes(path, &encoded)
+        .map_err(|error| LoadSampleError::Fingerprint(error.to_string()))?;
+    let decoded = decode_bytes_with_limits(
         path,
+        encoded,
         DecodeLimits {
             max_frames: MAX_DECODED_FRAMES,
             max_bytes: MAX_DECODED_BYTES,
@@ -360,6 +554,7 @@ fn load_sample(
     let rendered =
         render_sample_edit(&base, base_preview, recipe).map_err(LoadSampleError::Prepare)?;
     Ok(LoadedSample {
+        fingerprint,
         base,
         base_preview: rendered.base_preview,
         rendered: rendered.rendered,
@@ -522,15 +717,19 @@ mod tests {
     use std::time::Duration;
 
     use sampler_audio::SampleBuffer;
-    use sampler_core::{BankId, PadId, SampleEditRecipe};
+    use sampler_core::{BankId, PadId, ProjectId, SampleEditRecipe};
 
     use super::{
         EDIT_PREVIEW_COLUMNS, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
-        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
-        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
-        preview_column, scan_directory, try_send_request, worker_loop,
+        ProjectStoreBackend, ProjectToken, StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY,
+        WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, build_preview,
+        downsample_preview, frame_duration, load_sample, preview_column, scan_directory,
+        try_send_request, worker_loop, worker_loop_with_store,
     };
-    use crate::DirectoryEntry;
+    use crate::{
+        DirectoryEntry, ProjectProbe, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError,
+        SaveKind, SaveReceipt, SourceFingerprint,
+    };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -607,6 +806,20 @@ mod tests {
         }
     }
 
+    fn worker_with_store(store: Box<dyn ProjectStoreBackend>) -> WorkerHandle {
+        let (requests, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let (result_sender, results) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let worker = thread::Builder::new()
+            .name("sampler-loader".to_owned())
+            .spawn(move || worker_loop_with_store(request_receiver, result_sender, store))
+            .unwrap();
+        WorkerHandle {
+            requests: Some(requests),
+            results,
+            worker: Some(worker),
+        }
+    }
+
     fn panicked_worker() -> WorkerHandle {
         let (requests, request_receiver) = mpsc::sync_channel(8);
         let (result_sender, results) = mpsc::sync_channel(8);
@@ -617,6 +830,96 @@ mod tests {
             requests: Some(requests),
             results,
             worker: Some(worker),
+        }
+    }
+
+    fn empty_save_request(kind: SaveKind, revision: u64) -> ProjectSaveRequest {
+        ProjectSaveRequest {
+            directory: PathBuf::from(format!("project-{revision}")),
+            save_as: false,
+            kind,
+            snapshot: ProjectSaveSnapshot {
+                project_id: ProjectId::from_bytes([revision as u8; 16]),
+                name: format!("project-{revision}"),
+                revision,
+                pads: Vec::new(),
+                patterns: Vec::new(),
+            },
+        }
+    }
+
+    struct ScriptedProjectStore;
+
+    impl ProjectStoreBackend for ScriptedProjectStore {
+        fn save(&self, request: ProjectSaveRequest) -> Result<SaveReceipt, ProjectStoreError> {
+            assert_eq!(thread::current().name(), Some("sampler-loader"));
+            if request.kind == SaveKind::Recovery {
+                return Err(ProjectStoreError::Filesystem {
+                    operation: "scripted save",
+                    path: request.directory,
+                    kind: std::io::ErrorKind::PermissionDenied,
+                });
+            }
+            Ok(SaveReceipt {
+                directory: request.directory,
+                kind: request.kind,
+                project_id: request.snapshot.project_id,
+                revision: request.snapshot.revision,
+                canonical_toml: "scripted".to_owned(),
+                mappings: Vec::new(),
+            })
+        }
+
+        fn probe(&self, directory: &Path) -> Result<ProjectProbe, ProjectStoreError> {
+            assert_eq!(thread::current().name(), Some("sampler-loader"));
+            if directory.ends_with("bad-probe") {
+                return Err(ProjectStoreError::Filesystem {
+                    operation: "scripted probe",
+                    path: directory.to_owned(),
+                    kind: std::io::ErrorKind::NotFound,
+                });
+            }
+            Ok(ProjectProbe {
+                directory: directory.to_owned(),
+                explicit: None,
+                recovery: None,
+            })
+        }
+
+        fn discard_recovery(
+            &self,
+            directory: &Path,
+            _project_id: ProjectId,
+            revision: u64,
+        ) -> Result<(), ProjectStoreError> {
+            assert_eq!(thread::current().name(), Some("sampler-loader"));
+            if revision == 404 {
+                return Err(ProjectStoreError::RecoveryMismatch {
+                    path: directory.to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    struct PanickingProjectStore;
+
+    impl ProjectStoreBackend for PanickingProjectStore {
+        fn save(&self, _request: ProjectSaveRequest) -> Result<SaveReceipt, ProjectStoreError> {
+            panic!("injected project store panic")
+        }
+
+        fn probe(&self, _directory: &Path) -> Result<ProjectProbe, ProjectStoreError> {
+            panic!("injected project store panic")
+        }
+
+        fn discard_recovery(
+            &self,
+            _directory: &Path,
+            _project_id: ProjectId,
+            _revision: u64,
+        ) -> Result<(), ProjectStoreError> {
+            panic!("injected project store panic")
         }
     }
 
@@ -648,11 +951,207 @@ mod tests {
         assert_eq!(generation, 7);
         assert_eq!(purpose, LoadPurpose::Recovery);
         assert_eq!(sample.rendered.sample_rate(), 48_000);
+        assert_eq!(
+            sample.fingerprint,
+            SourceFingerprint::from_path(fixture.path()).unwrap()
+        );
         assert_eq!(sample.base_preview.len(), EDIT_PREVIEW_COLUMNS);
         assert!(sample.base_preview.iter().any(|column| column.max > 0));
         assert!(sample.base_preview.iter().any(|column| column.min < 0));
         assert!(Arc::ptr_eq(&sample.base_preview, &sample.rendered_preview));
         worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stage_project_sample_applies_its_recipe_and_echoes_context_on_decode_error() {
+        let fixture = wav_fixture(48_000, &[i16::MAX, 0, 0, i16::MIN]);
+        let recipe =
+            SampleEditRecipe::new(0, sampler_core::SAMPLE_PHASE_SCALE / 2, false, false).unwrap();
+        let token = ProjectToken::new(73);
+        let project_pad = pad(1, 4);
+        let missing = fixture.path().with_file_name("missing-stage.wav");
+        let mut worker = WorkerHandle::spawn();
+
+        worker
+            .try_send(WorkerRequest::StageProjectSample(Box::new(
+                StageProjectSampleRequest {
+                    token,
+                    pad: project_pad,
+                    revision: 19,
+                    path: fixture.path().to_owned(),
+                    engine_rate: 48_000,
+                    recipe,
+                },
+            )))
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::StageProjectSample(Box::new(
+                StageProjectSampleRequest {
+                    token,
+                    pad: project_pad,
+                    revision: 20,
+                    path: missing.clone(),
+                    engine_rate: 48_000,
+                    recipe,
+                },
+            )))
+            .unwrap();
+
+        let WorkerResult::ProjectSampleStaged {
+            token: success_token,
+            pad: success_pad,
+            revision: success_revision,
+            path: success_path,
+            recipe: success_recipe,
+            result: Ok(sample),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong stage success result")
+        };
+        assert_eq!(success_token, token);
+        assert_eq!(success_pad, project_pad);
+        assert_eq!(success_revision, 19);
+        assert_eq!(success_path, fixture.path());
+        assert_eq!(success_recipe, recipe);
+        assert_eq!(sample.recipe, recipe);
+        assert!(!Arc::ptr_eq(&sample.base, &sample.rendered));
+
+        let WorkerResult::ProjectSampleStaged {
+            token: error_token,
+            pad: error_pad,
+            revision: error_revision,
+            path: error_path,
+            recipe: error_recipe,
+            result: Err(_),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong stage error result")
+        };
+        assert_eq!(error_token, token);
+        assert_eq!(error_pad, project_pad);
+        assert_eq!(error_revision, 20);
+        assert_eq!(error_path, missing);
+        assert_eq!(error_recipe, recipe);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn project_store_successes_and_errors_echo_operation_context() {
+        let mut worker = worker_with_store(Box::new(ScriptedProjectStore));
+        let save_success = empty_save_request(SaveKind::Explicit, 31);
+        let save_error = empty_save_request(SaveKind::Recovery, 32);
+        let probe_token = ProjectToken::new(81);
+        let discard_token = ProjectToken::new(82);
+        let project_id = ProjectId::from_bytes([9; 16]);
+
+        worker
+            .try_send(WorkerRequest::SaveProject(Box::new(save_success)))
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::SaveProject(Box::new(save_error)))
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::ProbeProject {
+                token: probe_token,
+                directory: PathBuf::from("good-probe"),
+            })
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::ProbeProject {
+                token: probe_token,
+                directory: PathBuf::from("bad-probe"),
+            })
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::DiscardRecovery {
+                token: discard_token,
+                directory: PathBuf::from("project"),
+                project_id,
+                revision: 33,
+            })
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::DiscardRecovery {
+                token: discard_token,
+                directory: PathBuf::from("project"),
+                project_id,
+                revision: 404,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::ProjectSaved {
+                kind: SaveKind::Explicit,
+                revision: 31,
+                result: Ok(_)
+            }
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::ProjectSaved {
+                kind: SaveKind::Recovery,
+                revision: 32,
+                result: Err(_)
+            }
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::ProjectProbed { token, result: Ok(_), .. } if token == probe_token
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::ProjectProbed { token, result: Err(_), .. } if token == probe_token
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::RecoveryDiscarded { token, project_id: result_id, revision: 33, result: Ok(()), .. }
+                if token == discard_token && result_id == project_id
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::RecoveryDiscarded { token, project_id: result_id, revision: 404, result: Err(_), .. }
+                if token == discard_token && result_id == project_id
+        ));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn full_and_closed_send_errors_retain_the_original_request() {
+        let (sender, _receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        for _ in 0..WORKER_CHANNEL_CAPACITY {
+            try_send_request(Some(&sender), WorkerRequest::Shutdown).unwrap();
+        }
+        let request =
+            WorkerRequest::SaveProject(Box::new(empty_save_request(SaveKind::Recovery, 91)));
+        let failure = try_send_request(Some(&sender), request.clone()).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerBusy);
+        assert_eq!(failure.into_request(), request);
+
+        let request = WorkerRequest::ProbeProject {
+            token: ProjectToken::new(92),
+            directory: PathBuf::from("closed"),
+        };
+        let failure = try_send_request(None, request.clone()).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), request);
+    }
+
+    #[test]
+    fn project_store_panic_keeps_join_terminal_safe() {
+        let mut worker = worker_with_store(Box::new(PanickingProjectStore));
+        worker
+            .try_send(WorkerRequest::ProbeProject {
+                token: ProjectToken::new(99),
+                directory: PathBuf::from("panic"),
+            })
+            .unwrap();
+
+        assert_eq!(worker.join(), Err(WorkerPanicked));
+        assert_eq!(worker.join(), Ok(()));
+        let failure = worker.try_send(WorkerRequest::Shutdown).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
     }
 
     #[test]
@@ -974,21 +1473,18 @@ mod tests {
     fn request_try_send_distinguishes_full_and_closed_channels() {
         let (full_sender, _full_receiver) = mpsc::sync_channel(1);
         try_send_request(Some(&full_sender), WorkerRequest::Shutdown).unwrap();
-        assert_eq!(
-            try_send_request(Some(&full_sender), WorkerRequest::Shutdown),
-            Err(WorkerSendError::WorkerBusy)
-        );
+        let failure = try_send_request(Some(&full_sender), WorkerRequest::Shutdown).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerBusy);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
 
         let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
         drop(closed_receiver);
-        assert_eq!(
-            try_send_request(Some(&closed_sender), WorkerRequest::Shutdown),
-            Err(WorkerSendError::WorkerClosed)
-        );
-        assert_eq!(
-            try_send_request(None, WorkerRequest::Shutdown),
-            Err(WorkerSendError::WorkerClosed)
-        );
+        let failure = try_send_request(Some(&closed_sender), WorkerRequest::Shutdown).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
+        let failure = try_send_request(None, WorkerRequest::Shutdown).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
     }
 
     #[test]
@@ -1017,10 +1513,9 @@ mod tests {
 
         worker.request_shutdown();
 
-        assert_eq!(
-            worker.try_send(WorkerRequest::Shutdown),
-            Err(WorkerSendError::WorkerClosed)
-        );
+        let failure = worker.try_send(WorkerRequest::Shutdown).unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
         assert_eq!(worker.join(), Ok(()));
     }
 

@@ -868,6 +868,10 @@ mod tests {
             crate::WorkerRequest::LoadSample { generation, .. } => generation,
             crate::WorkerRequest::EditSample { .. }
             | crate::WorkerRequest::ScanDirectory { .. }
+            | crate::WorkerRequest::SaveProject(_)
+            | crate::WorkerRequest::ProbeProject { .. }
+            | crate::WorkerRequest::DiscardRecovery { .. }
+            | crate::WorkerRequest::StageProjectSample(_)
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
@@ -880,22 +884,29 @@ mod tests {
                 max: height,
             };
         }
-        assert!(app.apply_worker_result(WorkerResult::Loaded {
-            pad: kick,
-            generation,
-            purpose: LoadPurpose::User,
-            path,
-            result: Ok(LoadedSample {
-                base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
-                base_preview: Arc::new(preview),
-                rendered: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
-                rendered_preview: Arc::new(preview),
-                recipe: sampler_core::SampleEditRecipe::identity(),
-                source_rate: 48_000,
-                source_frames: 128,
-                duration: Duration::from_secs_f64(128.0 / 48_000.0),
-            }),
-        }));
+        assert!(
+            app.apply_worker_result(WorkerResult::Loaded {
+                pad: kick,
+                generation,
+                purpose: LoadPurpose::User,
+                path,
+                result: Ok(LoadedSample {
+                    fingerprint: crate::SourceFingerprint::from_encoded_bytes(
+                        std::path::Path::new("fixture.wav"),
+                        &[],
+                    )
+                    .unwrap(),
+                    base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                    base_preview: Arc::new(preview),
+                    rendered: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                    rendered_preview: Arc::new(preview),
+                    recipe: sampler_core::SampleEditRecipe::identity(),
+                    source_rate: 48_000,
+                    source_frames: 128,
+                    duration: Duration::from_secs_f64(128.0 / 48_000.0),
+                }),
+            })
+        );
         assert_eq!(app.pad(kick).preview[0], PreviewColumn { min: -8, max: 8 });
         app.begin_load(pad(4), "/samples/HAT.wav");
         let error_path = std::path::PathBuf::from("/samples/CLAP.wav");
@@ -904,6 +915,10 @@ mod tests {
             crate::WorkerRequest::LoadSample { generation, .. } => generation,
             crate::WorkerRequest::EditSample { .. }
             | crate::WorkerRequest::ScanDirectory { .. }
+            | crate::WorkerRequest::SaveProject(_)
+            | crate::WorkerRequest::ProbeProject { .. }
+            | crate::WorkerRequest::DiscardRecovery { .. }
+            | crate::WorkerRequest::StageProjectSample(_)
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
@@ -1532,24 +1547,33 @@ mod tests {
         let crate::WorkerRequest::LoadSample { generation, .. } = request else {
             panic!("wrong request")
         };
-        assert!(app.apply_worker_result(WorkerResult::Loaded {
-            pad: pad(0),
-            generation,
-            purpose: LoadPurpose::User,
-            path: sample_path,
-            result: Ok(LoadedSample {
-                base: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
-                base_preview: Arc::new([PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],),
-                rendered: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
-                rendered_preview: Arc::new(
-                    [PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],
-                ),
-                recipe: sampler_core::SampleEditRecipe::identity(),
-                source_rate: 48_000,
-                source_frames: 64,
-                duration: Duration::from_secs_f64(64.0 / 48_000.0),
-            }),
-        }));
+        assert!(
+            app.apply_worker_result(WorkerResult::Loaded {
+                pad: pad(0),
+                generation,
+                purpose: LoadPurpose::User,
+                path: sample_path,
+                result: Ok(LoadedSample {
+                    fingerprint: crate::SourceFingerprint::from_encoded_bytes(
+                        std::path::Path::new("fixture.wav"),
+                        &[],
+                    )
+                    .unwrap(),
+                    base: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                    base_preview: Arc::new(
+                        [PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],
+                    ),
+                    rendered: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                    rendered_preview: Arc::new(
+                        [PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],
+                    ),
+                    recipe: sampler_core::SampleEditRecipe::identity(),
+                    source_rate: 48_000,
+                    source_frames: 64,
+                    duration: Duration::from_secs_f64(64.0 / 48_000.0),
+                }),
+            })
+        );
 
         let snapshot = render_lines(80, 24, &app).join("\n");
 

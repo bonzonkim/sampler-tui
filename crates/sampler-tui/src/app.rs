@@ -819,7 +819,12 @@ impl App {
             WorkerRequest::LoadSample { pad, .. } | WorkerRequest::EditSample { pad, .. } => {
                 Some(pad_offset(*pad))
             }
-            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => None,
+            WorkerRequest::ScanDirectory { .. }
+            | WorkerRequest::SaveProject(_)
+            | WorkerRequest::ProbeProject { .. }
+            | WorkerRequest::DiscardRecovery { .. }
+            | WorkerRequest::StageProjectSample(_)
+            | WorkerRequest::Shutdown => None,
         };
         let message = error.to_string();
         let applied = match request {
@@ -877,7 +882,12 @@ impl App {
                 }
                 true
             }
-            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => false,
+            WorkerRequest::ScanDirectory { .. }
+            | WorkerRequest::SaveProject(_)
+            | WorkerRequest::ProbeProject { .. }
+            | WorkerRequest::DiscardRecovery { .. }
+            | WorkerRequest::StageProjectSample(_)
+            | WorkerRequest::Shutdown => false,
         };
         if applied {
             self.status = message;
@@ -3713,6 +3723,11 @@ mod tests {
             purpose,
             path: source.into(),
             result: Ok(LoadedSample {
+                fingerprint: crate::SourceFingerprint::from_encoded_bytes(
+                    std::path::Path::new("fixture.wav"),
+                    &[],
+                )
+                .unwrap(),
                 base: Arc::clone(&rendered),
                 base_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
                 rendered,

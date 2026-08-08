@@ -4,7 +4,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use sampler_audio::{DecodeError, decode_path};
+use sampler_audio::{
+    DecodeError, DecodeLimits, decode_bytes_with_limits, decode_path, decode_path_with_limits,
+};
 
 static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -155,5 +157,67 @@ fn corrupt_input_returns_a_probe_or_decode_error() {
     assert!(matches!(
         decode_path(fixture.path()),
         Err(DecodeError::Probe { .. })
+    ));
+}
+
+#[test]
+fn byte_and_path_decoders_share_format_error_and_limit_behavior() {
+    let fixtures = [
+        wav_fixture(44_100, 1, &[0_i16, i16::MAX, i16::MIN]),
+        hex_fixture("aiff", AIFF_MONO_8K),
+        hex_fixture("flac", FLAC_MONO_8K),
+        hex_fixture("mp3", MP3_MONO_8K),
+    ];
+    let generous = DecodeLimits {
+        max_frames: 4_096,
+        max_bytes: 32_768,
+    };
+    for fixture in fixtures {
+        let encoded = fs::read(fixture.path()).unwrap();
+        assert_eq!(
+            decode_bytes_with_limits(fixture.path(), encoded, generous).unwrap(),
+            decode_path_with_limits(fixture.path(), generous).unwrap()
+        );
+    }
+
+    let corrupt = byte_fixture("mp3", b"not audio");
+    let path_error = decode_path_with_limits(corrupt.path(), generous).unwrap_err();
+    let bytes_error =
+        decode_bytes_with_limits(corrupt.path(), fs::read(corrupt.path()).unwrap(), generous)
+            .unwrap_err();
+    assert_eq!(
+        std::mem::discriminant(&bytes_error),
+        std::mem::discriminant(&path_error)
+    );
+
+    let limited = wav_fixture(48_000, 1, &[0_i16, 1, 2]);
+    let limits = DecodeLimits {
+        max_frames: 2,
+        max_bytes: 64,
+    };
+    assert!(matches!(
+        decode_path_with_limits(limited.path(), limits),
+        Err(DecodeError::FrameLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        decode_bytes_with_limits(limited.path(), fs::read(limited.path()).unwrap(), limits,),
+        Err(DecodeError::FrameLimitExceeded { .. })
+    ));
+
+    let byte_limits = DecodeLimits {
+        max_frames: 3,
+        max_bytes: 11,
+    };
+    assert!(matches!(
+        decode_path_with_limits(limited.path(), byte_limits),
+        Err(DecodeError::ByteLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        decode_bytes_with_limits(
+            limited.path(),
+            fs::read(limited.path()).unwrap(),
+            byte_limits,
+        ),
+        Err(DecodeError::ByteLimitExceeded { .. })
     ));
 }

@@ -15,6 +15,25 @@ use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const HELP_LINES: [&str; 17] = [
+    "GLOBAL: Ctrl+R retries audio first when the device is unavailable",
+    "Tab / Shift+Tab: cycle Perform / Pattern / Sample",
+    "Space: play / stop selected pattern",
+    "Ctrl+R: overdub record selected pattern",
+    ", / .: previous / next pattern (1..16)",
+    "PATTERN",
+    "Arrows / PgUp / PgDn: cursor / visible bar",
+    "Enter / Delete: toggle / remove event",
+    "+ / - / u / Ctrl+Delete: velocity / undo / clear",
+    "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
+    "Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
+    "plain z remains pad 13; Apply is in-memory only",
+    "Source file unchanged",
+    "Disk/project persistence is not implemented yet",
+    "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
+    "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
+    "Ctrl+Q / Ctrl+C quit · Esc or ? close help",
+];
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -364,31 +383,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
     match overlay {
-        Overlay::Help => render_list_overlay(
-            frame,
-            area,
-            " HELP ",
-            72,
-            20,
-            [
-                "GLOBAL (Ctrl+R retries audio first when device is unavailable)",
-                "Tab / Shift+Tab                            cycle Perform / Pattern / Sample",
-                "Space                                      play / stop selected pattern",
-                "Ctrl+R                                     overdub record selected pattern",
-                ", / .                                     previous / next pattern (1..16)",
-                "PATTERN",
-                "Arrows / PgUp / PgDn                       cursor / visible bar",
-                "Enter / Delete                             toggle / remove event",
-                "+ / - / u / Ctrl+Delete                   velocity / undo / clear",
-                "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
-                "        Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
-                "        plain z remains pad 13; Apply is in-memory only; source unchanged",
-                "PADS: 1-4/Q-R/A-F/Z-V are global · Shift+pad stop · [/] bank",
-                "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
-                "Ctrl+Q / Ctrl+C                            quit",
-                "Esc or ?                                   close help",
-            ],
-        ),
+        Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 20, HELP_LINES),
         Overlay::Palette => render_palette(frame, area, app),
         Overlay::FilePicker => render_picker(frame, area, app),
         Overlay::DeviceError(error) => render_list_overlay(
@@ -424,12 +419,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             area,
             " APPLY SAMPLE EDIT ",
             72,
-            6,
+            8,
             [
                 format!("Apply in-memory edit to pad {}?", pad.index() + 1),
-                format!(
-                    "{before_frames} frames → {after_frames} frames; in-memory only; source file unchanged."
-                ),
+                format!("Before {before_frames} frames"),
+                format!("After {after_frames} frames"),
+                "Source file unchanged. Disk/project persistence is not implemented.".to_owned(),
                 "Enter confirms · Esc cancels".to_owned(),
             ],
         ),
@@ -438,10 +433,11 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             area,
             " DISCARD SAMPLE DRAFT ",
             72,
-            6,
+            7,
             [
                 format!("Discard un-applied edits for pad {}?", pad.index() + 1),
-                "Committed in-memory audio remains unchanged; source file unchanged.".to_owned(),
+                "Committed in-memory audio remains unchanged.".to_owned(),
+                "Source file unchanged.".to_owned(),
                 "Enter confirms · Esc keeps editing".to_owned(),
             ],
         ),
@@ -1381,6 +1377,40 @@ mod tests {
     }
 
     #[test]
+    fn sample_workspace_status_ignores_an_unrelated_pad_error() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+
+        assert!(screen.contains("STATUS CLEAN"));
+        assert!(!screen.contains("decode failed"));
+    }
+
+    #[test]
+    fn help_keeps_sample_safety_and_persistence_tails_visible_at_eighty_columns() {
+        let mut app = ready_app();
+        app.open_help();
+
+        let screen = render_lines(80, 24, &app).join("\n");
+
+        assert!(screen.contains("Apply is in-memory only"));
+        assert!(screen.contains("Source file unchanged"));
+        assert!(screen.contains("Disk/project persistence is not implemented yet"));
+    }
+
+    #[test]
+    fn help_lines_fit_the_seventy_column_inner_width_with_display_width_safe_text() {
+        assert!(
+            super::HELP_LINES
+                .iter()
+                .all(|line| super::display_width(line) <= 70)
+        );
+        assert_eq!(super::display_width(&super::truncate("샘플 help", 7)), 7);
+    }
+
+    #[test]
     fn sample_confirmation_overlays_clear_and_state_that_edits_are_in_memory_only() {
         let mut apply = loaded_states_app(FakeAudio::ready());
         apply.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1388,16 +1418,43 @@ mod tests {
         apply.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         apply.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let apply_screen = render_lines(80, 24, &apply).join("\n");
-        assert!(apply_screen.contains("in-memory only; source file unchanged"));
+        assert!(apply_screen.contains("Source file unchanged"));
+        assert!(apply_screen.contains("Disk/project persistence is not implemented"));
 
         let mut discard = loaded_states_app(FakeAudio::ready());
         discard.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         discard.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         discard.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         discard.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(render_symbol(80, 24, &discard, 4, 9), "┌");
+        assert_eq!(render_symbol(80, 24, &discard, 4, 8), "┌");
         let discard_screen = render_lines(80, 24, &discard).join("\n");
         assert!(discard_screen.contains("source file unchanged"));
+    }
+
+    #[test]
+    fn apply_overlay_keeps_maximum_frame_counts_and_source_safety_visible() {
+        let app = ready_app();
+        let overlay = Overlay::ApplySample {
+            pad: pad(0),
+            before_frames: 8_388_608,
+            after_frames: 8_388_607,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render_overlay(frame, frame.area(), &app, &overlay))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+        }
+
+        assert!(screen.contains("Before 8388608 frames"));
+        assert!(screen.contains("After 8388607 frames"));
+        assert!(screen.contains("Source file unchanged"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use sampler_core::PlaybackMode;
 
 use crate::{
-    App, EDIT_PREVIEW_COLUMNS, OffscreenDirection, PreviewColumn, SampleMarker,
+    App, EDIT_PREVIEW_COLUMNS, OffscreenDirection, PreviewColumn, SampleEditStatus, SampleMarker,
     WorkspaceSampleEditorStatus,
 };
 
@@ -99,7 +99,11 @@ pub(crate) fn render_sample(frame: &mut Frame, area: Rect, app: &App) {
         frame,
         inner,
         16,
-        sample_status_line(app.status(), editor.status()),
+        sample_status_line(
+            editor.status(),
+            &pad.state,
+            app.sample_edit_status(editor.pad()),
+        ),
         Style::default().fg(Color::Yellow),
     );
     render_line(
@@ -159,20 +163,19 @@ fn render_waveform(frame: &mut Frame, area: Rect, app: &App) {
     let editor = app.sample_editor();
     let projection = editor.project(inner.width);
     let preview = app.edit_preview(editor.pad());
+    let preview_bins = preview_bins_for_viewport(projection.visible.start, projection.visible.end);
     let rows = usize::from(inner.height);
     let columns = usize::from(inner.width);
     for row in 0..rows {
         let mut spans = Vec::with_capacity(columns);
         for column in 0..columns {
-            let index = preview_index(
-                projection.visible.start,
-                projection.visible.end,
-                column,
-                columns,
-            );
             let value = preview
-                .and_then(|preview| preview.get(index))
-                .copied()
+                .map(|preview| {
+                    aggregate_preview_column(
+                        preview.as_ref(),
+                        preview_partition(preview_bins.clone(), column, columns),
+                    )
+                })
                 .unwrap_or_default();
             let (mut glyph, mut style) = waveform_cell(value, row, rows);
             let column = u16::try_from(column).expect("terminal column fits u16");
@@ -197,23 +200,70 @@ fn render_waveform(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn preview_index(visible_start: u64, visible_end: u64, column: usize, columns: usize) -> usize {
-    if columns == 0 {
-        return 0;
-    }
-    let span = visible_end.saturating_sub(visible_start).max(1);
-    let phase = u128::from(visible_start).saturating_add(
-        u128::from(span)
-            .saturating_mul(u128::try_from(column).unwrap_or(u128::MAX))
-            .saturating_add(u128::try_from(columns / 2).unwrap_or(0))
-            / u128::try_from(columns).unwrap_or(1),
-    );
-    usize::try_from(
-        phase.saturating_mul(u128::try_from(EDIT_PREVIEW_COLUMNS).unwrap_or(0))
-            / u128::from(sampler_core::SAMPLE_PHASE_SCALE),
+fn preview_bins_for_viewport(visible_start: u64, visible_end: u64) -> std::ops::Range<usize> {
+    let scale = u128::from(sampler_core::SAMPLE_PHASE_SCALE);
+    let columns = u128::try_from(EDIT_PREVIEW_COLUMNS).expect("preview column constant fits u128");
+    let start = u128::from(visible_start)
+        .checked_mul(columns)
+        .expect("Q32 preview projection fits u128")
+        / scale;
+    let end = u128::from(visible_end)
+        .checked_mul(columns)
+        .expect("Q32 preview projection fits u128")
+        .div_ceil(scale);
+    let start = usize::try_from(start.min(columns.saturating_sub(1)))
+        .expect("preview start is bounded by column count");
+    let end = usize::try_from(
+        end.min(columns)
+            .max(u128::try_from(start + 1).expect("usize fits u128")),
     )
-    .unwrap_or(EDIT_PREVIEW_COLUMNS.saturating_sub(1))
-    .min(EDIT_PREVIEW_COLUMNS.saturating_sub(1))
+    .expect("preview end is bounded by column count");
+    start..end
+}
+
+fn preview_partition(
+    preview_bins: std::ops::Range<usize>,
+    column: usize,
+    columns: usize,
+) -> std::ops::Range<usize> {
+    let columns = columns.max(1);
+    let column = column.min(columns.saturating_sub(1));
+    let length = preview_bins.end.saturating_sub(preview_bins.start).max(1);
+    if length < columns {
+        let offset = column.saturating_mul(length) / columns;
+        let start = preview_bins
+            .start
+            .saturating_add(offset)
+            .min(preview_bins.end - 1);
+        return start..start + 1;
+    }
+    let start = preview_bins
+        .start
+        .saturating_add(column.saturating_mul(length) / columns);
+    let end = preview_bins
+        .start
+        .saturating_add((column.saturating_add(1)).saturating_mul(length) / columns)
+        .max(start + 1)
+        .min(preview_bins.end);
+    start..end
+}
+
+fn aggregate_preview_column(
+    preview: &[PreviewColumn; EDIT_PREVIEW_COLUMNS],
+    range: std::ops::Range<usize>,
+) -> PreviewColumn {
+    let Some((&first, rest)) = preview
+        .get(range.clone())
+        .and_then(|columns| columns.split_first())
+    else {
+        return PreviewColumn::default();
+    };
+    rest.iter()
+        .copied()
+        .fold(first, |combined, column| PreviewColumn {
+            min: combined.min.min(column.min),
+            max: combined.max.max(column.max),
+        })
 }
 
 fn waveform_cell(value: PreviewColumn, row: usize, rows: usize) -> (char, Style) {
@@ -348,11 +398,39 @@ fn marker_frame(phase: u64, frames: Option<usize>, ceil: bool) -> String {
     value.min(frames as u128).to_string()
 }
 
-fn sample_status_line(app_status: &str, status: WorkspaceSampleEditorStatus) -> String {
-    if !app_status.is_empty() {
-        return format!(" STATUS {app_status}");
+fn sample_status_line(
+    editor_status: WorkspaceSampleEditorStatus,
+    pad_status: &crate::PadLoadState,
+    edit_status: SampleEditStatus,
+) -> String {
+    match editor_status {
+        WorkspaceSampleEditorStatus::Error(error) => format!(" STATUS EDITOR ERROR: {error:?}"),
+        WorkspaceSampleEditorStatus::Pending
+        | WorkspaceSampleEditorStatus::ApplyConfirmation
+        | WorkspaceSampleEditorStatus::DiscardConfirmation => {
+            format!(" STATUS EDITOR {}", editor_status_name(&editor_status))
+        }
+        _ => match pad_status {
+            crate::PadLoadState::Error(error) => format!(" STATUS PAD ERROR: {error}"),
+            crate::PadLoadState::Loading | crate::PadLoadState::WaitingForDevice => {
+                format!(" STATUS PAD {}", load_state_name(pad_status))
+            }
+            _ => match edit_status {
+                SampleEditStatus::Failed | SampleEditStatus::GenerationExhausted => {
+                    format!(" STATUS EDIT ERROR: {edit_status:?}")
+                }
+                SampleEditStatus::AwaitingWorker
+                | SampleEditStatus::Rendering
+                | SampleEditStatus::ReadyToInstall => {
+                    format!(" STATUS EDIT {edit_status:?}")
+                }
+                _ if matches!(editor_status, WorkspaceSampleEditorStatus::Dirty) => {
+                    " STATUS DRAFT DIRTY".to_owned()
+                }
+                _ => format!(" STATUS {}", editor_status_name(&editor_status)),
+            },
+        },
     }
-    format!(" STATUS {}", editor_status_name(&status))
 }
 
 fn editor_status_name(status: &WorkspaceSampleEditorStatus) -> &'static str {
@@ -425,4 +503,36 @@ fn truncate(value: &str, width: usize) -> String {
 
 fn display_width(value: &str) -> usize {
     Line::from(Span::raw(value)).width()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{EDIT_PREVIEW_COLUMNS, PreviewColumn};
+
+    use super::{aggregate_preview_column, preview_bins_for_viewport, preview_partition};
+
+    #[test]
+    fn preview_columns_aggregate_every_bin_in_each_monotonic_partition() {
+        let mut preview = [PreviewColumn::default(); EDIT_PREVIEW_COLUMNS];
+        preview[1] = PreviewColumn { min: -8, max: 8 };
+        preview[EDIT_PREVIEW_COLUMNS - 1] = PreviewColumn { min: -7, max: 7 };
+
+        assert_eq!(
+            aggregate_preview_column(&preview, preview_partition(0..EDIT_PREVIEW_COLUMNS, 0, 1)),
+            PreviewColumn { min: -8, max: 8 }
+        );
+        assert_eq!(
+            aggregate_preview_column(&preview, preview_partition(0..EDIT_PREVIEW_COLUMNS, 75, 76),),
+            PreviewColumn { min: -7, max: 7 }
+        );
+    }
+
+    #[test]
+    fn tiny_viewport_uses_the_containing_preview_bin() {
+        let scale = sampler_core::SAMPLE_PHASE_SCALE;
+        let bin = scale / EDIT_PREVIEW_COLUMNS as u64;
+        let bins = preview_bins_for_viewport(bin.saturating_add(1), bin.saturating_add(2));
+
+        assert_eq!(bins, 1..2);
+    }
 }

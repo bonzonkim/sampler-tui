@@ -134,6 +134,18 @@ struct InstalledPattern {
     snapshot: Arc<PatternSnapshot>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PatternGenerationId {
+    slot: PatternSlotId,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PatternTransition {
+    outgoing: PatternGenerationId,
+    incoming: PatternGenerationId,
+}
+
 #[derive(Clone, Copy)]
 struct PendingPatternSwitch {
     slot: PatternSlotId,
@@ -189,6 +201,13 @@ impl PatternPlayer {
         self.selected_slot.and_then(|slot| self.installed(slot))
     }
 
+    fn current_generation_id(&self) -> Option<PatternGenerationId> {
+        self.current().map(|pattern| PatternGenerationId {
+            slot: pattern.snapshot.slot(),
+            generation: pattern.snapshot.generation(),
+        })
+    }
+
     fn replace(
         &mut self,
         owner_slot: PatternSnapshotSlot,
@@ -201,8 +220,19 @@ impl PatternPlayer {
         })
     }
 
-    fn select(&mut self, slot: PatternSlotId, switch_at: PatternSwitch, now: Frame, sequence: u64) {
+    fn select(
+        &mut self,
+        slot: PatternSlotId,
+        switch_at: PatternSwitch,
+        now: Frame,
+        sequence: u64,
+    ) -> Option<PatternTransition> {
+        let incoming = self.installed(slot).map(|pattern| PatternGenerationId {
+            slot: pattern.snapshot.slot(),
+            generation: pattern.snapshot.generation(),
+        })?;
         if !self.playing || switch_at == PatternSwitch::Immediate {
+            let outgoing = self.current_generation_id();
             self.selected_slot = Some(slot);
             self.selected_sequence = sequence;
             self.pending_switch = None;
@@ -210,20 +240,22 @@ impl PatternPlayer {
                 self.origin = now;
                 self.loop_count = 0;
             }
-            return;
+            return outgoing.map(|outgoing| PatternTransition { outgoing, incoming });
         }
 
         if self.selected_slot == Some(slot) {
             self.pending_switch = None;
-            return;
+            return None;
         }
         let boundary = self.next_boundary(now);
         if boundary <= now {
+            let outgoing = self.current_generation_id();
             self.selected_slot = Some(slot);
             self.selected_sequence = sequence;
             self.pending_switch = None;
             self.origin = now;
             self.loop_count = 0;
+            return outgoing.map(|outgoing| PatternTransition { outgoing, incoming });
         } else {
             self.pending_switch = Some(PendingPatternSwitch {
                 slot,
@@ -231,6 +263,7 @@ impl PatternPlayer {
                 sequence,
             });
         }
+        None
     }
 
     fn play(&mut self, now: Frame, sequence: u64) {
@@ -246,23 +279,35 @@ impl PatternPlayer {
         self.pending_switch = None;
     }
 
-    fn advance_to(&mut self, frame: Frame) {
+    fn advance_to(&mut self, frame: Frame) -> Option<PatternTransition> {
         if !self.playing {
-            return;
+            return None;
         }
+        let mut transition = None;
         if let Some(pending) = self.pending_switch
             && pending.at_frame <= frame
         {
+            let outgoing = self.current_generation_id();
+            let incoming = self
+                .installed(pending.slot)
+                .map(|pattern| PatternGenerationId {
+                    slot: pattern.snapshot.slot(),
+                    generation: pattern.snapshot.generation(),
+                });
             self.selected_slot = Some(pending.slot);
             self.selected_sequence = pending.sequence;
             self.origin = pending.at_frame;
             self.loop_count = 0;
             self.pending_switch = None;
+            transition = outgoing
+                .zip(incoming)
+                .map(|(outgoing, incoming)| PatternTransition { outgoing, incoming });
         }
         let Some(loop_frames) = self.current().map(|pattern| pattern.snapshot.loop_frames()) else {
-            return;
+            return transition;
         };
         self.loop_count = frame.saturating_sub(self.origin) / loop_frames;
+        transition
     }
 
     fn next_boundary(&self, now: Frame) -> Frame {
@@ -559,20 +604,20 @@ impl AudioEngine {
 
         self.flush_deferred_retirement();
         self.flush_pattern_retirement();
-        self.pattern_player.advance_to(self.rendered_frame);
+        self.advance_pattern_to(self.rendered_frame);
         self.apply_stop_fence();
         self.drain_commands(horizon);
         self.schedule_pattern_actions(horizon);
 
         for _ in 0..frame_count {
-            self.pattern_player.advance_to(self.rendered_frame);
+            self.advance_pattern_to(self.rendered_frame);
             self.execute_due_actions();
             let frame = self.render_frame();
             self.telemetry_peak_left = self.telemetry_peak_left.max(frame[0].abs());
             self.telemetry_peak_right = self.telemetry_peak_right.max(frame[1].abs());
             write_frame(frame);
             self.rendered_frame = self.rendered_frame.saturating_add(1);
-            self.pattern_player.advance_to(self.rendered_frame);
+            self.advance_pattern_to(self.rendered_frame);
             self.emit_telemetry_if_due();
         }
 
@@ -609,6 +654,21 @@ impl AudioEngine {
 
     pub fn queued_commands(&self) -> usize {
         self.ports.queued_commands()
+    }
+
+    fn advance_pattern_to(&mut self, frame: Frame) {
+        if let Some(transition) = self.pattern_player.advance_to(frame) {
+            self.apply_pattern_transition(transition);
+        }
+    }
+
+    fn apply_pattern_transition(&mut self, transition: PatternTransition) {
+        let PatternTransition {
+            outgoing,
+            incoming: _,
+        } = transition;
+        self.release_pattern_generation(outgoing.slot, outgoing.generation);
+        self.cancel_pattern_generation(outgoing.slot, outgoing.generation);
     }
 
     #[cfg(test)]
@@ -810,11 +870,12 @@ impl AudioEngine {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
                     return;
                 }
-                if switch_at == PatternSwitch::Immediate {
-                    self.cancel_pattern_actions();
+                let transition =
+                    self.pattern_player
+                        .select(slot, switch_at, self.rendered_frame, sequence);
+                if let Some(transition) = transition {
+                    self.apply_pattern_transition(transition);
                 }
-                self.pattern_player
-                    .select(slot, switch_at, self.rendered_frame, sequence);
             }
             AudioCommand::PatternPlay { sequence } => {
                 if self.sequence_is_stopped(sequence) {
@@ -1039,7 +1100,7 @@ impl AudioEngine {
         if !self.pattern_player.playing || start >= horizon {
             return;
         }
-        self.pattern_player.advance_to(start);
+        self.advance_pattern_to(start);
         let Some(selected_slot) = self.pattern_player.selected_slot else {
             return;
         };
@@ -2164,6 +2225,160 @@ mod tests {
 
         engine.render_frames(10, |_| {});
         assert_eq!(engine.voices_for_pad(pad_b), 1);
+    }
+
+    #[test]
+    fn immediate_switch_releases_gate_and_loop_outgoing_voices_only() {
+        for mode in [PlaybackMode::Gate, PlaybackMode::Loop] {
+            let (mut controller, ports) = audio_channels();
+            let mut engine = AudioEngine::new(100, ports).unwrap();
+            let outgoing_pad = PadId::first();
+            let incoming_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+            let preserved_pad = PadId::new(BankId::new(0).unwrap(), 2).unwrap();
+            let switched = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
+            let preserved = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+            install_ready_sample(
+                &mut controller,
+                &mut engine,
+                100,
+                outgoing_pad,
+                switched,
+                128,
+            );
+            install_ready_sample(
+                &mut controller,
+                &mut engine,
+                100,
+                incoming_pad,
+                switched,
+                128,
+            );
+            install_ready_sample(
+                &mut controller,
+                &mut engine,
+                100,
+                preserved_pad,
+                preserved,
+                128,
+            );
+            controller
+                .install_pattern(pattern_snapshot_with_triggers(0, 100, &[(0, outgoing_pad)]))
+                .unwrap();
+            controller
+                .install_pattern(pattern_snapshot_with_triggers(1, 100, &[(0, incoming_pad)]))
+                .unwrap();
+            controller
+                .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+                .unwrap();
+            controller.play_pattern().unwrap();
+            engine.render_frames(1, |_| {});
+
+            controller
+                .select_pattern(PatternSlotId::new(1).unwrap(), PatternSwitch::Immediate)
+                .unwrap();
+            controller.trigger(preserved_pad, 50, 1.0).unwrap();
+            controller.trigger_live(preserved_pad, 1.0).unwrap();
+            engine.render_frames(1, |_| {});
+
+            assert!(engine.voices.iter().flatten().any(|voice| {
+                voice.pad == outgoing_pad && voice.envelope.release_frame.is_some()
+            }));
+            assert!(engine.voices.iter().flatten().any(|voice| {
+                voice.pad == incoming_pad && voice.envelope.release_frame.is_none()
+            }));
+            assert!(
+                engine
+                    .pending
+                    .iter()
+                    .take(engine.pending_len)
+                    .flatten()
+                    .any(|action| matches!(
+                        action,
+                        ScheduledAction::Trigger {
+                            pad,
+                            source: ActionSource::Command | ActionSource::Live(_),
+                            ..
+                        } if *pad == preserved_pad
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_switch_cleans_exact_outgoing_actions_and_gate_or_loop_voices() {
+        for mode in [PlaybackMode::Gate, PlaybackMode::Loop] {
+            let (mut controller, ports) = audio_channels();
+            let mut engine = AudioEngine::new(100, ports).unwrap();
+            let outgoing_pad = PadId::first();
+            let incoming_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+            let preserved_pad = PadId::new(BankId::new(0).unwrap(), 2).unwrap();
+            let switched = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
+            let preserved = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+            for (pad, settings) in [
+                (outgoing_pad, switched),
+                (incoming_pad, switched),
+                (preserved_pad, preserved),
+            ] {
+                install_ready_sample(&mut controller, &mut engine, 100, pad, settings, 128);
+            }
+            let outgoing = pattern_snapshot_with_triggers(0, 100, &[(0, outgoing_pad)]);
+            let outgoing_generation = outgoing.generation();
+            controller.install_pattern(outgoing).unwrap();
+            controller
+                .install_pattern(pattern_snapshot_with_triggers(1, 100, &[(0, incoming_pad)]))
+                .unwrap();
+            controller
+                .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+                .unwrap();
+            controller.play_pattern().unwrap();
+            engine.render_frames(1, |_| {});
+            engine.schedule_pattern_actions(30);
+
+            controller
+                .select_pattern(PatternSlotId::new(1).unwrap(), PatternSwitch::NextBoundary)
+                .unwrap();
+            controller.trigger(preserved_pad, 10, 1.0).unwrap();
+            controller.trigger_live(preserved_pad, 1.0).unwrap();
+            engine.render_frames(10, |_| {});
+
+            assert!(engine.voices.iter().flatten().any(|voice| {
+                voice.pad == outgoing_pad && voice.envelope.release_frame.is_some()
+            }));
+            assert!(engine.voices.iter().flatten().any(|voice| {
+                voice.pad == incoming_pad && voice.envelope.release_frame.is_none()
+            }));
+            assert!(engine.voices.iter().flatten().any(|voice| {
+                voice.pad == preserved_pad
+                    && voice.pattern_voice.is_none()
+                    && voice.envelope.release_frame.is_none()
+            }));
+            assert!(
+                !engine
+                    .pending
+                    .iter()
+                    .take(engine.pending_len)
+                    .flatten()
+                    .any(|action| action.pattern_voice_id().is_some_and(|id| {
+                        id.slot == PatternSlotId::new(0).unwrap()
+                            && id.generation == outgoing_generation
+                    }))
+            );
+            assert!(
+                engine
+                    .pending
+                    .iter()
+                    .take(engine.pending_len)
+                    .flatten()
+                    .any(|action| matches!(
+                        action,
+                        ScheduledAction::Trigger {
+                            pad,
+                            source: ActionSource::Live(_),
+                            ..
+                        } if *pad == preserved_pad
+                    ))
+            );
+        }
     }
 
     #[test]

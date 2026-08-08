@@ -622,10 +622,22 @@ impl App {
         let pad = pad_from_offset(offset);
         let settings = self.pads[offset].settings;
         if let Err(error) = audio.install(pad, Arc::clone(&rendered.rendered), settings) {
+            let kind = pending.kind;
             pending.phase = PendingEditPhase::Ready(rendered);
             self.sample_editor.pending[offset] = Some(pending);
             self.pads[offset].state = PadLoadState::Error(error.clone());
             self.status = error;
+            if self.patterns.view() == WorkspaceView::Sample && self.selected_pad_id() == Some(pad)
+            {
+                match kind {
+                    PendingEditKind::Apply => self
+                        .editor
+                        .observe_apply_failed(SampleEditorError::InstallFailed),
+                    PendingEditKind::Undo => self
+                        .editor
+                        .observe_undo_failed(SampleEditorError::InstallFailed),
+                }
+            }
             return true;
         }
 

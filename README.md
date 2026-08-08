@@ -25,6 +25,8 @@ Delivery slice 3 is implemented with automated acceptance evidence. The tests co
 
 Delivery slice 4 pattern sequencing is implemented with automated callback-to-TUI workflow evidence: sixteen in-memory pattern slots, sample-clock playback, exact acknowledged live overdub, step edits, quantize/swing, next-loop slot switching, typed pattern/record-ack overflow visibility, and round-robin device-rate rebuild. Patterns are deliberately in-memory only for this slice: quitting discards pattern edits until the persistence slice lands. Automated tests do not establish human audibility, physical-device behavior, or terminal interaction; see [`docs/manual-pattern-checklist.md`](docs/manual-pattern-checklist.md).
 
+Delivery slice 5 in-memory sample editing is implemented with automated worker-to-audio evidence: exact trim markers, reverse, -1 dBFS normalize, pitch and OneShot/Gate/Loop settings, confirmed Apply, one-level Undo, failure-atomic retry, and device-rate recipe replay. Apply replaces only the pad's immutable in-memory audio; the imported source file is never overwritten. Source overwrite/export, project save/load, and autosave recovery are not implemented yet, so quitting still discards sample recipes and rendered edits. Automated tests do not establish human audibility, trim-click quality, physical-device recovery, or interactive marker usability; see [`docs/manual-sample-editor-checklist.md`](docs/manual-sample-editor-checklist.md).
+
 ## Build and test
 
 Rust 1.95.0 is selected by `rust-toolchain.toml`.
@@ -45,7 +47,7 @@ The interactive loader is deliberately bounded: a directory view keeps the first
 
 1. Add offline mixing, sample decoding/resampling, real device output, and responsive pad triggering.
 2. Harden the implemented 80×24 performance TUI with recorded macOS/Linux interactive and hardware acceptance.
-3. Add waveform sample editing, project save/load, atomic saves, and autosave recovery for the implemented in-memory patterns.
+3. Persist the implemented waveform recipes and in-memory patterns with project save/load, atomic saves, and autosave recovery.
 4. Add audio input, resampling, mixer and choke controls, built-in effects, MIDI, export, and cross-platform release hardening.
 
 The approved product design is in [`docs/superpowers/specs/2026-08-07-sampler-tui-design.md`](docs/superpowers/specs/2026-08-07-sampler-tui-design.md), and the slice 1 execution plan is in [`docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md`](docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md).

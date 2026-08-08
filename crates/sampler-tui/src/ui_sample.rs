@@ -427,6 +427,9 @@ fn sample_status_line(
                 _ if matches!(editor_status, WorkspaceSampleEditorStatus::Dirty) => {
                     " STATUS DRAFT DIRTY".to_owned()
                 }
+                _ if matches!(editor_status, WorkspaceSampleEditorStatus::UndoAvailable) => {
+                    " STATUS APPLIED · UNDO AVAILABLE".to_owned()
+                }
                 _ => format!(" STATUS {}", editor_status_name(&editor_status)),
             },
         },
@@ -507,9 +510,15 @@ fn display_width(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::{EDIT_PREVIEW_COLUMNS, PreviewColumn};
+    use crate::{
+        EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, SampleEditStatus,
+        WorkspaceSampleEditorStatus,
+    };
 
-    use super::{aggregate_preview_column, preview_bins_for_viewport, preview_partition};
+    use super::{
+        aggregate_preview_column, display_width, preview_bins_for_viewport, preview_partition,
+        sample_status_line,
+    };
 
     #[test]
     fn preview_columns_aggregate_every_bin_in_each_monotonic_partition() {
@@ -534,5 +543,33 @@ mod tests {
         let bins = preview_bins_for_viewport(bin.saturating_add(1), bin.saturating_add(2));
 
         assert_eq!(bins, 1..2);
+    }
+
+    #[test]
+    fn admitted_edit_reports_applied_and_undo_without_overriding_errors() {
+        let applied = sample_status_line(
+            WorkspaceSampleEditorStatus::UndoAvailable,
+            &PadLoadState::Ready,
+            SampleEditStatus::UndoAvailable,
+        );
+        assert_eq!(applied, " STATUS APPLIED · UNDO AVAILABLE");
+        assert!(display_width(&applied) <= 76);
+
+        assert_eq!(
+            sample_status_line(
+                WorkspaceSampleEditorStatus::UndoAvailable,
+                &PadLoadState::Error("install failed".to_owned()),
+                SampleEditStatus::UndoAvailable,
+            ),
+            " STATUS PAD ERROR: install failed"
+        );
+        assert_eq!(
+            sample_status_line(
+                WorkspaceSampleEditorStatus::Error(crate::SampleEditorError::InstallFailed),
+                &PadLoadState::Ready,
+                SampleEditStatus::UndoAvailable,
+            ),
+            " STATUS EDITOR ERROR: InstallFailed"
+        );
     }
 }

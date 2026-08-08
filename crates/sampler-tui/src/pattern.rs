@@ -361,6 +361,31 @@ mod tests {
     }
 
     #[test]
+    fn invalidating_a_confirmed_capture_clears_all_held_correlations() {
+        let stamp = origin(1_000);
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = FakeAudio::default();
+        workspace.start_recording(stamp).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(stamp));
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+
+        workspace.maintain(&mut audio, telemetry());
+
+        assert_eq!(workspace.capture_state(), None);
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
+
+        workspace.start_recording(stamp).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(stamp));
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        let mut replacement = recording_telemetry(stamp);
+        replacement.pattern_origin = Some(stamp.origin + 100);
+        workspace.maintain(&mut audio, replacement);
+
+        assert_eq!(workspace.capture_state(), None);
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
+    }
+
+    #[test]
     fn moving_bar_keeps_the_local_column_and_updates_absolute_step() {
         let mut workspace = PatternWorkspace::new(48_000);
         workspace.set_bars(2).unwrap();
@@ -1009,7 +1034,7 @@ impl PatternWorkspace {
             && telemetry.pattern_slot == Some(stamp.slot)
             && telemetry.pattern_generation == Some(stamp.generation)
             && telemetry.pattern_origin == Some(stamp.origin);
-        self.recording = match state {
+        let next = match state {
             RecordingState::Pending(intent) if matches_capture => {
                 Some(RecordingState::Confirmed(intent))
             }
@@ -1017,6 +1042,10 @@ impl PatternWorkspace {
             RecordingState::Disarming(_) if !matches_capture => None,
             _ => Some(state),
         };
+        if next.is_none() {
+            self.held_keys.fill(None);
+        }
+        self.recording = next;
     }
 
     pub fn is_playing(&self) -> bool {

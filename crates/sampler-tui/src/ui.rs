@@ -424,7 +424,8 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 format!("Apply in-memory edit to pad {}?", pad.index() + 1),
                 format!("Before {before_frames} frames"),
                 format!("After {after_frames} frames"),
-                "Source file unchanged. Disk/project persistence is not implemented.".to_owned(),
+                "in-memory only; source file unchanged".to_owned(),
+                "Disk/project persistence is not implemented.".to_owned(),
                 "Enter confirms · Esc cancels".to_owned(),
             ],
         ),
@@ -1418,7 +1419,7 @@ mod tests {
         apply.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         apply.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let apply_screen = render_lines(80, 24, &apply).join("\n");
-        assert!(apply_screen.contains("Source file unchanged"));
+        assert!(apply_screen.contains("in-memory only; source file unchanged"));
         assert!(apply_screen.contains("Disk/project persistence is not implemented"));
 
         let mut discard = loaded_states_app(FakeAudio::ready());
@@ -1454,7 +1455,7 @@ mod tests {
 
         assert!(screen.contains("Before 8388608 frames"));
         assert!(screen.contains("After 8388607 frames"));
-        assert!(screen.contains("Source file unchanged"));
+        assert!(screen.contains("in-memory only; source file unchanged"));
     }
 
     #[test]

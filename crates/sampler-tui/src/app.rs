@@ -1071,22 +1071,37 @@ impl App {
     }
 
     fn select_pattern(&mut self, slot: PatternSlotId) {
-        self.patterns.select_slot(slot);
         if !self.patterns.is_slot_ready(slot) {
+            self.patterns.select_slot(slot);
             self.report_pattern_not_ready(slot);
             return;
         }
+        let disarm_capture = self
+            .patterns
+            .record_capture()
+            .is_some_and(|(captured_slot, _)| captured_slot != slot);
         let switch = if self.pattern_transport_is_playing() {
             PatternSwitch::NextBoundary
         } else {
             PatternSwitch::Immediate
         };
-        if let Some(audio) = self.audio.as_mut()
-            && let Err(error) = audio.select_pattern(slot, switch)
-        {
-            self.status = error;
+        if let Some(audio) = self.audio.as_mut() {
+            if disarm_capture && let Err(error) = audio.set_record_capture(None) {
+                self.status = error;
+                return;
+            }
+            if disarm_capture {
+                self.patterns.stop_recording();
+            }
+            if let Err(error) = audio.select_pattern(slot, switch) {
+                self.status = error;
+                return;
+            }
+        } else if disarm_capture {
+            self.report_audio_unavailable();
             return;
         }
+        self.patterns.select_slot(slot);
         self.overlay = None;
     }
 
@@ -1935,6 +1950,7 @@ mod tests {
         stop_pad_error: Option<String>,
         stop_all_error: Option<String>,
         stop_pattern_error: Option<String>,
+        capture_error: Option<String>,
         install_error: Option<String>,
         calls: CallLog,
         maintenance: Rc<RefCell<Vec<&'static str>>>,
@@ -1958,6 +1974,7 @@ mod tests {
                 stop_pad_error: None,
                 stop_all_error: None,
                 stop_pattern_error: None,
+                capture_error: None,
                 install_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
@@ -1983,6 +2000,7 @@ mod tests {
                 stop_pad_error: None,
                 stop_all_error: None,
                 stop_pattern_error: None,
+                capture_error: None,
                 install_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
@@ -2021,6 +2039,11 @@ mod tests {
 
         fn failing_stop_pattern_once(mut self, error: &str) -> Self {
             self.stop_pattern_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_capture_once(mut self, error: &str) -> Self {
+            self.capture_error = Some(error.to_owned());
             self
         }
 
@@ -2186,6 +2209,9 @@ mod tests {
             &mut self,
             capture: Option<(PatternSlotId, u64)>,
         ) -> Result<(), String> {
+            if let Some(error) = self.capture_error.take() {
+                return Err(error);
+            }
             self.calls
                 .0
                 .borrow_mut()
@@ -3279,6 +3305,138 @@ mod tests {
         );
         assert!(calls.snapshot().is_empty());
         assert!(app.status().contains("pattern 2 update pending"));
+    }
+
+    #[test]
+    fn changing_slot_disarms_a_different_capture_before_selecting_and_next_pad_is_untracked() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        for _ in 0..32 {
+            app.maintain_audio();
+        }
+        let captured = PatternSlotId::new(1).unwrap();
+        app.patterns.select_slot(captured);
+        app.patterns
+            .start_recording(sampler_audio::TransportStamp {
+                slot: captured,
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        calls.clear();
+
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply(InputAction::PadPress(0));
+
+        assert!(!app.patterns().is_recording());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SetRecordCapture(None),
+                AudioCall::SelectPattern(PatternSlotId::new(2).unwrap(), PatternSwitch::Immediate),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_the_current_pattern_cancels_a_pending_other_slot_capture() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        for _ in 0..32 {
+            app.maintain_audio();
+        }
+        let captured = PatternSlotId::new(1).unwrap();
+        app.patterns.select_slot(captured);
+        app.patterns
+            .start_recording(sampler_audio::TransportStamp {
+                slot: captured,
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        calls.clear();
+
+        app.apply_key(key(',', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            app.patterns().selected_slot(),
+            PatternSlotId::new(0).unwrap()
+        );
+        assert!(!app.patterns().is_recording());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SetRecordCapture(None),
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_disarm_failure_aborts_slot_supersede_without_losing_recording() {
+        let fake = FakeAudio::ready(48_000, 2).failing_capture_once("capture queue full");
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        for _ in 0..32 {
+            app.maintain_audio();
+        }
+        let captured = PatternSlotId::new(1).unwrap();
+        app.patterns.select_slot(captured);
+        app.patterns
+            .start_recording(sampler_audio::TransportStamp {
+                slot: captured,
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        calls.clear();
+
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(app.patterns().selected_slot(), captured);
+        assert!(app.patterns().is_recording());
+        assert!(app.status().contains("capture queue full"));
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn palette_pattern_selection_uses_the_same_capture_disarm_reducer() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        for _ in 0..32 {
+            app.maintain_audio();
+        }
+        let captured = PatternSlotId::new(1).unwrap();
+        app.patterns.select_slot(captured);
+        app.patterns
+            .start_recording(sampler_audio::TransportStamp {
+                slot: captured,
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        calls.clear();
+
+        app.apply_key(key(':', KeyModifiers::SHIFT, KeyEventKind::Press));
+        app.apply_terminal_event(Event::Paste("pattern 3".into()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.patterns().is_recording());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SetRecordCapture(None),
+                AudioCall::SelectPattern(PatternSlotId::new(2).unwrap(), PatternSwitch::Immediate),
+            ]
+        );
     }
 
     #[test]

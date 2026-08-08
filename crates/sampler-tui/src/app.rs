@@ -3189,7 +3189,11 @@ impl App {
         let cleanup_succeeded = result.is_ok();
         self.in_flight_project = None;
         self.recovery_cleanup_warning = result.err();
-        if cleanup_succeeded && self.project_session.autosaved_revision() == revision {
+        if cleanup_succeeded
+            && self.project_session.project_id() == project_id
+            && self.project_session.directory() == Some(directory.as_path())
+            && self.project_session.autosaved_revision() == revision
+        {
             self.project_session
                 .mark_autosaved(self.project_session.saved_revision());
         }
@@ -11344,6 +11348,71 @@ mod tests {
         let cleanup_b = take_recovery_cleanup(&mut app);
         assert_eq!(cleanup_b.directory, PathBuf::from("project-b"));
         assert_eq!(cleanup_b.project_id, project_b);
+    }
+
+    #[test]
+    fn delayed_cleanup_from_old_project_does_not_clear_opened_project_recovery_truth() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let project_a = name_project(&mut app, "project-a", now);
+        app.request_save().unwrap();
+        app.maintain_project(now);
+        let save_a = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_result(&save_a, Vec::new())));
+        let cleanup_revision = app
+            .pending_recovery_cleanup
+            .front()
+            .expect("explicit save queues recovery cleanup")
+            .revision;
+
+        let project_b = sampler_core::ProjectId::from_bytes([0x81; 16]);
+        let open_token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token: open_token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(project_open_document(
+                    project_b,
+                    "Explicit B",
+                    cleanup_revision - 1,
+                    Vec::new(),
+                ))),
+                recovery: Some(Ok(project_open_document(
+                    project_b,
+                    "Recovery B",
+                    cleanup_revision,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+        app.choose_project_recovery(crate::RecoveryChoice::Restore)
+            .unwrap();
+        while app.project_open_stage().is_some() {
+            assert!(app.maintain_project(now));
+        }
+
+        assert_eq!(app.project_session.project_id(), project_b);
+        assert_eq!(app.project_session.directory(), Some(path("project-b")));
+        assert_eq!(app.project_session.autosaved_revision(), cleanup_revision);
+        assert!(app.maintain_project(now));
+        let cleanup_a = take_recovery_cleanup(&mut app);
+        assert_eq!(cleanup_a.project_id, project_a);
+        assert_eq!(cleanup_a.directory, path("project-a"));
+        assert_eq!(cleanup_a.revision, cleanup_revision);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup_a.token,
+            directory: cleanup_a.directory,
+            project_id: cleanup_a.project_id,
+            revision: cleanup_a.revision,
+            result: Ok(()),
+        }));
+
+        assert_eq!(app.project_session.project_id(), project_b);
+        assert_eq!(app.project_session.directory(), Some(path("project-b")));
+        assert_eq!(app.project_session.autosaved_revision(), cleanup_revision);
+        assert_eq!(app.project_session.saved_revision(), cleanup_revision - 1);
     }
 
     #[test]

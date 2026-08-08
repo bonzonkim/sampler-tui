@@ -65,6 +65,7 @@ pub enum SampleEditorError {
     GenerationExhausted,
     SelectedPadReplaced,
     UnsupportedSourceLength,
+    InvalidSourceRate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +230,8 @@ impl SampleEditor {
                     .is_some_and(|frames| !source_frames_supported(frames))
                 {
                     SampleEditorStatus::Error(SampleEditorError::UnsupportedSourceLength)
+                } else if context.base_rate == Some(0) {
+                    SampleEditorStatus::Error(SampleEditorError::InvalidSourceRate)
                 } else {
                     SampleEditorStatus::Empty
                 };
@@ -422,24 +425,12 @@ impl SampleEditor {
 
     /// A replacement notification cannot erase an uncommitted draft; Task 5 owns the discard
     /// overlay and decides whether to call `confirm_discard` before rebuilding this editor.
-    pub fn observe_selected_pad_replaced(&mut self, recipe: SampleEditRecipe, frames: usize) {
+    pub fn observe_selected_pad_replaced(&mut self, context: SampleEditorContext) {
         if self.is_dirty() {
             self.status = SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced);
             return;
         }
-        self.sync_context(SampleEditorContext {
-            pad: self.pad,
-            committed: Some(recipe),
-            base_frames: Some(frames),
-            base_rate: self.base_rate.or(Some(1)),
-            settings: self.committed_settings,
-            edit_status: if self.undo_available {
-                SampleEditStatus::UndoAvailable
-            } else {
-                SampleEditStatus::Idle
-            },
-            device_available: true,
-        });
+        self.sync_context(context);
     }
 
     pub fn project(&self, width: u16) -> SampleProjection {
@@ -614,6 +605,22 @@ mod tests {
         )
     }
 
+    fn replacement_context(
+        recipe: SampleEditRecipe,
+        frames: usize,
+        rate: u32,
+    ) -> SampleEditorContext {
+        SampleEditorContext {
+            pad: pad(0),
+            committed: Some(recipe),
+            base_frames: Some(frames),
+            base_rate: Some(rate),
+            settings: PadSettings::default(),
+            edit_status: crate::SampleEditStatus::Idle,
+            device_available: true,
+        }
+    }
+
     #[test]
     fn workspace_view_cycles_through_sample_in_both_directions() {
         assert_eq!(WorkspaceView::Perform.next(), WorkspaceView::Pattern);
@@ -708,10 +715,11 @@ mod tests {
     #[test]
     fn replacement_reuses_context_validation_for_unsupported_then_recovered_sources() {
         let mut editor = loaded(100);
-        editor.observe_selected_pad_replaced(
+        editor.observe_selected_pad_replaced(replacement_context(
             SampleEditRecipe::identity(),
             (sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1),
-        );
+            48_000,
+        ));
         assert_eq!(editor.base_frames(), None);
         assert_eq!(
             editor.status(),
@@ -720,9 +728,54 @@ mod tests {
         editor.move_marker(1, false);
         assert_eq!(editor.draft(), SampleEditRecipe::identity());
 
-        editor.observe_selected_pad_replaced(SampleEditRecipe::identity(), 100);
+        editor.observe_selected_pad_replaced(replacement_context(
+            SampleEditRecipe::identity(),
+            100,
+            48_000,
+        ));
         assert_eq!(editor.base_frames(), Some(100));
         assert_eq!(editor.status(), SampleEditorStatus::Clean);
+    }
+
+    #[test]
+    fn replacement_requires_complete_context_without_synthesizing_a_sample_rate() {
+        let mut editor = loaded(100);
+        let unsupported = SampleEditorContext {
+            pad: pad(0),
+            committed: Some(SampleEditRecipe::identity()),
+            base_frames: Some((sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1)),
+            base_rate: Some(48_000),
+            settings: PadSettings::default(),
+            edit_status: crate::SampleEditStatus::Idle,
+            device_available: true,
+        };
+        editor.observe_selected_pad_replaced(unsupported);
+        assert_eq!(editor.base_rate(), None);
+
+        editor.observe_selected_pad_replaced(SampleEditorContext {
+            base_frames: Some(100),
+            base_rate: Some(44_100),
+            ..unsupported
+        });
+        assert_eq!(editor.base_rate(), Some(44_100));
+
+        editor.observe_selected_pad_replaced(SampleEditorContext {
+            base_frames: Some(100),
+            base_rate: Some(0),
+            ..unsupported
+        });
+        assert_eq!(
+            editor.status(),
+            SampleEditorStatus::Error(SampleEditorError::InvalidSourceRate)
+        );
+
+        let mut empty = SampleEditor::open_empty(pad(0), PadSettings::default());
+        empty.observe_selected_pad_replaced(SampleEditorContext {
+            base_frames: Some(100),
+            base_rate: Some(48_000),
+            ..unsupported
+        });
+        assert_eq!(empty.base_rate(), Some(48_000));
     }
 
     #[test]
@@ -826,7 +879,11 @@ mod tests {
             editor.status(),
             SampleEditorStatus::Error(SampleEditorError::AudioQueueFull)
         );
-        editor.observe_selected_pad_replaced(SampleEditRecipe::identity(), 200);
+        editor.observe_selected_pad_replaced(replacement_context(
+            SampleEditRecipe::identity(),
+            200,
+            48_000,
+        ));
         assert_eq!(editor.draft(), draft);
         assert_eq!(
             editor.status(),

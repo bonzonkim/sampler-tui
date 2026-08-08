@@ -5,6 +5,8 @@ use std::{
 
 use sampler_core::{PadId, ProjectId};
 
+use crate::loader::LoadSampleError;
+use crate::project_store::ProjectStoreError;
 use crate::{ProjectToken, SaveKind};
 
 pub const MAX_PROJECT_REVISION: u64 = i64::MAX as u64;
@@ -38,16 +40,44 @@ pub struct ProjectOpenStage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectStageError {
+    Load(LoadSampleError),
+    AssetDigestChanged,
+    RecipeContextChanged,
+    AudioDeviceRateChanged,
+}
+
+impl std::fmt::Display for ProjectStageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(formatter),
+            Self::AssetDigestChanged => formatter.write_str("asset digest changed during staging"),
+            Self::RecipeContextChanged => formatter.write_str("staged recipe context changed"),
+            Self::AudioDeviceRateChanged => {
+                formatter.write_str("audio device rate changed during staging")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectStageError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectOpenError {
     OperationPending,
+    CancellationLocked,
     TokenExhausted,
     AudioUnavailable,
     NoUsableDocument,
     RecoveryMismatch,
     UnresolvedState(String),
-    Probe(String),
+    Probe(ProjectStoreError),
+    RecoveryDiscard(ProjectStoreError),
     InvalidPatterns(String),
-    Stage { pad: PadId, message: String },
+    Stage {
+        pad: PadId,
+        error: ProjectStageError,
+    },
     Admission(String),
 }
 
@@ -55,6 +85,9 @@ impl std::fmt::Display for ProjectOpenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OperationPending => formatter.write_str("a project operation is already pending"),
+            Self::CancellationLocked => {
+                formatter.write_str("project open can no longer be cancelled safely")
+            }
             Self::TokenExhausted => formatter.write_str("project operation token is exhausted"),
             Self::AudioUnavailable => formatter.write_str("audio device is unavailable"),
             Self::NoUsableDocument => formatter.write_str("project has no usable document"),
@@ -67,12 +100,15 @@ impl std::fmt::Display for ProjectOpenError {
                     "current project state must be resolved before open: {message}"
                 )
             }
-            Self::Probe(message) => write!(formatter, "project probe failed: {message}"),
+            Self::Probe(error) => write!(formatter, "project probe failed: {error}"),
+            Self::RecoveryDiscard(error) => {
+                write!(formatter, "recovery discard failed: {error}")
+            }
             Self::InvalidPatterns(message) => {
                 write!(formatter, "project patterns are invalid: {message}")
             }
-            Self::Stage { pad, message } => {
-                write!(formatter, "could not stage pad {pad:?}: {message}")
+            Self::Stage { pad, error } => {
+                write!(formatter, "could not stage pad {pad:?}: {error}")
             }
             Self::Admission(message) => write!(formatter, "audio admission failed: {message}"),
         }

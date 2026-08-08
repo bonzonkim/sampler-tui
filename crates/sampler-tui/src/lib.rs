@@ -37,7 +37,7 @@ pub use pattern::{
 pub use project_session::{
     AutosaveDescriptor, MAX_PROJECT_REVISION, ProjectMutationError, ProjectOpenError,
     ProjectOpenPhase, ProjectOpenStage, ProjectOperationDescriptor, ProjectSession,
-    ProjectSnapshotError, ProjectStatus, RecoveryChoice,
+    ProjectSnapshotError, ProjectStageError, ProjectStatus, RecoveryChoice,
 };
 pub use project_store::{
     AtomicWritePoint, AtomicWriteVisibility, ProjectAssetMapping, ProjectProbe, ProjectSavePad,

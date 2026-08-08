@@ -10,7 +10,9 @@ use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
 use crate::ui_pattern::{live_identity, live_pattern, render_pattern, transport_bar_index};
 use crate::ui_sample::render_sample as render_sample_workspace;
-use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
+use crate::{
+    App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView, ProjectAction, ProjectOpenPhase,
+};
 
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
@@ -27,9 +29,9 @@ const HELP_LINES: [&str; 17] = [
     "+ / - / u / Ctrl+Delete: velocity / undo / clear",
     "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
     "Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
-    "plain z remains pad 13; Apply is in-memory only",
-    "Source file unchanged",
-    "Disk/project persistence is not implemented yet",
+    "plain z remains pad 13; Apply is in-memory only; Source file unchanged",
+    "PROJECT: save · save-as <directory> · open-project <directory>",
+    "Recovery: R restore · D discard · C cancel",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
     "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
     "Ctrl+Q / Ctrl+C quit · Esc or ? close help",
@@ -401,18 +403,49 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "r retry · Esc browse without audio".to_owned(),
             ],
         ),
-        Overlay::ProjectOpenProgress => render_list_overlay(
-            frame,
-            area,
-            " OPEN PROJECT ",
-            62,
-            6,
-            [
-                app.status().to_owned(),
-                "Project state remains unchanged while validation runs.".to_owned(),
-                "Esc cancels before audio admission begins.".to_owned(),
-            ],
-        ),
+        Overlay::ProjectOpenProgress => {
+            let stage = app.project_open_stage();
+            let title = if stage
+                .is_some_and(|stage| stage.phase == ProjectOpenPhase::AwaitingRecoveryChoice)
+            {
+                " RECOVERY AVAILABLE "
+            } else {
+                " OPEN PROJECT "
+            };
+            let mut lines = vec![app.status().to_owned()];
+            if let Some(stage) = stage {
+                lines.push(format!("Directory {}", stage.directory.to_string_lossy()));
+                if let Some(revision) = stage.revision {
+                    lines.push(format!("Revision {revision}"));
+                }
+                match stage.phase {
+                    ProjectOpenPhase::Probing => {
+                        lines.push("Checking project and recovery documents…".to_owned());
+                        lines.push("Esc cancels before audio admission begins.".to_owned());
+                    }
+                    ProjectOpenPhase::AwaitingRecoveryChoice => {
+                        lines.push("A newer recovery can replace the explicit save.".to_owned());
+                        lines.push("R Restore · D Discard · C Cancel".to_owned());
+                    }
+                    ProjectOpenPhase::Staging => {
+                        lines.push(format!(
+                            "Staging samples {}/{}",
+                            stage.staged_pads, stage.total_pads
+                        ));
+                        lines.push("Esc cancels before audio admission begins.".to_owned());
+                    }
+                    ProjectOpenPhase::Admitting => {
+                        lines.push(format!(
+                            "Installing audio {}/{}",
+                            stage.admitted_actions, stage.total_actions
+                        ));
+                        lines.push("Audio admission is in progress; please wait.".to_owned());
+                    }
+                }
+            }
+            lines.push("Current project remains unchanged until open completes.".to_owned());
+            render_list_overlay(frame, area, title, 72, 9, lines);
+        }
         Overlay::ClearPattern { slot, event_count } => render_list_overlay(
             frame,
             area,
@@ -440,7 +473,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 format!("Before {before_frames} frames"),
                 format!("After {after_frames} frames"),
                 "in-memory only; source file unchanged".to_owned(),
-                "Disk/project persistence is not implemented.".to_owned(),
+                "Project becomes MODIFIED until saved.".to_owned(),
                 "Enter confirms · Esc cancels".to_owned(),
             ],
         ),
@@ -457,6 +490,83 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "Enter confirms · Esc keeps editing".to_owned(),
             ],
         ),
+        Overlay::ResolveSampleDraft { pad, action } => render_list_overlay(
+            frame,
+            area,
+            " RESOLVE SAMPLE DRAFT ",
+            72,
+            8,
+            [
+                format!(
+                    "Pad {} has un-applied edits before {}.",
+                    pad.index() + 1,
+                    project_action_name(*action)
+                ),
+                "Enter Apply · Backspace Discard · Esc Cancel".to_owned(),
+                "Apply changes only in-memory audio and marks the project modified.".to_owned(),
+                "Discard keeps committed audio; source file remains unchanged.".to_owned(),
+            ],
+        ),
+        Overlay::UnsavedProject { action } => render_list_overlay(
+            frame,
+            area,
+            " UNSAVED PROJECT ",
+            72,
+            8,
+            [
+                format!("Save changes before {}?", project_action_name(*action)),
+                "Y Save · N Discard · Esc Cancel".to_owned(),
+                if app.project_header().starts_with("Untitled") {
+                    "Untitled project: use save-as <directory> before continuing.".to_owned()
+                } else {
+                    "Save waits for the exact matching worker result.".to_owned()
+                },
+                "Discard removes an exact newer recovery before continuing.".to_owned(),
+            ],
+        ),
+        Overlay::ProjectLifecycleProgress { action } => render_list_overlay(
+            frame,
+            area,
+            " PROJECT OPERATION ",
+            72,
+            7,
+            [
+                app.status().to_owned(),
+                format!("Preparing to {} safely.", project_action_name(*action)),
+                "Waiting for the exact save result or recovery deletion.".to_owned(),
+            ],
+        ),
+        Overlay::ProjectSaveProgress => render_list_overlay(
+            frame,
+            area,
+            " SAVE PROJECT ",
+            72,
+            6,
+            [
+                app.status().to_owned(),
+                "Waiting for the exact matching save result.".to_owned(),
+                "The project remains MODIFIED if saving fails.".to_owned(),
+            ],
+        ),
+        Overlay::ProjectError { title, message } => render_list_overlay(
+            frame,
+            area,
+            &format!(" {title} "),
+            72,
+            7,
+            [
+                message.to_owned(),
+                "Current project remains open and unchanged.".to_owned(),
+                "Enter or Esc dismisses this error.".to_owned(),
+            ],
+        ),
+    }
+}
+
+const fn project_action_name(action: ProjectAction) -> &'static str {
+    match action {
+        ProjectAction::Open => "opening another project",
+        ProjectAction::Quit => "quitting",
     }
 }
 
@@ -747,13 +857,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::{Modifier, Style};
     use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
-    use sampler_core::{PadId, PadSettings};
+    use sampler_core::{PadId, PadSettings, ProjectDocument, ProjectId};
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
     use crate::loader::{LoadPurpose, LoadSampleError, LoadedSample, WorkerResult};
     use crate::{
-        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, Overlay, PreviewColumn,
+        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, Overlay, PatternWorkspace,
+        PreviewColumn,
     };
 
     use super::{render, transport_bar_index};
@@ -1431,7 +1542,83 @@ mod tests {
 
         assert!(screen.contains("Apply is in-memory only"));
         assert!(screen.contains("Source file unchanged"));
-        assert!(screen.contains("Disk/project persistence is not implemented yet"));
+        assert!(screen.contains("save · save-as <directory> · open-project <directory>"));
+        assert!(screen.contains("Recovery: R restore · D discard · C cancel"));
+    }
+
+    #[test]
+    fn project_unsaved_and_progress_overlays_show_safe_choices_at_eighty_columns() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply(InputAction::Quit);
+
+        let unsaved = render_lines(80, 24, &app).join("\n");
+        assert!(unsaved.contains("UNSAVED PROJECT"));
+        assert!(unsaved.contains("Save"));
+        assert!(unsaved.contains("Discard"));
+        assert!(unsaved.contains("Cancel"));
+
+        app.apply_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let untitled = render_lines(80, 24, &app).join("\n");
+        assert!(untitled.contains("use save-as <directory>"));
+
+        let mut saving = ready_app();
+        saving.open_palette();
+        for character in "save-as /projects/new project".chars() {
+            saving.apply_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        saving.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(saving.overlay(), Some(Overlay::ProjectSaveProgress)),
+            "unexpected overlay {:?}, status {}",
+            saving.overlay(),
+            saving.status()
+        );
+        let progress = render_lines(80, 24, &saving).join("\n");
+        assert!(progress.contains("SAVE PROJECT"));
+        assert!(progress.contains("Waiting for the exact matching save result"));
+    }
+
+    #[test]
+    fn project_open_recovery_overlay_shows_revision_path_and_keyboard_choices() {
+        let mut app = ready_app();
+        let directory = std::path::PathBuf::from("/projects/a project with a very long name");
+        let token = app.request_open_project(&directory).unwrap();
+        let project_id = ProjectId::from_bytes([0x51; 16]);
+        let explicit = ProjectDocument::new_v2(
+            project_id,
+            "Explicit",
+            i64::MAX as u64 - 1,
+            Vec::new(),
+            PatternWorkspace::new(48_000)
+                .export_project_patterns()
+                .unwrap(),
+        )
+        .unwrap();
+        let recovery = ProjectDocument::new_v2(
+            project_id,
+            "Recovery",
+            i64::MAX as u64,
+            Vec::new(),
+            PatternWorkspace::new(48_000)
+                .export_project_patterns()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: directory.clone(),
+            result: Ok(crate::ProjectProbe {
+                directory,
+                explicit: Some(Ok(explicit)),
+                recovery: Some(Ok(recovery)),
+            }),
+        }));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+        assert!(screen.contains("RECOVERY AVAILABLE"));
+        assert!(screen.contains("Revision 9223372036854775807"));
+        assert!(screen.contains("R Restore · D Discard · C Cancel"));
+        assert!(screen.contains("a project with a very long name"));
     }
 
     #[test]
@@ -1453,7 +1640,7 @@ mod tests {
         apply.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let apply_screen = render_lines(80, 24, &apply).join("\n");
         assert!(apply_screen.contains("in-memory only; source file unchanged"));
-        assert!(apply_screen.contains("Disk/project persistence is not implemented"));
+        assert!(apply_screen.contains("Project becomes MODIFIED until saved"));
 
         let mut discard = loaded_states_app(FakeAudio::ready());
         discard.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));

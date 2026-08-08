@@ -349,10 +349,18 @@ impl TuiHarness {
             event: Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             user_input: false,
         };
+        let discard_modified = QueuedEvent {
+            event: Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            user_input: false,
+        };
         if self.awaiting_load {
             self.post_load_events.borrow_mut().push_back(quit);
+            self.post_load_events
+                .borrow_mut()
+                .push_back(discard_modified);
         } else {
             self.events.borrow_mut().push_back(quit);
+            self.events.borrow_mut().push_back(discard_modified);
         }
         let mut events = HarnessEvents {
             events: Rc::clone(&self.events),
@@ -946,7 +954,8 @@ fn loads_plays_releases_switches_banks_and_renders_status() {
     let screen = harness.draw();
 
     assert!(screen.contains("BANK B"));
-    assert!(screen.contains("KICK.WAV"));
+    assert!(screen.contains("UNTITLED · MODIFIED"));
+    assert!(screen.contains("Current project has unsaved changes"));
     assert!(screen.contains("Voices 02"));
     assert_eq!(harness.accepted_audio_calls(), 4);
     assert_eq!(
@@ -970,7 +979,7 @@ fn loads_plays_releases_switches_banks_and_renders_status() {
     );
     assert_eq!(harness.worker_delivery(), (2, 2));
     assert_eq!(harness.worker_result_draws(), 1);
-    assert_eq!(harness.events_per_iteration(), [0, 1, 0, 5]);
+    assert_eq!(harness.events_per_iteration(), [0, 1, 0, 6]);
 }
 
 #[test]
@@ -988,7 +997,7 @@ fn rapid_sixteen_pad_input_is_bounded_and_loss_is_typed() {
     assert_eq!(harness.max_events_per_iteration(), 64);
     assert_eq!(
         harness.events_per_iteration(),
-        [vec![64; 16], vec![1]].concat()
+        [vec![64; 16], vec![2]].concat()
     );
     assert_eq!(
         harness.completed_audio_calls(),

@@ -17,7 +17,8 @@ mod ui_sample;
 
 pub use app::{
     App, EDIT_PREVIEW_COLUMNS, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView,
-    PreviewColumn, ProjectSaveError, ProjectSaveFailure, SampleEditRequestError, SampleEditStatus,
+    PreviewColumn, ProjectAction, ProjectSaveError, ProjectSaveFailure, SampleEditRequestError,
+    SampleEditStatus,
 };
 pub use audio::AudioPort;
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};

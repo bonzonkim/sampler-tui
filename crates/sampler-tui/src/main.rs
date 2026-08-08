@@ -14,7 +14,8 @@ fn main() -> ExitCode {
     };
 
     let result = match command {
-        CliCommand::Tui => run_tui(),
+        CliCommand::Tui => run_tui(None),
+        CliCommand::Open(directory) => run_tui(Some(directory)),
         CliCommand::Play(path) => diagnostic::play(path),
         CliCommand::Help => {
             println!("{USAGE}");

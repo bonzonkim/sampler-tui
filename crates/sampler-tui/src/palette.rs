@@ -74,6 +74,9 @@ impl LineEditor {
 pub enum PaletteCommand {
     OpenPicker,
     LoadPath(PathBuf),
+    Save,
+    SaveAs(PathBuf),
+    OpenProject(PathBuf),
     Bank(BankId),
     Select(usize),
     StopAll,
@@ -112,6 +115,11 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
     match command {
         "load" if remainder.is_empty() => Ok(PaletteCommand::OpenPicker),
         "load" => Ok(PaletteCommand::LoadPath(PathBuf::from(remainder))),
+        "save" => no_arguments(remainder, "save", PaletteCommand::Save),
+        "save-as" => parse_project_path(remainder, "save-as").map(PaletteCommand::SaveAs),
+        "open-project" => {
+            parse_project_path(remainder, "open-project").map(PaletteCommand::OpenProject)
+        }
         "bank" => parse_bank(remainder).map(PaletteCommand::Bank),
         "select" => parse_selection(remainder).map(PaletteCommand::Select),
         "stop-all" => no_arguments(remainder, "stop-all", PaletteCommand::StopAll),
@@ -141,6 +149,26 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "undo-sample" => no_arguments(remainder, "undo-sample", PaletteCommand::UndoSample),
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_project_path(input: &str, command: &str) -> Result<PathBuf, String> {
+    if input.is_empty() {
+        return Err(format!("{command} expects a project directory"));
+    }
+    let mut characters = input.chars();
+    let Some(quote @ ('\'' | '"')) = characters.next() else {
+        return Ok(PathBuf::from(input));
+    };
+    let Some(content) = input
+        .strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+    else {
+        return Err(format!("{command} expects one project directory"));
+    };
+    if content.is_empty() || content.contains(quote) {
+        return Err(format!("{command} expects one project directory"));
+    }
+    Ok(PathBuf::from(content))
 }
 
 fn parse_frame(input: &str) -> Result<u64, String> {
@@ -297,6 +325,55 @@ mod tests {
             Ok(PaletteCommand::LoadPath(PathBuf::from(
                 "drums/kick one.wav"
             )))
+        );
+    }
+
+    #[test]
+    fn project_commands_are_strict_and_preserve_directory_remainders() {
+        assert_eq!(parse_palette("save"), Ok(PaletteCommand::Save));
+        assert_eq!(
+            parse_palette("save now"),
+            Err("save does not accept arguments".into())
+        );
+        assert_eq!(
+            parse_palette("save-as  projects/live set "),
+            Ok(PaletteCommand::SaveAs(PathBuf::from("projects/live set")))
+        );
+        assert_eq!(
+            parse_palette("open-project /Volumes/Sets/Friday Night"),
+            Ok(PaletteCommand::OpenProject(PathBuf::from(
+                "/Volumes/Sets/Friday Night"
+            )))
+        );
+        assert_eq!(
+            parse_palette("save-as"),
+            Err("save-as expects a project directory".into())
+        );
+        assert_eq!(
+            parse_palette("open-project"),
+            Err("open-project expects a project directory".into())
+        );
+    }
+
+    #[test]
+    fn project_path_commands_accept_one_shell_quoted_remainder() {
+        assert_eq!(
+            parse_palette("save-as \"projects/live set\""),
+            Ok(PaletteCommand::SaveAs(PathBuf::from("projects/live set")))
+        );
+        assert_eq!(
+            parse_palette("open-project 'projects/archive set'"),
+            Ok(PaletteCommand::OpenProject(PathBuf::from(
+                "projects/archive set"
+            )))
+        );
+        assert_eq!(
+            parse_palette("open-project \"projects/live set\" trailing"),
+            Err("open-project expects one project directory".into())
+        );
+        assert_eq!(
+            parse_palette("save-as \"unterminated"),
+            Err("save-as expects one project directory".into())
         );
     }
 

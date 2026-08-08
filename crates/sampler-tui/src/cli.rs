@@ -1,11 +1,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "Usage:\n  sampler-tui play <path>\n  sampler-tui --help";
+pub const USAGE: &str = "Usage:\n  sampler-tui\n  sampler-tui open <project-directory>\n  sampler-tui play <path>\n  sampler-tui --help";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliCommand {
     Tui,
+    Open(PathBuf),
     Play(PathBuf),
     Help,
 }
@@ -19,6 +20,9 @@ pub fn parse_args_os(mut args: impl Iterator<Item = OsString>) -> Result<CliComm
     };
     match (args.next(), args.next(), args.next()) {
         (None, None, None) => Ok(CliCommand::Tui),
+        (Some(command), Some(path), None) if command == "open" => {
+            Ok(CliCommand::Open(PathBuf::from(path)))
+        }
         (Some(command), Some(path), None) if command == "play" => {
             Ok(CliCommand::Play(PathBuf::from(path)))
         }
@@ -58,6 +62,16 @@ mod tests {
         assert!(parse_args_os(args(&["sampler-tui", "play", "one.wav", "two.wav"])).is_err());
     }
 
+    #[test]
+    fn open_accepts_exactly_one_project_directory_and_preserves_spaces() {
+        assert_eq!(
+            parse_args_os(args(&["sampler-tui", "open", "projects/live set"])),
+            Ok(CliCommand::Open(PathBuf::from("projects/live set")))
+        );
+        assert!(parse_args_os(args(&["sampler-tui", "open"])).is_err());
+        assert!(parse_args_os(args(&["sampler-tui", "open", "project-a", "project-b"])).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn play_preserves_non_unicode_paths() {
@@ -73,5 +87,22 @@ mod tests {
             .into_iter(),
         );
         assert_eq!(parsed, Ok(CliCommand::Play(PathBuf::from(path))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_preserves_non_unicode_project_directories() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = OsString::from_vec(vec![b'p', 0x80, b'r', b'o', b'j']);
+        let parsed = parse_args_os(
+            [
+                OsString::from("sampler-tui"),
+                OsString::from("open"),
+                path.clone(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(parsed, Ok(CliCommand::Open(PathBuf::from(path))));
     }
 }

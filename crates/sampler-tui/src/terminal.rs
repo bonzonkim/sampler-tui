@@ -324,6 +324,8 @@ where
         }
     }
 
+    state.dirty |= app.maintain_project(now);
+
     let mut events_applied = 0;
     for event_index in 0..MAX_EVENTS_PER_ITERATION {
         let timeout = if event_index == 0 {
@@ -348,8 +350,6 @@ where
         state.dirty = true;
         state.next_tick = now.checked_add(TICK_INTERVAL).unwrap_or(now);
     }
-
-    state.dirty |= app.maintain_project(now);
 
     let mut requests = app.take_worker_requests().into_iter();
     while let Some(request) = requests.next() {
@@ -761,8 +761,20 @@ fn app_with_default_audio(open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>
     }
 }
 
-pub fn run_tui() -> Result<(), DynError> {
-    let mut app = app_with_default_audio(open_default_audio);
+fn app_with_default_audio_and_project(
+    open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>, String>,
+    initial_project: Option<std::path::PathBuf>,
+) -> App {
+    let mut app = app_with_default_audio(open_audio);
+    if let Some(directory) = initial_project {
+        app.request_open_project(directory)
+            .expect("a fresh app can queue its startup project");
+    }
+    app
+}
+
+pub fn run_tui(initial_project: Option<std::path::PathBuf>) -> Result<(), DynError> {
+    let mut app = app_with_default_audio_and_project(open_default_audio, initial_project);
     let mut events = CrosstermEventSource;
     let mut worker = WorkerHandle::spawn();
     let mut lifecycle = RatatuiTerminalLifecycle::default();
@@ -986,6 +998,106 @@ mod tests {
     }
 
     #[test]
+    fn worker_results_and_project_maintenance_precede_input_and_requests_precede_draw() {
+        struct TraceApp(Arc<Mutex<Vec<&'static str>>>);
+        impl EventLoopApp for TraceApp {
+            fn maintain_audio(&mut self) -> bool {
+                self.0.lock().unwrap().push("audio");
+                false
+            }
+            fn maintain_project(&mut self, _now: Instant) -> bool {
+                self.0.lock().unwrap().push("project");
+                true
+            }
+            fn apply_worker_result(&mut self, _result: WorkerResult) -> bool {
+                self.0.lock().unwrap().push("worker-result");
+                true
+            }
+            fn take_worker_requests(&mut self) -> Vec<WorkerRequest> {
+                self.0.lock().unwrap().push("take-requests");
+                vec![WorkerRequest::Shutdown]
+            }
+            fn apply_worker_send_error(
+                &mut self,
+                _request: WorkerRequest,
+                _error: WorkerSendError,
+            ) -> bool {
+                false
+            }
+            fn take_device_retry_requests(&mut self) -> usize {
+                0
+            }
+            fn retry_default_device(&mut self) -> bool {
+                false
+            }
+            fn apply_terminal_event(&mut self, _event: Event) {
+                self.0.lock().unwrap().push("event");
+            }
+            fn tick(&mut self) {}
+        }
+        struct TraceEvents(Arc<Mutex<Vec<&'static str>>>, bool);
+        impl EventSource for TraceEvents {
+            fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+                self.0.lock().unwrap().push("poll");
+                Ok(!std::mem::replace(&mut self.1, true))
+            }
+            fn read(&mut self) -> io::Result<Event> {
+                Ok(pad_press('1'))
+            }
+        }
+        struct TraceWorker(Arc<Mutex<Vec<&'static str>>>, Option<WorkerResult>);
+        impl EventLoopWorker for TraceWorker {
+            fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError> {
+                self.1.take().ok_or(TryRecvError::Empty)
+            }
+            fn try_send(&mut self, _request: WorkerRequest) -> Result<(), WorkerSendFailure> {
+                self.0.lock().unwrap().push("send");
+                Ok(())
+            }
+        }
+        struct TraceDrawer(Arc<Mutex<Vec<&'static str>>>);
+        impl EventLoopDrawer<TraceApp> for TraceDrawer {
+            fn draw(&mut self, _app: &TraceApp) -> io::Result<()> {
+                self.0.lock().unwrap().push("draw");
+                Ok(())
+            }
+        }
+
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut app = TraceApp(Arc::clone(&trace));
+        let mut events = TraceEvents(Arc::clone(&trace), false);
+        let mut worker = TraceWorker(Arc::clone(&trace), Some(failed_scan()));
+        let mut drawer = TraceDrawer(Arc::clone(&trace));
+        let now = Instant::now();
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        run_iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                "audio",
+                "worker-result",
+                "project",
+                "poll",
+                "event",
+                "poll",
+                "take-requests",
+                "send",
+                "draw",
+            ]
+        );
+    }
+
+    #[test]
     fn worker_result_burst_is_bounded() {
         let now = Instant::now();
         let mut app = FakeApp::default();
@@ -1144,6 +1256,22 @@ mod tests {
         app.close_overlay();
         app.open_help();
         assert_eq!(app.overlay(), Some(&crate::Overlay::Help));
+    }
+
+    #[test]
+    fn startup_project_is_queued_before_terminal_initialization_or_input() {
+        let directory = std::path::PathBuf::from("/projects/start here");
+        let mut app = app_with_default_audio_and_project(
+            || Err("no output device".to_owned()),
+            Some(directory.clone()),
+        );
+
+        assert_eq!(app.overlay(), Some(&crate::Overlay::ProjectOpenProgress));
+        let requests = app.take_worker_requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [WorkerRequest::ProbeProject { directory: queued, .. }] if queued == &directory
+        ));
     }
 
     #[derive(Clone)]

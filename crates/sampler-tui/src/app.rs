@@ -319,6 +319,21 @@ pub enum Overlay {
     FilePicker,
     DeviceError(String),
     ProjectOpenProgress,
+    ResolveSampleDraft {
+        pad: PadId,
+        action: ProjectAction,
+    },
+    UnsavedProject {
+        action: ProjectAction,
+    },
+    ProjectLifecycleProgress {
+        action: ProjectAction,
+    },
+    ProjectSaveProgress,
+    ProjectError {
+        title: String,
+        message: String,
+    },
     ClearPattern {
         slot: PatternSlotId,
         event_count: usize,
@@ -331,6 +346,35 @@ pub enum Overlay {
     DiscardSample {
         pad: PadId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAction {
+    Open,
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingProjectAction {
+    Open(PathBuf),
+    Quit,
+}
+
+impl PendingProjectAction {
+    const fn label(&self) -> ProjectAction {
+        match self {
+            Self::Open(_) => ProjectAction::Open,
+            Self::Quit => ProjectAction::Quit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectLifecycleWait {
+    SampleApply,
+    ChoosingProject,
+    Saving(ProjectToken),
+    DiscardingRecovery(RecoveryCleanup),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -395,6 +439,8 @@ pub struct App {
     autosave_retry_since: Option<Instant>,
     project_open: Option<ProjectOpenOperation>,
     project_open_error: Option<ProjectOpenError>,
+    pending_project_action: Option<PendingProjectAction>,
+    project_lifecycle_wait: Option<ProjectLifecycleWait>,
 }
 
 impl App {
@@ -494,6 +540,8 @@ impl App {
             autosave_retry_since: None,
             project_open: None,
             project_open_error: None,
+            pending_project_action: None,
+            project_lifecycle_wait: None,
         }
     }
 
@@ -509,7 +557,7 @@ impl App {
             InputAction::PadStop(index) => self.stop_pad(index),
             InputAction::BankDelta(delta) => self.change_bank(delta),
             InputAction::StopAll => self.stop_all(),
-            InputAction::Quit => self.should_quit = true,
+            InputAction::Quit => self.begin_project_action(PendingProjectAction::Quit),
         }
     }
 
@@ -537,12 +585,25 @@ impl App {
             return;
         }
         if let Some(action) = map_key(key, self.keyboard_capabilities) {
+            let captures_pad_keys = matches!(
+                self.overlay,
+                Some(
+                    Overlay::Palette
+                        | Overlay::ProjectOpenProgress
+                        | Overlay::ResolveSampleDraft { .. }
+                        | Overlay::UnsavedProject { .. }
+                        | Overlay::ProjectLifecycleProgress { .. }
+                        | Overlay::ProjectSaveProgress
+                        | Overlay::ProjectError { .. }
+                )
+            );
             match action {
-                InputAction::Quit
-                | InputAction::StopAll
-                | InputAction::PadRelease(_)
-                | InputAction::PadPress(_)
-                | InputAction::PadStop(_) => {
+                InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
+                    self.apply(action);
+                    return;
+                }
+                InputAction::PadPress(_) | InputAction::PadStop(_) if captures_pad_keys => {}
+                InputAction::PadPress(_) | InputAction::PadStop(_) => {
                     self.apply(action);
                     return;
                 }
@@ -565,7 +626,12 @@ impl App {
 
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
-            Some(Overlay::ProjectOpenProgress) => {}
+            Some(Overlay::ProjectOpenProgress) => self.apply_project_open_key(key),
+            Some(Overlay::ResolveSampleDraft { .. }) => self.apply_sample_resolution_key(key),
+            Some(Overlay::UnsavedProject { .. }) => self.apply_unsaved_project_key(key),
+            Some(Overlay::ProjectLifecycleProgress { .. }) => {}
+            Some(Overlay::ProjectSaveProgress) => {}
+            Some(Overlay::ProjectError { .. }) => self.apply_project_error_key(key),
             Some(Overlay::Palette) => self.apply_palette_key(key),
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
@@ -725,6 +791,7 @@ impl App {
         }
 
         if self.in_flight_project.is_none()
+            && self.pending_project_action.is_none()
             && self.pending_explicit_save.is_none()
             && self.pending_autosave_save.as_ref().is_none_or(|pending| {
                 pending.descriptor.revision < self.project_session.current_revision()
@@ -838,6 +905,183 @@ impl App {
         Ok(token)
     }
 
+    pub fn request_open_project_interactive(&mut self, directory: impl Into<PathBuf>) {
+        self.begin_project_action(PendingProjectAction::Open(directory.into()));
+    }
+
+    fn begin_project_action(&mut self, action: PendingProjectAction) {
+        if self.pending_project_action.is_some() || self.project_open.is_some() {
+            self.status = "a project lifecycle operation is already pending".to_owned();
+            return;
+        }
+        self.pending_project_action = Some(action);
+        self.advance_project_action();
+    }
+
+    fn advance_project_action(&mut self) {
+        let Some(action) = self.pending_project_action.as_ref() else {
+            return;
+        };
+        let label = action.label();
+        if self.editor.is_dirty() {
+            self.project_lifecycle_wait = None;
+            self.overlay = Some(Overlay::ResolveSampleDraft {
+                pad: self.editor.pad(),
+                action: label,
+            });
+            self.status = "Resolve the un-applied sample draft first".to_owned();
+            return;
+        }
+        if self.project_session.current_revision() != self.project_session.saved_revision() {
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
+            self.overlay = Some(Overlay::UnsavedProject { action: label });
+            self.status = "Current project has unsaved changes".to_owned();
+            return;
+        }
+        self.complete_project_action();
+    }
+
+    fn complete_project_action(&mut self) {
+        let Some(action) = self.pending_project_action.take() else {
+            return;
+        };
+        self.project_lifecycle_wait = None;
+        match action {
+            PendingProjectAction::Quit => {
+                self.overlay = None;
+                self.should_quit = true;
+            }
+            PendingProjectAction::Open(directory) => {
+                if let Err(error) = self.request_open_project(directory) {
+                    let message = error.to_string();
+                    self.status = message.clone();
+                    self.overlay = Some(Overlay::ProjectError {
+                        title: "OPEN PROJECT ERROR".to_owned(),
+                        message,
+                    });
+                }
+            }
+        }
+    }
+
+    fn cancel_project_action(&mut self) {
+        self.pending_project_action = None;
+        self.project_lifecycle_wait = None;
+        self.overlay = None;
+        self.status = "Project action cancelled".to_owned();
+    }
+
+    fn apply_sample_resolution_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                let Some(SampleEditorIntent::Apply { pad, recipe }) = self.editor.request_apply()
+                else {
+                    self.status = "Sample draft cannot be applied right now".to_owned();
+                    return;
+                };
+                match self.request_sample_edit(pad, recipe) {
+                    Ok(()) => {
+                        self.editor.observe_pending();
+                        self.project_lifecycle_wait = Some(ProjectLifecycleWait::SampleApply);
+                        let action = self
+                            .pending_project_action
+                            .as_ref()
+                            .map_or(ProjectAction::Quit, PendingProjectAction::label);
+                        self.overlay = Some(Overlay::ProjectLifecycleProgress { action });
+                        self.status = "Applying sample draft before project action…".to_owned();
+                    }
+                    Err(error) => {
+                        self.editor.cancel_confirmation();
+                        self.status = error.to_string();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.editor.confirm_discard();
+                self.sync_editor_to_selected_pad();
+                self.advance_project_action();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_unsaved_project_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => self.save_before_project_action(),
+            KeyCode::Char('n' | 'N') => self.discard_before_project_action(),
+            _ => {}
+        }
+    }
+
+    fn save_before_project_action(&mut self) {
+        match self.request_save() {
+            Ok(()) => {
+                let token = self
+                    .pending_explicit_save
+                    .as_ref()
+                    .map(|save| save.descriptor.token)
+                    .expect("accepted explicit save owns a token");
+                self.project_lifecycle_wait = Some(ProjectLifecycleWait::Saving(token));
+                let action = self
+                    .pending_project_action
+                    .as_ref()
+                    .map_or(ProjectAction::Quit, PendingProjectAction::label);
+                self.overlay = Some(Overlay::ProjectLifecycleProgress { action });
+                self.status = "Saving project before continuing…".to_owned();
+            }
+            Err(ProjectSaveError::Untitled) => {
+                self.status =
+                    "Untitled project: use save-as <directory> before continuing".to_owned();
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn discard_before_project_action(&mut self) {
+        let recovery_revision = self.project_session.autosaved_revision();
+        if recovery_revision <= self.project_session.saved_revision() {
+            self.complete_project_action();
+            return;
+        }
+        let Some(directory) = self.project_session.directory().map(Path::to_owned) else {
+            self.complete_project_action();
+            return;
+        };
+        if self.pending_recovery_cleanup.len() >= WORKER_CHANNEL_CAPACITY
+            || self.in_flight_project.is_some()
+        {
+            self.status = "project worker is busy; recovery discard is still pending".to_owned();
+            return;
+        }
+        let token = match self.allocate_project_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        };
+        let cleanup = RecoveryCleanup {
+            token,
+            directory,
+            project_id: self.project_session.project_id(),
+            revision: recovery_revision,
+        };
+        self.pending_recovery_cleanup.push_back(cleanup.clone());
+        self.project_lifecycle_wait = Some(ProjectLifecycleWait::DiscardingRecovery(cleanup));
+        let action = self
+            .pending_project_action
+            .as_ref()
+            .map_or(ProjectAction::Quit, PendingProjectAction::label);
+        self.overlay = Some(Overlay::ProjectLifecycleProgress { action });
+        self.status = "Discarding newer recovery before continuing…".to_owned();
+    }
+
     pub fn project_open_stage(&self) -> Option<&ProjectOpenStage> {
         match self.project_open.as_ref()? {
             ProjectOpenOperation::Probing { progress, .. } => Some(progress),
@@ -852,8 +1096,12 @@ impl App {
 
     fn fail_project_open(&mut self, error: ProjectOpenError) {
         self.project_open = None;
-        self.overlay = None;
-        self.status = error.to_string();
+        let message = error.to_string();
+        self.overlay = Some(Overlay::ProjectError {
+            title: "OPEN PROJECT ERROR".to_owned(),
+            message: message.clone(),
+        });
+        self.status = message;
         self.project_open_error = Some(error);
     }
 
@@ -1895,6 +2143,10 @@ impl App {
             self.sync_editor_to_selected_pad();
         }
         self.commit_project_mutation();
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::SampleApply) {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
         true
     }
 
@@ -1993,9 +2245,17 @@ impl App {
     }
 
     fn cancel_overlay(&mut self) {
-        if self.overlay == Some(Overlay::ProjectOpenProgress) {
-            let _ = self.cancel_project_open();
-            return;
+        match self.overlay {
+            Some(Overlay::ProjectOpenProgress) => {
+                let _ = self.cancel_project_open();
+                return;
+            }
+            Some(Overlay::ResolveSampleDraft { .. } | Overlay::UnsavedProject { .. }) => {
+                self.cancel_project_action();
+                return;
+            }
+            Some(Overlay::ProjectLifecycleProgress { .. } | Overlay::ProjectSaveProgress) => return,
+            _ => {}
         }
         self.close_overlay();
     }
@@ -2722,6 +2982,7 @@ impl App {
         {
             return false;
         }
+        let save_succeeded = result.is_ok();
 
         let InFlightProjectOperation::Save(save) = self
             .in_flight_project
@@ -2733,6 +2994,7 @@ impl App {
         self.project_session.set_in_flight(None);
         match result {
             Err(error) => {
+                self.status = error.to_string();
                 self.project_save_error = Some(ProjectSaveFailure { kind, error });
                 if kind == SaveKind::Recovery {
                     self.autosave_retry_clock_pending = true;
@@ -2781,6 +3043,31 @@ impl App {
                 }
             }
         }
+        if kind == SaveKind::Explicit
+            && self.project_lifecycle_wait == Some(ProjectLifecycleWait::Saving(token))
+        {
+            if save_succeeded {
+                self.complete_project_action();
+            } else {
+                self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
+                let action = self
+                    .pending_project_action
+                    .as_ref()
+                    .map_or(ProjectAction::Quit, PendingProjectAction::label);
+                self.overlay = Some(Overlay::UnsavedProject { action });
+            }
+        } else if kind == SaveKind::Explicit
+            && matches!(self.overlay, Some(Overlay::ProjectSaveProgress))
+        {
+            self.overlay = if save_succeeded {
+                None
+            } else {
+                Some(Overlay::ProjectError {
+                    title: "SAVE PROJECT ERROR".to_owned(),
+                    message: self.status.clone(),
+                })
+            };
+        }
         true
     }
 
@@ -2825,8 +3112,28 @@ impl App {
         {
             return false;
         }
+        let lifecycle_cleanup = matches!(
+            self.project_lifecycle_wait.as_ref(),
+            Some(ProjectLifecycleWait::DiscardingRecovery(expected)) if expected == cleanup
+        );
+        let cleanup_succeeded = result.is_ok();
         self.in_flight_project = None;
         self.recovery_cleanup_warning = result.err();
+        if lifecycle_cleanup {
+            if cleanup_succeeded {
+                self.complete_project_action();
+            } else {
+                self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
+                let action = self
+                    .pending_project_action
+                    .as_ref()
+                    .map_or(ProjectAction::Quit, PendingProjectAction::label);
+                self.overlay = Some(Overlay::UnsavedProject { action });
+                if let Some(error) = &self.recovery_cleanup_warning {
+                    self.status = error.to_string();
+                }
+            }
+        }
         true
     }
 
@@ -2927,6 +3234,31 @@ impl App {
         }
     }
 
+    fn apply_project_open_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press
+            || self
+                .project_open_stage()
+                .is_none_or(|stage| stage.phase != ProjectOpenPhase::AwaitingRecoveryChoice)
+        {
+            return;
+        }
+        let choice = match key.code {
+            KeyCode::Char('r' | 'R') => RecoveryChoice::Restore,
+            KeyCode::Char('d' | 'D') => RecoveryChoice::Discard,
+            KeyCode::Char('c' | 'C') => RecoveryChoice::Cancel,
+            _ => return,
+        };
+        if let Err(error) = self.choose_project_recovery(choice) {
+            self.status = error.to_string();
+        }
+    }
+
+    fn apply_project_error_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press && matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.overlay = None;
+        }
+    }
+
     fn apply_palette_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -2990,6 +3322,33 @@ impl App {
                 self.begin_selected_load(path);
                 self.overlay = None;
             }
+            PaletteCommand::Save => match self.request_save() {
+                Ok(()) => {
+                    self.overlay = Some(Overlay::ProjectSaveProgress);
+                    self.status = "Saving project…".to_owned();
+                }
+                Err(ProjectSaveError::Untitled) => {
+                    self.overlay = None;
+                    self.status = "Untitled project: use save-as <directory>".to_owned();
+                }
+                Err(error) => {
+                    self.overlay = None;
+                    self.status = error.to_string();
+                }
+            },
+            PaletteCommand::SaveAs(directory) => match self.request_save_as(directory) {
+                Ok(()) => {
+                    self.overlay = Some(Overlay::ProjectSaveProgress);
+                    self.status = "Saving project as a new directory…".to_owned();
+                }
+                Err(error) => {
+                    self.overlay = None;
+                    self.status = error.to_string();
+                }
+            },
+            PaletteCommand::OpenProject(directory) => {
+                self.request_open_project_interactive(directory);
+            }
             PaletteCommand::Bank(bank) => {
                 if self.editor.is_dirty() {
                     self.status = "discard sample draft before changing bank".to_owned();
@@ -3010,8 +3369,7 @@ impl App {
             }
             PaletteCommand::Help => self.open_help(),
             PaletteCommand::Quit => {
-                self.should_quit = true;
-                self.overlay = None;
+                self.begin_project_action(PendingProjectAction::Quit);
             }
             PaletteCommand::Pattern(slot) => self.select_pattern_slot(usize::from(slot)),
             PaletteCommand::Tempo(tempo) => self.apply_pattern_edit(|patterns| {
@@ -7223,7 +7581,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_error_survives_multibyte_and_no_op_cursor_navigation() {
+    fn palette_error_survives_multibyte_and_no_op_navigation_but_typing_clears_it() {
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
         app.open_palette();
         app.apply_terminal_event(Event::Paste("wat한".into()));
@@ -7253,7 +7611,8 @@ mod tests {
         assert_eq!(app.palette_error(), error);
 
         app.apply_key(key('x', KeyModifiers::NONE, KeyEventKind::Press));
-        assert_eq!(app.palette_error(), error);
+        assert_eq!(app.palette_text(), "wat한x");
+        assert_eq!(app.palette_error(), None);
     }
 
     #[test]
@@ -8966,6 +9325,201 @@ mod tests {
             project_id: *project_id,
             revision: *revision,
         }
+    }
+
+    #[test]
+    fn dirty_quit_save_waits_for_exact_success_and_failure_stays_open() {
+        let now = Instant::now();
+        let mut success = project_app();
+        name_project(&mut success, "named", now);
+        success.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        assert_eq!(
+            success.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+        success.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(!success.should_quit());
+        assert!(success.maintain_project(now));
+        let request = take_project_save(&mut success);
+        assert!(!success.should_quit());
+        assert!(success.apply_worker_result(save_result(&request, Vec::new())));
+        assert!(success.should_quit());
+
+        let mut failure = project_app();
+        name_project(&mut failure, "named", now);
+        failure.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        failure.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(failure.maintain_project(now));
+        let request = take_project_save(&mut failure);
+        assert!(failure.apply_worker_result(save_error(&request, "save before quit")));
+        assert!(!failure.should_quit());
+        assert_eq!(
+            failure.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+        assert!(failure.status().contains("save before quit"));
+    }
+
+    #[test]
+    fn untitled_dirty_quit_save_stays_open_with_save_as_instruction() {
+        let mut app = project_app();
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(!app.should_quit());
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+        assert!(app.status().contains("save-as <directory>"));
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn discard_and_quit_waits_for_exact_newer_recovery_deletion() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let project_id = name_project(&mut app, "named", now);
+        let revision = app.project_revision();
+        app.project_session.mark_autosaved(revision);
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(!app.should_quit());
+        assert!(app.maintain_project(now));
+        let cleanup = take_recovery_cleanup(&mut app);
+        assert_eq!(cleanup.project_id, project_id);
+        assert_eq!(cleanup.revision, revision);
+        assert!(!app.should_quit());
+        assert!(!app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: crate::ProjectToken::new(cleanup.token.get() + 1),
+            directory: cleanup.directory.clone(),
+            project_id,
+            revision,
+            result: Ok(()),
+        }));
+        assert!(!app.should_quit());
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup.token,
+            directory: cleanup.directory,
+            project_id,
+            revision,
+            result: Ok(()),
+        }));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn sample_draft_discard_and_apply_resolve_before_dirty_quit_choice() {
+        let now = Instant::now();
+        let mut discard = project_app();
+        name_project(&mut discard, "named", now);
+        discard.editor_mut_for_test().move_marker(1, false);
+        discard.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        assert_eq!(
+            discard.overlay(),
+            Some(&super::Overlay::ResolveSampleDraft {
+                pad: pad(0, 0),
+                action: super::ProjectAction::Quit,
+            })
+        );
+        discard.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert!(!discard.sample_editor().is_dirty());
+        assert_eq!(
+            discard.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+
+        let mut apply = project_app();
+        name_project(&mut apply, "named", now);
+        apply.editor_mut_for_test().move_marker(1, false);
+        apply.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        apply.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let requests = apply.take_worker_requests();
+        let [
+            WorkerRequest::EditSample {
+                generation, recipe, ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected sample draft apply request");
+        };
+        assert!(apply.apply_worker_result(edited(
+            &apply,
+            pad(0, 0),
+            *generation,
+            *recipe,
+            48_000,
+            vec![0.25, -0.25],
+        )));
+        assert!(apply.maintain_audio());
+        assert_eq!(
+            apply.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+        assert!(!apply.should_quit());
+    }
+
+    #[test]
+    fn palette_open_project_prompts_before_replacing_a_modified_project() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("open-project next-project".to_owned()));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Open,
+            })
+        );
+        assert!(app.take_worker_requests().is_empty());
+
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        assert_eq!(app.overlay(), Some(&super::Overlay::ProjectOpenProgress));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::ProbeProject { directory, .. }] = requests.as_slice() else {
+            panic!("expected open probe after discard choice");
+        };
+        assert_eq!(directory, path("next-project"));
+    }
+
+    #[test]
+    fn palette_save_on_untitled_project_closes_to_the_actionable_status() {
+        let mut app = project_app();
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("save".to_owned()));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(app.overlay(), None);
+        assert_eq!(app.status(), "Untitled project: use save-as <directory>");
     }
 
     fn save_result(

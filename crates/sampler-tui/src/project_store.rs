@@ -953,7 +953,18 @@ impl ProjectStore {
             SaveKind::Recovery => ".sampler-tui-recovery.toml",
         });
         project.revalidate_path_identity()?;
-        atomic_replace(&destination, canonical_toml.as_bytes(), &project, &mut hook)?;
+        let publication = if request.save_as && request.kind == SaveKind::Explicit {
+            MetadataPublication::NoReplace
+        } else {
+            MetadataPublication::Replace
+        };
+        atomic_replace(
+            &destination,
+            canonical_toml.as_bytes(),
+            &project,
+            publication,
+            &mut hook,
+        )?;
         project.revalidate_path_identity()?;
         if request.save_as {
             remove_save_as_owner(&project)?;
@@ -1379,6 +1390,7 @@ fn atomic_replace<F>(
     destination: &Path,
     bytes: &[u8],
     project: &ProjectDirectory,
+    publication: MetadataPublication,
     hook: &mut F,
 ) -> Result<(), ProjectStoreError>
 where
@@ -1390,7 +1402,12 @@ where
             message: "metadata destination has no leaf".to_owned(),
         }
     })?;
-    let _ = open_optional_regular_at(&project.file, leaf, destination)?;
+    let existing = open_optional_regular_at(&project.file, leaf, destination)?;
+    if publication == MetadataPublication::NoReplace && existing.is_some() {
+        return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+            path: project.path.clone(),
+        });
+    }
     let (mut file, mut temporary) =
         create_anchored_temp(&project.file, &project.path, destination)?;
     checkpoint(hook, AtomicWritePoint::AfterCreate, destination, false)?;
@@ -1423,15 +1440,55 @@ where
     drop(file);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
     project.revalidate_path_identity()?;
-    rustix::fs::renameat(&project.file, &temporary.leaf, &project.file, leaf).map_err(|error| {
-        atomic_error(
-            destination,
-            AtomicWritePoint::BeforeRename,
-            io::Error::from(error).kind(),
-            false,
-        )
-    })?;
-    temporary.disarm();
+    match publication {
+        MetadataPublication::Replace => {
+            rustix::fs::renameat(&project.file, &temporary.leaf, &project.file, leaf).map_err(
+                |error| {
+                    atomic_error(
+                        destination,
+                        AtomicWritePoint::BeforeRename,
+                        io::Error::from(error).kind(),
+                        false,
+                    )
+                },
+            )?;
+            temporary.disarm();
+        }
+        MetadataPublication::NoReplace => {
+            match rustix::fs::linkat(
+                &project.file,
+                &temporary.leaf,
+                &project.file,
+                leaf,
+                rustix::fs::AtFlags::empty(),
+            ) {
+                Ok(()) => {
+                    if rustix::fs::unlinkat(
+                        &project.file,
+                        &temporary.leaf,
+                        rustix::fs::AtFlags::empty(),
+                    )
+                    .is_ok()
+                    {
+                        temporary.disarm();
+                    }
+                }
+                Err(rustix::io::Errno::EXIST) => {
+                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                        path: project.path.clone(),
+                    });
+                }
+                Err(error) => {
+                    return Err(atomic_error(
+                        destination,
+                        AtomicWritePoint::BeforeRename,
+                        io::Error::from(error).kind(),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
     checkpoint(
         hook,
         AtomicWritePoint::BeforeDirectorySync,
@@ -1446,6 +1503,12 @@ where
             true,
         )
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataPublication {
+    Replace,
+    NoReplace,
 }
 
 fn verify_existing_asset(
@@ -2553,6 +2616,42 @@ pitch_semitones = 0.0
                 .unwrap()
                 .project_id,
             receipt.project_id
+        );
+    }
+
+    #[test]
+    fn first_save_as_never_replaces_foreign_metadata_published_after_owner_claim() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("foreign-save-as");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.project_id = ProjectId::from_bytes([0x71; 16]);
+        let foreign = ProjectDocument::new_v2(
+            ProjectId::from_bytes([0x72; 16]),
+            "foreign",
+            99,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+        .to_toml()
+        .unwrap();
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::AfterSourceFingerprint {
+                fs::write(target.join("project.toml"), &foreign).unwrap();
+            }
+            None
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::SaveAsTargetNotEmpty { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(target.join("project.toml")).unwrap(),
+            foreign
         );
     }
 

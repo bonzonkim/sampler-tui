@@ -23,8 +23,8 @@ pub use loader::{
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{
-    MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCursor, PatternMaintenance, PatternStatus,
-    PatternWorkspace, WorkspaceView,
+    MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCaptureState, PatternCursor,
+    PatternMaintenance, PatternStatus, PatternWorkspace, WorkspaceView,
 };
 pub use sampler_audio::{LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch};
 pub use sampler_core::{PatternSlotId, PatternSnapshot};

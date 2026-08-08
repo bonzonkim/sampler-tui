@@ -10,7 +10,7 @@ mod tests {
 
     use crate::AudioPort;
 
-    use super::{MAX_ACKS_PER_MAINTENANCE, PatternStatus, PatternWorkspace};
+    use super::{MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace};
 
     #[derive(Default)]
     struct FakeAudio {
@@ -113,6 +113,15 @@ mod tests {
             pattern_overflows: 0,
             live_ack_overflows: 0,
         }
+    }
+
+    fn recording_telemetry(stamp: TransportStamp) -> Telemetry {
+        let mut telemetry = telemetry();
+        telemetry.pattern_slot = Some(stamp.slot);
+        telemetry.pattern_generation = Some(stamp.generation);
+        telemetry.pattern_origin = Some(stamp.origin);
+        telemetry.pattern_recording = true;
+        telemetry
     }
 
     fn pad() -> PadId {
@@ -254,6 +263,147 @@ mod tests {
 
         assert_eq!(maintenance.compiled_slot, Some(edited_slot));
     }
+
+    #[test]
+    fn release_ack_for_an_exact_loop_hold_keeps_a_full_loop_duration() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.apply_ack(trigger_ack(7, 1_008));
+        workspace.note_live_release(key(0), command(8));
+        workspace.apply_ack(release_ack(8, 1_108));
+
+        assert_eq!(workspace.selected_pattern().events()[0].duration, Some(100));
+    }
+
+    #[test]
+    fn release_ack_longer_than_one_loop_is_capped_to_the_core_duration_limit() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.apply_ack(trigger_ack(7, 1_008));
+        workspace.note_live_release(key(0), command(8));
+        workspace.apply_ack(release_ack(8, 1_308));
+
+        assert_eq!(workspace.selected_pattern().events()[0].duration, Some(100));
+    }
+
+    #[test]
+    fn off_slot_record_ack_never_corrupts_current_selection_or_panics_edits() {
+        let mut workspace = recording_workspace();
+        let other_slot = PatternSlotId::new(1).unwrap();
+        workspace.select_slot(other_slot);
+        workspace.toggle_step().unwrap();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.apply_ack(trigger_ack(7, 1_008));
+
+        workspace.adjust_velocity(-0.25).unwrap();
+
+        assert_eq!(workspace.selected_slot(), other_slot);
+        assert_eq!(workspace.selected_event().unwrap().velocity, 0.75);
+    }
+
+    #[test]
+    fn recording_waits_for_an_exact_telemetry_confirmation_and_disarms_causally() {
+        let mut workspace = PatternWorkspace::new(100);
+        let stamp = origin(1_000);
+        workspace.start_recording(stamp).unwrap();
+        let mut audio = FakeAudio::default();
+
+        workspace.maintain(&mut audio, telemetry());
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+
+        let mut stale = recording_telemetry(stamp);
+        stale.pattern_generation = Some(99);
+        workspace.maintain(&mut audio, stale);
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+
+        workspace.maintain(&mut audio, recording_telemetry(stamp));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+
+        workspace.stop_recording();
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Disarming)
+        );
+        workspace.maintain(&mut audio, telemetry());
+        assert_eq!(workspace.capture_state(), None);
+    }
+
+    #[test]
+    fn moving_bar_keeps_the_local_column_and_updates_absolute_step() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.set_bars(2).unwrap();
+        workspace.move_cursor_to(pad(), 5);
+
+        workspace.move_cursor_bar(1);
+
+        assert_eq!(
+            (workspace.cursor().bar(), workspace.cursor().step()),
+            (1, 21)
+        );
+    }
+
+    #[test]
+    fn latest_dirty_ticket_wins_even_when_an_older_slot_has_a_higher_generation() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        let first = PatternSlotId::new(0).unwrap();
+        let second = PatternSlotId::new(1).unwrap();
+        workspace.select_slot(first);
+        workspace.toggle_step().unwrap();
+        workspace.toggle_step().unwrap();
+        workspace.select_slot(second);
+        workspace.toggle_step().unwrap();
+        let mut audio = FakeAudio {
+            backpressured: true,
+            ..FakeAudio::default()
+        };
+
+        let maintenance = workspace.maintain(&mut audio, telemetry());
+
+        assert_eq!(maintenance.compiled_slot, Some(second));
+    }
+
+    #[test]
+    fn rejected_matching_trigger_ack_clears_only_that_held_correlation() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.note_live_trigger(key(1), command(8), pad(), 1.0);
+        let mut stale = trigger_ack(7, 1_008);
+        stale.transport.as_mut().unwrap().generation = 99;
+
+        workspace.apply_ack(stale);
+
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
+        assert_eq!(workspace.pending_trigger_id(key(1)), Some(command(8)));
+    }
+
+    #[test]
+    fn full_pattern_rejects_a_matching_trigger_ack_without_leaking_its_key() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        workspace.start_recording(origin(1_000)).unwrap();
+        for frame in 0..sampler_core::MAX_PATTERN_EVENTS {
+            workspace.patterns[0]
+                .insert_new(pad(), u64::try_from(frame).unwrap(), 1.0, None)
+                .unwrap();
+        }
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+
+        workspace.apply_ack(trigger_ack(7, 1_008));
+
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
+        assert_eq!(
+            workspace.selected_pattern().events().len(),
+            sampler_core::MAX_PATTERN_EVENTS
+        );
+    }
 }
 
 use std::{array, sync::Arc};
@@ -330,6 +480,40 @@ struct RecordingIntent {
     stamp: TransportStamp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternCaptureState {
+    Pending,
+    Confirmed,
+    Disarming,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordingState {
+    Pending(RecordingIntent),
+    Confirmed(RecordingIntent),
+    Disarming(RecordingIntent),
+}
+
+impl RecordingState {
+    fn intent(self) -> RecordingIntent {
+        match self {
+            Self::Pending(intent) | Self::Confirmed(intent) | Self::Disarming(intent) => intent,
+        }
+    }
+
+    fn capture_state(self) -> PatternCaptureState {
+        match self {
+            Self::Pending(_) => PatternCaptureState::Pending,
+            Self::Confirmed(_) => PatternCaptureState::Confirmed,
+            Self::Disarming(_) => PatternCaptureState::Disarming,
+        }
+    }
+
+    fn accepts_acks(self) -> bool {
+        !matches!(self, Self::Disarming(_))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HeldRecordingKey {
     pad: PadId,
@@ -338,6 +522,19 @@ struct HeldRecordingKey {
     release_id: Option<LiveCommandId>,
     event_id: Option<EventId>,
     trigger_frame: Option<u64>,
+    trigger_absolute_frame: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedEvent {
+    slot: PatternSlotId,
+    event_id: EventId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirtyPattern {
+    generation: u64,
+    ticket: u64,
 }
 
 #[derive(Debug)]
@@ -353,12 +550,13 @@ pub struct PatternWorkspace {
     patterns: Box<[EditablePattern; PATTERN_SLOT_COUNT]>,
     selected_slot: PatternSlotId,
     cursor: PatternCursor,
-    selected_event: Option<EventId>,
+    selected_event: Option<SelectedEvent>,
     view: WorkspaceView,
     playing: bool,
-    recording: Option<RecordingIntent>,
+    recording: Option<RecordingState>,
     held_keys: [Option<HeldRecordingKey>; MAX_RECORDING_KEYS],
-    dirty_generations: [Option<u64>; PATTERN_SLOT_COUNT],
+    dirty_patterns: [Option<DirtyPattern>; PATTERN_SLOT_COUNT],
+    next_dirty_ticket: u64,
     pending_snapshots: [Option<PendingSnapshot>; PATTERN_SLOT_COUNT],
     reinstall_pending: [bool; PATTERN_SLOT_COUNT],
     installed_generations: [Option<u64>; PATTERN_SLOT_COUNT],
@@ -393,7 +591,13 @@ impl PatternWorkspace {
             playing: false,
             recording: None,
             held_keys: [None; MAX_RECORDING_KEYS],
-            dirty_generations: array::from_fn(|_| Some(0)),
+            dirty_patterns: array::from_fn(|_| {
+                Some(DirtyPattern {
+                    generation: 0,
+                    ticket: 0,
+                })
+            }),
+            next_dirty_ticket: 0,
             pending_snapshots: array::from_fn(|_| None),
             reinstall_pending: [true; PATTERN_SLOT_COUNT],
             installed_generations: [None; PATTERN_SLOT_COUNT],
@@ -456,17 +660,27 @@ impl PatternWorkspace {
     }
 
     pub fn move_cursor_bar(&mut self, delta: i32) {
-        let bars = self.selected_pattern().transport().bars();
+        let transport = self.selected_pattern().transport();
+        let bars = transport.bars();
+        let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
+        let local_step = self.cursor.step % steps_per_bar;
         let bar = i32::from(self.cursor.bar)
             .saturating_add(delta)
             .clamp(0, i32::from(bars.saturating_sub(1)));
         self.cursor.bar = u16::try_from(bar).expect("clamped bar fits in u16");
+        self.cursor.step = u32::from(self.cursor.bar)
+            .saturating_mul(steps_per_bar)
+            .saturating_add(local_step)
+            .min(transport.step_count().saturating_sub(1));
         self.refresh_selected_event();
     }
 
     pub fn selected_event(&self) -> Option<&PatternEvent> {
-        self.selected_event
-            .and_then(|event_id| self.selected_pattern().event(event_id))
+        self.selected_event.and_then(|selected| {
+            (selected.slot == self.selected_slot)
+                .then(|| self.selected_pattern().event(selected.event_id))
+                .flatten()
+        })
     }
 
     pub fn toggle_step(&mut self) -> Result<(), PatternEditError> {
@@ -476,13 +690,16 @@ impl PatternWorkspace {
             .step_frame(self.cursor.step);
         let index = self.slot_index();
         let event = self.patterns[index].toggle_at(self.cursor.pad, raw_frame, 1.0)?;
-        self.selected_event = event;
+        self.selected_event = event.map(|event_id| SelectedEvent {
+            slot: self.selected_slot,
+            event_id,
+        });
         self.mark_dirty(index);
         Ok(())
     }
 
     pub fn delete_step(&mut self) -> Result<(), PatternEditError> {
-        let Some(event_id) = self.selected_event else {
+        let Some(event_id) = self.selected_event_id() else {
             return Ok(());
         };
         let index = self.slot_index();
@@ -496,14 +713,14 @@ impl PatternWorkspace {
         if !delta.is_finite() {
             return Err(PatternEditError::InvalidVelocity);
         }
-        let Some(event_id) = self.selected_event else {
+        let Some(event_id) = self.selected_event_id() else {
             return Ok(());
         };
-        let velocity = self
-            .selected_pattern()
-            .event(event_id)
-            .expect("selected event belongs to the selected pattern")
-            .velocity;
+        let Some(event) = self.selected_pattern().event(event_id) else {
+            self.selected_event = None;
+            return Ok(());
+        };
+        let velocity = event.velocity;
         let index = self.slot_index();
         self.patterns[index].set_velocity(event_id, (velocity + delta).clamp(0.0, 1.0))?;
         self.mark_dirty(index);
@@ -574,23 +791,33 @@ impl PatternWorkspace {
         if stamp.slot != self.selected_slot || stamp.loop_frames == 0 {
             return Err(PatternEditError::InvalidSlot);
         }
-        self.recording = Some(RecordingIntent { stamp });
+        self.recording = Some(RecordingState::Pending(RecordingIntent { stamp }));
         self.held_keys.fill(None);
         Ok(())
     }
 
     pub fn stop_recording(&mut self) {
-        self.recording = None;
+        self.recording = self
+            .recording
+            .map(|state| RecordingState::Disarming(state.intent()));
         self.held_keys.fill(None);
     }
 
     pub fn is_recording(&self) -> bool {
-        self.recording.is_some()
+        self.recording.is_some_and(RecordingState::accepts_acks)
+    }
+
+    pub fn capture_state(&self) -> Option<PatternCaptureState> {
+        self.recording.map(RecordingState::capture_state)
     }
 
     pub fn record_capture(&self) -> Option<(PatternSlotId, u64)> {
         self.recording
-            .map(|intent| (intent.stamp.slot, intent.stamp.generation))
+            .filter(|state| state.accepts_acks())
+            .map(|state| {
+                let stamp = state.intent().stamp;
+                (stamp.slot, stamp.generation)
+            })
     }
 
     pub fn note_live_trigger(
@@ -610,6 +837,7 @@ impl PatternWorkspace {
             release_id: None,
             event_id: None,
             trigger_frame: None,
+            trigger_absolute_frame: None,
         });
     }
 
@@ -627,31 +855,38 @@ impl PatternWorkspace {
     }
 
     pub fn apply_ack(&mut self, ack: LiveAck) {
-        let Some(intent) = self.recording else {
+        let Some(key) = self.matching_held_key(ack) else {
             return;
         };
-        let Some(stamp) = ack.transport else {
+        let Some(entry) = self.held_keys[key] else {
             return;
         };
-        if stamp.slot != intent.stamp.slot
-            || stamp.generation != intent.stamp.generation
-            || stamp.origin != intent.stamp.origin
-            || stamp.loop_frames != intent.stamp.loop_frames
-        {
+        let matching_trigger =
+            matches!(ack.kind, LiveAckKind::Trigger { .. }) && entry.trigger_id == Some(ack.id);
+        let matching_release =
+            matches!(ack.kind, LiveAckKind::Release) && entry.release_id == Some(ack.id);
+        if !matching_trigger && !matching_release {
             return;
         }
 
-        let Some(key) = self.held_keys.iter().position(|entry| {
-            entry.is_some_and(|entry| {
-                entry.trigger_id == Some(ack.id) || entry.release_id == Some(ack.id)
-            })
-        }) else {
+        let Some(state) = self.recording else {
+            self.held_keys[key] = None;
             return;
         };
-        let mut entry = self.held_keys[key].expect("the matching held key exists");
+        let intent = state.intent();
+        let Some(stamp) = ack.transport else {
+            self.held_keys[key] = None;
+            return;
+        };
+        if !state.accepts_acks() || stamp != intent.stamp {
+            self.held_keys[key] = None;
+            return;
+        }
+
         match ack.kind {
-            LiveAckKind::Trigger { velocity } if entry.trigger_id == Some(ack.id) => {
+            LiveAckKind::Trigger { velocity } => {
                 if ack.pad != entry.pad {
+                    self.held_keys[key] = None;
                     return;
                 }
                 let frame = ack.frame.wrapping_sub(stamp.origin) % stamp.loop_frames;
@@ -661,56 +896,89 @@ impl PatternWorkspace {
                 } else {
                     entry.velocity
                 };
-                if let Ok(event_id) =
-                    self.patterns[index].insert_new(entry.pad, frame, velocity, None)
-                {
-                    entry.event_id = Some(event_id);
-                    entry.trigger_frame = Some(frame);
-                    self.held_keys[key] = Some(entry);
-                    self.selected_event = Some(event_id);
-                    self.mark_dirty(index);
+                match self.patterns[index].insert_new(entry.pad, frame, velocity, None) {
+                    Ok(event_id) => {
+                        let mut entry = entry;
+                        entry.event_id = Some(event_id);
+                        entry.trigger_frame = Some(frame);
+                        entry.trigger_absolute_frame = Some(ack.frame);
+                        self.held_keys[key] = Some(entry);
+                        if stamp.slot == self.selected_slot {
+                            self.selected_event = Some(SelectedEvent {
+                                slot: stamp.slot,
+                                event_id,
+                            });
+                        }
+                        self.mark_dirty(index);
+                    }
+                    Err(_) => self.held_keys[key] = None,
                 }
             }
-            LiveAckKind::Release if entry.release_id == Some(ack.id) => {
-                let (Some(event_id), Some(trigger_frame)) = (entry.event_id, entry.trigger_frame)
+            LiveAckKind::Release => {
+                let (Some(event_id), Some(trigger_absolute_frame)) =
+                    (entry.event_id, entry.trigger_absolute_frame)
                 else {
-                    return;
-                };
-                let release_frame = ack.frame.wrapping_sub(stamp.origin) % stamp.loop_frames;
-                let duration = release_frame
-                    .wrapping_add(stamp.loop_frames)
-                    .wrapping_sub(trigger_frame)
-                    % stamp.loop_frames;
-                if duration == 0 {
                     self.held_keys[key] = None;
                     return;
-                }
+                };
+                let elapsed = ack.frame.saturating_sub(trigger_absolute_frame);
+                let duration = elapsed.min(stamp.loop_frames);
                 let index = usize::from(stamp.slot.get());
                 let Some(event) = self.patterns[index].event(event_id).copied() else {
                     self.held_keys[key] = None;
                     return;
                 };
-                let _ = self.patterns[index].remove(event_id);
-                if self.patterns[index]
-                    .insert(
-                        PatternEvent::new(
-                            event_id,
-                            event.pad,
-                            event.frame,
-                            event.velocity,
-                            Some(duration),
-                        )
-                        .expect("recorded duration is valid"),
-                    )
-                    .is_ok()
-                {
-                    self.selected_event = Some(event_id);
-                    self.mark_dirty(index);
+                if duration != 0 {
+                    let replacement = PatternEvent::new(
+                        event_id,
+                        event.pad,
+                        event.frame,
+                        event.velocity,
+                        Some(duration),
+                    );
+                    if let Ok(replacement) = replacement
+                        && self.patterns[index].remove(event_id).is_ok()
+                        && self.patterns[index].insert(replacement).is_ok()
+                    {
+                        if stamp.slot == self.selected_slot {
+                            self.selected_event = Some(SelectedEvent {
+                                slot: stamp.slot,
+                                event_id,
+                            });
+                        }
+                        self.mark_dirty(index);
+                    }
                 }
                 self.held_keys[key] = None;
             }
-            _ => {}
         }
+    }
+
+    fn matching_held_key(&self, ack: LiveAck) -> Option<usize> {
+        self.held_keys.iter().position(|entry| {
+            entry.is_some_and(|entry| match ack.kind {
+                LiveAckKind::Trigger { .. } => entry.trigger_id == Some(ack.id),
+                LiveAckKind::Release => entry.release_id == Some(ack.id),
+            })
+        })
+    }
+
+    fn reconcile_record_capture(&mut self, telemetry: Telemetry) {
+        let Some(state) = self.recording else {
+            return;
+        };
+        let stamp = state.intent().stamp;
+        let matches_capture = telemetry.pattern_recording
+            && telemetry.pattern_slot == Some(stamp.slot)
+            && telemetry.pattern_generation == Some(stamp.generation)
+            && telemetry.pattern_origin == Some(stamp.origin);
+        self.recording = match state {
+            RecordingState::Pending(intent) if matches_capture => {
+                Some(RecordingState::Confirmed(intent))
+            }
+            RecordingState::Disarming(_) if !telemetry.pattern_recording => None,
+            _ => Some(state),
+        };
     }
 
     pub fn is_playing(&self) -> bool {
@@ -755,20 +1023,18 @@ impl PatternWorkspace {
         }
 
         self.playing = telemetry.pattern_playing;
-        if !telemetry.pattern_recording && self.recording.is_some() {
-            self.stop_recording();
-        }
+        self.reconcile_record_capture(telemetry);
 
-        if let Some((index, generation)) = self.next_dirty_slot() {
+        if let Some((index, dirty)) = self.next_dirty_slot() {
             let slot = self.patterns[index].slot();
             match self.patterns[index].compile() {
                 Ok(snapshot) => {
-                    if self.patterns[index].generation() == generation {
+                    if self.patterns[index].generation() == dirty.generation {
                         self.pending_snapshots[index] = Some(PendingSnapshot {
-                            generation,
+                            generation: dirty.generation,
                             snapshot: Arc::new(snapshot),
                         });
-                        self.dirty_generations[index] = None;
+                        self.dirty_patterns[index] = None;
                         result.compiled_slot = Some(slot);
                     }
                 }
@@ -791,7 +1057,7 @@ impl PatternWorkspace {
                 .expect("selected pending slot holds a snapshot");
             if self.patterns[index].generation() != pending.generation {
                 self.pending_snapshots[index] = None;
-                self.dirty_generations[index] = Some(self.patterns[index].generation());
+                self.mark_dirty(index);
                 let status = PatternStatus::UpdatePending { slot };
                 self.last_status = Some(status.clone());
                 result.status = Some(status);
@@ -829,9 +1095,19 @@ impl PatternWorkspace {
         usize::from(self.selected_slot.get())
     }
 
+    fn selected_event_id(&self) -> Option<EventId> {
+        self.selected_event
+            .filter(|selected| selected.slot == self.selected_slot)
+            .map(|selected| selected.event_id)
+    }
+
     fn mark_dirty(&mut self, index: usize) {
         let generation = self.patterns[index].generation();
-        self.dirty_generations[index] = Some(generation);
+        self.next_dirty_ticket = self.next_dirty_ticket.saturating_add(1);
+        self.dirty_patterns[index] = Some(DirtyPattern {
+            generation,
+            ticket: self.next_dirty_ticket,
+        });
         self.reinstall_pending[index] = true;
         if self.pending_snapshots[index]
             .as_ref()
@@ -841,13 +1117,13 @@ impl PatternWorkspace {
         }
     }
 
-    fn next_dirty_slot(&self) -> Option<(usize, u64)> {
-        self.dirty_generations
+    fn next_dirty_slot(&self) -> Option<(usize, DirtyPattern)> {
+        self.dirty_patterns
             .iter()
             .enumerate()
-            .filter_map(|(index, generation)| generation.map(|generation| (index, generation)))
+            .filter_map(|(index, dirty)| dirty.map(|dirty| (index, dirty)))
             .fold(None, |best, candidate| match best {
-                Some((_, generation)) if generation >= candidate.1 => best,
+                Some((_, dirty)) if dirty.ticket >= candidate.1.ticket => best,
                 _ => Some(candidate),
             })
     }
@@ -877,7 +1153,10 @@ impl PatternWorkspace {
             .transport()
             .step_frame(self.cursor.step);
         self.selected_event = self.selected_pattern().events().iter().find_map(|event| {
-            (event.pad == self.cursor.pad && event.frame == raw_frame).then_some(event.id)
+            (event.pad == self.cursor.pad && event.frame == raw_frame).then_some(SelectedEvent {
+                slot: self.selected_slot,
+                event_id: event.id,
+            })
         });
     }
 }

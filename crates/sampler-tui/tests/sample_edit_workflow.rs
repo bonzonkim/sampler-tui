@@ -61,14 +61,12 @@ impl Fixture {
 
     fn rate_mapping_48_000_frames() -> Self {
         let frames = (0..48_000)
-            .map(|index| match index % 4 {
-                0 => [0.25, -0.5],
-                1 => [-0.75, 0.125],
-                2 => [0.5, 0.875],
-                _ => [-0.125, 0.375],
+            .map(|index| {
+                let position = index as f32 / 47_999.0;
+                [-0.8 + 1.6 * position, 0.7 - 1.4 * position]
             })
             .collect::<Vec<_>>();
-        Self::write("rate-mapping.wav", 48_000, &frames)
+        Self::write("absolute-position.wav", 48_000, &frames)
     }
 
     fn identity_48_000_frames() -> Self {
@@ -391,6 +389,18 @@ fn audio_pair(sample_rate: u32) -> (ControllerPort, AudioEngine, Rc<ProbeState>)
 
 fn pad(index: u8) -> PadId {
     PadId::new(BankId::new(0).unwrap(), index).unwrap()
+}
+
+fn stereo_frame(sample: &SampleBuffer, frame: usize) -> [f32; 2] {
+    [sample.data()[frame * 2], sample.data()[frame * 2 + 1]]
+}
+
+fn first_callback_frame(sample: [f32; 2]) -> [f32; 2] {
+    let pan_gain = (std::f32::consts::PI / 4.0).cos();
+    sample.map(|value| {
+        let value = value * pan_gain / 32.0;
+        value / (1.0 + value.abs())
+    })
 }
 
 #[test]
@@ -769,17 +779,19 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     );
     let recovered_base = harness.app.base_sample(first).unwrap();
     let recovered = harness.app.pad(first).sample.as_ref().unwrap();
+    let correct_first = stereo_frame(recovered_base, 11_025);
+    let correct_last = stereo_frame(recovered_base, 33_074);
+    for wrong_start in [10_878, 11_024, 11_026, 11_172] {
+        assert_ne!(correct_first, stereo_frame(recovered_base, wrong_start));
+    }
+    for wrong_last in [32_927, 33_073, 33_075, 33_221] {
+        assert_ne!(correct_last, stereo_frame(recovered_base, wrong_last));
+    }
+    assert_ne!(correct_first, correct_last);
+    assert_eq!(stereo_frame(recovered, 0), correct_first);
     assert_eq!(
-        &recovered.data()[..2],
-        &recovered_base.data()[11_025 * 2..11_025 * 2 + 2]
-    );
-    assert_eq!(
-        &recovered.data()[recovered.data().len() - 2..],
-        &recovered_base.data()[33_074 * 2..33_074 * 2 + 2]
-    );
-    assert_ne!(
-        &recovered.data()[..2],
-        &recovered_base.data()[33_074 * 2..33_074 * 2 + 2]
+        stereo_frame(recovered, recovered.frames() - 1),
+        correct_last
     );
     assert_eq!(
         harness.app.base_sample(second).unwrap().sample_rate(),
@@ -845,12 +857,11 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     harness
         .engine
         .render_frames(65, |frame| committed_audition.push(frame));
-    let committed_first = committed_audition.last().unwrap();
-    assert!(
-        committed_first[0] < 0.0 && committed_first[1] < 0.0,
-        "committed callback frame {committed_first:?}, triggers {}",
-        harness.engine.executed_triggers()
-    );
+    let committed_first = *committed_audition.last().unwrap();
+    let expected_callback = first_callback_frame(correct_first);
+    assert!((committed_first[0] - expected_callback[0]).abs() < 1e-6);
+    assert!((committed_first[1] - expected_callback[1]).abs() < 1e-6);
+    assert!(committed_first[0] < 0.0 && committed_first[1] > 0.0);
     assert_eq!(harness.engine.executed_triggers(), 2);
     assert_eq!(fixture.bytes(), source_before);
     assert_eq!(identity_fixture.bytes(), identity_source_before);

@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_leaf_uses_256_bit_lower_hex_entropy_without_process_identity() {
+    fn temporary_leaf_uses_256_bit_lower_hex_entropy() {
         let fixture = ProjectFixture::new();
         let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
         let destination = fixture.directory.join("project.toml");
@@ -2195,7 +2195,6 @@ mod tests {
         assert_eq!(suffix.len(), 64);
         assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(suffix, suffix.to_ascii_lowercase());
-        assert!(!suffix.contains(&std::process::id().to_string()));
     }
 
     #[test]

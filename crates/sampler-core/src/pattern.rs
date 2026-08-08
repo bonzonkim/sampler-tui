@@ -7,6 +7,7 @@ use crate::{Frame, ModelError, PadId, PatternCompileError, PatternEditError, Tra
 pub const PATTERN_SLOT_COUNT: usize = 16;
 pub const MAX_PATTERN_EVENTS: usize = 1_024;
 pub const MAX_PATTERN_ACTIONS: usize = 2_048;
+pub const FIRST_LOOP_VALID_MASK_WORDS: usize = MAX_PATTERN_ACTIONS / u64::BITS as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventId(pub u64);
@@ -550,6 +551,7 @@ impl EditablePattern {
                 PatternAction {
                     frame: event.frame,
                     trigger_frame: event.frame,
+                    trigger_loop_delta: 0,
                     event_id: event.id,
                     pad: event.pad,
                     kind: PatternActionKind::Trigger {
@@ -558,16 +560,17 @@ impl EditablePattern {
                 },
             )?;
             if let Some(duration) = event.duration {
-                let release_frame = event
+                let release_offset = event
                     .frame
                     .checked_add(duration)
-                    .ok_or(PatternCompileError::ArithmeticOverflow)?
-                    % loop_frames;
+                    .ok_or(PatternCompileError::ArithmeticOverflow)?;
+                let release_frame = release_offset % loop_frames;
                 push_action(
                     &mut actions,
                     PatternAction {
                         frame: release_frame,
                         trigger_frame: event.frame,
+                        trigger_loop_delta: u8::from(release_offset >= loop_frames),
                         event_id: event.id,
                         pad: event.pad,
                         kind: PatternActionKind::Release,
@@ -581,11 +584,19 @@ impl EditablePattern {
                 .then(left.event_id.cmp(&right.event_id))
                 .then(action_kind_order(left.kind).cmp(&action_kind_order(right.kind)))
         });
+        let mut first_loop_valid = [0_u64; FIRST_LOOP_VALID_MASK_WORDS];
+        for (index, action) in actions.iter().enumerate() {
+            if action.trigger_loop_delta == 0 {
+                first_loop_valid[index / u64::BITS as usize] |=
+                    1_u64 << (index % u64::BITS as usize);
+            }
+        }
         Ok(PatternSnapshot {
             slot: self.slot,
             generation: self.generation,
             loop_frames,
             actions: actions.into_boxed_slice(),
+            first_loop_valid,
         })
     }
 
@@ -630,6 +641,7 @@ pub enum PatternActionKind {
 pub struct PatternAction {
     pub frame: Frame,
     pub trigger_frame: Frame,
+    pub trigger_loop_delta: u8,
     pub event_id: EventId,
     pub pad: PadId,
     pub kind: PatternActionKind,
@@ -641,6 +653,7 @@ pub struct PatternSnapshot {
     generation: u64,
     loop_frames: Frame,
     actions: Box<[PatternAction]>,
+    first_loop_valid: [u64; FIRST_LOOP_VALID_MASK_WORDS],
 }
 
 impl PatternSnapshot {
@@ -659,6 +672,10 @@ impl PatternSnapshot {
     pub fn actions(&self) -> &[PatternAction] {
         &self.actions
     }
+
+    pub fn first_loop_valid_word(&self, word_index: usize) -> u64 {
+        self.first_loop_valid.get(word_index).copied().unwrap_or(0)
+    }
 }
 
 fn validate_compilable_event(
@@ -669,7 +686,10 @@ fn validate_compilable_event(
         && event.frame < loop_frames
         && event.velocity.is_finite()
         && (0.0..=1.0).contains(&event.velocity)
-        && event.duration != Some(0))
+        && event.duration != Some(0)
+        && event
+            .duration
+            .is_none_or(|duration| duration <= loop_frames))
     .then_some(())
     .ok_or(PatternCompileError::InvalidEvent)
 }
@@ -700,7 +720,10 @@ fn validate_editable_event(
         && event.frame < loop_frames
         && event.velocity.is_finite()
         && (0.0..=1.0).contains(&event.velocity)
-        && event.duration != Some(0))
+        && event.duration != Some(0)
+        && event
+            .duration
+            .is_none_or(|duration| duration <= loop_frames))
     .then_some(())
     .ok_or(PatternEditError::Model(ModelError::InvalidEvent))
 }
@@ -846,8 +869,95 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            (release.event_id, release.frame, release.trigger_frame),
-            (EventId(7), 5, loop_frames - 5)
+            (
+                release.event_id,
+                release.frame,
+                release.trigger_frame,
+                release.trigger_loop_delta,
+            ),
+            (EventId(7), 5, loop_frames - 5, 1)
+        );
+    }
+
+    #[test]
+    fn release_loop_delta_distinguishes_non_wrapped_wrapped_and_exact_loop_durations() {
+        let mut pattern = editable(100, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        pattern.insert(event_with_duration(1, 10, 5)).unwrap();
+        pattern
+            .insert(event_with_duration(2, loop_frames - 2, 4))
+            .unwrap();
+        pattern
+            .insert(event_with_duration(3, 20, loop_frames))
+            .unwrap();
+
+        let snapshot = pattern.compile().unwrap();
+        let delta = |id| {
+            snapshot
+                .actions()
+                .iter()
+                .find(|action| {
+                    action.event_id == EventId(id) && action.kind == PatternActionKind::Release
+                })
+                .unwrap()
+                .trigger_loop_delta
+        };
+
+        assert_eq!((delta(1), delta(2), delta(3)), (0, 1, 1));
+    }
+
+    #[test]
+    fn duration_longer_than_the_loop_is_rejected_without_mutating_editable_state() {
+        let mut pattern = editable(100, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        let before_generation = pattern.generation();
+        let before_next_event_id = pattern.next_event_id();
+        let before_raw_frames = pattern.raw_frames.clone();
+
+        assert_eq!(
+            pattern.insert_new(pad(), 10, 1.0, Some(loop_frames + 1)),
+            Err(PatternEditError::Model(ModelError::InvalidEvent))
+        );
+        assert!(pattern.events().is_empty());
+        assert_eq!(pattern.raw_frames, before_raw_frames);
+        assert_eq!(pattern.generation(), before_generation);
+        assert_eq!(pattern.next_event_id(), before_next_event_id);
+    }
+
+    #[test]
+    fn compile_rejects_a_corrupted_duration_longer_than_the_loop() {
+        let mut pattern = editable(100, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        pattern.insert(event_with_duration(1, 10, 5)).unwrap();
+        pattern.events.events[0].duration = Some(loop_frames + 1);
+
+        assert!(matches!(
+            pattern.compile(),
+            Err(PatternCompileError::InvalidEvent)
+        ));
+    }
+
+    #[test]
+    fn first_loop_validity_mask_skips_a_thousand_twenty_four_wrapped_releases() {
+        let mut pattern = editable(100, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        for id in 1..=MAX_PATTERN_EVENTS as u64 {
+            pattern
+                .insert(event_with_duration(id, loop_frames - 1, 1))
+                .unwrap();
+        }
+
+        let snapshot = pattern.compile().unwrap();
+        let valid = (0..FIRST_LOOP_VALID_MASK_WORDS)
+            .map(|word| snapshot.first_loop_valid_word(word).count_ones() as usize)
+            .sum::<usize>();
+
+        assert_eq!(valid, MAX_PATTERN_EVENTS);
+        assert!((0..16).all(|word| snapshot.first_loop_valid_word(word) == 0));
+        assert!((16..32).all(|word| snapshot.first_loop_valid_word(word) == u64::MAX));
+        assert_eq!(
+            snapshot.first_loop_valid_word(FIRST_LOOP_VALID_MASK_WORDS),
+            0
         );
     }
 

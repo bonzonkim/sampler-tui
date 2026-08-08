@@ -93,6 +93,12 @@ pub enum Overlay {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPatternTransport {
+    playing: bool,
+    submitted_frame: u64,
+}
+
 pub struct App {
     active_bank: BankId,
     selected_pad: usize,
@@ -121,6 +127,7 @@ pub struct App {
     meter_right: f32,
     recorded_ack_count: usize,
     pattern_submission_count: usize,
+    pending_pattern_transport: Option<PendingPatternTransport>,
     should_quit: bool,
 }
 
@@ -189,6 +196,7 @@ impl App {
             meter_right: 0.0,
             recorded_ack_count: 0,
             pattern_submission_count: 0,
+            pending_pattern_transport: None,
             should_quit: false,
         }
     }
@@ -873,7 +881,7 @@ impl App {
                 true
             }
             KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-                if self.patterns.is_playing() {
+                if self.pattern_transport_is_playing() {
                     self.stop_pattern_playback();
                 } else {
                     self.start_pattern_playback();
@@ -1036,7 +1044,7 @@ impl App {
 
     fn select_pattern(&mut self, slot: PatternSlotId) {
         self.patterns.select_slot(slot);
-        let switch = if self.patterns.is_playing() {
+        let switch = if self.pattern_transport_is_playing() {
             PatternSwitch::NextBoundary
         } else {
             PatternSwitch::Immediate
@@ -1064,6 +1072,7 @@ impl App {
             self.status = error;
             return;
         }
+        self.note_pattern_transport_intent(true);
         self.overlay = None;
     }
 
@@ -1076,11 +1085,12 @@ impl App {
             self.status = error;
             return;
         }
+        self.patterns.stop_recording();
         if let Err(error) = audio.stop_pattern() {
             self.status = error;
             return;
         }
-        self.patterns.stop_recording();
+        self.note_pattern_transport_intent(false);
         self.overlay = None;
     }
 
@@ -1098,28 +1108,44 @@ impl App {
         let stamp = TransportStamp {
             slot,
             generation,
-            origin: self.telemetry.pattern_origin.unwrap_or(0),
+            origin: (self.telemetry.pattern_slot == Some(slot)
+                && self.telemetry.pattern_generation == Some(generation))
+            .then_some(self.telemetry.pattern_origin)
+            .flatten()
+            .unwrap_or(0),
             loop_frames: self.patterns.selected_pattern().transport().loop_frames(),
         };
-        let Some(audio) = self.audio.as_mut() else {
-            self.report_audio_unavailable();
-            return;
-        };
-        if !self.patterns.is_playing() {
-            if let Err(error) = audio.select_pattern(slot, PatternSwitch::Immediate) {
-                self.status = error;
+        let start_transport = !self.pattern_transport_is_playing();
+        {
+            let Some(audio) = self.audio.as_mut() else {
+                self.report_audio_unavailable();
                 return;
+            };
+            if start_transport {
+                if let Err(error) = audio.select_pattern(slot, PatternSwitch::Immediate) {
+                    self.status = error;
+                    return;
+                }
+                if let Err(error) = audio.play_pattern() {
+                    self.status = error;
+                    return;
+                }
             }
-            if let Err(error) = audio.play_pattern() {
-                self.status = error;
-                return;
-            }
+        }
+        if start_transport {
+            self.note_pattern_transport_intent(true);
         }
         if let Err(error) = self.patterns.start_recording(stamp) {
             self.status = error.to_string();
             return;
         }
-        if let Err(error) = audio.set_record_capture(self.patterns.record_capture()) {
+        let capture = self.patterns.record_capture();
+        let result = self
+            .audio
+            .as_mut()
+            .expect("audio remains present after transport admission")
+            .set_record_capture(capture);
+        if let Err(error) = result {
             self.patterns.stop_recording();
             self.status = error;
         }
@@ -1139,6 +1165,19 @@ impl App {
         self.overlay = Some(Overlay::ClearPattern {
             slot,
             event_count: self.patterns.selected_pattern().events().len(),
+        });
+    }
+
+    fn pattern_transport_is_playing(&self) -> bool {
+        self.pending_pattern_transport
+            .map(|intent| intent.playing)
+            .unwrap_or(self.telemetry.pattern_playing)
+    }
+
+    fn note_pattern_transport_intent(&mut self, playing: bool) {
+        self.pending_pattern_transport = Some(PendingPatternTransport {
+            playing,
+            submitted_frame: self.telemetry.rendered_frame,
         });
     }
 
@@ -1264,6 +1303,7 @@ impl App {
             Ok(()) => {
                 self.held_pad_by_key.fill(None);
                 self.patterns.stop_recording();
+                self.note_pattern_transport_intent(false);
             }
             Err(error) => self.status = error,
         }
@@ -1316,6 +1356,12 @@ impl App {
 
     fn apply_telemetry(&mut self, telemetry: Telemetry) -> bool {
         let changed = self.telemetry != telemetry;
+        if self
+            .pending_pattern_transport
+            .is_some_and(|intent| telemetry.rendered_frame > intent.submitted_frame)
+        {
+            self.pending_pattern_transport = None;
+        }
         self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
         self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
         self.telemetry = telemetry;
@@ -1347,6 +1393,7 @@ impl App {
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
         self.patterns.stop_recording();
+        self.pending_pattern_transport = None;
         for pad in &mut self.pads {
             pad.active = false;
         }
@@ -1366,6 +1413,7 @@ impl App {
         self.overlay = None;
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
+        self.pending_pattern_transport = None;
         if let Err(error) = self.patterns.rebuild_sample_rate(sample_rate) {
             self.status = error.to_string();
         }
@@ -1820,6 +1868,7 @@ mod tests {
         release_error: Option<String>,
         stop_pad_error: Option<String>,
         stop_all_error: Option<String>,
+        stop_pattern_error: Option<String>,
         install_error: Option<String>,
         calls: CallLog,
         maintenance: Rc<RefCell<Vec<&'static str>>>,
@@ -1838,6 +1887,7 @@ mod tests {
                 release_error: None,
                 stop_pad_error: None,
                 stop_all_error: None,
+                stop_pattern_error: None,
                 install_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
@@ -1868,6 +1918,11 @@ mod tests {
 
         fn failing_stop_all_once(mut self, error: &str) -> Self {
             self.stop_all_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_stop_pattern_once(mut self, error: &str) -> Self {
+            self.stop_pattern_error = Some(error.to_owned());
             self
         }
 
@@ -2015,6 +2070,9 @@ mod tests {
         }
 
         fn stop_pattern(&mut self) -> Result<(), String> {
+            if let Some(error) = self.stop_pattern_error.take() {
+                return Err(error);
+            }
             self.calls.0.borrow_mut().push(AudioCall::StopPattern);
             Ok(())
         }
@@ -2948,6 +3006,93 @@ mod tests {
                 AudioCall::TrackedTrigger(pad(0, 0)),
             ]
         );
+    }
+
+    #[test]
+    fn accepted_play_intent_makes_same_batch_slot_change_wait_for_the_next_boundary() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+                AudioCall::SelectPattern(
+                    PatternSlotId::new(1).unwrap(),
+                    PatternSwitch::NextBoundary,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepted_play_intent_makes_a_second_space_stop_before_telemetry_arrives() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+                AudioCall::SetRecordCapture(None),
+                AudioCall::StopPattern,
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_all_replaces_a_pending_play_intent_before_telemetry_arrives() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply(InputAction::StopAll);
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+                AudioCall::StopAll,
+                AudioCall::SelectPattern(PatternSlotId::new(1).unwrap(), PatternSwitch::Immediate),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_disarms_before_a_failed_transport_stop() {
+        let fake = FakeAudio::ready(48_000, 2).failing_stop_pattern_once("stop failed");
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key('r', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(!app.patterns().is_recording());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+                AudioCall::SetRecordCapture(Some((PatternSlotId::new(0).unwrap(), 0))),
+                AudioCall::SetRecordCapture(None),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
+        );
+        assert_eq!(app.status(), "stop failed");
     }
 
     #[test]

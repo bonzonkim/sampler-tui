@@ -155,6 +155,36 @@ mod tests {
         workspace
     }
 
+    #[test]
+    fn pending_capture_accepts_its_first_exact_ack_before_telemetry_establishes_origin() {
+        let mut workspace = PatternWorkspace::new(100);
+        workspace.start_recording(origin(0)).unwrap();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+
+        workspace.apply_ack(trigger_ack(7, 1_008));
+
+        assert_eq!(workspace.selected_pattern().events().len(), 1);
+        assert_eq!(workspace.selected_pattern().events()[0].frame, 8);
+        assert_eq!(workspace.pending_trigger_id(key(0)), Some(command(7)));
+    }
+
+    #[test]
+    fn pending_capture_confirms_exact_origin_when_ack_and_telemetry_arrive_together() {
+        let mut workspace = PatternWorkspace::new(100);
+        workspace.start_recording(origin(0)).unwrap();
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        let mut audio = FakeAudio::default();
+        audio.acks.push_back(trigger_ack(7, 1_008));
+
+        workspace.maintain(&mut audio, recording_telemetry(origin(1_000)));
+
+        assert_eq!(workspace.selected_pattern().events().len(), 1);
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+    }
+
     fn trigger_ack(id: u64, frame: u64) -> LiveAck {
         LiveAck {
             id: command(id),
@@ -952,13 +982,22 @@ impl PatternWorkspace {
             return;
         };
         let intent = state.intent();
-        let Some(stamp) = ack.transport else {
+        let Some(mut stamp) = ack.transport else {
             self.held_keys[key] = None;
             return;
         };
-        if !state.accepts_acks() || stamp != intent.stamp {
+        let pending_target_matches = matches!(state, RecordingState::Pending(_))
+            && stamp.slot == intent.stamp.slot
+            && stamp.generation == intent.stamp.generation
+            && stamp.loop_frames != 0;
+        if !state.accepts_acks() || (stamp != intent.stamp && !pending_target_matches) {
             self.held_keys[key] = None;
             return;
+        }
+        if pending_target_matches && stamp != intent.stamp {
+            self.recording = Some(RecordingState::Pending(RecordingIntent { stamp }));
+        } else {
+            stamp = intent.stamp;
         }
 
         match ack.kind {

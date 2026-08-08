@@ -1,5 +1,6 @@
 //! Real-time audio boundary for sampler-tui.
 
+mod capture;
 mod command;
 mod decode;
 mod device;
@@ -8,6 +9,11 @@ mod error;
 mod resample;
 mod sample;
 
+pub use capture::{
+    CaptureBuffer, CaptureCommand, CaptureCompletion, CaptureController, CaptureCore,
+    CaptureOutcome, CaptureSendFailure, CaptureSource, CaptureState, MAX_CAPTURE_FRAMES,
+    capture_channels,
+};
 pub use command::{
     AudioCommand, AudioController, COMMAND_CAPACITY, CommandConsumer, CriticalEvent, EnginePorts,
     LIVE_ACK_CAPACITY, LiveAck, LiveAckKind, LiveCommandId, PATTERN_RETIREMENT_CAPACITY,
@@ -22,8 +28,8 @@ pub use decode::{
 pub use device::{AudioSession, write_frames};
 pub use engine::AudioEngine;
 pub use error::{
-    ControlError, DecodeError, DeviceBufferError, DeviceError, EngineError, PrepareError,
-    SampleError,
+    CaptureError, ControlError, DecodeError, DeviceBufferError, DeviceError, EngineError,
+    PrepareError, SampleError,
 };
 pub use resample::{prepare_sample, prepare_sample_with_frame_limit};
 pub use sample::{SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};

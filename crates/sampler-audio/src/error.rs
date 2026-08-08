@@ -91,6 +91,30 @@ pub enum EngineError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CaptureError {
+    #[error("could not allocate capture storage")]
+    AllocationFailed,
+    #[error("capture sample rate must be non-zero")]
+    ZeroSampleRate,
+    #[error("capture frame limit must be non-zero")]
+    ZeroFrameLimit,
+    #[error("capture frame limit {max_frames} exceeds the maximum")]
+    FrameLimitTooLarge { max_frames: usize },
+    #[error("capture command queue is full")]
+    CommandFull,
+    #[error("capture command queue is closed")]
+    CommandClosed,
+    #[error("capture command is invalid in the current state")]
+    InvalidState,
+    #[error("capture command token {received} does not match active token {expected}")]
+    StaleToken { expected: u64, received: u64 },
+    #[error("capture contains no frames")]
+    EmptyCapture,
+    #[error("capture completion is pending controller reclamation")]
+    CompletionPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DeviceBufferError {
     #[error("device channel count must be non-zero")]
     ZeroChannels,

@@ -1084,13 +1084,22 @@ impl AudioEngine {
                 }
             }
             AudioCommand::SetRecordCapture { capture, sequence } => {
-                if !self.sequence_is_stopped(sequence) {
-                    self.pattern_player.record_capture =
-                        capture.map(|(slot, generation)| PatternRecordCapture {
-                            slot,
-                            generation,
-                            sequence,
-                        });
+                let Some((slot, generation)) = capture else {
+                    self.pattern_player.record_capture = None;
+                    return;
+                };
+                let current = self.pattern_player.transport_stamp();
+                if !self.sequence_is_stopped(sequence)
+                    && current
+                        .is_some_and(|stamp| (stamp.slot, stamp.generation) == (slot, generation))
+                {
+                    self.pattern_player.record_capture = Some(PatternRecordCapture {
+                        slot,
+                        generation,
+                        sequence,
+                    });
+                } else {
+                    self.invalid_commands = self.invalid_commands.saturating_add(1);
                 }
             }
             AudioCommand::Trigger { .. }
@@ -2848,6 +2857,60 @@ mod tests {
     }
 
     #[test]
+    fn capture_admission_rejects_stale_or_wrong_slot_but_accepts_exact_current_identity() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let first = pattern_snapshot_with_triggers(0, 100, &[]);
+        let first_generation = first.generation();
+        let second = pattern_snapshot_with_triggers(1, 100, &[]);
+        let first_slot = PatternSlotId::new(0).unwrap();
+        let second_slot = PatternSlotId::new(1).unwrap();
+        controller.install_pattern(first).unwrap();
+        controller.install_pattern(second).unwrap();
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        controller
+            .set_record_capture(Some((first_slot, first_generation)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(
+            engine
+                .pattern_player
+                .record_capture
+                .map(|capture| (capture.slot, capture.generation)),
+            Some((first_slot, first_generation))
+        );
+
+        controller
+            .set_record_capture(Some((first_slot, first_generation + 1)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(
+            engine
+                .pattern_player
+                .record_capture
+                .map(|capture| (capture.slot, capture.generation)),
+            Some((first_slot, first_generation))
+        );
+
+        controller
+            .select_pattern(second_slot, PatternSwitch::Immediate)
+            .unwrap();
+        controller
+            .set_record_capture(Some((first_slot, first_generation)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
+        assert!(engine.invalid_commands() >= 2);
+
+        controller.set_record_capture(None).unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
+    }
+
+    #[test]
     fn tracked_live_ack_and_sound_share_observed_callback_plus_sixty_four() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
@@ -2910,14 +2973,14 @@ mod tests {
         controller.set_record_capture(Some((slot_zero, 0))).unwrap();
         let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
         engine.render_frames(0, |_| {});
+        engine.render_frames(64, |_| {});
         controller
             .set_record_capture(Some((slot_one, second_generation)))
             .unwrap();
-        engine.render_frames(0, |_| {});
-        let mut callback_frame = 36;
+        let mut callback_frame = 100;
         let mut onset = None;
 
-        engine.render_frames(65, |frame| {
+        engine.render_frames(1, |frame| {
             if onset.is_none() && frame != [0.0, 0.0] {
                 onset = Some(callback_frame);
             }
@@ -3324,10 +3387,10 @@ mod tests {
                 controller.stop_all().unwrap();
                 controller.play_pattern().unwrap();
                 controller
-                    .set_record_capture(Some((slot_one, second_generation)))
+                    .select_pattern(slot_one, PatternSwitch::Immediate)
                     .unwrap();
                 controller
-                    .select_pattern(slot_one, PatternSwitch::Immediate)
+                    .set_record_capture(Some((slot_one, second_generation)))
                     .unwrap();
             },
             |_| {},

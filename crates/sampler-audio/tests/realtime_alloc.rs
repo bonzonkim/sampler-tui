@@ -391,11 +391,12 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
             controller
                 .select_pattern(slot_one, PatternSwitch::NextBoundary)
                 .unwrap();
+            controller.release_live_tracked(PadId::first()).unwrap();
+            engine.render_frames(25, |_| {});
             controller
                 .set_record_capture(Some((slot_one, boundary_generation)))
                 .unwrap();
-            controller.release_live_tracked(PadId::first()).unwrap();
-            engine.render_frames(128, |_| {});
+            engine.render_frames(103, |_| {});
             controller.stop_pattern().unwrap();
             engine.render_frames(128, |_| {});
         },

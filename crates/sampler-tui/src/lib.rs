@@ -13,7 +13,7 @@ mod ui_pattern;
 
 pub use app::{
     App, EDIT_PREVIEW_COLUMNS, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView,
-    PreviewColumn,
+    PreviewColumn, SampleEditStatus,
 };
 pub use audio::AudioPort;
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};

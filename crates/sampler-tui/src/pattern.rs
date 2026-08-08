@@ -1124,6 +1124,13 @@ impl PatternWorkspace {
         self.reinstall_pending[usize::from(slot.get())]
     }
 
+    /// True only after the current editable generation has been admitted to the audio controller.
+    pub fn is_slot_ready(&self, slot: PatternSlotId) -> bool {
+        let index = usize::from(slot.get());
+        self.installed_generations[index] == Some(self.patterns[index].generation())
+            && !self.reinstall_pending[index]
+    }
+
     pub fn rebuild_sample_rate(&mut self, sample_rate: u32) -> Result<(), PatternEditError> {
         for index in 0..PATTERN_SLOT_COUNT {
             self.patterns[index].rebuild_sample_rate(sample_rate)?;

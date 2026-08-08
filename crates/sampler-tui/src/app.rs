@@ -1043,6 +1043,10 @@ impl App {
 
     fn select_pattern(&mut self, slot: PatternSlotId) {
         self.patterns.select_slot(slot);
+        if !self.patterns.is_slot_ready(slot) {
+            self.report_pattern_not_ready(slot);
+            return;
+        }
         let switch = if self.pattern_transport_is_playing() {
             PatternSwitch::NextBoundary
         } else {
@@ -1059,6 +1063,10 @@ impl App {
 
     fn start_pattern_playback(&mut self) {
         let slot = self.patterns.selected_slot();
+        if !self.patterns.is_slot_ready(slot) {
+            self.report_pattern_not_ready(slot);
+            return;
+        }
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
@@ -1103,6 +1111,10 @@ impl App {
 
     fn start_pattern_recording(&mut self) {
         let slot = self.patterns.selected_slot();
+        if !self.patterns.is_slot_ready(slot) {
+            self.report_pattern_not_ready(slot);
+            return;
+        }
         let generation = self.patterns.selected_pattern().generation();
         let stamp = TransportStamp {
             slot,
@@ -1165,6 +1177,23 @@ impl App {
             slot,
             event_count: self.patterns.selected_pattern().events().len(),
         });
+    }
+
+    fn report_pattern_not_ready(&mut self, slot: PatternSlotId) {
+        let status = self.patterns.last_status().filter(|status| match status {
+            PatternStatus::UpdatePending { slot: status_slot }
+            | PatternStatus::SnapshotBackpressured { slot: status_slot }
+            | PatternStatus::SnapshotCompileFailed {
+                slot: status_slot, ..
+            }
+            | PatternStatus::AudioCommandFailed {
+                slot: status_slot, ..
+            } => *status_slot == slot,
+        });
+        self.status = status.map_or_else(
+            || pattern_status_text(&PatternStatus::UpdatePending { slot }),
+            pattern_status_text,
+        );
     }
 
     fn pattern_transport_is_playing(&self) -> bool {
@@ -1815,8 +1844,9 @@ mod tests {
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
-        Frame, LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch, SampleBuffer,
-        SampleSlot, Telemetry,
+        AudioController, EnginePorts, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
+        PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+        audio_channels_with_test_capacities,
     };
     use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode};
 
@@ -1853,6 +1883,10 @@ mod tests {
         fn snapshot(&self) -> Vec<AudioCall> {
             self.0.borrow().clone()
         }
+
+        fn clear(&self) {
+            self.0.borrow_mut().clear();
+        }
     }
 
     struct FakeAudio {
@@ -1870,10 +1904,14 @@ mod tests {
         maintenance: Rc<RefCell<Vec<&'static str>>>,
         runtime_error: Option<String>,
         shutdown: Option<Rc<RefCell<Vec<&'static str>>>>,
+        pattern_controller: AudioController,
+        _pattern_ports: EnginePorts,
+        drain_pattern_queue_after_backpressure: bool,
     }
 
     impl FakeAudio {
         fn ready(sample_rate: u32, channels: u16) -> Self {
+            let (pattern_controller, pattern_ports) = audio_channels();
             Self {
                 sample_rate,
                 channels,
@@ -1889,6 +1927,34 @@ mod tests {
                 maintenance: Rc::new(RefCell::new(Vec::new())),
                 runtime_error: None,
                 shutdown: None,
+                pattern_controller,
+                _pattern_ports: pattern_ports,
+                drain_pattern_queue_after_backpressure: false,
+            }
+        }
+
+        fn pattern_queue_full_once(sample_rate: u32, channels: u16) -> Self {
+            let (mut pattern_controller, pattern_ports) =
+                audio_channels_with_test_capacities(1, 256, 64);
+            pattern_controller.play_pattern().unwrap();
+            Self {
+                sample_rate,
+                channels,
+                horizon: 0,
+                horizon_reads: Rc::new(Cell::new(0)),
+                trigger_error: None,
+                release_error: None,
+                stop_pad_error: None,
+                stop_all_error: None,
+                stop_pattern_error: None,
+                install_error: None,
+                calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
+                maintenance: Rc::new(RefCell::new(Vec::new())),
+                runtime_error: None,
+                shutdown: None,
+                pattern_controller,
+                _pattern_ports: pattern_ports,
+                drain_pattern_queue_after_backpressure: false,
             }
         }
 
@@ -2042,10 +2108,17 @@ mod tests {
 
         fn install_pattern(
             &mut self,
-            _snapshot: Arc<PatternSnapshot>,
+            snapshot: Arc<PatternSnapshot>,
         ) -> Result<PatternSnapshotSlot, String> {
             self.calls.0.borrow_mut().push(AudioCall::InstallPattern);
-            Err("no test snapshot slot".to_owned())
+            let result = self
+                .pattern_controller
+                .install_pattern(snapshot)
+                .map_err(|error| error.to_string());
+            if result.is_err() {
+                self.drain_pattern_queue_after_backpressure = true;
+            }
+            result
         }
 
         fn select_pattern(
@@ -2117,6 +2190,11 @@ mod tests {
 
         fn reclaim_retired(&mut self) -> usize {
             self.maintenance.borrow_mut().push("reclaim");
+            if self.drain_pattern_queue_after_backpressure {
+                while self._pattern_ports.immediate_commands.pop().is_ok() {}
+                while self._pattern_ports.commands.pop().is_ok() {}
+                self.drain_pattern_queue_after_backpressure = false;
+            }
             0
         }
 
@@ -2958,7 +3036,7 @@ mod tests {
         app.apply(InputAction::PadPress(16));
         app.apply(InputAction::PadRelease(usize::MAX));
 
-        assert!(calls.snapshot().is_empty());
+        assert!(calls.snapshot().is_empty(), "{:?}", calls.snapshot());
         assert!(app.status().contains("outside 0..16"));
         assert!(!app.should_quit());
     }
@@ -3010,6 +3088,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        app.maintain_audio();
+        calls.clear();
         app.apply_telemetry(transport_telemetry(100, false));
 
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
@@ -3034,6 +3115,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        app.maintain_audio();
+        calls.clear();
         app.apply_telemetry(transport_telemetry(100, true));
 
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
@@ -3051,10 +3135,84 @@ mod tests {
     }
 
     #[test]
+    fn play_does_not_admit_transport_before_the_selected_snapshot_is_installed() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(calls.snapshot().is_empty());
+        assert!(app.status().contains("pattern 1 update pending"));
+    }
+
+    #[test]
+    fn play_waits_for_backpressured_install_then_admits_after_a_later_maintenance_success() {
+        let fake = FakeAudio::pattern_queue_full_once(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.maintain_audio();
+        calls.clear();
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(calls.snapshot().is_empty());
+        assert!(app.status().contains("waiting for audio queue"));
+
+        app.maintain_audio();
+        calls.clear();
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate),
+                AudioCall::PlayPattern,
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_an_installed_pattern_invalidates_transport_readiness_until_reinstalled() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        calls.clear();
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(calls.snapshot().is_empty());
+        assert!(app.status().contains("pattern 1 update pending"));
+    }
+
+    #[test]
+    fn selecting_an_unready_slot_never_admits_a_pattern_switch() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        calls.clear();
+
+        app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            app.patterns().selected_slot(),
+            PatternSlotId::new(1).unwrap()
+        );
+        assert!(calls.snapshot().is_empty());
+        assert!(app.status().contains("pattern 2 update pending"));
+    }
+
+    #[test]
     fn control_r_arms_pattern_recording_while_plain_r_remains_a_pad() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        calls.clear();
 
         app.apply_key(key('r', KeyModifiers::NONE, KeyEventKind::Press));
         app.apply_key(key('r', KeyModifiers::CONTROL, KeyEventKind::Press));
@@ -3077,6 +3235,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        app.maintain_audio();
+        calls.clear();
 
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
         app.apply_key(key('.', KeyModifiers::NONE, KeyEventKind::Press));
@@ -3099,6 +3260,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        app.maintain_audio();
+        calls.clear();
 
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
@@ -3119,6 +3283,9 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        app.maintain_audio();
+        calls.clear();
 
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));
         app.apply(InputAction::StopAll);
@@ -3140,6 +3307,8 @@ mod tests {
         let fake = FakeAudio::ready(48_000, 2).failing_stop_pattern_once("stop failed");
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
+        app.maintain_audio();
+        calls.clear();
 
         app.apply_key(key('r', KeyModifiers::CONTROL, KeyEventKind::Press));
         app.apply_key(key(' ', KeyModifiers::NONE, KeyEventKind::Press));

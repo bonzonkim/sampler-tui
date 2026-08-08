@@ -18,6 +18,7 @@ mod tests {
             ports.commands.pop().unwrap(),
             AudioCommand::Trigger { at_frame: 10, .. }
         ));
+        ports.shared.complete_command();
     }
 
     #[test]
@@ -27,7 +28,8 @@ mod tests {
         let slot = controller
             .install(PadId::first(), sample, PadSettings::default())
             .unwrap();
-        let installed = ports.commands.pop().unwrap();
+        let installed = ports.immediate_commands.pop().unwrap();
+        ports.shared.complete_command();
         let buffer = installed.into_installed_buffer().unwrap();
         ports
             .retirements
@@ -59,7 +61,9 @@ mod tests {
         );
         assert_eq!(controller.command_overflows(), 1);
         assert!(ports.commands.pop().is_ok());
+        ports.shared.complete_command();
         assert!(ports.commands.pop().is_ok());
+        ports.shared.complete_command();
     }
 
     #[test]
@@ -128,7 +132,8 @@ mod tests {
                 Err(ControlError::CommandQueueFull)
             );
         }
-        ports.commands.pop().unwrap();
+        ports.immediate_commands.pop().unwrap();
+        ports.shared.complete_command();
 
         controller
             .install_recovery(
@@ -152,6 +157,7 @@ mod tests {
         );
         for _ in 0..COMMAND_CAPACITY {
             assert!(ports.commands.pop().is_ok());
+            ports.shared.complete_command();
         }
     }
 
@@ -215,6 +221,8 @@ mod tests {
         assert_eq!(controller.stop_pad(pad), Err(ControlError::ClosedSession));
         assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
         assert_eq!(ports.commands.slots(), 0);
+        assert_eq!(ports.immediate_commands.slots(), 0);
+        assert_eq!(ports.shared.queued_commands(), 0);
     }
 
     #[test]
@@ -325,6 +333,7 @@ impl Telemetry {
 
 pub struct AudioController {
     commands: Producer<AudioCommand>,
+    immediate_commands: Producer<AudioCommand>,
     retirements: Consumer<CriticalEvent>,
     telemetry: Consumer<Telemetry>,
     shared: Arc<SharedControlState>,
@@ -334,12 +343,15 @@ pub struct AudioController {
 
 pub struct EnginePorts {
     pub commands: Consumer<AudioCommand>,
+    pub(crate) immediate_commands: Consumer<AudioCommand>,
     pub retirements: Producer<CriticalEvent>,
     pub telemetry: Producer<Telemetry>,
     pub(crate) shared: Arc<SharedControlState>,
 }
 
 pub(crate) struct SharedControlState {
+    command_capacity: usize,
+    queued_commands: AtomicUsize,
     render_horizon: AtomicU64,
     fence_sequence: AtomicU64,
     stop_requested: AtomicBool,
@@ -349,8 +361,10 @@ pub(crate) struct SharedControlState {
 }
 
 impl SharedControlState {
-    fn new() -> Self {
+    fn new(command_capacity: usize) -> Self {
         Self {
+            command_capacity,
+            queued_commands: AtomicUsize::new(0),
             render_horizon: AtomicU64::new(0),
             fence_sequence: AtomicU64::new(0),
             stop_requested: AtomicBool::new(false),
@@ -358,6 +372,23 @@ impl SharedControlState {
             failed: AtomicBool::new(false),
             queued_recovery_commands: AtomicUsize::new(0),
         }
+    }
+
+    fn reserve_command(&self) -> bool {
+        self.queued_commands
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < self.command_capacity).then_some(queued + 1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn complete_command(&self) {
+        let previous = self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "command completion must match admission");
+    }
+
+    pub(crate) fn queued_commands(&self) -> usize {
+        self.queued_commands.load(Ordering::Acquire)
     }
 
     pub(crate) fn publish_render_horizon(&self, frame: Frame) {
@@ -444,13 +475,16 @@ fn audio_channels_with_capacity_values(
     telemetry_capacity: usize,
 ) -> (AudioController, EnginePorts) {
     let (command_producer, command_consumer) = RingBuffer::new(command_capacity);
+    let (immediate_command_producer, immediate_command_consumer) =
+        RingBuffer::new(command_capacity);
     let (retirement_producer, retirement_consumer) = RingBuffer::new(retirement_capacity);
     let (telemetry_producer, telemetry_consumer) = RingBuffer::new(telemetry_capacity);
-    let shared = Arc::new(SharedControlState::new());
+    let shared = Arc::new(SharedControlState::new(command_capacity));
 
     (
         AudioController {
             commands: command_producer,
+            immediate_commands: immediate_command_producer,
             retirements: retirement_consumer,
             telemetry: telemetry_consumer,
             shared: Arc::clone(&shared),
@@ -459,6 +493,7 @@ fn audio_channels_with_capacity_values(
         },
         EnginePorts {
             commands: command_consumer,
+            immediate_commands: immediate_command_consumer,
             retirements: retirement_producer,
             telemetry: telemetry_producer,
             shared,
@@ -516,7 +551,7 @@ impl AudioController {
             settings,
             recovery,
         };
-        if let Err(error) = self.push_command(command) {
+        if let Err(error) = self.push_immediate_command(command) {
             if recovery {
                 self.shared.complete_recovery_command();
             }
@@ -538,7 +573,7 @@ impl AudioController {
             return Err(ControlError::InvalidVelocity);
         }
         let sequence = self.next_timed_sequence;
-        let result = self.push_command(AudioCommand::Trigger {
+        let result = self.push_timed_command(AudioCommand::Trigger {
             pad,
             at_frame,
             velocity,
@@ -556,7 +591,7 @@ impl AudioController {
             return Err(ControlError::InvalidVelocity);
         }
         let sequence = self.next_timed_sequence;
-        let result = self.push_command(AudioCommand::TriggerLive {
+        let result = self.push_immediate_command(AudioCommand::TriggerLive {
             pad,
             velocity,
             sequence,
@@ -570,7 +605,7 @@ impl AudioController {
     pub fn release(&mut self, pad: PadId, at_frame: Frame) -> Result<(), ControlError> {
         self.ensure_open()?;
         let sequence = self.next_timed_sequence;
-        let result = self.push_command(AudioCommand::Release {
+        let result = self.push_timed_command(AudioCommand::Release {
             pad,
             at_frame,
             sequence,
@@ -584,7 +619,7 @@ impl AudioController {
     pub fn release_live(&mut self, pad: PadId) -> Result<(), ControlError> {
         self.ensure_open()?;
         let sequence = self.next_timed_sequence;
-        let result = self.push_command(AudioCommand::ReleaseLive { pad, sequence });
+        let result = self.push_immediate_command(AudioCommand::ReleaseLive { pad, sequence });
         if result.is_ok() {
             self.advance_timed_sequence();
         }
@@ -593,12 +628,12 @@ impl AudioController {
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
         self.ensure_open()?;
-        self.push_command(AudioCommand::UpdatePad { pad, settings })
+        self.push_immediate_command(AudioCommand::UpdatePad { pad, settings })
     }
 
     pub fn stop_pad(&mut self, pad: PadId) -> Result<(), ControlError> {
         self.ensure_open()?;
-        self.push_command(AudioCommand::StopPad { pad })
+        self.push_immediate_command(AudioCommand::StopPad { pad })
     }
 
     pub fn stop_all(&mut self) -> Result<(), ControlError> {
@@ -639,14 +674,32 @@ impl AudioController {
         self.shared.command_overflows()
     }
 
-    fn push_command(&mut self, command: AudioCommand) -> Result<(), ControlError> {
+    fn push_timed_command(&mut self, command: AudioCommand) -> Result<(), ControlError> {
         self.ensure_open()?;
-        if self.commands.push(command).is_err() {
+        if !self.shared.reserve_command() {
             self.shared.record_command_overflow();
-            Err(ControlError::CommandQueueFull)
-        } else {
-            Ok(())
+            return Err(ControlError::CommandQueueFull);
         }
+        if self.commands.push(command).is_ok() {
+            return Ok(());
+        }
+        self.shared.complete_command();
+        self.shared.record_command_overflow();
+        Err(ControlError::CommandQueueFull)
+    }
+
+    fn push_immediate_command(&mut self, command: AudioCommand) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        if !self.shared.reserve_command() {
+            self.shared.record_command_overflow();
+            return Err(ControlError::CommandQueueFull);
+        }
+        if self.immediate_commands.push(command).is_ok() {
+            return Ok(());
+        }
+        self.shared.complete_command();
+        self.shared.record_command_overflow();
+        Err(ControlError::CommandQueueFull)
     }
 
     fn advance_timed_sequence(&mut self) {

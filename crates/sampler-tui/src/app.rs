@@ -484,7 +484,6 @@ impl App {
         let path = path.into();
         let engine_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
         let offset = pad_offset(pad);
-        self.reinstall_pending[offset] = false;
         let view = &mut self.pads[offset];
         view.generation = view.generation.wrapping_add(1);
         view.state = if engine_rate.is_some() {
@@ -1991,6 +1990,51 @@ mod tests {
             app.pad(pad(0, 0)).sample.as_ref().unwrap().sample_rate(),
             48_000
         );
+    }
+
+    #[test]
+    fn same_rate_recovery_survives_replacement_started_before_maintenance() {
+        let failed_audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed_audio));
+        for (index, source) in [(0, "first.wav"), (1, "old.wav")] {
+            let pad = pad(0, index);
+            let request = app.begin_load(pad, source).unwrap();
+            let WorkerRequest::LoadSample { generation, .. } = request else {
+                panic!("wrong request")
+            };
+            assert!(app.apply_worker_result(loaded(pad, generation, source)));
+        }
+        assert!(app.maintain_audio());
+
+        let replacement_audio = FakeAudio::ready(48_000, 2);
+        let calls = replacement_audio.call_log();
+        app.retry_default_device_with(|| Ok(Box::new(replacement_audio)));
+        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+
+        let replacement = app.begin_load(pad(0, 1), "new.wav").unwrap();
+        let WorkerRequest::LoadSample {
+            generation,
+            path: replacement_path,
+            ..
+        } = replacement
+        else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0, 1),
+            generation,
+            path: replacement_path,
+            result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
+        }));
+
+        assert!(app.maintain_audio());
+
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::Install(pad(0, 0)), AudioCall::Install(pad(0, 1)),]
+        );
+        assert_eq!(app.pad(pad(0, 1)).source.as_deref(), Some(path("old.wav")));
+        assert_eq!(app.pad(pad(0, 1)).state, PadLoadState::Ready);
     }
 
     #[test]

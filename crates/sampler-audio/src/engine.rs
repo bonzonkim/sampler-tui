@@ -242,7 +242,7 @@ impl AudioEngine {
     }
 
     pub fn queued_commands(&self) -> usize {
-        self.ports.commands.slots()
+        self.ports.shared.queued_commands()
     }
 
     #[cfg(test)]
@@ -261,55 +261,28 @@ impl AudioEngine {
 
     fn drain_commands(&mut self) {
         let mut processed = 0;
-        while processed < MAX_COMMANDS_PER_RENDER {
-            let (timed_action, is_live) = match self.ports.commands.peek() {
-                Ok(AudioCommand::Trigger {
-                    pad,
-                    at_frame,
-                    velocity,
-                    sequence,
-                }) => (
-                    Some(ScheduledAction::Trigger {
-                        pad: *pad,
-                        at_frame: *at_frame,
-                        velocity: *velocity,
-                        sequence: *sequence,
-                    }),
-                    false,
-                ),
-                Ok(AudioCommand::Release {
-                    pad,
-                    at_frame,
-                    sequence,
-                }) => (
-                    Some(ScheduledAction::Release {
-                        pad: *pad,
-                        at_frame: *at_frame,
-                        sequence: *sequence,
-                    }),
-                    false,
-                ),
+        self.drain_immediate_commands(&mut processed);
+        self.drain_timed_commands(&mut processed);
+    }
+
+    fn drain_immediate_commands(&mut self, processed: &mut usize) {
+        while *processed < MAX_COMMANDS_PER_RENDER {
+            let live_action = match self.ports.immediate_commands.peek() {
                 Ok(AudioCommand::TriggerLive {
                     pad,
                     velocity,
                     sequence,
-                }) => (
-                    Some(ScheduledAction::Trigger {
-                        pad: *pad,
-                        at_frame: self.rendered_frame,
-                        velocity: *velocity,
-                        sequence: *sequence,
-                    }),
-                    true,
-                ),
-                Ok(AudioCommand::ReleaseLive { pad, sequence }) => (
-                    Some(ScheduledAction::Release {
-                        pad: *pad,
-                        at_frame: self.rendered_frame,
-                        sequence: *sequence,
-                    }),
-                    true,
-                ),
+                }) => Some(ScheduledAction::Trigger {
+                    pad: *pad,
+                    at_frame: self.rendered_frame,
+                    velocity: *velocity,
+                    sequence: *sequence,
+                }),
+                Ok(AudioCommand::ReleaseLive { pad, sequence }) => Some(ScheduledAction::Release {
+                    pad: *pad,
+                    at_frame: self.rendered_frame,
+                    sequence: *sequence,
+                }),
                 Ok(AudioCommand::InstallSample {
                     slot,
                     buffer,
@@ -320,40 +293,77 @@ impl AudioEngine {
                 {
                     break;
                 }
-                Ok(_) => (None, false),
+                Ok(_) => None,
                 Err(_) => break,
             };
+            if live_action.is_some() {
+                self.apply_stop_fence();
+            }
+
+            let Ok(command) = self.ports.immediate_commands.pop() else {
+                break;
+            };
+            self.ports.shared.complete_command();
+            if let Some(action) = live_action {
+                if !self.action_is_stopped(action) {
+                    self.execute_action(action);
+                }
+            } else {
+                self.execute_immediate(command);
+            }
+            *processed += 1;
+        }
+    }
+
+    fn drain_timed_commands(&mut self, processed: &mut usize) {
+        while *processed < MAX_COMMANDS_PER_RENDER {
+            let timed_action = match self.ports.commands.peek() {
+                Ok(AudioCommand::Trigger {
+                    pad,
+                    at_frame,
+                    velocity,
+                    sequence,
+                }) => Some(ScheduledAction::Trigger {
+                    pad: *pad,
+                    at_frame: *at_frame,
+                    velocity: *velocity,
+                    sequence: *sequence,
+                }),
+                Ok(AudioCommand::Release {
+                    pad,
+                    at_frame,
+                    sequence,
+                }) => Some(ScheduledAction::Release {
+                    pad: *pad,
+                    at_frame: *at_frame,
+                    sequence: *sequence,
+                }),
+                Ok(_) => None,
+                Err(_) => break,
+            };
+            if timed_action.is_some() {
+                self.apply_stop_fence();
+            }
 
             if let Some(action) = timed_action {
-                if self.action_is_stopped(action) {
-                    if self.ports.commands.pop().is_err() {
-                        break;
-                    }
-                    processed += 1;
-                    continue;
-                }
-                if is_live {
-                    if self.ports.commands.pop().is_err() {
-                        break;
-                    }
-                    self.execute_action(action);
-                    processed += 1;
-                    continue;
-                }
-                if self.pending_len == PENDING_COUNT {
+                if !self.action_is_stopped(action) && self.pending_len == PENDING_COUNT {
                     break;
                 }
                 if self.ports.commands.pop().is_err() {
                     break;
                 }
-                self.insert_pending(action);
+                self.ports.shared.complete_command();
+                if !self.action_is_stopped(action) {
+                    self.insert_pending(action);
+                }
             } else {
                 let Ok(command) = self.ports.commands.pop() else {
                     break;
                 };
+                self.ports.shared.complete_command();
                 self.execute_immediate(command);
             }
-            processed += 1;
+            *processed += 1;
         }
     }
 
@@ -892,6 +902,100 @@ mod tests {
         assert_eq!(engine.executed_triggers(), 1);
         assert_eq!(engine.last_triggered_frame, Some(1));
         assert_eq!(engine.pending_actions(), PENDING_COUNT);
+    }
+
+    #[test]
+    fn live_input_bypasses_a_blocked_timed_command_without_overtaking_setup() {
+        let (mut controller, mut engine) = harness();
+        let first = PadId::first();
+        let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        controller
+            .install(first, constant_sample(1_024, 0.25), PadSettings::default())
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        for _ in 0..PENDING_COUNT {
+            controller.trigger(first, 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+
+        controller.trigger(first, 20_000, 1.0).unwrap();
+        controller
+            .install(second, constant_sample(1_024, 0.5), PadSettings::default())
+            .unwrap();
+        let gate = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+        controller.update_pad(second, gate).unwrap();
+        controller.trigger_live(second, 1.0).unwrap();
+        controller.release_live(second).unwrap();
+        for _ in 0..61 {
+            controller.stop_pad(first).unwrap();
+        }
+
+        engine.render_frames(64, |_| {});
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.last_triggered_frame, Some(64));
+        assert_eq!(engine.voices_for_pad(second), 0);
+        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(engine.queued_commands(), 2);
+        assert_eq!(engine.late_commands(), 0);
+    }
+
+    #[test]
+    fn stop_all_cancels_blocked_timed_actions_but_not_newer_live_input() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(pad, constant_sample(1_024, 0.25), settings)
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        for _ in 0..PENDING_COUNT {
+            controller.trigger(pad, 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        engine.render_frames(0, |_| {});
+
+        controller.trigger(pad, 20_000, 1.0).unwrap();
+        controller.trigger_live(pad, 1.0).unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.executed_triggers(), 1);
+
+        controller.stop_all().unwrap();
+        controller.trigger_live(pad, 1.0).unwrap();
+        engine.render_frames(1, |_| {});
+
+        assert_eq!(engine.executed_triggers(), 2);
+        assert_eq!(engine.last_triggered_frame, Some(64));
+        assert_eq!(engine.pending_actions(), 0);
+        assert_eq!(engine.queued_commands(), 0);
+    }
+
+    #[test]
+    fn post_fence_actions_observed_after_the_initial_poll_survive_stop_all() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(pad, constant_sample(1_024, 0.25), settings)
+            .unwrap();
+        engine.render_frames(1, |_| {});
+
+        engine.apply_stop_fence();
+        controller.stop_all().unwrap();
+        controller.trigger_live(pad, 1.0).unwrap();
+        controller
+            .trigger(pad, engine.rendered_frame(), 1.0)
+            .unwrap();
+        engine.drain_commands();
+        engine.execute_due_actions();
+        assert_eq!(engine.executed_triggers(), 2);
+        assert_eq!(engine.voices_for_pad(pad), 2);
+
+        engine.render_frames(usize::from(RELEASE_FRAMES), |_| {});
+
+        assert_eq!(engine.voices_for_pad(pad), 2);
     }
 
     #[test]

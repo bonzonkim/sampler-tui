@@ -148,6 +148,32 @@ fn measure_live_and_recovery_command_ingestion() {
     drop(keepalive);
 }
 
+fn measure_live_input_behind_a_full_future_action_array() {
+    let (mut controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(48_000, ports).unwrap();
+    let pad = PadId::first();
+    controller
+        .install(
+            pad,
+            Arc::new(SampleBuffer::new(48_000, vec![0.25; 2_048]).unwrap()),
+            PadSettings::default(),
+        )
+        .unwrap();
+    engine.render_frames(1, |_| {});
+    for _ in 0..128 {
+        controller.trigger(pad, 10_000, 1.0).unwrap();
+    }
+    engine.render_frames(0, |_| {});
+    engine.render_frames(0, |_| {});
+    controller.trigger(pad, 20_000, 1.0).unwrap();
+    controller.trigger_live(pad, 1.0).unwrap();
+
+    assert_zero_callback_activity("live input behind full future actions", || {
+        engine.render_frames(1, |_| {});
+    });
+    assert_eq!(engine.executed_triggers(), 1);
+}
+
 fn measure_invalid_command_handling() {
     let (mut controller, ports) = audio_channels();
     let mut engine = AudioEngine::new(48_000, ports).unwrap();
@@ -271,6 +297,7 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
     measure_timed_and_immediate_command_ingestion();
     measure_live_and_recovery_command_ingestion();
+    measure_live_input_behind_a_full_future_action_array();
     measure_invalid_command_handling();
     measure_voice_completion_without_final_arc_drop();
     measure_sample_remap_retirement();

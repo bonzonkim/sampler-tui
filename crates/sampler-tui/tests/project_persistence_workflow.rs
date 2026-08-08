@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -271,6 +271,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::new_with_worker(WorkerHandle::spawn())
+    }
+
+    fn new_with_worker(worker: WorkerHandle) -> Self {
         let (controller, ports) = audio_channels_with_test_capacities(8, 256, 8);
         let controller = Rc::new(RefCell::new(controller));
         let engine = AudioEngine::new(48_000, ports).unwrap();
@@ -284,7 +288,7 @@ impl Harness {
         let mut harness = Self {
             app,
             engine,
-            worker: WorkerHandle::spawn(),
+            worker,
             controller,
         };
         for _ in 0..40 {
@@ -900,4 +904,58 @@ fn probe_then_symlink_replacement_fails_secure_stage_without_replacing_old_tuple
 
     assert!(target.app.project_open_error().is_some());
     assert_eq!(target.app.project_snapshot().unwrap(), old);
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_fails_if_project_directory_path_changes_after_asset_fd_open() {
+    let fixture = FixtureTree::new();
+    let source_path = fixture.write_wav("directory-race-source.wav");
+    let project = fixture.path("directory-race-project");
+    let moved = fixture.path("opened-directory-race-project");
+    let now = Instant::now();
+    let mut source = Harness::new();
+    source.load(pad(0), &source_path);
+    source.save_as(&project, now);
+
+    let opened = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let worker_opened = Arc::clone(&opened);
+    let worker_resume = Arc::clone(&resume);
+    let worker = WorkerHandle::spawn_with_project_asset_open_hook(move || {
+        worker_opened.wait();
+        worker_resume.wait();
+    });
+    let mut target = Harness::new_with_worker(worker);
+    let old = target.app.project_snapshot().unwrap();
+    let old_header = target.app.project_header();
+    target.app.request_open_project(&project).unwrap();
+    assert_eq!(target.dispatch_queued(), 1, "probe completes first");
+    assert!(target.app.maintain_project(now));
+    let [request] = target.app.take_worker_requests().try_into().unwrap();
+    target.worker.try_send(request).unwrap();
+
+    opened.wait();
+    fs::rename(&project, &moved).unwrap();
+    fs::create_dir(&project).unwrap();
+    resume.wait();
+    let result = target.worker.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(target.app.apply_worker_result(result));
+
+    assert!(matches!(
+        target.app.project_open_error(),
+        Some(sampler_tui::ProjectOpenError::Stage {
+            error: sampler_tui::ProjectStageError::Load(
+                sampler_tui::LoadSampleError::ProjectAsset(
+                    sampler_tui::ProjectStoreError::Filesystem {
+                        operation: "verify project directory identity",
+                        ..
+                    }
+                )
+            ),
+            ..
+        })
+    ));
+    assert_eq!(target.app.project_snapshot().unwrap(), old);
+    assert_eq!(target.app.project_header(), old_header);
 }

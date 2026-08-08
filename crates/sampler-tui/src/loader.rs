@@ -279,11 +279,23 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     pub fn spawn() -> Self {
+        Self::spawn_with_asset_hook(None)
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_with_project_asset_open_hook<F>(hook: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        Self::spawn_with_asset_hook(Some(Arc::new(hook)))
+    }
+
+    fn spawn_with_asset_hook(hook: Option<ProjectAssetOpenHook>) -> Self {
         let (requests, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
         let (result_sender, results) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
         let worker = thread::Builder::new()
             .name("sampler-loader".to_owned())
-            .spawn(move || worker_loop(request_receiver, result_sender))
+            .spawn(move || worker_loop_with_asset_hook(request_receiver, result_sender, hook))
             .expect("loader worker thread can be spawned");
         Self {
             requests: Some(requests),
@@ -356,8 +368,19 @@ impl Drop for WorkerHandle {
     }
 }
 
+#[cfg(test)]
 fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResult>) {
-    worker_loop_with_store(requests, results, Box::new(ProjectStore));
+    worker_loop_with_asset_hook(requests, results, None);
+}
+
+type ProjectAssetOpenHook = Arc<dyn Fn() + Send + Sync>;
+
+fn worker_loop_with_asset_hook(
+    requests: Receiver<WorkerRequest>,
+    results: SyncSender<WorkerResult>,
+    hook: Option<ProjectAssetOpenHook>,
+) {
+    worker_loop_with_store_and_asset_hook(requests, results, Box::new(ProjectStore), hook);
 }
 
 trait ProjectStoreBackend: Send {
@@ -390,10 +413,20 @@ impl ProjectStoreBackend for ProjectStore {
     }
 }
 
+#[cfg(test)]
 fn worker_loop_with_store(
     requests: Receiver<WorkerRequest>,
     results: SyncSender<WorkerResult>,
     store: Box<dyn ProjectStoreBackend>,
+) {
+    worker_loop_with_store_and_asset_hook(requests, results, store, None);
+}
+
+fn worker_loop_with_store_and_asset_hook(
+    requests: Receiver<WorkerRequest>,
+    results: SyncSender<WorkerResult>,
+    store: Box<dyn ProjectStoreBackend>,
+    asset_hook: Option<ProjectAssetOpenHook>,
 ) {
     while let Ok(request) = requests.recv() {
         let result = match request {
@@ -488,6 +521,7 @@ fn worker_loop_with_store(
                         expected_digest,
                         engine_rate,
                         recipe,
+                        asset_hook.as_ref(),
                     ),
                     path,
                     recipe,
@@ -582,9 +616,14 @@ fn load_project_sample(
     expected_digest: AssetDigest,
     engine_rate: u32,
     recipe: SampleEditRecipe,
+    asset_hook: Option<&ProjectAssetOpenHook>,
 ) -> Result<LoadedSample, LoadSampleError> {
     let asset = ProjectStore
-        .read_project_asset(project_directory, asset_path, expected_digest)
+        .read_project_asset_after_open(project_directory, asset_path, expected_digest, || {
+            if let Some(hook) = asset_hook {
+                hook();
+            }
+        })
         .map_err(LoadSampleError::ProjectAsset)?;
     decode_and_render_sample(
         &asset.path,

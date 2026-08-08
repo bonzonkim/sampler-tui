@@ -356,14 +356,19 @@ impl ProjectDirectory {
 }
 
 impl ProjectStore {
-    pub(crate) fn read_project_asset(
+    pub(crate) fn read_project_asset_after_open<F>(
         &self,
         directory: &Path,
         relative: &str,
         expected_digest: AssetDigest,
-    ) -> Result<ProjectAssetBytes, ProjectStoreError> {
+        after_open: F,
+    ) -> Result<ProjectAssetBytes, ProjectStoreError>
+    where
+        F: FnOnce(),
+    {
         let project = ProjectDirectory::open_existing(directory)?;
         let mut source = project.open_asset(relative)?;
+        after_open();
         if source.fingerprint.digest != expected_digest {
             return Err(ProjectStoreError::AssetIntegrity { path: source.path });
         }
@@ -385,6 +390,7 @@ impl ProjectStore {
         if fingerprint != source.fingerprint || fingerprint.digest != expected_digest {
             return Err(ProjectStoreError::AssetIntegrity { path: source.path });
         }
+        project.revalidate_path_identity()?;
         Ok(ProjectAssetBytes {
             path: source.path,
             encoded: Arc::from(encoded),

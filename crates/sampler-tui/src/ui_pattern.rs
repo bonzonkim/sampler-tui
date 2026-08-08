@@ -14,11 +14,39 @@ const STEPS_PER_BAR: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct GridProjection {
+    transport: Transport,
     bar: u16,
     steps_per_bar: u32,
     start_step: u32,
-    start_frame: u64,
-    end_frame: u64,
+    bounds: BarBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BarBounds {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+pub(crate) fn bar_bounds(loop_frames: u64, bars: u16, bar: u16) -> BarBounds {
+    let bars = bars.max(1);
+    let bar = bar.min(bars);
+    let boundary = |index: u16| {
+        let numerator = u128::from(loop_frames) * u128::from(index);
+        let divisor = u128::from(bars);
+        u64::try_from(numerator.div_ceil(divisor)).expect("bar boundary fits in u64")
+    };
+    BarBounds {
+        start: boundary(bar),
+        end: boundary(bar.saturating_add(1).min(bars)),
+    }
+}
+
+pub(crate) fn bar_index(playhead: u64, loop_frames: u64, bars: u16) -> u64 {
+    if loop_frames == 0 || bars == 0 {
+        return 1;
+    }
+    (u128::from(playhead % loop_frames) * u128::from(bars) / u128::from(loop_frames) + 1)
+        .min(u128::from(bars)) as u64
 }
 
 impl GridProjection {
@@ -27,14 +55,13 @@ impl GridProjection {
         let bar = bar.min(bars.saturating_sub(1));
         let steps_per_bar = (transport.step_count() / u32::from(bars)).max(1);
         let loop_frames = transport.loop_frames();
-        let start_frame = scaled_bar_frame(loop_frames, bar, bars);
-        let end_frame = scaled_bar_frame(loop_frames, bar.saturating_add(1), bars);
+        let bounds = bar_bounds(loop_frames, bars, bar);
         Self {
+            transport,
             bar,
             steps_per_bar,
             start_step: u32::from(bar) * steps_per_bar,
-            start_frame,
-            end_frame,
+            bounds,
         }
     }
 
@@ -45,17 +72,18 @@ impl GridProjection {
 
     #[cfg(test)]
     fn bar_start_frame(self) -> u64 {
-        self.start_frame
+        self.bounds.start
     }
 
     fn column_for_step(self, step: u32) -> Option<u32> {
-        let local = step.checked_sub(self.start_step)?;
-        (local < self.steps_per_bar).then(|| local * STEPS_PER_BAR / self.steps_per_bar)
+        (step >= self.start_step && step < self.start_step + self.steps_per_bar)
+            .then(|| self.column_for_frame(self.transport.step_frame(step)))
+            .flatten()
     }
 
     fn column_for_frame(self, frame: u64) -> Option<u32> {
-        let local = frame.checked_sub(self.start_frame)?;
-        let length = self.end_frame.saturating_sub(self.start_frame);
+        let local = frame.checked_sub(self.bounds.start)?;
+        let length = self.bounds.end.saturating_sub(self.bounds.start);
         (local < length && length != 0).then(|| {
             u32::try_from(u128::from(local) * u128::from(STEPS_PER_BAR) / u128::from(length))
                 .expect("sixteen-column projection fits in u32")
@@ -63,9 +91,11 @@ impl GridProjection {
     }
 }
 
-fn scaled_bar_frame(loop_frames: u64, bar: u16, bars: u16) -> u64 {
-    u64::try_from(u128::from(loop_frames) * u128::from(bar) / u128::from(bars.max(1)))
-        .expect("bar frame fits in u64")
+#[derive(Clone, Copy)]
+pub(crate) struct LiveIdentity {
+    pub(crate) slot: PatternSlotId,
+    pub(crate) playing: bool,
+    pub(crate) recording: bool,
 }
 
 /// Pure Pattern-workspace view. Editing and audio commands remain in `App`.
@@ -74,10 +104,13 @@ pub(crate) fn render_pattern(frame: &mut Frame, area: Rect, app: &App) {
     let pattern = workspace.selected_pattern();
     let transport = pattern.transport();
     let telemetry = app.telemetry();
-    let live = live_pattern(app);
-    let selected_is_live = live.is_some_and(|(slot, _)| slot == workspace.selected_slot());
-    let recording = selected_is_live && telemetry.pattern_recording;
-    let playing = selected_is_live && telemetry.pattern_playing;
+    let identity = live_identity(app);
+    let live = identity.and_then(|identity| matching_live_pattern(app, identity));
+    let selected_is_live = live.is_some_and(|(_, slot, _)| slot == workspace.selected_slot());
+    let recording = identity
+        .is_some_and(|identity| identity.slot == workspace.selected_slot() && identity.recording);
+    let playing = identity
+        .is_some_and(|identity| identity.slot == workspace.selected_slot() && identity.playing);
     let state = if recording {
         "REC"
     } else if playing {
@@ -91,7 +124,7 @@ pub(crate) fn render_pattern(frame: &mut Frame, area: Rect, app: &App) {
             " PATTERN {:02} ",
             workspace.selected_slot().get() + 1
         ))
-        .title(live_state_label(live, telemetry).to_string());
+        .title(live_state_label(identity).to_string());
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     if inner.is_empty() {
@@ -193,30 +226,44 @@ pub(crate) fn render_pattern(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-pub(crate) fn live_pattern(app: &App) -> Option<(PatternSlotId, &EditablePattern)> {
+pub(crate) fn live_identity(app: &App) -> Option<LiveIdentity> {
     let telemetry = app.telemetry();
     let slot = telemetry.pattern_slot?;
-    let generation = telemetry.pattern_generation?;
-    app.patterns()
-        .pattern_for_generation(slot, generation)
-        .map(|pattern| (slot, pattern))
+    Some(LiveIdentity {
+        slot,
+        playing: telemetry.pattern_playing,
+        recording: telemetry.pattern_recording,
+    })
 }
 
-fn live_state_label(
-    live: Option<(PatternSlotId, &EditablePattern)>,
-    telemetry: sampler_audio::Telemetry,
-) -> String {
-    let Some((slot, _)) = live else {
+fn matching_live_pattern(
+    app: &App,
+    identity: LiveIdentity,
+) -> Option<(LiveIdentity, PatternSlotId, &EditablePattern)> {
+    let generation = app.telemetry().pattern_generation?;
+    app.patterns()
+        .pattern_for_generation(identity.slot, generation)
+        .map(|pattern| (identity, identity.slot, pattern))
+}
+
+pub(crate) fn live_pattern(app: &App) -> Option<(PatternSlotId, &EditablePattern)> {
+    live_identity(app)
+        .and_then(|identity| matching_live_pattern(app, identity))
+        .map(|(_, slot, pattern)| (slot, pattern))
+}
+
+fn live_state_label(identity: Option<LiveIdentity>) -> String {
+    let Some(identity) = identity else {
         return " STOP ".to_owned();
     };
-    let state = if telemetry.pattern_recording {
+    let state = if identity.recording {
         "REC"
-    } else if telemetry.pattern_playing {
+    } else if identity.playing {
         "PLAY"
     } else {
         "STOP"
     };
-    format!(" P{:02} {state} ", slot.get() + 1)
+    format!(" P{:02} {state} ", identity.slot.get() + 1)
 }
 
 fn line(frame: &mut Frame, area: Rect, row: u16, value: String) {
@@ -297,7 +344,7 @@ fn metadata(events: &[PatternEvent], projection: GridProjection, pad: PadId) -> 
 mod tests {
     use sampler_core::{BankId, EventId, Meter, PadId, PatternEvent, Resolution, Tempo, Transport};
 
-    use super::{GridProjection, event_glyph};
+    use super::{GridProjection, bar_bounds, bar_index, event_glyph};
 
     fn transport(resolution: Resolution) -> Transport {
         Transport::new(
@@ -349,7 +396,7 @@ mod tests {
             Resolution::ThirtySecond,
         ] {
             let projection = GridProjection::new(transport(resolution), 1);
-            let frame = projection.end_frame - 1;
+            let frame = projection.bounds.end - 1;
             let event = PatternEvent::new(EventId(1), pad, frame, 1.0, None).unwrap();
             let column = projection.column_for_frame(frame).unwrap();
 
@@ -359,5 +406,35 @@ mod tests {
                 ('o', 1)
             );
         }
+    }
+
+    #[test]
+    fn swung_cursor_and_toggled_event_share_the_same_projected_column() {
+        let pad = PadId::new(BankId::new(0).unwrap(), 0).unwrap();
+        for resolution in [Resolution::Quarter, Resolution::Eighth] {
+            let transport = transport(resolution).with_swing(0.75).unwrap();
+            let projection = GridProjection::new(transport, 0);
+            let frame = transport.step_frame(1);
+            let event = PatternEvent::new(EventId(1), pad, frame, 1.0, None).unwrap();
+            let column = projection.column_for_step(1).unwrap();
+
+            assert_eq!(column, projection.column_for_frame(frame).unwrap());
+            assert_eq!(
+                event_glyph(&[event], projection, pad, column, None),
+                ('o', 1)
+            );
+        }
+    }
+
+    #[test]
+    fn half_open_bar_bounds_use_ceil_at_non_divisible_boundaries() {
+        let bounds = bar_bounds(1_719_403, 3, 0);
+        let next = bar_bounds(1_719_403, 3, 1);
+
+        assert_eq!((bounds.start, bounds.end), (0, 573_135));
+        assert_eq!(next.start, 573_135);
+        assert_eq!(bounds.end, next.start);
+        assert_eq!(bar_index(573_134, 1_719_403, 3), 1);
+        assert_eq!(bar_index(573_135, 1_719_403, 3), 2);
     }
 }

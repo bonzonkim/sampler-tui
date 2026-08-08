@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
-use crate::ui_pattern::{live_pattern, render_pattern};
+use crate::ui_pattern::{bar_index, live_identity, live_pattern, render_pattern};
 use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 
 const MIN_WIDTH: u16 = 80;
@@ -299,34 +299,33 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
 
 fn perform_pattern_summary(app: &App) -> String {
     let telemetry = app.telemetry();
-    let Some((slot, pattern)) = live_pattern(app) else {
+    let Some(identity) = live_identity(app) else {
         return format!("P{:02} STOP", app.patterns().selected_slot().get() + 1);
     };
-    let state = if telemetry.pattern_recording {
+    let state = if identity.recording {
         "REC"
-    } else if telemetry.pattern_playing {
+    } else if identity.playing {
         "PLAY"
     } else {
         "STOP"
     };
     if state == "STOP" {
-        return format!("P{:02} STOP", slot.get() + 1);
+        return format!("P{:02} STOP", identity.slot.get() + 1);
     }
+    let Some((_, pattern)) = live_pattern(app) else {
+        return format!("P{:02} {state}", identity.slot.get() + 1);
+    };
     let transport = pattern.transport();
-    let bar = pattern_bar(
+    let bar = bar_index(
         telemetry.pattern_playhead,
         transport.loop_frames(),
         transport.bars(),
     );
-    format!("P{:02} {state} {bar}/{}", slot.get() + 1, transport.bars())
-}
-
-fn pattern_bar(playhead: u64, loop_frames: u64, bars: u16) -> u64 {
-    if loop_frames == 0 || bars == 0 {
-        return 1;
-    }
-    (u128::from(playhead % loop_frames) * u128::from(bars) / u128::from(loop_frames) + 1)
-        .min(u128::from(bars)) as u64
+    format!(
+        "P{:02} {state} {bar}/{}",
+        identity.slot.get() + 1,
+        transport.bars()
+    )
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -709,7 +708,7 @@ mod tests {
     use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
     use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
 
-    use super::{pattern_bar, render};
+    use super::{bar_index, render};
 
     struct FakeAudio {
         stop_error: Option<String>,
@@ -1100,8 +1099,8 @@ mod tests {
         .unwrap();
         let boundary = transport.loop_frames().div_ceil(3);
 
-        assert_eq!(pattern_bar(boundary - 1, transport.loop_frames(), 3), 1);
-        assert_eq!(pattern_bar(boundary, transport.loop_frames(), 3), 2);
+        assert_eq!(bar_index(boundary - 1, transport.loop_frames(), 3), 1);
+        assert_eq!(bar_index(boundary, transport.loop_frames(), 3), 2);
     }
 
     #[test]
@@ -1158,6 +1157,44 @@ mod tests {
         assert!(screen.contains("PATTERN 02"));
         assert!(screen.contains("P01 PLAY"));
         assert!(!screen.contains("P02 PLAY"));
+        assert_eq!(render_symbol(80, 24, &app, 6, 4), ".");
+    }
+
+    #[test]
+    fn stale_edit_generation_keeps_the_live_play_state_but_omits_a_fabricated_bar() {
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 0,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(0),
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 48_000,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("tempo 121".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.tick();
+
+        let perform = render_lines(80, 24, &app).join("\n");
+        assert!(perform.contains("P01 PLAY"));
+        assert!(!perform.contains("P01 PLAY 1/1"));
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let pattern = render_lines(80, 24, &app).join("\n");
+        assert!(pattern.contains("P01 PLAY"));
         assert_eq!(render_symbol(80, 24, &app, 6, 4), ".");
     }
 

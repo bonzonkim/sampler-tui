@@ -572,6 +572,36 @@ mod tests {
     }
 
     #[test]
+    fn different_live_slot_invalidates_rearming_and_cannot_confirm_when_switching_back() {
+        let previous = origin(1_000);
+        let target = TransportStamp {
+            generation: 2,
+            ..previous
+        };
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = FakeAudio::default();
+        workspace.recording = Some(RecordingState::Rearming {
+            previous: RecordingIntent { stamp: previous },
+            target: RecordingIntent { stamp: target },
+            capture_command_pending: false,
+        });
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.dirty_patterns.fill(None);
+        let mut switched = telemetry();
+        switched.pattern_playing = true;
+        switched.pattern_slot = Some(PatternSlotId::new(1).unwrap());
+
+        workspace.maintain(&mut audio, switched);
+
+        assert!(!workspace.is_recording());
+        assert_eq!(workspace.record_capture(), None);
+        assert_eq!(workspace.pending_trigger_id(key(0)), None);
+        workspace.maintain(&mut audio, recording_telemetry(target));
+        assert!(!workspace.is_recording());
+        assert_eq!(workspace.capture_state(), None);
+    }
+
+    #[test]
     fn rearming_capture_retries_once_per_maintenance_after_admission_backpressure() {
         let previous = origin(1_000);
         let target = TransportStamp {
@@ -1487,6 +1517,13 @@ impl PatternWorkspace {
                 Some(RecordingState::Confirmed(intent))
             }
             RecordingState::Confirmed(_) if !matches_capture => None,
+            RecordingState::Rearming { target, .. }
+                if telemetry
+                    .pattern_slot
+                    .is_some_and(|live_slot| live_slot != target.stamp.slot) =>
+            {
+                None
+            }
             RecordingState::Rearming {
                 previous: _,
                 target,

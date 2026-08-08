@@ -736,6 +736,9 @@ pub struct ProjectProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicWritePoint {
     AfterSaveAsPreflight,
+    OwnerAfterTempCreate,
+    OwnerBeforePublish,
+    OwnerAfterPublish,
     AfterSourceFingerprint,
     BeforeParentDirectorySync,
     AfterCreate,
@@ -903,7 +906,7 @@ impl ProjectStore {
         let project = ProjectDirectory::open_existing(&directory)?;
         let _lock = project.lock_exclusive()?;
         if request.save_as {
-            claim_or_validate_save_as_target(&project, request.snapshot.project_id)?;
+            claim_or_validate_save_as_target(&project, request.snapshot.project_id, &mut hook)?;
         }
         let directory = project.path.clone();
         let audio_directory = project.ensure_audio_directory()?;
@@ -1289,25 +1292,61 @@ fn inspect_save_as_target(
     }
 }
 
-fn claim_or_validate_save_as_target(
+fn claim_or_validate_save_as_target<F>(
     project: &ProjectDirectory,
     project_id: ProjectId,
-) -> Result<(), ProjectStoreError> {
+    hook: &mut F,
+) -> Result<(), ProjectStoreError>
+where
+    F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
+{
     if inspect_save_as_target(project, project_id)? == SaveAsTargetState::Owned {
         return Ok(());
     }
     let path = project.path.join(SAVE_AS_OWNER);
-    let owned = rustix::fs::openat(
+    let (mut file, mut temporary) = create_anchored_temp(&project.file, &project.path, &path)?;
+    checkpoint(hook, AtomicWritePoint::OwnerAfterTempCreate, &path, false)?;
+    file.write_all(project_id.to_string().as_bytes())
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            atomic_error(
+                &path,
+                AtomicWritePoint::OwnerBeforePublish,
+                error.kind(),
+                false,
+            )
+        })?;
+    drop(file);
+    checkpoint(hook, AtomicWritePoint::OwnerBeforePublish, &path, false)?;
+    project.revalidate_path_identity()?;
+    match rustix::fs::linkat(
+        &project.file,
+        &temporary.leaf,
         &project.file,
         SAVE_AS_OWNER,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|error| filesystem_error("claim save-as target", &path, io::Error::from(error)))?;
-    let mut file = File::from(owned);
-    file.write_all(project_id.to_string().as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| filesystem_error("write save-as owner", &path, error))?;
+        rustix::fs::AtFlags::empty(),
+    ) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                path: project.path.clone(),
+            });
+        }
+        Err(error) => {
+            return Err(atomic_error(
+                &path,
+                AtomicWritePoint::OwnerBeforePublish,
+                io::Error::from(error).kind(),
+                false,
+            ));
+        }
+    }
+    rustix::fs::unlinkat(&project.file, &temporary.leaf, rustix::fs::AtFlags::empty()).map_err(
+        |error| filesystem_error("remove save-as owner temp", &path, io::Error::from(error)),
+    )?;
+    temporary.disarm();
+    checkpoint(hook, AtomicWritePoint::OwnerAfterPublish, &path, true)?;
     project
         .file
         .sync_all()
@@ -2701,6 +2740,89 @@ pitch_semitones = 0.0
                 .unwrap()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn owner_claim_failure_before_publication_cleans_temp_and_same_id_retries() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("owner-prepublish-failure");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.pads.clear();
+
+        let error = fixture
+            .store
+            .save_with_hook(request.clone(), |point| {
+                (point == AtomicWritePoint::OwnerAfterTempCreate).then_some(io::ErrorKind::Other)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::AtomicWrite {
+                point: AtomicWritePoint::OwnerAfterTempCreate,
+                visibility: AtomicWriteVisibility::PreviousDestinationPreserved,
+                ..
+            }
+        ));
+        assert!(!target.join(SAVE_AS_OWNER).exists());
+        assert!(
+            fs::read_dir(&target).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("tmp"))
+        );
+        assert_eq!(fixture.store.save(request).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn owner_claim_failure_after_publication_leaves_valid_retryable_marker() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("owner-postpublish-failure");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.pads.clear();
+        let expected_owner = request.snapshot.project_id.to_string();
+
+        let error = fixture
+            .store
+            .save_with_hook(request.clone(), |point| {
+                (point == AtomicWritePoint::OwnerAfterPublish).then_some(io::ErrorKind::Other)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::AtomicWrite {
+                point: AtomicWritePoint::OwnerAfterPublish,
+                visibility: AtomicWriteVisibility::NewDestinationVisibleDurabilityUnconfirmed,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(target.join(SAVE_AS_OWNER)).unwrap(),
+            expected_owner
+        );
+        assert_eq!(fixture.store.save(request).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn corrupt_preexisting_owner_is_rejected_without_deleting_attacker_bytes() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("corrupt-owner");
+        fs::create_dir(&target).unwrap();
+        let attacker = b"partial attacker marker";
+        fs::write(target.join(SAVE_AS_OWNER), attacker).unwrap();
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+
+        assert!(matches!(
+            fixture.store.save(request),
+            Err(ProjectStoreError::SaveAsTargetNotEmpty { .. })
+        ));
+        assert_eq!(fs::read(target.join(SAVE_AS_OWNER)).unwrap(), attacker);
     }
 
     #[test]

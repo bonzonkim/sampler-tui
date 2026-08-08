@@ -14,6 +14,8 @@ pub enum SampleEditError {
     NonFiniteSource { sample: usize },
     #[error("sample edit frame arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("sample edit output allocation failed")]
+    AllocationFailed,
     #[error("sample edit phases selected no source frames")]
     EmptyFrameRange,
     #[error("sample edit produced a non-finite output sample")]

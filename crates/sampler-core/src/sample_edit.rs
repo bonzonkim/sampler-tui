@@ -133,6 +133,14 @@ mod tests {
         .unwrap();
         assert_eq!(invalid.validate(), Err(SampleEditError::InvalidPhaseRange));
     }
+
+    #[test]
+    fn output_reservation_failure_is_a_typed_error() {
+        assert_eq!(
+            reserve_stereo(&mut Vec::new(), usize::MAX),
+            Err(SampleEditError::AllocationFailed)
+        );
+    }
 }
 use std::ops::Range;
 
@@ -267,10 +275,10 @@ pub fn apply_sample_edit(
         .end
         .checked_mul(2)
         .ok_or(SampleEditError::ArithmeticOverflow)?;
-    let mut stereo = source
+    let stereo = source
         .get(sample_start..sample_end)
-        .ok_or(SampleEditError::ArithmeticOverflow)?
-        .to_vec();
+        .ok_or(SampleEditError::ArithmeticOverflow)?;
+    let mut stereo = copy_stereo(stereo)?;
 
     if recipe.reversed {
         reverse_stereo_frames(&mut stereo);
@@ -307,6 +315,19 @@ fn validate_source(sample_rate: u32, source: &[f32]) -> Result<(), SampleEditErr
         return Err(SampleEditError::NonFiniteSource { sample });
     }
     Ok(())
+}
+
+fn copy_stereo(source: &[f32]) -> Result<Vec<f32>, SampleEditError> {
+    let mut stereo = Vec::new();
+    reserve_stereo(&mut stereo, source.len())?;
+    stereo.extend_from_slice(source);
+    Ok(stereo)
+}
+
+fn reserve_stereo(stereo: &mut Vec<f32>, samples: usize) -> Result<(), SampleEditError> {
+    stereo
+        .try_reserve_exact(samples)
+        .map_err(|_| SampleEditError::AllocationFailed)
 }
 
 fn reverse_stereo_frames(stereo: &mut [f32]) {

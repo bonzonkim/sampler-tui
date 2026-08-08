@@ -114,7 +114,9 @@ struct ProjectOpenCandidate {
     patterns: PatternWorkspace,
     staged_pads: [Option<Box<StagedProjectPad>>; PAD_VIEW_COUNT],
     next_decode: usize,
-    decode_in_flight: Option<PadId>,
+    decode_in_flight: Option<(PadId, u64)>,
+    stage_generation: u64,
+    engine_rate: u32,
     saved_revision: u64,
     restored_recovery: bool,
     admission: ProjectAdmission,
@@ -924,6 +926,7 @@ impl App {
                         .push(WorkerRequest::StageProjectSample(Box::new(
                             StageProjectSampleRequest {
                                 token: candidate.progress.token,
+                                generation: candidate.stage_generation,
                                 pad: pad.pad,
                                 revision: candidate.document.revision,
                                 path,
@@ -931,7 +934,7 @@ impl App {
                                 recipe: pad.recipe,
                             },
                         )));
-                    candidate.decode_in_flight = Some(pad.pad);
+                    candidate.decode_in_flight = Some((pad.pad, candidate.stage_generation));
                     changed = true;
                 } else if candidate.decode_in_flight.is_none()
                     && candidate.next_decode == candidate.document.pads.len()
@@ -1241,6 +1244,8 @@ impl App {
                 staged_pads: array::from_fn(|_| None),
                 next_decode: 0,
                 decode_in_flight: None,
+                stage_generation: 0,
+                engine_rate: sample_rate,
                 saved_revision,
                 restored_recovery,
                 admission: ProjectAdmission::StopAll,
@@ -1340,15 +1345,19 @@ impl App {
         Ok(())
     }
 
-    fn apply_project_sample_staged(
-        &mut self,
-        token: ProjectToken,
-        pad: PadId,
-        revision: u64,
-        path: PathBuf,
-        recipe: SampleEditRecipe,
-        result: Result<crate::LoadedSample, crate::LoadSampleError>,
-    ) -> bool {
+    fn apply_project_sample_staged(&mut self, result: WorkerResult) -> bool {
+        let WorkerResult::ProjectSampleStaged {
+            token,
+            generation,
+            pad,
+            revision,
+            path,
+            recipe,
+            result,
+        } = result
+        else {
+            return false;
+        };
         let Some(ProjectOpenOperation::Staging(candidate)) = self.project_open.as_ref() else {
             return false;
         };
@@ -1358,7 +1367,8 @@ impl App {
         let expected_settings = expected.settings;
         let expected_path = candidate.progress.directory.join(&expected.audio_path);
         if candidate.progress.token != token
-            || candidate.decode_in_flight != Some(pad)
+            || candidate.decode_in_flight != Some((pad, generation))
+            || candidate.stage_generation != generation
             || expected.pad != pad
             || candidate.document.revision != revision
             || expected_path != path
@@ -2137,7 +2147,8 @@ impl App {
                     return false;
                 };
                 if candidate.progress.token != request.token
-                    || candidate.decode_in_flight != Some(request.pad)
+                    || candidate.decode_in_flight != Some((request.pad, request.generation))
+                    || candidate.stage_generation != request.generation
                     || candidate.document.revision != request.revision
                 {
                     return false;
@@ -2541,16 +2552,8 @@ impl App {
                 directory,
                 result,
             } => return self.apply_project_probe(token, directory, result),
-            WorkerResult::ProjectSampleStaged {
-                token,
-                pad,
-                revision,
-                path,
-                recipe,
-                result,
-            } => {
-                return self
-                    .apply_project_sample_staged(token, pad, revision, path, recipe, result);
+            result @ WorkerResult::ProjectSampleStaged { .. } => {
+                return self.apply_project_sample_staged(result);
             }
             WorkerResult::ProjectSaved {
                 token,
@@ -4082,12 +4085,16 @@ impl App {
         self.current_session_bound.fill(false);
         self.pending_pattern_transport = None;
         if let Some(ProjectOpenOperation::Staging(candidate)) = self.project_open.as_mut() {
+            let rate_changed = candidate.engine_rate != sample_rate;
             let staged_rate_matches = candidate
                 .staged_pads
                 .iter()
                 .flatten()
                 .all(|staged| staged.loaded.rendered.sample_rate() == sample_rate);
-            if !staged_rate_matches {
+            let restart_staging = rate_changed || !staged_rate_matches;
+            if restart_staging {
+                candidate.engine_rate = sample_rate;
+                candidate.stage_generation = candidate.stage_generation.wrapping_add(1);
                 candidate.staged_pads.fill_with(|| None);
                 candidate.next_decode = 0;
                 candidate.decode_in_flight = None;
@@ -4110,10 +4117,10 @@ impl App {
             candidate.admission = ProjectAdmission::StopAll;
             candidate.progress.admitted_actions = 0;
             self.overlay = Some(Overlay::ProjectOpenProgress);
-            self.status = if staged_rate_matches {
-                "Audio reconnected; restarting project admission".to_owned()
-            } else {
+            self.status = if restart_staging {
                 "Audio rate changed; restaging project audio".to_owned()
+            } else {
+                "Audio reconnected; restarting project admission".to_owned()
             };
             self.sync_editor_to_selected_pad();
             return;
@@ -9037,6 +9044,7 @@ mod tests {
         let rendered = Arc::new(SampleBuffer::new(request.engine_rate, vec![0.25, -0.25]).unwrap());
         WorkerResult::ProjectSampleStaged {
             token: request.token,
+            generation: request.generation,
             pad: request.pad,
             revision: request.revision,
             path: request.path.clone(),
@@ -9223,6 +9231,63 @@ mod tests {
     }
 
     #[test]
+    fn project_open_rate_change_ignores_in_flight_old_rate_result_and_reissues_the_pad() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device lost");
+        let mut app = App::with_audio(Box::new(audio));
+        let before = app.project_snapshot().unwrap();
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x91; 16]),
+            "Project B",
+            5,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+        );
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(first_request)] = requests.as_slice() else {
+            panic!("expected the first 48 kHz stage request");
+        };
+        assert_eq!(first_request.engine_rate, 48_000);
+        let first_request = (**first_request).clone();
+
+        assert!(app.maintain_audio());
+        assert!(app.retry_with(Box::new(FakeAudio::ready(44_100, 2))));
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(reissued)] = requests.as_slice() else {
+            panic!("expected the pad to be reissued at 44.1 kHz");
+        };
+        assert_eq!(reissued.token, token);
+        assert_ne!(reissued.generation, first_request.generation);
+        assert_eq!(reissued.pad, pad(0, 0));
+        assert_eq!(reissued.engine_rate, 44_100);
+        let reissued = (**reissued).clone();
+        let fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+        assert!(!app.apply_worker_result(staged_project_result(&first_request, fingerprint,)));
+        assert!(app.project_open_error().is_none());
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::Staging
+        );
+        assert_eq!(app.project_snapshot().unwrap(), before);
+
+        assert!(app.apply_worker_result(staged_project_result(&reissued, fingerprint)));
+        assert_eq!(app.project_open_stage().unwrap().staged_pads, 1);
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
     fn project_open_probe_failure_is_retained_as_the_exact_typed_error() {
         let mut app = project_app();
         let before = app.project_snapshot().unwrap();
@@ -9334,6 +9399,7 @@ mod tests {
         let load_error = LoadSampleError::Prepare("recipe failed".to_owned());
         assert!(app.apply_worker_result(WorkerResult::ProjectSampleStaged {
             token: request.token,
+            generation: request.generation,
             pad: request.pad,
             revision: request.revision,
             path: request.path.clone(),

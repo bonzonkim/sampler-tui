@@ -51,6 +51,7 @@ impl ProjectToken {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageProjectSampleRequest {
     pub token: ProjectToken,
+    pub generation: u64,
     pub pad: PadId,
     pub revision: u64,
     pub path: PathBuf,
@@ -143,6 +144,7 @@ pub enum WorkerResult {
     },
     ProjectSampleStaged {
         token: ProjectToken,
+        generation: u64,
         pad: PadId,
         revision: u64,
         path: PathBuf,
@@ -460,6 +462,7 @@ fn worker_loop_with_store(
             WorkerRequest::StageProjectSample(request) => {
                 let StageProjectSampleRequest {
                     token,
+                    generation,
                     pad,
                     revision,
                     path,
@@ -468,6 +471,7 @@ fn worker_loop_with_store(
                 } = *request;
                 WorkerResult::ProjectSampleStaged {
                     token,
+                    generation,
                     pad,
                     revision,
                     result: load_sample(&path, engine_rate, recipe),
@@ -1017,6 +1021,7 @@ mod tests {
             .try_send(WorkerRequest::StageProjectSample(Box::new(
                 StageProjectSampleRequest {
                     token,
+                    generation: 9,
                     pad: project_pad,
                     revision: 23,
                     path: fixture.path().to_owned(),
@@ -1152,6 +1157,7 @@ mod tests {
             .try_send(WorkerRequest::StageProjectSample(Box::new(
                 StageProjectSampleRequest {
                     token,
+                    generation: 31,
                     pad: project_pad,
                     revision: 19,
                     path: fixture.path().to_owned(),
@@ -1164,6 +1170,7 @@ mod tests {
             .try_send(WorkerRequest::StageProjectSample(Box::new(
                 StageProjectSampleRequest {
                     token,
+                    generation: 32,
                     pad: project_pad,
                     revision: 20,
                     path: missing.clone(),
@@ -1175,6 +1182,7 @@ mod tests {
 
         let WorkerResult::ProjectSampleStaged {
             token: success_token,
+            generation: success_generation,
             pad: success_pad,
             revision: success_revision,
             path: success_path,
@@ -1185,6 +1193,7 @@ mod tests {
             panic!("wrong stage success result")
         };
         assert_eq!(success_token, token);
+        assert_eq!(success_generation, 31);
         assert_eq!(success_pad, project_pad);
         assert_eq!(success_revision, 19);
         assert_eq!(success_path, fixture.path());
@@ -1194,6 +1203,7 @@ mod tests {
 
         let WorkerResult::ProjectSampleStaged {
             token: error_token,
+            generation: error_generation,
             pad: error_pad,
             revision: error_revision,
             path: error_path,
@@ -1204,6 +1214,7 @@ mod tests {
             panic!("wrong stage error result")
         };
         assert_eq!(error_token, token);
+        assert_eq!(error_generation, 32);
         assert_eq!(error_pad, project_pad);
         assert_eq!(error_revision, 20);
         assert_eq!(error_path, missing);

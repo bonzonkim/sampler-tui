@@ -712,6 +712,10 @@ impl PatternWorkspace {
         &self.patterns[usize::from(slot.get())]
     }
 
+    pub fn sample_rates(&self) -> [u32; PATTERN_SLOT_COUNT] {
+        array::from_fn(|index| self.patterns[index].transport().sample_rate())
+    }
+
     pub fn cursor(&self) -> PatternCursor {
         self.cursor
     }
@@ -1030,6 +1034,23 @@ impl PatternWorkspace {
             return;
         };
         let stamp = state.intent().stamp;
+        if let RecordingState::Pending(intent) = state
+            && telemetry.pattern_recording
+            && telemetry.pattern_slot == Some(intent.stamp.slot)
+            && telemetry.pattern_generation == Some(intent.stamp.generation)
+            && let Some(origin) = telemetry.pattern_origin
+            && origin != intent.stamp.origin
+        {
+            let index = usize::from(intent.stamp.slot.get());
+            self.recording = Some(RecordingState::Pending(RecordingIntent {
+                stamp: TransportStamp {
+                    origin,
+                    loop_frames: self.patterns[index].transport().loop_frames(),
+                    ..intent.stamp
+                },
+            }));
+            return;
+        }
         let matches_capture = telemetry.pattern_recording
             && telemetry.pattern_slot == Some(stamp.slot)
             && telemetry.pattern_generation == Some(stamp.generation)

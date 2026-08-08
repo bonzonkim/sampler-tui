@@ -4,10 +4,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use sampler_audio::{SampleBuffer, Telemetry};
+use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
-use sampler_core::{BankId, PadId, PadSettings, PlaybackMode};
+use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PlaybackMode};
 
+use crate::PatternSwitch;
 use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
@@ -15,6 +16,7 @@ use crate::loader::{
     MAX_DIRECTORY_ENTRIES, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
+use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
 
 pub const PAD_VIEW_COUNT: usize = 160;
 pub const PREVIEW_COLUMNS: usize = 64;
@@ -85,12 +87,17 @@ pub enum Overlay {
     Palette,
     FilePicker,
     DeviceError(String),
+    ClearPattern {
+        slot: PatternSlotId,
+        event_count: usize,
+    },
 }
 
 pub struct App {
     active_bank: BankId,
     selected_pad: usize,
     pads: [PadView; PAD_VIEW_COUNT],
+    patterns: PatternWorkspace,
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
@@ -112,6 +119,8 @@ pub struct App {
     telemetry: Telemetry,
     meter_left: f32,
     meter_right: f32,
+    recorded_ack_count: usize,
+    pattern_submission_count: usize,
     should_quit: bool,
 }
 
@@ -130,12 +139,14 @@ impl App {
         let audio_format = audio
             .as_ref()
             .map(|audio| (audio.sample_rate(), audio.channels()));
+        let pattern_sample_rate = audio_format.map_or(48_000, |(sample_rate, _)| sample_rate);
         let current_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from(std::path::MAIN_SEPARATOR_STR));
         Self {
             active_bank: BankId::new(0).expect("bank zero is valid"),
             selected_pad: 0,
             pads: array::from_fn(|_| PadView::default()),
+            patterns: PatternWorkspace::new(pattern_sample_rate),
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
@@ -176,6 +187,8 @@ impl App {
             },
             meter_left: 0.0,
             meter_right: 0.0,
+            recorded_ack_count: 0,
+            pattern_submission_count: 0,
             should_quit: false,
         }
     }
@@ -206,14 +219,6 @@ impl App {
         if key.kind == KeyEventKind::Repeat {
             return;
         }
-        if key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Esc
-            && key.modifiers == KeyModifiers::NONE
-            && self.overlay.is_some()
-        {
-            self.close_overlay();
-            return;
-        }
         if let Some(action) = map_key(key, self.keyboard_capabilities) {
             match action {
                 InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
@@ -228,12 +233,22 @@ impl App {
             return;
         }
 
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+            && self.overlay.is_some()
+        {
+            self.close_overlay();
+            return;
+        }
+
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
             Some(Overlay::Palette) => self.apply_palette_key(key),
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
-            None => self.apply_perform_key(key),
+            Some(Overlay::ClearPattern { .. }) => self.apply_clear_pattern_key(key),
+            None => self.apply_workspace_key(key),
         }
     }
 
@@ -268,6 +283,22 @@ impl App {
         self.telemetry
     }
 
+    pub fn patterns(&self) -> &PatternWorkspace {
+        &self.patterns
+    }
+
+    pub fn workspace_view(&self) -> WorkspaceView {
+        self.patterns.view()
+    }
+
+    pub fn recorded_ack_count(&self) -> usize {
+        self.recorded_ack_count
+    }
+
+    pub fn maintain_audio_pattern_submissions(&self) -> usize {
+        self.pattern_submission_count
+    }
+
     pub fn meter_levels(&self) -> (f32, f32) {
         (self.meter_left, self.meter_right)
     }
@@ -282,16 +313,7 @@ impl App {
         self.meter_left = sanitize_peak(self.meter_left * METER_DECAY);
         self.meter_right = sanitize_peak(self.meter_right * METER_DECAY);
         if let Some(telemetry) = next {
-            self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
-            self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
-            self.telemetry = telemetry;
-            for bank in 0..BANK_COUNT {
-                let bank = BankId::new(bank).expect("bounded bank is valid");
-                for index in 0..PADS_PER_BANK {
-                    let pad = PadId::new(bank, index).expect("bounded pad is valid");
-                    self.pads[pad_offset(pad)].active = telemetry.is_pad_active(pad);
-                }
-            }
+            self.apply_telemetry(telemetry);
         }
     }
 
@@ -306,7 +328,43 @@ impl App {
             self.fail_audio(error);
             true
         } else {
-            self.pump_recovery_requests()
+            let mut changed = self.pump_recovery_requests();
+            let telemetry = self
+                .audio
+                .as_mut()
+                .and_then(|audio| audio.latest_telemetry());
+            if let Some(telemetry) = telemetry {
+                changed |= self.apply_telemetry(telemetry);
+            }
+            let maintenance = {
+                let audio = self
+                    .audio
+                    .as_mut()
+                    .expect("audio remains present after a successful poll");
+                self.patterns.maintain(audio.as_mut(), self.telemetry)
+            };
+            changed |= maintenance.reclaimed_snapshots > 0
+                || maintenance.drained_acks > 0
+                || maintenance.compiled_slot.is_some()
+                || maintenance.submitted_slot.is_some();
+            self.recorded_ack_count = self
+                .recorded_ack_count
+                .saturating_add(maintenance.drained_acks);
+            if maintenance.submitted_slot.is_some() {
+                self.pattern_submission_count = self.pattern_submission_count.saturating_add(1);
+            }
+            if let Some(status) = maintenance.status {
+                let unsupported_bootstrap = matches!(
+                    &status,
+                    PatternStatus::AudioCommandFailed { error, .. }
+                        if error == "pattern audio is unsupported"
+                ) && self.patterns.view() == WorkspaceView::Perform;
+                if !unsupported_bootstrap {
+                    self.status = pattern_status_text(&status);
+                    changed = true;
+                }
+            }
+            changed
         }
     }
 
@@ -446,6 +504,11 @@ impl App {
 
     pub fn retry_default_device(&mut self) -> bool {
         self.retry_default_device_with(open_default_audio)
+    }
+
+    pub fn retry_with(&mut self, audio: Box<dyn AudioPort>) -> bool {
+        self.recover_audio(audio);
+        true
     }
 
     pub fn shutdown_audio(&mut self) -> Result<(), String> {
@@ -618,19 +681,36 @@ impl App {
             return;
         };
         self.selected_pad = index;
+        if self.patterns.view() == WorkspaceView::Pattern {
+            let step = self.patterns.cursor().step();
+            self.patterns.move_cursor_to(pad, step);
+        }
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
         };
-        match audio.trigger_live(pad, 1.0) {
-            Ok(())
+        let recording = self.patterns.is_recording();
+        let result = if recording {
+            audio.trigger_live_tracked(pad, 1.0).map(Some)
+        } else {
+            audio.trigger_live(pad, 1.0).map(|()| None)
+        };
+        match result {
+            Ok(command)
                 if track_physical_hold
                     && (self.keyboard_capabilities.release_events
                         || self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot) =>
             {
                 self.held_pad_by_key[index] = Some(pad);
+                if let Some(command) = command {
+                    self.patterns.note_live_trigger(index, command, pad, 1.0);
+                }
             }
-            Ok(()) => {}
+            Ok(command) => {
+                if let Some(command) = command {
+                    self.patterns.note_live_trigger(index, command, pad, 1.0);
+                }
+            }
             Err(error) => self.status = error,
         }
     }
@@ -724,18 +804,27 @@ impl App {
                 self.should_quit = true;
                 self.overlay = None;
             }
-            PaletteCommand::Pattern(_)
-            | PaletteCommand::Tempo(_)
-            | PaletteCommand::Bars(_)
-            | PaletteCommand::Resolution(_)
-            | PaletteCommand::Swing(_)
-            | PaletteCommand::Quantize(_)
-            | PaletteCommand::Record
-            | PaletteCommand::Play
-            | PaletteCommand::Stop
-            | PaletteCommand::ClearPattern => {
-                self.palette_error = Some("pattern commands are not available yet".to_owned());
+            PaletteCommand::Pattern(slot) => self.select_pattern_slot(usize::from(slot)),
+            PaletteCommand::Tempo(tempo) => self.apply_pattern_edit(|patterns| {
+                patterns
+                    .set_tempo(sampler_core::Tempo::new(tempo).expect("palette validated tempo"))
+            }),
+            PaletteCommand::Bars(bars) => {
+                self.apply_pattern_edit(|patterns| patterns.set_bars(bars))
             }
+            PaletteCommand::Resolution(resolution) => {
+                self.apply_pattern_edit(|patterns| patterns.set_resolution(resolution))
+            }
+            PaletteCommand::Swing(swing) => {
+                self.apply_pattern_edit(|patterns| patterns.set_swing(swing))
+            }
+            PaletteCommand::Quantize(strength) => {
+                self.apply_pattern_edit(|patterns| patterns.set_quantize(strength))
+            }
+            PaletteCommand::Record => self.toggle_pattern_recording(),
+            PaletteCommand::Play => self.start_pattern_playback(),
+            PaletteCommand::Stop => self.stop_pattern_playback(),
+            PaletteCommand::ClearPattern => self.open_clear_pattern(),
         }
     }
 
@@ -764,6 +853,46 @@ impl App {
             && key.code == KeyCode::Char('?')
         {
             self.overlay = None;
+        }
+    }
+
+    fn apply_workspace_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press && self.apply_global_pattern_key(key) {
+            return;
+        }
+        match self.patterns.view() {
+            WorkspaceView::Perform => self.apply_perform_key(key),
+            WorkspaceView::Pattern => self.apply_pattern_key(key),
+        }
+    }
+
+    fn apply_global_pattern_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
+                self.patterns.toggle_view();
+                true
+            }
+            KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+                if self.patterns.is_playing() {
+                    self.stop_pattern_playback();
+                } else {
+                    self.start_pattern_playback();
+                }
+                true
+            }
+            KeyCode::Char('r' | 'R') if is_explicit_device_retry(key) => {
+                self.toggle_pattern_recording();
+                true
+            }
+            KeyCode::Char(',') if key.modifiers == KeyModifiers::NONE => {
+                self.change_pattern_slot(-1);
+                true
+            }
+            KeyCode::Char('.') if key.modifiers == KeyModifiers::NONE => {
+                self.change_pattern_slot(1);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -799,12 +928,229 @@ impl App {
         }
     }
 
+    fn apply_pattern_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            if let Some(action) = map_key(key, self.keyboard_capabilities) {
+                self.apply(action);
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('?')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.open_help();
+            }
+            KeyCode::Char(':')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.open_palette();
+            }
+            KeyCode::Left => self.patterns.move_cursor_steps(-1),
+            KeyCode::Right => self.patterns.move_cursor_steps(1),
+            KeyCode::Up => self.move_pattern_cursor_pad(-1),
+            KeyCode::Down => self.move_pattern_cursor_pad(1),
+            KeyCode::PageUp => self.patterns.move_cursor_bar(-1),
+            KeyCode::PageDown => self.patterns.move_cursor_bar(1),
+            KeyCode::Enter => self.apply_pattern_edit(|patterns| patterns.toggle_step()),
+            KeyCode::Delete if key.modifiers == KeyModifiers::CONTROL => self.open_clear_pattern(),
+            KeyCode::Delete => self.apply_pattern_edit(|patterns| patterns.delete_step()),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.apply_pattern_edit(|patterns| patterns.adjust_velocity(0.05))
+            }
+            KeyCode::Char('-') => {
+                self.apply_pattern_edit(|patterns| patterns.adjust_velocity(-0.05))
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::NONE => {
+                self.apply_pattern_edit(|patterns| patterns.undo_clear())
+            }
+            _ => {
+                if let Some(action) = map_key(key, self.keyboard_capabilities) {
+                    self.apply(action);
+                }
+            }
+        }
+    }
+
+    fn apply_clear_pattern_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+            let Some(Overlay::ClearPattern { slot, .. }) = self.overlay.clone() else {
+                return;
+            };
+            self.patterns.select_slot(slot);
+            self.apply_pattern_edit(|patterns| patterns.clear_selected());
+            if let Some(audio) = self.audio.as_mut()
+                && let Err(error) = audio.set_record_capture(None)
+            {
+                self.status = error;
+            }
+            self.overlay = None;
+        }
+    }
+
     fn move_selection(&mut self, horizontal: isize, vertical: isize) {
         let row = self.selected_pad / 4;
         let column = self.selected_pad % 4;
         let row = row.saturating_add_signed(vertical).min(3);
         let column = column.saturating_add_signed(horizontal).min(3);
         self.selected_pad = row * 4 + column;
+    }
+
+    fn move_pattern_cursor_pad(&mut self, delta: i8) {
+        let cursor = self.patterns.cursor();
+        let index = i16::from(cursor.pad().index())
+            .saturating_add(i16::from(delta))
+            .clamp(0, i16::from(PADS_PER_BANK.saturating_sub(1)));
+        let index = u8::try_from(index).expect("clamped pattern pad index fits in u8");
+        let pad = PadId::new(self.active_bank, index).expect("bounded pattern pad is valid");
+        self.selected_pad = usize::from(index);
+        self.patterns.move_cursor_to(pad, cursor.step());
+    }
+
+    fn change_pattern_slot(&mut self, delta: i8) {
+        let current = i16::from(self.patterns.selected_slot().get());
+        let requested = current.saturating_add(i16::from(delta)).clamp(0, 15);
+        let slot = PatternSlotId::new(u8::try_from(requested).expect("bounded slot fits in u8"))
+            .expect("bounded slot is valid");
+        if slot == self.patterns.selected_slot() {
+            self.status = if delta < 0 {
+                "already at pattern 1".to_owned()
+            } else {
+                "already at pattern 16".to_owned()
+            };
+            return;
+        }
+        self.select_pattern(slot);
+    }
+
+    fn select_pattern_slot(&mut self, index: usize) {
+        let Some(slot) = u8::try_from(index)
+            .ok()
+            .and_then(|index| PatternSlotId::new(index).ok())
+        else {
+            self.palette_error = Some("pattern must be 1..16".to_owned());
+            return;
+        };
+        self.select_pattern(slot);
+    }
+
+    fn select_pattern(&mut self, slot: PatternSlotId) {
+        self.patterns.select_slot(slot);
+        let switch = if self.patterns.is_playing() {
+            PatternSwitch::NextBoundary
+        } else {
+            PatternSwitch::Immediate
+        };
+        if let Some(audio) = self.audio.as_mut()
+            && let Err(error) = audio.select_pattern(slot, switch)
+        {
+            self.status = error;
+            return;
+        }
+        self.overlay = None;
+    }
+
+    fn start_pattern_playback(&mut self) {
+        let slot = self.patterns.selected_slot();
+        let Some(audio) = self.audio.as_mut() else {
+            self.report_audio_unavailable();
+            return;
+        };
+        if let Err(error) = audio.select_pattern(slot, PatternSwitch::Immediate) {
+            self.status = error;
+            return;
+        }
+        if let Err(error) = audio.play_pattern() {
+            self.status = error;
+            return;
+        }
+        self.overlay = None;
+    }
+
+    fn stop_pattern_playback(&mut self) {
+        let Some(audio) = self.audio.as_mut() else {
+            self.report_audio_unavailable();
+            return;
+        };
+        if let Err(error) = audio.set_record_capture(None) {
+            self.status = error;
+            return;
+        }
+        if let Err(error) = audio.stop_pattern() {
+            self.status = error;
+            return;
+        }
+        self.patterns.stop_recording();
+        self.overlay = None;
+    }
+
+    fn toggle_pattern_recording(&mut self) {
+        if self.patterns.capture_state().is_some() {
+            self.stop_pattern_recording();
+        } else {
+            self.start_pattern_recording();
+        }
+    }
+
+    fn start_pattern_recording(&mut self) {
+        let slot = self.patterns.selected_slot();
+        let generation = self.patterns.selected_pattern().generation();
+        let stamp = TransportStamp {
+            slot,
+            generation,
+            origin: self.telemetry.pattern_origin.unwrap_or(0),
+            loop_frames: self.patterns.selected_pattern().transport().loop_frames(),
+        };
+        let Some(audio) = self.audio.as_mut() else {
+            self.report_audio_unavailable();
+            return;
+        };
+        if !self.patterns.is_playing() {
+            if let Err(error) = audio.select_pattern(slot, PatternSwitch::Immediate) {
+                self.status = error;
+                return;
+            }
+            if let Err(error) = audio.play_pattern() {
+                self.status = error;
+                return;
+            }
+        }
+        if let Err(error) = self.patterns.start_recording(stamp) {
+            self.status = error.to_string();
+            return;
+        }
+        if let Err(error) = audio.set_record_capture(self.patterns.record_capture()) {
+            self.patterns.stop_recording();
+            self.status = error;
+        }
+    }
+
+    fn stop_pattern_recording(&mut self) {
+        self.patterns.stop_recording();
+        if let Some(audio) = self.audio.as_mut()
+            && let Err(error) = audio.set_record_capture(None)
+        {
+            self.status = error;
+        }
+    }
+
+    fn open_clear_pattern(&mut self) {
+        let slot = self.patterns.selected_slot();
+        self.overlay = Some(Overlay::ClearPattern {
+            slot,
+            event_count: self.patterns.selected_pattern().events().len(),
+        });
+    }
+
+    fn apply_pattern_edit(
+        &mut self,
+        edit: impl FnOnce(&mut PatternWorkspace) -> Result<(), sampler_core::PatternEditError>,
+    ) {
+        if let Err(error) = edit(&mut self.patterns) {
+            self.status = error.to_string();
+        } else {
+            self.overlay = None;
+        }
     }
 
     fn selected_pad_id(&self) -> Option<PadId> {
@@ -874,8 +1220,19 @@ impl App {
             self.report_audio_unavailable();
             return;
         };
-        match audio.release_live(pad) {
-            Ok(()) => self.held_pad_by_key[index] = None,
+        let recording = self.patterns.is_recording();
+        let result = if recording {
+            audio.release_live_tracked(pad).map(Some)
+        } else {
+            audio.release_live(pad).map(|()| None)
+        };
+        match result {
+            Ok(command) => {
+                self.held_pad_by_key[index] = None;
+                if let Some(command) = command {
+                    self.patterns.note_live_release(index, command);
+                }
+            }
             Err(error) => self.status = error,
         }
     }
@@ -904,7 +1261,10 @@ impl App {
             return;
         };
         match audio.stop_all() {
-            Ok(()) => self.held_pad_by_key.fill(None),
+            Ok(()) => {
+                self.held_pad_by_key.fill(None);
+                self.patterns.stop_recording();
+            }
             Err(error) => self.status = error,
         }
     }
@@ -922,6 +1282,12 @@ impl App {
         }
         let value = u8::try_from(requested).expect("bounded bank fits in u8");
         self.active_bank = BankId::new(value).expect("bounded bank is valid");
+        if self.patterns.view() == WorkspaceView::Pattern {
+            let cursor = self.patterns.cursor();
+            let pad = PadId::new(self.active_bank, cursor.pad().index())
+                .expect("existing cursor index is valid");
+            self.patterns.move_cursor_to(pad, cursor.step());
+        }
     }
 
     fn pad_in_active_bank(&mut self, index: usize) -> Option<PadId> {
@@ -948,6 +1314,21 @@ impl App {
             .unwrap_or_else(|| "audio device is unavailable".to_owned());
     }
 
+    fn apply_telemetry(&mut self, telemetry: Telemetry) -> bool {
+        let changed = self.telemetry != telemetry;
+        self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
+        self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
+        self.telemetry = telemetry;
+        for bank in 0..BANK_COUNT {
+            let bank = BankId::new(bank).expect("bounded bank is valid");
+            for index in 0..PADS_PER_BANK {
+                let pad = PadId::new(bank, index).expect("bounded pad is valid");
+                self.pads[pad_offset(pad)].active = telemetry.is_pad_active(pad);
+            }
+        }
+        changed
+    }
+
     fn queue_worker_request(&mut self, request: WorkerRequest) -> bool {
         if self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY {
             self.pending_worker_requests.push(request);
@@ -965,6 +1346,7 @@ impl App {
         self.reinstall_pending.fill(false);
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
+        self.patterns.stop_recording();
         for pad in &mut self.pads {
             pad.active = false;
         }
@@ -984,6 +1366,9 @@ impl App {
         self.overlay = None;
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
+        if let Err(error) = self.patterns.rebuild_sample_rate(sample_rate) {
+            self.status = error.to_string();
+        }
 
         for bank in 0..BANK_COUNT {
             let bank = BankId::new(bank).expect("bounded bank is valid");
@@ -1340,6 +1725,23 @@ fn sanitize_peak(value: f32) -> f32 {
     }
 }
 
+fn pattern_status_text(status: &PatternStatus) -> String {
+    match status {
+        PatternStatus::UpdatePending { slot } => {
+            format!("pattern {} update pending", slot.get() + 1)
+        }
+        PatternStatus::SnapshotBackpressured { slot } => {
+            format!("pattern {} update waiting for audio queue", slot.get() + 1)
+        }
+        PatternStatus::SnapshotCompileFailed { slot, error } => {
+            format!("pattern {} compile failed: {error}", slot.get() + 1)
+        }
+        PatternStatus::AudioCommandFailed { slot, error } => {
+            format!("pattern {} audio command failed: {error}", slot.get() + 1)
+        }
+    }
+}
+
 fn is_explicit_device_retry(key: KeyEvent) -> bool {
     let allowed = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
     key.kind == KeyEventKind::Press
@@ -1368,8 +1770,11 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
-    use sampler_core::{BankId, PadId, PadSettings, PlaybackMode};
+    use sampler_audio::{
+        Frame, LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch, SampleBuffer,
+        SampleSlot, Telemetry,
+    };
+    use sampler_core::{BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode};
 
     use crate::audio::AudioPort;
     use crate::input::InputAction;
@@ -1388,6 +1793,13 @@ mod tests {
         Release(PadId, Frame),
         StopPad(PadId),
         StopAll,
+        TrackedTrigger(PadId),
+        TrackedRelease(PadId),
+        InstallPattern,
+        SelectPattern(PatternSlotId, PatternSwitch),
+        PlayPattern,
+        StopPattern,
+        SetRecordCapture(Option<(PatternSlotId, u64)>),
     }
 
     #[derive(Clone)]
@@ -1557,6 +1969,75 @@ mod tests {
             Ok(())
         }
 
+        fn trigger_live_tracked(
+            &mut self,
+            pad: PadId,
+            _velocity: f32,
+        ) -> Result<LiveCommandId, String> {
+            self.calls
+                .0
+                .borrow_mut()
+                .push(AudioCall::TrackedTrigger(pad));
+            Ok(LiveCommandId::FIRST)
+        }
+
+        fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, String> {
+            self.calls
+                .0
+                .borrow_mut()
+                .push(AudioCall::TrackedRelease(pad));
+            Ok(LiveCommandId::FIRST)
+        }
+
+        fn install_pattern(
+            &mut self,
+            _snapshot: Arc<PatternSnapshot>,
+        ) -> Result<PatternSnapshotSlot, String> {
+            self.calls.0.borrow_mut().push(AudioCall::InstallPattern);
+            Err("no test snapshot slot".to_owned())
+        }
+
+        fn select_pattern(
+            &mut self,
+            slot: PatternSlotId,
+            switch: PatternSwitch,
+        ) -> Result<(), String> {
+            self.calls
+                .0
+                .borrow_mut()
+                .push(AudioCall::SelectPattern(slot, switch));
+            Ok(())
+        }
+
+        fn play_pattern(&mut self) -> Result<(), String> {
+            self.calls.0.borrow_mut().push(AudioCall::PlayPattern);
+            Ok(())
+        }
+
+        fn stop_pattern(&mut self) -> Result<(), String> {
+            self.calls.0.borrow_mut().push(AudioCall::StopPattern);
+            Ok(())
+        }
+
+        fn set_record_capture(
+            &mut self,
+            capture: Option<(PatternSlotId, u64)>,
+        ) -> Result<(), String> {
+            self.calls
+                .0
+                .borrow_mut()
+                .push(AudioCall::SetRecordCapture(capture));
+            Ok(())
+        }
+
+        fn drain_live_acks(&mut self, _output: &mut [LiveAck]) -> usize {
+            0
+        }
+
+        fn reclaim_retired_patterns(&mut self) -> usize {
+            0
+        }
+
         fn stop_pad(&mut self, pad: PadId) -> Result<(), String> {
             if let Some(error) = self.stop_pad_error.take() {
                 return Err(error);
@@ -1601,7 +2082,7 @@ mod tests {
         let maintenance = Rc::clone(&audio.maintenance);
         let mut app = App::with_audio(Box::new(audio));
 
-        assert!(!app.maintain_audio());
+        assert!(app.maintain_audio());
         assert_eq!(*maintenance.borrow(), ["reclaim", "poll"]);
     }
 
@@ -2051,8 +2532,12 @@ mod tests {
         assert!(app.maintain_audio());
 
         assert_eq!(
-            calls.snapshot(),
-            [AudioCall::Install(pad(0, 0)), AudioCall::Install(pad(0, 1)),]
+            calls
+                .snapshot()
+                .into_iter()
+                .filter(|call| matches!(call, AudioCall::Install(_)))
+                .collect::<Vec<_>>(),
+            [AudioCall::Install(pad(0, 0)), AudioCall::Install(pad(0, 1))]
         );
         assert_eq!(app.pad(pad(0, 1)).source.as_deref(), Some(path("old.wav")));
         assert_eq!(app.pad(pad(0, 1)).state, PadLoadState::Ready);
@@ -2441,6 +2926,39 @@ mod tests {
 
     fn key(character: char, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
         KeyEvent::new_with_kind(KeyCode::Char(character), modifiers, kind)
+    }
+
+    #[test]
+    fn control_r_arms_pattern_recording_while_plain_r_remains_a_pad() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+
+        app.apply_key(key('r', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(key('r', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 7), 64, 1.0),
+                AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate,),
+                AudioCall::PlayPattern,
+                AudioCall::SetRecordCapture(Some((PatternSlotId::new(0).unwrap(), 0))),
+                AudioCall::TrackedTrigger(pad(0, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_at_a_new_rate_rebuilds_all_editable_pattern_slots() {
+        let failed = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(failed));
+        app.maintain_audio();
+
+        app.retry_with(Box::new(FakeAudio::ready(44_100, 2)));
+
+        assert_eq!(app.patterns().sample_rates(), [44_100; 16]);
     }
 
     #[test]

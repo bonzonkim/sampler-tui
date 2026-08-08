@@ -358,6 +358,17 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "r retry · Esc browse without audio".to_owned(),
             ],
         ),
+        Overlay::ClearPattern { slot, event_count } => render_list_overlay(
+            frame,
+            area,
+            " CLEAR PATTERN ",
+            52,
+            6,
+            [
+                format!("Clear pattern {} ({event_count} events)?", slot.get() + 1),
+                "Enter confirms · Esc cancels".to_owned(),
+            ],
+        ),
     }
 }
 

@@ -7,6 +7,7 @@ pub mod input;
 pub mod loader;
 pub mod palette;
 pub mod pattern;
+pub mod project_store;
 pub mod sample_editor;
 pub mod terminal;
 pub mod ui;
@@ -29,6 +30,11 @@ pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{
     MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCaptureState, PatternCursor,
     PatternMaintenance, PatternStatus, PatternWorkspace, WorkspaceView,
+};
+pub use project_store::{
+    AtomicWritePoint, AtomicWriteVisibility, ProjectAssetMapping, ProjectProbe, ProjectSavePad,
+    ProjectSaveRequest, ProjectSaveSnapshot, ProjectStore, ProjectStoreError, SaveKind,
+    SaveReceipt, SourceFingerprint, SupportedAudioExtension,
 };
 pub use sample_editor::{
     OffscreenDirection, SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent,

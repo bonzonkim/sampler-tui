@@ -1609,10 +1609,13 @@ name = "sampler-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "getrandom 0.3.4",
  "hound",
  "ratatui",
  "sampler-audio",
  "sampler-core",
+ "sha2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

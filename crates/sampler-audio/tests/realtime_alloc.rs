@@ -105,6 +105,29 @@ fn pattern_snapshot(
     Arc::new(pattern.compile().unwrap())
 }
 
+fn duration_pattern_snapshot(
+    slot: u8,
+    sample_rate: u32,
+    pad: PadId,
+    trigger_frame: u64,
+    duration: u64,
+) -> Arc<sampler_core::PatternSnapshot> {
+    let transport = Transport::new(
+        sample_rate,
+        Tempo::new(300.0).unwrap(),
+        Meter::new(1, 8).unwrap(),
+        1,
+        Resolution::Sixteenth,
+    )
+    .unwrap();
+    let mut pattern =
+        EditablePattern::new(PatternSlotId::new(slot).unwrap(), "Duration", transport).unwrap();
+    pattern
+        .insert(PatternEvent::new(EventId(1), pad, trigger_frame, 1.0, Some(duration)).unwrap())
+        .unwrap();
+    Arc::new(pattern.compile().unwrap())
+}
+
 fn assert_zero_callback_activity(name: &str, callback: impl FnOnce()) {
     COUNTS.reset_and_enable();
     callback();
@@ -383,6 +406,32 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
     assert_eq!(controller.reclaim_retired_pattern(), Some(initial_owner));
 }
 
+fn measure_exact_duration_pattern_releases() {
+    for mode in [PlaybackMode::Gate, PlaybackMode::Loop] {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(1_000, ports).unwrap();
+        let pad = PadId::first();
+        let sample = Arc::new(SampleBuffer::new(1_000, vec![0.5; 256]).unwrap());
+        let settings = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
+        controller.install(pad, sample, settings).unwrap();
+        engine.render_frames(0, |_| {});
+        controller
+            .install_pattern(duration_pattern_snapshot(0, 1_000, pad, 2, 3))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+
+        assert_zero_callback_activity("exact duration pattern release", || {
+            engine.render_frames(69, |_| {});
+        });
+
+        assert_eq!(engine.executed_triggers(), 1);
+        assert_eq!(engine.active_voices(), 0);
+    }
+}
+
 #[test]
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
@@ -397,4 +446,5 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_pure_device_write_adapter();
     measure_render_horizon_publication();
     measure_pattern_playback_acknowledgement_and_retirement();
+    measure_exact_duration_pattern_releases();
 }

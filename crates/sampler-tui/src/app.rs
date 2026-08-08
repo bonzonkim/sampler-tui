@@ -373,8 +373,14 @@ impl PendingProjectAction {
 enum ProjectLifecycleWait {
     SampleApply,
     ChoosingProject,
-    Saving(ProjectToken),
-    DiscardingRecovery(RecoveryCleanup),
+    Saving {
+        token: ProjectToken,
+        action_revision: u64,
+    },
+    DiscardingRecovery {
+        cleanup: RecoveryCleanup,
+        action_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -983,6 +989,16 @@ impl App {
         self.status = "Project action cancelled".to_owned();
     }
 
+    fn reconfirm_project_action(&mut self, status: &str) {
+        self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
+        let action = self
+            .pending_project_action
+            .as_ref()
+            .map_or(ProjectAction::Quit, PendingProjectAction::label);
+        self.overlay = Some(Overlay::UnsavedProject { action });
+        self.status = status.to_owned();
+    }
+
     fn apply_sample_resolution_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -1054,7 +1070,10 @@ impl App {
                     .as_ref()
                     .map(|save| save.descriptor.token)
                     .expect("accepted explicit save owns a token");
-                self.project_lifecycle_wait = Some(ProjectLifecycleWait::Saving(token));
+                self.project_lifecycle_wait = Some(ProjectLifecycleWait::Saving {
+                    token,
+                    action_revision: self.project_session.current_revision(),
+                });
                 let action = self
                     .pending_project_action
                     .as_ref()
@@ -1100,7 +1119,10 @@ impl App {
             revision: recovery_revision,
         };
         self.pending_recovery_cleanup.push_back(cleanup.clone());
-        self.project_lifecycle_wait = Some(ProjectLifecycleWait::DiscardingRecovery(cleanup));
+        self.project_lifecycle_wait = Some(ProjectLifecycleWait::DiscardingRecovery {
+            cleanup,
+            action_revision: self.project_session.current_revision(),
+        });
         let action = self
             .pending_project_action
             .as_ref()
@@ -3079,18 +3101,27 @@ impl App {
                 }
             }
         }
+        let lifecycle_save_revision = match self.project_lifecycle_wait {
+            Some(ProjectLifecycleWait::Saving {
+                token: expected,
+                action_revision,
+            }) if expected == token => Some(action_revision),
+            _ => None,
+        };
         if kind == SaveKind::Explicit
-            && self.project_lifecycle_wait == Some(ProjectLifecycleWait::Saving(token))
+            && let Some(action_revision) = lifecycle_save_revision
         {
             if save_succeeded {
-                self.complete_project_action();
+                if self.project_session.current_revision() == action_revision {
+                    self.complete_project_action();
+                } else {
+                    self.reconfirm_project_action(
+                        "Project changed while saving; review the newer changes",
+                    );
+                }
             } else {
-                self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
-                let action = self
-                    .pending_project_action
-                    .as_ref()
-                    .map_or(ProjectAction::Quit, PendingProjectAction::label);
-                self.overlay = Some(Overlay::UnsavedProject { action });
+                let error = self.status.clone();
+                self.reconfirm_project_action(&error);
             }
         } else if kind == SaveKind::Explicit
             && matches!(self.overlay, Some(Overlay::ProjectSaveProgress))
@@ -3148,23 +3179,31 @@ impl App {
         {
             return false;
         }
-        let lifecycle_cleanup = matches!(
-            self.project_lifecycle_wait.as_ref(),
-            Some(ProjectLifecycleWait::DiscardingRecovery(expected)) if expected == cleanup
-        );
+        let lifecycle_action_revision = match self.project_lifecycle_wait.as_ref() {
+            Some(ProjectLifecycleWait::DiscardingRecovery {
+                cleanup: expected,
+                action_revision,
+            }) if expected == cleanup => Some(*action_revision),
+            _ => None,
+        };
         let cleanup_succeeded = result.is_ok();
         self.in_flight_project = None;
         self.recovery_cleanup_warning = result.err();
-        if lifecycle_cleanup {
+        if cleanup_succeeded && self.project_session.autosaved_revision() == revision {
+            self.project_session
+                .mark_autosaved(self.project_session.saved_revision());
+        }
+        if let Some(action_revision) = lifecycle_action_revision {
             if cleanup_succeeded {
-                self.complete_project_action();
+                if self.project_session.current_revision() == action_revision {
+                    self.complete_project_action();
+                } else {
+                    self.reconfirm_project_action(
+                        "Project changed while discarding recovery; choose how to continue",
+                    );
+                }
             } else {
-                self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingProject);
-                let action = self
-                    .pending_project_action
-                    .as_ref()
-                    .map_or(ProjectAction::Quit, PendingProjectAction::label);
-                self.overlay = Some(Overlay::UnsavedProject { action });
+                self.reconfirm_project_action("Recovery discard failed; choose how to continue");
                 if let Some(error) = &self.recovery_cleanup_warning {
                     self.status = error.to_string();
                 }
@@ -9427,6 +9466,56 @@ mod tests {
         assert_eq!(app.project_revision(), saved_revision);
     }
 
+    fn queue_record_trigger_ack(app: &mut App) -> TransportStamp {
+        let pad = pad(0, 0);
+        let stamp = TransportStamp {
+            slot: PatternSlotId::new(0).unwrap(),
+            generation: app.patterns.selected_pattern().generation(),
+            origin: 1_000,
+            loop_frames: app.patterns.selected_pattern().transport().loop_frames(),
+        };
+        app.patterns.start_recording(stamp).unwrap();
+        app.patterns
+            .note_live_trigger(0, LiveCommandId::FIRST, pad, 1.0);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: LiveCommandId::FIRST,
+                pad,
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_120,
+                transport: Some(stamp),
+            },
+        ])));
+        stamp
+    }
+
+    #[test]
+    fn save_before_quit_reconfirms_if_record_ack_advances_past_the_snapshot() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        queue_record_trigger_ack(&mut app);
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.maintain_project(now));
+        let request = take_project_save(&mut app);
+        let saved_revision = request.request.snapshot.revision;
+
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), saved_revision + 1);
+        assert!(app.apply_worker_result(save_result(&request, Vec::new())));
+
+        assert!(!app.should_quit());
+        assert_eq!(app.project_session.saved_revision(), saved_revision);
+        assert_eq!(app.project_revision(), saved_revision + 1);
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+    }
+
     #[test]
     fn post_quit_input_fence_still_accepts_stop_all_and_pad_release() {
         let audio = FakeAudio::ready(48_000, 2);
@@ -9504,6 +9593,57 @@ mod tests {
             result: Ok(()),
         }));
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn discard_before_quit_reconfirms_if_release_ack_advances_past_the_action_revision() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let stamp = queue_record_trigger_ack(&mut app);
+        assert!(app.maintain_audio());
+        let project_id = name_project(&mut app, "named", now);
+        let action_revision = app.project_revision();
+        app.project_session.mark_autosaved(action_revision);
+        app.patterns.note_live_release(0, LiveCommandId::FIRST);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: LiveCommandId::FIRST,
+                pad: pad(0, 0),
+                kind: LiveAckKind::Release,
+                frame: 1_240,
+                transport: Some(stamp),
+            },
+        ])));
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.maintain_project(now));
+        let cleanup = take_recovery_cleanup(&mut app);
+
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), action_revision + 1);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup.token,
+            directory: cleanup.directory,
+            project_id,
+            revision: cleanup.revision,
+            result: Ok(()),
+        }));
+
+        assert!(!app.should_quit());
+        assert_eq!(app.project_revision(), action_revision + 1);
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::UnsavedProject {
+                action: super::ProjectAction::Quit,
+            })
+        );
+        assert_eq!(
+            app.project_session.autosaved_revision(),
+            app.project_session.saved_revision()
+        );
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.should_quit());
+        assert!(app.take_worker_requests().is_empty());
     }
 
     #[test]

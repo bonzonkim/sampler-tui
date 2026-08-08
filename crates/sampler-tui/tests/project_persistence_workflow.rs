@@ -909,6 +909,8 @@ fn probe_then_symlink_replacement_fails_secure_stage_without_replacing_old_tuple
 #[cfg(unix)]
 #[test]
 fn stage_fails_if_project_directory_path_changes_after_asset_fd_open() {
+    use std::os::unix::fs::symlink;
+
     let fixture = FixtureTree::new();
     let source_path = fixture.write_wav("directory-race-source.wav");
     let project = fixture.path("directory-race-project");
@@ -937,7 +939,7 @@ fn stage_fails_if_project_directory_path_changes_after_asset_fd_open() {
 
     opened.wait();
     fs::rename(&project, &moved).unwrap();
-    fs::create_dir(&project).unwrap();
+    symlink(&moved, &project).unwrap();
     resume.wait();
     let result = target.worker.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(target.app.apply_worker_result(result));

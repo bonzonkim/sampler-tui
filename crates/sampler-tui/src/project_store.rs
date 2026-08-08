@@ -227,9 +227,21 @@ impl ProjectDirectory {
                 io::Error::from(error),
             )
         })?;
-        let current = rustix::fs::stat(&self.path).map_err(|error| {
+        let (parent, leaf) = open_anchored_parent(&self.path, false)?;
+        let current_file = rustix::fs::openat(
+            &parent,
+            &leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ProjectStoreError::Filesystem {
+            operation: "verify project directory identity",
+            path: self.path.clone(),
+            kind: io::Error::from(error).kind(),
+        })?;
+        let current = rustix::fs::fstat(&current_file).map_err(|error| {
             filesystem_error(
-                "inspect project directory path",
+                "inspect current project directory",
                 &self.path,
                 io::Error::from(error),
             )
@@ -2316,6 +2328,8 @@ pitch_semitones = 0.0
     #[cfg(unix)]
     #[test]
     fn empty_project_swap_before_metadata_commit_preserves_both_directories() {
+        use std::os::unix::fs::symlink;
+
         let fixture = ProjectFixture::new();
         let opened_directory = fixture.root.join("opened-empty-project");
         let mut request = fixture.request(1, SaveKind::Explicit);
@@ -2324,13 +2338,12 @@ pitch_semitones = 0.0
         let result = fixture.store.save_with_hook(request, |point| {
             if point == AtomicWritePoint::BeforeRename {
                 fs::rename(&fixture.directory, &opened_directory).unwrap();
-                fs::create_dir(&fixture.directory).unwrap();
+                symlink(&opened_directory, &fixture.directory).unwrap();
             }
             None
         });
 
         assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
-        assert!(!fixture.directory.join("project.toml").exists());
         assert!(!opened_directory.join("project.toml").exists());
         assert!(
             fs::read_dir(&opened_directory).unwrap().all(|entry| !entry

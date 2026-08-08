@@ -381,7 +381,7 @@ impl App {
             && key.modifiers == KeyModifiers::NONE
             && self.overlay.is_some()
         {
-            self.close_overlay();
+            self.cancel_overlay();
             return;
         }
 
@@ -713,6 +713,12 @@ impl App {
     }
 
     pub fn close_overlay(&mut self) {
+        if matches!(
+            self.overlay,
+            Some(Overlay::ApplySample { .. } | Overlay::DiscardSample { .. })
+        ) {
+            self.editor.cancel_confirmation();
+        }
         if self.overlay == Some(Overlay::Palette) {
             self.palette_error = None;
         }
@@ -720,6 +726,10 @@ impl App {
             self.status = format!("{error} · Ctrl+R retries audio");
         }
         self.overlay = None;
+    }
+
+    fn cancel_overlay(&mut self) {
+        self.close_overlay();
     }
 
     pub fn palette_text(&self) -> &str {
@@ -759,6 +769,12 @@ impl App {
         request: WorkerRequest,
         error: WorkerSendError,
     ) -> bool {
+        let affected_offset = match &request {
+            WorkerRequest::LoadSample { pad, .. } | WorkerRequest::EditSample { pad, .. } => {
+                Some(pad_offset(*pad))
+            }
+            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => None,
+        };
         let message = error.to_string();
         let applied = match request {
             WorkerRequest::LoadSample {
@@ -818,6 +834,9 @@ impl App {
         };
         if applied {
             self.status = message;
+            if let Some(offset) = affected_offset {
+                self.refresh_editor_for_offset(offset);
+            }
         }
         applied
     }
@@ -895,7 +914,7 @@ impl App {
         };
         let generation = view.generation;
 
-        if let Some(engine_rate) = engine_rate {
+        let request = if let Some(engine_rate) = engine_rate {
             self.pending_loads[offset] = Some(Box::new(PendingLoad {
                 path: path.clone(),
                 phase: PendingLoadPhase::WorkerQueued,
@@ -916,7 +935,9 @@ impl App {
             }));
             self.recovery_cursor = Some(offset);
             None
-        }
+        };
+        self.refresh_editor_for_offset(offset);
+        request
     }
 
     /// Starts a bounded worker render of a new recipe. The pad tuple is not changed until the
@@ -1158,6 +1179,7 @@ impl App {
                 }
                 self.pads[offset].state = PadLoadState::Error(error.clone());
                 self.status = error;
+                self.refresh_editor_for_offset(offset);
                 return true;
             }
         };
@@ -1170,6 +1192,7 @@ impl App {
         let Some(sample_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
             self.pads[offset].state = PadLoadState::WaitingForDevice;
             self.recovery_cursor = Some(offset);
+            self.refresh_editor_for_offset(offset);
             return true;
         };
         if self
@@ -1186,6 +1209,7 @@ impl App {
             }
             self.pads[offset].state = PadLoadState::Loading;
             self.recovery_cursor = Some(offset);
+            self.refresh_editor_for_offset(offset);
             return true;
         }
         self.install_pending_load(offset, kind);
@@ -1217,6 +1241,7 @@ impl App {
                 self.status = error;
             }
         }
+        self.refresh_editor_for_offset(offset);
         true
     }
 
@@ -1352,7 +1377,12 @@ impl App {
                 self.overlay = None;
             }
             PaletteCommand::Bank(bank) => {
+                if self.editor.is_dirty() {
+                    self.status = "discard sample draft before changing bank".to_owned();
+                    return;
+                }
                 self.active_bank = bank;
+                self.sync_editor_to_selected_pad();
                 self.overlay = None;
             }
             PaletteCommand::Select(index) => {
@@ -1463,6 +1493,10 @@ impl App {
             self.palette_error = Some("selected pad is empty".to_owned());
             return false;
         }
+        if self.editor_operation_pending() {
+            self.palette_error = Some("sample edit is pending".to_owned());
+            return false;
+        }
         true
     }
 
@@ -1513,6 +1547,15 @@ impl App {
                 } else {
                     self.patterns.view().next()
                 };
+                if self.patterns.view() == WorkspaceView::Sample
+                    && view != WorkspaceView::Sample
+                    && self.editor.is_dirty()
+                {
+                    self.overlay = Some(Overlay::DiscardSample {
+                        pad: self.editor.pad(),
+                    });
+                    return true;
+                }
                 self.patterns.set_view(view);
                 if view == WorkspaceView::Sample {
                     self.sync_editor_to_selected_pad();
@@ -1623,6 +1666,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if self.editor_operation_pending() {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key
                 .modifiers
@@ -1688,7 +1734,16 @@ impl App {
         }
     }
 
+    fn refresh_editor_for_offset(&mut self, offset: usize) {
+        if self.selected_pad_id() == Some(pad_from_offset(offset)) {
+            self.sync_editor_to_selected_pad();
+        }
+    }
+
     fn request_editor_apply(&mut self) {
+        if self.editor_operation_pending() {
+            return;
+        }
         let Some(SampleEditorIntent::Apply { pad, recipe }) = self.editor.request_apply() else {
             return;
         };
@@ -1710,6 +1765,9 @@ impl App {
     }
 
     fn request_editor_undo(&mut self) {
+        if self.editor_operation_pending() {
+            return;
+        }
         if let Some(SampleEditorIntent::Undo { pad }) = self.editor.request_undo()
             && let Err(error) = self.undo_sample_edit(pad)
         {
@@ -1753,6 +1811,7 @@ impl App {
     fn apply_sample_discard_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
             self.editor.confirm_discard();
+            self.sync_editor_to_selected_pad();
             self.overlay = None;
         }
     }
@@ -1810,10 +1869,7 @@ impl App {
         let Some(pad) = self.pad_in_active_bank(index) else {
             return false;
         };
-        if self.patterns.view() == WorkspaceView::Sample
-            && self.editor.pad() != pad
-            && self.editor.is_dirty()
-        {
+        if self.editor.pad() != pad && self.editor.is_dirty() {
             self.status = "discard sample draft before selecting another pad".to_owned();
             return false;
         }
@@ -1822,6 +1878,18 @@ impl App {
             self.sync_editor_to_selected_pad();
         }
         true
+    }
+
+    fn editor_operation_pending(&self) -> bool {
+        matches!(
+            self.sample_edit_status(self.editor.pad()),
+            SampleEditStatus::AwaitingWorker
+                | SampleEditStatus::Rendering
+                | SampleEditStatus::ReadyToInstall
+        ) || matches!(
+            self.editor.status(),
+            crate::sample_editor::SampleEditorStatus::Pending
+        )
     }
 
     fn move_pattern_cursor_pad(&mut self, delta: i8) {
@@ -2186,7 +2254,7 @@ impl App {
         }
         let next_bank = BankId::new(u8::try_from(requested).expect("bounded bank fits in u8"))
             .expect("bounded bank is valid");
-        if self.patterns.view() == WorkspaceView::Sample && self.editor.is_dirty() {
+        if self.editor.is_dirty() {
             self.status = "discard sample draft before changing bank".to_owned();
             return;
         }
@@ -2273,6 +2341,7 @@ impl App {
         }
         self.status = error.clone();
         self.overlay = Some(Overlay::DeviceError(error));
+        self.sync_editor_to_selected_pad();
     }
 
     fn recover_audio(&mut self, audio: Box<dyn AudioPort>) {
@@ -2350,6 +2419,7 @@ impl App {
         self.recovery_cursor = Some(0);
         self.status = local_error.unwrap_or_else(|| "audio device connected".to_owned());
         self.pump_recovery_requests();
+        self.sync_editor_to_selected_pad();
     }
 
     fn pump_recovery_requests(&mut self) -> bool {
@@ -2524,6 +2594,7 @@ impl App {
             self.pads[offset].state = PadLoadState::Error(error.clone());
             self.status = error;
             self.recovery_cursor.get_or_insert(offset);
+            self.refresh_editor_for_offset(offset);
             return;
         }
 
@@ -2554,6 +2625,7 @@ impl App {
             "Loaded"
         };
         self.status = format!("{action} {}", label.to_uppercase());
+        self.refresh_editor_for_offset(offset);
     }
 
     fn reinstall_committed_sample(&mut self, offset: usize) {
@@ -2592,6 +2664,7 @@ impl App {
                 self.pads[offset].state = PadLoadState::Error(error.clone());
                 self.status = error;
                 self.recovery_cursor.get_or_insert(offset);
+                self.refresh_editor_for_offset(offset);
             }
         }
     }
@@ -3378,11 +3451,22 @@ mod tests {
     }
 
     fn loaded(pad: PadId, generation: u64, source: &str) -> WorkerResult {
-        loaded_at_rate(pad, generation, source, 48_000)
+        loaded_with_frames(pad, generation, source, 48_000, 1)
     }
 
     fn loaded_at_rate(pad: PadId, generation: u64, source: &str, sample_rate: u32) -> WorkerResult {
-        let rendered = Arc::new(SampleBuffer::new(sample_rate, vec![0.25, -0.25]).unwrap());
+        loaded_with_frames(pad, generation, source, sample_rate, 1)
+    }
+
+    fn loaded_with_frames(
+        pad: PadId,
+        generation: u64,
+        source: &str,
+        sample_rate: u32,
+        frames: usize,
+    ) -> WorkerResult {
+        let rendered =
+            Arc::new(SampleBuffer::new(sample_rate, [0.25, -0.25].repeat(frames)).unwrap());
         WorkerResult::Loaded {
             pad,
             generation,
@@ -3392,8 +3476,10 @@ mod tests {
                 rendered,
                 recipe: SampleEditRecipe::identity(),
                 source_rate: sample_rate,
-                source_frames: 1,
-                duration: std::time::Duration::from_secs_f64(1.0 / f64::from(sample_rate)),
+                source_frames: frames,
+                duration: std::time::Duration::from_secs_f64(
+                    frames as f64 / f64::from(sample_rate),
+                ),
                 preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }
@@ -5514,5 +5600,131 @@ mod tests {
         app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.palette_error(), Some("selected pad is empty"));
+    }
+
+    #[test]
+    fn dirty_sample_blocks_view_exit_and_pad_selection_until_discarded() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('2', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+        assert_eq!(app.selected_pad(), 0);
+        assert_eq!(app.sample_editor().pad(), pad);
+        assert!(
+            matches!(app.overlay(), Some(super::Overlay::DiscardSample { pad: actual }) if *actual == pad)
+        );
+    }
+
+    #[test]
+    fn sample_apply_pending_rejects_repeated_apply_and_undo_requests() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let pending_generation = app.sample_editor.pending[0].as_ref().unwrap().generation;
+
+        for _ in 0..4 {
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app.apply_key(key('z', KeyModifiers::CONTROL, KeyEventKind::Press));
+        }
+
+        assert_eq!(
+            app.sample_editor.pending[0].as_ref().unwrap().generation,
+            pending_generation
+        );
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Pending
+        ));
+        assert_eq!(app.overlay(), None);
+    }
+
+    #[test]
+    fn external_source_replacement_marks_a_dirty_editor_and_requires_discard_before_apply() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "first.wav").unwrap()
+        else {
+            panic!("expected initial load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "first.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "replacement.wav").unwrap()
+        else {
+            panic!("expected replacement load");
+        };
+        assert!(app.apply_worker_result(loaded_with_frames(
+            pad,
+            generation,
+            "replacement.wav",
+            48_000,
+            2,
+        )));
+
+        assert_eq!(app.pad(pad).sample.as_ref().unwrap().frames(), 2);
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Error(
+                crate::SampleEditorError::SelectedPadReplaced
+            )
+        ));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.sample_editor().base_frames(), Some(2));
+        assert!(!app.sample_editor().is_dirty());
+    }
+
+    #[test]
+    fn device_failure_and_retry_preserve_the_uncommitted_editor_draft() {
+        let mut app = App::with_audio(Box::new(
+            FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
+        ));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+
+        assert!(app.maintain_audio());
+        assert!(app.sample_editor().draft().normalize);
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Error(crate::SampleEditorError::DeviceUnavailable)
+        ));
+
+        app.retry_with(Box::new(FakeAudio::ready(48_000, 2)));
+        assert!(app.sample_editor().draft().normalize);
+        assert!(app.sample_editor().is_dirty());
     }
 }

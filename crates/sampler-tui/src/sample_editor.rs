@@ -192,6 +192,9 @@ impl SampleEditor {
             && context
                 .committed
                 .is_some_and(|recipe| Some(recipe) != self.committed);
+        let base_conflict = context.pad == self.pad
+            && (recipe_dirty || settings_dirty)
+            && (context.base_frames != self.base_frames || context.base_rate != self.base_rate);
         self.undo_available = matches!(context.edit_status, SampleEditStatus::UndoAvailable);
         self.pad = context.pad;
         match (context.committed, context.base_frames, context.base_rate) {
@@ -240,7 +243,7 @@ impl SampleEditor {
             self.observe_error(SampleEditorError::DeviceUnavailable);
             return;
         }
-        if recipe_conflict {
+        if recipe_conflict || base_conflict {
             self.observe_error(SampleEditorError::SelectedPadReplaced);
             return;
         }
@@ -390,6 +393,15 @@ impl SampleEditor {
 
     pub fn request_apply(&mut self) -> Option<SampleEditorIntent> {
         self.committed?;
+        if matches!(
+            self.status,
+            SampleEditorStatus::Pending
+                | SampleEditorStatus::ApplyConfirmation
+                | SampleEditorStatus::DiscardConfirmation
+                | SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced)
+        ) {
+            return None;
+        }
         if !self.is_dirty() {
             return None;
         }
@@ -401,6 +413,14 @@ impl SampleEditor {
     }
 
     pub fn request_undo(&mut self) -> Option<SampleEditorIntent> {
+        if matches!(
+            self.status,
+            SampleEditorStatus::Pending
+                | SampleEditorStatus::ApplyConfirmation
+                | SampleEditorStatus::DiscardConfirmation
+        ) {
+            return None;
+        }
         if !self.undo_available {
             return None;
         }
@@ -413,6 +433,15 @@ impl SampleEditor {
             self.draft = committed;
             self.settings = self.committed_settings;
             self.set_clean_status();
+        }
+    }
+
+    pub fn cancel_confirmation(&mut self) {
+        if matches!(
+            self.status,
+            SampleEditorStatus::ApplyConfirmation | SampleEditorStatus::DiscardConfirmation
+        ) {
+            self.note_draft_change();
         }
     }
 

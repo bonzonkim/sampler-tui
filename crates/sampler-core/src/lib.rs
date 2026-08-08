@@ -1,11 +1,17 @@
+pub mod error;
 pub mod pad;
 pub mod pattern;
 pub mod project;
 pub mod transport;
 pub mod voice;
 
+pub use error::{PatternCompileError, PatternEditError};
 pub use pad::{BankId, ChokeGroup, ModelError, PadId, PadSettings, PlaybackMode};
-pub use pattern::{EventId, Pattern, PatternEvent, ScheduleResult, ScheduledEvent};
+pub use pattern::{
+    EditablePattern, EventId, MAX_PATTERN_ACTIONS, MAX_PATTERN_EVENTS, PATTERN_SLOT_COUNT, Pattern,
+    PatternAction, PatternActionKind, PatternEvent, PatternSlotId, PatternSnapshot, ScheduleResult,
+    ScheduledEvent,
+};
 pub use project::{
     CURRENT_SCHEMA_VERSION, ProjectDocument, ProjectError, ProjectPad, ProjectPattern,
 };

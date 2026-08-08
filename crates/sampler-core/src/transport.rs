@@ -132,6 +132,30 @@ impl Transport {
         (frames_per_quarter * self.meter.quarters_per_bar() * f64::from(self.bars)).round() as Frame
     }
 
+    pub fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn tempo(self) -> Tempo {
+        self.tempo
+    }
+
+    pub fn meter(self) -> Meter {
+        self.meter
+    }
+
+    pub fn bars(self) -> u16 {
+        self.bars
+    }
+
+    pub fn resolution(self) -> Resolution {
+        self.resolution
+    }
+
+    pub fn swing(self) -> f64 {
+        self.swing
+    }
+
     pub fn step_count(self) -> u32 {
         (self.meter.quarters_per_bar()
             * f64::from(self.bars)

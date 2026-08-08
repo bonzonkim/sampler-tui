@@ -27,6 +27,8 @@ struct ControllerPort {
     runtime_failure: Rc<Cell<bool>>,
     observed_acks: Rc<RefCell<Vec<LiveAck>>>,
     installed_settings: Rc<RefCell<Vec<PadSettings>>>,
+    update_calls: Rc<Cell<usize>>,
+    reject_updates: Rc<Cell<bool>>,
 }
 
 impl ControllerPort {
@@ -131,6 +133,10 @@ impl AudioPort for ControllerPort {
         self.controller().stop_all().map_err(|e| e.to_string())
     }
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
+        self.update_calls.set(self.update_calls.get() + 1);
+        if self.reject_updates.get() {
+            return Err("test update rejected".to_owned());
+        }
         self.controller()
             .update_pad(pad, settings)
             .map_err(|e| e.to_string())
@@ -155,6 +161,8 @@ struct PatternHarness {
     runtime_failure: Rc<Cell<bool>>,
     observed_acks: Rc<RefCell<Vec<LiveAck>>>,
     installed_settings: Rc<RefCell<Vec<PadSettings>>>,
+    update_calls: Rc<Cell<usize>>,
+    reject_updates: Rc<Cell<bool>>,
 }
 
 impl PatternHarness {
@@ -164,6 +172,8 @@ impl PatternHarness {
         let runtime_failure = Rc::new(Cell::new(false));
         let observed_acks = Rc::new(RefCell::new(Vec::new()));
         let installed_settings = Rc::new(RefCell::new(Vec::new()));
+        let update_calls = Rc::new(Cell::new(0));
+        let reject_updates = Rc::new(Cell::new(false));
         let engine = AudioEngine::new(sample_rate, ports).expect("valid test engine");
         let mut app = App::with_audio(Box::new(ControllerPort {
             sample_rate,
@@ -171,6 +181,8 @@ impl PatternHarness {
             runtime_failure: Rc::clone(&runtime_failure),
             observed_acks: Rc::clone(&observed_acks),
             installed_settings: Rc::clone(&installed_settings),
+            update_calls: Rc::clone(&update_calls),
+            reject_updates: Rc::clone(&reject_updates),
         }));
         app.set_keyboard_capabilities(KeyboardCapabilities {
             release_events: true,
@@ -182,6 +194,8 @@ impl PatternHarness {
             runtime_failure,
             observed_acks,
             installed_settings,
+            update_calls,
+            reject_updates,
         };
         harness.drain_initial_patterns();
         let gate = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
@@ -325,24 +339,36 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
     harness.ui_iteration();
     harness.callback(0);
     harness.ui_iteration();
+    harness.palette("tempo 300");
+    harness.ui_iteration();
+    harness.callback(0);
+    harness.ui_iteration();
     // Restart through the public transport reducer so the newly compiled snapshot has a known
     // callback origin and its edited event must become an audible engine action.
     harness.key(KeyCode::Char(' '), KeyModifiers::NONE);
     harness.callback(0);
+    let align_to_telemetry = 1_600 - (harness.engine.rendered_frame() % 1_600) as usize;
+    harness.callback(align_to_telemetry);
+    harness.ui_iteration();
     harness.key(KeyCode::Char(' '), KeyModifiers::NONE);
     let origin = harness.engine.rendered_frame();
     harness.callback(0);
     let triggers_before = harness.engine.executed_triggers();
     harness.callback(1);
     assert!(harness.engine.executed_triggers() > triggers_before);
+    let active_loop_frames = harness
+        .app
+        .patterns()
+        .selected_pattern()
+        .transport()
+        .loop_frames();
     harness.key(KeyCode::Char('.'), KeyModifiers::NONE);
-    let boundary = origin
-        + harness
-            .app
-            .patterns()
-            .selected_pattern()
-            .transport()
-            .loop_frames();
+    let boundary = origin + active_loop_frames;
+    assert_eq!(
+        boundary % 1_600,
+        0,
+        "loop boundary shares telemetry publication frame"
+    );
     let before_boundary = usize::try_from(boundary - harness.engine.rendered_frame() - 1).unwrap();
     harness.callback(before_boundary);
     harness.ui_iteration();
@@ -353,10 +379,8 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
     );
     harness.callback(1);
     assert_eq!(harness.engine.rendered_frame(), boundary);
-    // Telemetry is emitted at fixed callback intervals, so wait only through the next interval
-    // after crossing the exact one-frame boundary rather than rendering a whole loop blindly.
-    harness.callback(1_600 - (boundary % 1_600) as usize);
     harness.ui_iteration();
+    assert_eq!(harness.app.telemetry().rendered_frame, boundary);
     let screen = harness.screen();
     assert!(screen.contains("PATTERN 02"), "{screen}");
     assert!(screen.contains("120.0 BPM"), "{screen}");
@@ -395,6 +419,8 @@ fn device_rate_retry_rebuilds_all_slots_round_robin_and_keeps_edits() {
         runtime_failure: Rc::clone(&retry_failure),
         observed_acks: Rc::clone(&harness.observed_acks),
         installed_settings: Rc::clone(&harness.installed_settings),
+        update_calls: Rc::clone(&harness.update_calls),
+        reject_updates: Rc::clone(&harness.reject_updates),
     }));
     harness.engine = retry_engine;
     harness.controller = retry_controller;
@@ -438,6 +464,37 @@ fn device_rate_retry_rebuilds_all_slots_round_robin_and_keeps_edits() {
 }
 
 #[test]
+fn pad_settings_update_is_validated_and_audio_atomic() {
+    let mut harness = PatternHarness::new(48_000);
+    let gate = PadSettings::new(PlaybackMode::Gate, -3.0, 0.25, 2.0, None).unwrap();
+    let calls = harness.update_calls.get();
+    harness.app.update_pad_settings(pad(1), gate).unwrap();
+    assert_eq!(
+        harness.update_calls.get(),
+        calls,
+        "empty pads do not send audio updates"
+    );
+    assert_eq!(harness.app.pad(pad(1)).settings, gate);
+
+    let before = harness.app.pad(pad(0)).settings;
+    let invalid = PadSettings {
+        gain_db: f32::NAN,
+        ..gate
+    };
+    assert!(harness.app.update_pad_settings(pad(0), invalid).is_err());
+    assert_eq!(harness.update_calls.get(), calls);
+    assert_eq!(harness.app.pad(pad(0)).settings, before);
+
+    harness.reject_updates.set(true);
+    assert!(harness.app.update_pad_settings(pad(0), gate).is_err());
+    assert_eq!(harness.app.pad(pad(0)).settings, before);
+    harness.reject_updates.set(false);
+    harness.app.update_pad_settings(pad(0), gate).unwrap();
+    assert_eq!(harness.update_calls.get(), calls + 2);
+    assert_eq!(harness.app.pad(pad(0)).settings, gate);
+}
+
+#[test]
 fn dense_pattern_and_ack_overflow_are_visible_without_silent_loss() {
     let (controller, ports) = audio_channels();
     let controller = Rc::new(RefCell::new(controller));
@@ -448,6 +505,8 @@ fn dense_pattern_and_ack_overflow_are_visible_without_silent_loss() {
         runtime_failure: Rc::new(Cell::new(false)),
         observed_acks: Rc::new(RefCell::new(Vec::new())),
         installed_settings: Rc::new(RefCell::new(Vec::new())),
+        update_calls: Rc::new(Cell::new(0)),
+        reject_updates: Rc::new(Cell::new(false)),
     };
     let mut app = App::with_audio(Box::new(app_port));
     app.set_keyboard_capabilities(KeyboardCapabilities {

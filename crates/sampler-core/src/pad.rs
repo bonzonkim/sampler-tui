@@ -158,6 +158,18 @@ impl PadSettings {
             choke_group,
         })
     }
+
+    /// Revalidates settings assembled through deserialization or a public struct literal.
+    pub fn validate(self) -> Result<(), ModelError> {
+        Self::new(
+            self.mode,
+            self.gain_db,
+            self.pan,
+            self.pitch_semitones,
+            self.choke_group,
+        )
+        .map(|_| ())
+    }
 }
 
 impl Default for PadSettings {

@@ -379,13 +379,17 @@ impl App {
         &self.pads[pad_offset(pad)]
     }
 
-    /// Updates a pad's audible settings and forwards the same validated value to audio when a
-    /// sample is already installed. This keeps callers from maintaining a second settings path.
+    /// Atomically updates a pad's validated settings. Unloaded pads remain a local edit; loaded
+    /// pads commit only after audio accepts the corresponding update.
     pub fn update_pad_settings(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
-        if let Some(audio) = self.audio.as_mut() {
+        settings.validate().map_err(|error| error.to_string())?;
+        let offset = pad_offset(pad);
+        if self.pads[offset].sample.is_some()
+            && let Some(audio) = self.audio.as_mut()
+        {
             audio.update_pad(pad, settings)?;
         }
-        self.pads[pad_offset(pad)].settings = settings;
+        self.pads[offset].settings = settings;
         Ok(())
     }
 

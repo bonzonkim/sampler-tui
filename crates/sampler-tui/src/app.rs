@@ -117,6 +117,7 @@ pub struct App {
     committed_recovery_loads: [Option<Box<PendingLoad>>; PAD_VIEW_COUNT],
     recovery_generations: [u64; PAD_VIEW_COUNT],
     reinstall_pending: [bool; PAD_VIEW_COUNT],
+    current_session_bound: [bool; PAD_VIEW_COUNT],
     device_retry_requests: usize,
     keyboard_capabilities: KeyboardCapabilities,
     status: String,
@@ -167,6 +168,7 @@ impl App {
             committed_recovery_loads: array::from_fn(|_| None),
             recovery_generations: [0; PAD_VIEW_COUNT],
             reinstall_pending: [false; PAD_VIEW_COUNT],
+            current_session_bound: [false; PAD_VIEW_COUNT],
             device_retry_requests: 0,
             keyboard_capabilities: KeyboardCapabilities::default(),
             status: audio_error.clone().unwrap_or_default(),
@@ -384,9 +386,7 @@ impl App {
     pub fn update_pad_settings(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
         settings.validate().map_err(|error| error.to_string())?;
         let offset = pad_offset(pad);
-        let bound_in_current_session = self.pads[offset].sample.is_some()
-            && !self.reinstall_pending[offset]
-            && self.pads[offset].state == PadLoadState::Ready;
+        let bound_in_current_session = self.current_session_bound[offset];
         if bound_in_current_session && let Some(audio) = self.audio.as_mut() {
             audio.update_pad(pad, settings)?;
         }
@@ -539,6 +539,7 @@ impl App {
         self.pending_loads.fill_with(|| None);
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
+        self.current_session_bound.fill(false);
         self.held_pad_by_key.fill(None);
         for pad in &mut self.pads {
             pad.active = false;
@@ -1430,6 +1431,7 @@ impl App {
         self.audio_format = None;
         self.recovery_cursor = None;
         self.reinstall_pending.fill(false);
+        self.current_session_bound.fill(false);
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
         self.patterns.stop_recording();
@@ -1453,6 +1455,7 @@ impl App {
         self.overlay = None;
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
+        self.current_session_bound.fill(false);
         self.pending_pattern_transport = None;
         if let Err(error) = self.patterns.rebuild_sample_rate(sample_rate) {
             self.status = error.to_string();
@@ -1703,6 +1706,7 @@ impl App {
         view.preview = loaded.preview;
         view.state = PadLoadState::Ready;
         self.reinstall_pending[offset] = false;
+        self.current_session_bound[offset] = true;
         if kind == PendingLoadKind::User {
             self.committed_recovery_loads[offset] = None;
         }
@@ -1743,6 +1747,7 @@ impl App {
         match audio.install_recovery(pad, sample, self.pads[offset].settings) {
             Ok(_) => {
                 self.reinstall_pending[offset] = false;
+                self.current_session_bound[offset] = true;
                 self.pads[offset].state = PadLoadState::Ready;
             }
             Err(error) => {

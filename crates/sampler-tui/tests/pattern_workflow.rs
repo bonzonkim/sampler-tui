@@ -17,8 +17,8 @@ use sampler_core::{
     PatternSnapshot, PlaybackMode, Resolution, Tempo, Transport,
 };
 use sampler_tui::{
-    App, AudioPort, KeyboardCapabilities, LoadedSample, PREVIEW_COLUMNS, PreviewColumn,
-    WorkerRequest, WorkerResult,
+    App, AudioPort, KeyboardCapabilities, LoadSampleError, LoadedSample, PREVIEW_COLUMNS,
+    PreviewColumn, WorkerRequest, WorkerResult,
 };
 
 struct ControllerPort {
@@ -534,6 +534,34 @@ fn retrying_pad_settings_wait_for_their_current_session_binding() {
         Some(&b_settings)
     );
     assert_eq!(harness.engine.invalid_commands(), 0);
+}
+
+#[test]
+fn replacement_loading_and_error_keep_the_current_session_pad_bound() {
+    let mut harness = PatternHarness::new(48_000);
+    let request = harness.app.begin_load(pad(0), "replacement.wav").unwrap();
+    let WorkerRequest::LoadSample {
+        generation, path, ..
+    } = request
+    else {
+        panic!("load request");
+    };
+    let calls = harness.update_calls.get();
+    let settings = PadSettings::new(PlaybackMode::Gate, -4.0, 0.0, 0.0, None).unwrap();
+    harness.app.update_pad_settings(pad(0), settings).unwrap();
+    assert_eq!(harness.update_calls.get(), calls + 1);
+    assert!(harness.app.apply_worker_result(WorkerResult::Loaded {
+        pad: pad(0),
+        generation,
+        path,
+        result: Err(LoadSampleError::Decode("replacement failed".to_owned())),
+    }));
+    let after_failure = PadSettings::new(PlaybackMode::Gate, -5.0, 0.0, 0.0, None).unwrap();
+    harness
+        .app
+        .update_pad_settings(pad(0), after_failure)
+        .unwrap();
+    assert_eq!(harness.update_calls.get(), calls + 2);
 }
 
 #[test]

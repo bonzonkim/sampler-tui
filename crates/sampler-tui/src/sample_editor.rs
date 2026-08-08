@@ -388,11 +388,7 @@ impl SampleEditor {
         if let Some(committed) = self.committed {
             self.draft = committed;
             self.settings = self.committed_settings;
-            self.status = if self.undo_available {
-                SampleEditorStatus::UndoAvailable
-            } else {
-                SampleEditorStatus::Clean
-            };
+            self.set_clean_status();
         }
     }
 
@@ -409,7 +405,7 @@ impl SampleEditor {
         }
         self.committed = Some(self.draft);
         self.committed_settings = self.settings;
-        self.status = SampleEditorStatus::Clean;
+        self.set_clean_status();
     }
 
     pub fn observe_apply_failed(&mut self, error: SampleEditorError) {
@@ -417,7 +413,7 @@ impl SampleEditor {
     }
 
     pub fn observe_undo_succeeded(&mut self) {
-        self.status = SampleEditorStatus::Clean;
+        self.set_clean_status();
     }
 
     pub fn observe_undo_failed(&mut self, error: SampleEditorError) {
@@ -431,20 +427,19 @@ impl SampleEditor {
             self.status = SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced);
             return;
         }
-        if recipe.validate().is_err() || frames == 0 {
-            self.committed = None;
-            self.base_frames = None;
-            self.status = SampleEditorStatus::Empty;
-            return;
-        }
-        self.committed = Some(recipe);
-        self.draft = recipe;
-        self.base_frames = Some(frames);
-        self.status = if self.undo_available {
-            SampleEditorStatus::UndoAvailable
-        } else {
-            SampleEditorStatus::Clean
-        };
+        self.sync_context(SampleEditorContext {
+            pad: self.pad,
+            committed: Some(recipe),
+            base_frames: Some(frames),
+            base_rate: self.base_rate.or(Some(1)),
+            settings: self.committed_settings,
+            edit_status: if self.undo_available {
+                SampleEditStatus::UndoAvailable
+            } else {
+                SampleEditStatus::Idle
+            },
+            device_available: true,
+        });
     }
 
     pub fn project(&self, width: u16) -> SampleProjection {
@@ -494,12 +489,20 @@ impl SampleEditor {
 
     fn note_draft_change(&mut self) {
         if self.committed.is_some() {
-            self.status = if self.is_dirty() {
-                SampleEditorStatus::Dirty
+            if self.is_dirty() {
+                self.status = SampleEditorStatus::Dirty;
             } else {
-                SampleEditorStatus::Clean
-            };
+                self.set_clean_status();
+            }
         }
+    }
+
+    fn set_clean_status(&mut self) {
+        self.status = if self.undo_available {
+            SampleEditorStatus::UndoAvailable
+        } else {
+            SampleEditorStatus::Clean
+        };
     }
 
     fn marker_frame(&self, frames: usize) -> usize {
@@ -523,9 +526,20 @@ impl SampleEditor {
     }
 
     fn coarse_frames(&self, frames: usize) -> usize {
-        let visible =
-            u128::from(self.viewport.width()) * frames as u128 / u128::from(SAMPLE_PHASE_SCALE);
-        usize::try_from(visible.div_ceil(100).max(1)).unwrap_or(usize::MAX)
+        let scale = u128::from(SAMPLE_PHASE_SCALE);
+        let source_frames = frames as u128;
+        let start = u128::from(self.viewport.start)
+            .checked_mul(source_frames)
+            .expect("bounded Q32 source span multiplication")
+            / scale;
+        let end = u128::from(self.viewport.end)
+            .checked_mul(source_frames)
+            .expect("bounded Q32 source span multiplication")
+            .div_ceil(scale);
+        let span = end
+            .checked_sub(start)
+            .expect("half-open viewport is monotonic");
+        usize::try_from(span.div_ceil(100).max(1)).unwrap_or(usize::MAX)
     }
 
     fn zoom_by(&mut self, delta: i8) {
@@ -660,6 +674,28 @@ mod tests {
     }
 
     #[test]
+    fn coarse_marker_uses_the_actual_half_open_visible_source_span() {
+        let mut editor = loaded(1_000);
+        editor.set_viewport(0, sampler_core::SAMPLE_PHASE_SCALE / 10 + 1);
+        editor.move_marker(1, true);
+        assert_eq!(editor.draft().frame_range(1_000).unwrap().start, 2);
+
+        let mut nonzero = loaded(1_000);
+        nonzero.set_viewport(
+            sampler_core::SAMPLE_PHASE_SCALE / 2 + 1,
+            sampler_core::SAMPLE_PHASE_SCALE / 2 + sampler_core::SAMPLE_PHASE_SCALE / 10 + 2,
+        );
+        nonzero.move_marker(1, true);
+        assert_eq!(nonzero.draft().frame_range(1_000).unwrap().start, 2);
+
+        for _ in 0..SampleEditor::MAX_ZOOM {
+            nonzero.zoom_in();
+        }
+        nonzero.move_marker(1, true);
+        assert!(nonzero.draft().frame_range(1_000).unwrap().start >= 3);
+    }
+
+    #[test]
     fn source_lengths_above_q32_precision_are_explicitly_unavailable() {
         let editor = loaded((sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1));
         assert_eq!(editor.base_frames(), None);
@@ -667,6 +703,26 @@ mod tests {
             editor.status(),
             SampleEditorStatus::Error(SampleEditorError::UnsupportedSourceLength)
         );
+    }
+
+    #[test]
+    fn replacement_reuses_context_validation_for_unsupported_then_recovered_sources() {
+        let mut editor = loaded(100);
+        editor.observe_selected_pad_replaced(
+            SampleEditRecipe::identity(),
+            (sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1),
+        );
+        assert_eq!(editor.base_frames(), None);
+        assert_eq!(
+            editor.status(),
+            SampleEditorStatus::Error(SampleEditorError::UnsupportedSourceLength)
+        );
+        editor.move_marker(1, false);
+        assert_eq!(editor.draft(), SampleEditRecipe::identity());
+
+        editor.observe_selected_pad_replaced(SampleEditRecipe::identity(), 100);
+        assert_eq!(editor.base_frames(), Some(100));
+        assert_eq!(editor.status(), SampleEditorStatus::Clean);
     }
 
     #[test]
@@ -755,7 +811,7 @@ mod tests {
             Some(SampleEditorIntent::Undo { pad: pad(0) })
         );
         editor.observe_undo_succeeded();
-        assert_eq!(editor.status(), SampleEditorStatus::Clean);
+        assert_eq!(editor.status(), SampleEditorStatus::UndoAvailable);
     }
 
     #[test]
@@ -918,6 +974,35 @@ mod tests {
         });
         assert_eq!(editor.status(), SampleEditorStatus::Clean);
         assert_eq!(editor.request_undo(), None);
+    }
+
+    #[test]
+    fn every_clean_reducer_path_keeps_app_owned_undo_available() {
+        let context = SampleEditorContext {
+            pad: pad(0),
+            committed: Some(SampleEditRecipe::identity()),
+            base_frames: Some(100),
+            base_rate: Some(48_000),
+            settings: PadSettings::default(),
+            edit_status: crate::SampleEditStatus::UndoAvailable,
+            device_available: true,
+        };
+        let mut editor = SampleEditor::open(context);
+        editor.toggle_reverse();
+        editor.toggle_reverse();
+        assert_eq!(editor.status(), SampleEditorStatus::UndoAvailable);
+        editor.toggle_normalize();
+        editor.toggle_normalize();
+        assert_eq!(editor.status(), SampleEditorStatus::UndoAvailable);
+        editor.adjust_pitch(1);
+        editor.adjust_pitch(-1);
+        editor.set_mode(PlaybackMode::Gate);
+        editor.set_mode(PlaybackMode::OneShot);
+        assert_eq!(editor.status(), SampleEditorStatus::UndoAvailable);
+        assert_eq!(
+            editor.request_undo(),
+            Some(SampleEditorIntent::Undo { pad: pad(0) })
+        );
     }
 
     #[test]

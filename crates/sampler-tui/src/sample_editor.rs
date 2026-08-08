@@ -136,45 +136,43 @@ impl SampleEditor {
         base_rate: u32,
         settings: PadSettings,
     ) -> Self {
-        let source_supported = source_frames_supported(base_frames);
-        let loaded =
-            base_frames != 0 && base_rate != 0 && source_supported && committed.validate().is_ok();
-        Self {
+        Self::open(SampleEditorContext {
             pad,
-            committed: loaded.then_some(committed),
-            draft: if loaded {
-                committed
-            } else {
-                SampleEditRecipe::identity()
-            },
-            committed_settings: settings,
+            committed: Some(committed),
+            base_frames: Some(base_frames),
+            base_rate: Some(base_rate),
             settings,
-            base_frames: loaded.then_some(base_frames),
-            base_rate: loaded.then_some(base_rate),
-            marker: SampleMarker::Start,
-            zoom: 0,
-            viewport: SampleViewport::full(),
-            status: if loaded {
-                SampleEditorStatus::Clean
-            } else if !source_supported {
-                SampleEditorStatus::Error(SampleEditorError::UnsupportedSourceLength)
-            } else {
-                SampleEditorStatus::Empty
-            },
-            undo_available: false,
-        }
+            edit_status: SampleEditStatus::Idle,
+            device_available: true,
+        })
     }
 
     pub fn open_empty(pad: PadId, settings: PadSettings) -> Self {
-        Self::open_loaded(pad, SampleEditRecipe::identity(), 0, 0, settings)
+        Self::open(SampleEditorContext {
+            pad,
+            committed: None,
+            base_frames: None,
+            base_rate: None,
+            settings,
+            edit_status: SampleEditStatus::Idle,
+            device_available: true,
+        })
     }
 
     pub fn open(context: SampleEditorContext) -> Self {
-        let mut editor = match (context.committed, context.base_frames, context.base_rate) {
-            (Some(recipe), Some(frames), Some(rate)) => {
-                Self::open_loaded(context.pad, recipe, frames, rate, context.settings)
-            }
-            _ => Self::open_empty(context.pad, context.settings),
+        let mut editor = Self {
+            pad: context.pad,
+            committed: None,
+            draft: SampleEditRecipe::identity(),
+            committed_settings: context.settings,
+            settings: context.settings,
+            base_frames: None,
+            base_rate: None,
+            marker: SampleMarker::Start,
+            zoom: 0,
+            viewport: SampleViewport::full(),
+            status: SampleEditorStatus::Empty,
+            undo_available: false,
         };
         editor.sync_context(context);
         editor
@@ -638,6 +636,39 @@ mod tests {
         let empty = SampleEditor::open_empty(pad(1), PadSettings::default());
         assert_eq!(empty.status(), SampleEditorStatus::Empty);
         assert_eq!(empty.base_frames(), None);
+    }
+
+    #[test]
+    fn loaded_constructor_uses_the_same_context_validation_as_open() {
+        for (frames, rate, expected) in [
+            (
+                100,
+                0,
+                SampleEditorStatus::Error(SampleEditorError::InvalidSourceRate),
+            ),
+            (
+                (sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1),
+                48_000,
+                SampleEditorStatus::Error(SampleEditorError::UnsupportedSourceLength),
+            ),
+            (100, 48_000, SampleEditorStatus::Clean),
+        ] {
+            let direct = SampleEditor::open_loaded(
+                pad(0),
+                SampleEditRecipe::identity(),
+                frames,
+                rate,
+                PadSettings::default(),
+            );
+            let contextual = SampleEditor::open(replacement_context(
+                SampleEditRecipe::identity(),
+                frames,
+                rate,
+            ));
+            assert_eq!(direct.status(), expected);
+            assert_eq!(direct.status(), contextual.status());
+            assert_eq!(direct.base_frames(), contextual.base_frames());
+        }
     }
 
     #[test]

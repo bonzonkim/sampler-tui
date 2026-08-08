@@ -834,6 +834,13 @@ impl AudioEngine {
 
     fn apply_pattern_transition(&mut self, transition: PatternTransition) {
         let PatternTransition { outgoing, incoming } = transition;
+        if self
+            .pattern_player
+            .record_capture
+            .is_some_and(|capture| capture.slot != incoming.slot)
+        {
+            self.pattern_player.record_capture = None;
+        }
         self.release_sustained_pattern_generation(outgoing.slot, outgoing.generation);
         self.cancel_pattern_generation(outgoing.slot, outgoing.generation);
         debug_assert_eq!(self.pattern_player.current_generation_id(), Some(incoming));
@@ -2793,6 +2800,51 @@ mod tests {
             .set_record_capture(Some((slot, generation)))
             .unwrap();
         engine.render_frames(0, |_| {});
+    }
+
+    #[test]
+    fn slot_switch_clears_ghost_capture_only_when_the_switch_executes() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let first = pattern_snapshot_with_triggers(0, 100, &[]);
+        let first_generation = first.generation();
+        let second = pattern_snapshot_with_triggers(1, 100, &[]);
+        let first_slot = PatternSlotId::new(0).unwrap();
+        let second_slot = PatternSlotId::new(1).unwrap();
+        controller.install_pattern(first).unwrap();
+        controller.install_pattern(second).unwrap();
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        controller
+            .set_record_capture(Some((first_slot, first_generation)))
+            .unwrap();
+        engine.render_frames(1, |_| {});
+
+        controller
+            .select_pattern(second_slot, PatternSwitch::NextBoundary)
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_some());
+        engine.render_frames(99, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
+
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
+
+        controller
+            .set_record_capture(Some((first_slot, first_generation)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        controller
+            .select_pattern(second_slot, PatternSwitch::Immediate)
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
     }
 
     #[test]

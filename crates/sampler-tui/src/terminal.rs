@@ -195,6 +195,7 @@ impl<O: KeyboardEnhancementOps> Drop for KeyboardEnhancementGuard<O> {
 }
 
 trait EventLoopApp {
+    fn should_quit(&self) -> bool;
     fn maintain_audio(&mut self) -> bool;
     fn maintain_project(&mut self, now: Instant) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
@@ -207,6 +208,10 @@ trait EventLoopApp {
 }
 
 impl EventLoopApp for App {
+    fn should_quit(&self) -> bool {
+        App::should_quit(self)
+    }
+
     fn maintain_audio(&mut self) -> bool {
         App::maintain_audio(self)
     }
@@ -313,7 +318,12 @@ where
 
     for _ in 0..MAX_WORKER_RESULTS_PER_ITERATION {
         match worker.try_recv() {
-            Ok(result) => state.dirty |= app.apply_worker_result(result),
+            Ok(result) => {
+                state.dirty |= app.apply_worker_result(result);
+                if app.should_quit() {
+                    return Ok(0);
+                }
+            }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::new(
@@ -838,6 +848,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeApp {
+        should_quit: bool,
+        quit_on_worker_result: bool,
         maintenance_calls: usize,
         project_maintenance_times: Vec<Instant>,
         worker_results: usize,
@@ -850,6 +862,10 @@ mod tests {
     }
 
     impl EventLoopApp for FakeApp {
+        fn should_quit(&self) -> bool {
+            self.should_quit
+        }
+
         fn maintain_audio(&mut self) -> bool {
             self.maintenance_calls += 1;
             false
@@ -862,6 +878,7 @@ mod tests {
 
         fn apply_worker_result(&mut self, _result: WorkerResult) -> bool {
             self.worker_results += 1;
+            self.should_quit |= self.quit_on_worker_result;
             true
         }
 
@@ -1001,6 +1018,10 @@ mod tests {
     fn worker_results_and_project_maintenance_precede_input_and_requests_precede_draw() {
         struct TraceApp(Arc<Mutex<Vec<&'static str>>>);
         impl EventLoopApp for TraceApp {
+            fn should_quit(&self) -> bool {
+                false
+            }
+
             fn maintain_audio(&mut self) -> bool {
                 self.0.lock().unwrap().push("audio");
                 false
@@ -1121,6 +1142,37 @@ mod tests {
 
         assert_eq!(app.worker_results, MAX_WORKER_RESULTS_PER_ITERATION);
         assert_eq!(worker.results.len(), 12);
+    }
+
+    #[test]
+    fn worker_result_quit_short_circuits_queued_input_in_the_same_iteration() {
+        let now = Instant::now();
+        let mut app = FakeApp {
+            quit_on_worker_result: true,
+            ..FakeApp::default()
+        };
+        let mut events = FakeEvents::with_events([pad_press('1')]);
+        let mut worker = FakeWorker {
+            results: VecDeque::from([failed_scan()]),
+            ..FakeWorker::default()
+        };
+        let mut drawer = FakeDrawer::default();
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        let events_applied = iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(events_applied, 0);
+        assert_eq!(app.events_applied, 0);
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(drawer.draws, 0);
     }
 
     #[test]

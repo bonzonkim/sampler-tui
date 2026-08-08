@@ -546,6 +546,10 @@ impl App {
     }
 
     pub fn apply(&mut self, action: InputAction) {
+        if self.should_quit && !matches!(action, InputAction::StopAll | InputAction::PadRelease(_))
+        {
+            return;
+        }
         if self.project_open_is_admitting()
             && !matches!(action, InputAction::StopAll | InputAction::PadRelease(_))
         {
@@ -574,6 +578,14 @@ impl App {
 
     pub fn apply_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Repeat {
+            return;
+        }
+        if self.should_quit {
+            if let Some(action @ (InputAction::StopAll | InputAction::PadRelease(_))) =
+                map_key(key, self.keyboard_capabilities)
+            {
+                self.apply(action);
+            }
             return;
         }
         if matches!(self.overlay, Some(Overlay::DeviceError(_)))
@@ -1017,6 +1029,21 @@ impl App {
             KeyCode::Char('n' | 'N') => self.discard_before_project_action(),
             _ => {}
         }
+    }
+
+    fn fail_project_sample_apply(&mut self, pad: PadId) {
+        if self.project_lifecycle_wait != Some(ProjectLifecycleWait::SampleApply) {
+            return;
+        }
+        self.project_lifecycle_wait = None;
+        let Some(action) = self
+            .pending_project_action
+            .as_ref()
+            .map(PendingProjectAction::label)
+        else {
+            return;
+        };
+        self.overlay = Some(Overlay::ResolveSampleDraft { pad, action });
     }
 
     fn save_before_project_action(&mut self) {
@@ -2095,6 +2122,7 @@ impl App {
                         .observe_undo_failed(SampleEditorError::InstallFailed),
                 }
             }
+            self.fail_project_sample_apply(pad);
             return true;
         }
 
@@ -2228,6 +2256,7 @@ impl App {
     }
 
     pub fn close_overlay(&mut self) {
+        let device_error = matches!(self.overlay, Some(Overlay::DeviceError(_)));
         if matches!(
             self.overlay,
             Some(Overlay::ApplySample { .. } | Overlay::DiscardSample { .. })
@@ -2242,6 +2271,12 @@ impl App {
             self.status = format!("{error} · Ctrl+R retries audio");
         }
         self.overlay = None;
+        if device_error
+            && self.pending_project_action.is_some()
+            && self.project_lifecycle_wait.is_none()
+        {
+            self.advance_project_action();
+        }
     }
 
     fn cancel_overlay(&mut self) {
@@ -2361,6 +2396,7 @@ impl App {
                 } else {
                     pending.phase = PendingEditPhase::Failed;
                     self.pads[offset].state = PadLoadState::Error(message.clone());
+                    self.fail_project_sample_apply(pad);
                 }
                 true
             }
@@ -3160,6 +3196,7 @@ impl App {
                 pending.phase = PendingEditPhase::Failed;
                 self.pads[offset].state = PadLoadState::Error(error.clone());
                 self.status = error;
+                self.fail_project_sample_apply(pad);
             }
         }
         self.refresh_editor_for_offset(offset);
@@ -4416,6 +4453,7 @@ impl App {
         self.reinstall_pending.fill(false);
         self.current_session_bound.fill(false);
         self.suspend_pending_sample_edits();
+        self.fail_project_sample_apply(self.editor.pad());
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
         self.patterns.stop_recording();
@@ -4545,6 +4583,9 @@ impl App {
         self.status = local_error.unwrap_or_else(|| "audio device connected".to_owned());
         self.pump_recovery_requests();
         self.sync_editor_to_selected_pad();
+        if self.pending_project_action.is_some() && self.project_lifecycle_wait.is_none() {
+            self.advance_project_action();
+        }
     }
 
     fn pump_recovery_requests(&mut self) -> bool {
@@ -9365,6 +9406,56 @@ mod tests {
     }
 
     #[test]
+    fn exact_save_and_quit_fences_a_queued_pattern_edit() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        app.patterns.set_view(WorkspaceView::Pattern);
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.maintain_project(now));
+        let request = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_result(&request, Vec::new())));
+        assert!(app.should_quit());
+        let saved_revision = app.project_revision();
+
+        app.apply_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.project_revision(), saved_revision);
+    }
+
+    #[test]
+    fn post_quit_input_fence_still_accepts_stop_all_and_pad_release() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Press));
+        app.should_quit = true;
+
+        app.apply_key(key('1', KeyModifiers::NONE, KeyEventKind::Release));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::StopAll,
+            ]
+        );
+    }
+
+    #[test]
     fn untitled_dirty_quit_save_stays_open_with_save_as_instruction() {
         let mut app = project_app();
         app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
@@ -9476,6 +9567,112 @@ mod tests {
             })
         );
         assert!(!apply.should_quit());
+    }
+
+    fn begin_quit_draft_apply(app: &mut App, now: Instant) -> WorkerRequest {
+        name_project(app, "named", now);
+        app.editor_mut_for_test().move_marker(1, false);
+        app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let requests = app.take_worker_requests();
+        let [request @ WorkerRequest::EditSample { .. }] = requests.as_slice() else {
+            panic!("expected lifecycle sample edit request");
+        };
+        request.clone()
+    }
+
+    #[test]
+    fn draft_apply_render_failure_returns_to_cancelable_resolution() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let request = begin_quit_draft_apply(&mut app, now);
+        let WorkerRequest::EditSample {
+            pad,
+            generation,
+            recipe,
+            ..
+        } = request
+        else {
+            unreachable!()
+        };
+
+        assert!(app.apply_worker_result(WorkerResult::Edited {
+            pad,
+            generation,
+            recipe,
+            result: Err("render failed".to_owned()),
+        }));
+
+        assert_eq!(app.project_lifecycle_wait, None);
+        assert!(app.pending_project_action.is_some());
+        assert!(app.sample_editor().is_dirty());
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::ResolveSampleDraft {
+                pad,
+                action: super::ProjectAction::Quit,
+            })
+        );
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+        assert!(app.pending_project_action.is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn draft_apply_closed_worker_returns_to_cancelable_resolution() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let request = begin_quit_draft_apply(&mut app, now);
+        let pad = match &request {
+            WorkerRequest::EditSample { pad, .. } => *pad,
+            _ => unreachable!(),
+        };
+
+        assert!(app.apply_worker_send_error(request, WorkerSendError::WorkerClosed));
+
+        assert_eq!(app.project_lifecycle_wait, None);
+        assert!(app.pending_project_action.is_some());
+        assert_eq!(
+            app.overlay(),
+            Some(&super::Overlay::ResolveSampleDraft {
+                pad,
+                action: super::ProjectAction::Quit,
+            })
+        );
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pending_project_action.is_none());
+    }
+
+    #[test]
+    fn draft_apply_device_failure_exposes_error_then_cancelable_resolution() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let _request = begin_quit_draft_apply(&mut app, now);
+        app.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
+        ));
+
+        assert!(app.maintain_audio());
+
+        assert_eq!(app.project_lifecycle_wait, None);
+        assert!(app.pending_project_action.is_some());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::DeviceError(_))
+        ));
+        assert!(app.retry_with(Box::new(FakeAudio::ready(48_000, 2))));
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ResolveSampleDraft { .. })
+        ));
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pending_project_action.is_none());
+        assert!(!app.should_quit());
     }
 
     #[test]

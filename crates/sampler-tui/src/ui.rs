@@ -886,12 +886,13 @@ mod tests {
             path,
             result: Ok(LoadedSample {
                 base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                base_preview: Arc::new(preview),
                 rendered: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                rendered_preview: Arc::new(preview),
                 recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 128,
                 duration: Duration::from_secs_f64(128.0 / 48_000.0),
-                preview: Arc::new(preview),
             }),
         }));
         assert_eq!(app.pad(kick).preview[0], PreviewColumn { min: -8, max: 8 });
@@ -1535,12 +1536,15 @@ mod tests {
             path: sample_path,
             result: Ok(LoadedSample {
                 base: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                base_preview: Arc::new([PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],),
                 rendered: Arc::new(SampleBuffer::new(48_000, vec![0.5; 128]).unwrap()),
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS],
+                ),
                 recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 64,
                 duration: Duration::from_secs_f64(64.0 / 48_000.0),
-                preview: Arc::new([PreviewColumn { min: -8, max: 8 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }));
 

@@ -100,6 +100,9 @@ pub enum SampleEditorIntent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SampleEditorContext {
     pub pad: PadId,
+    /// Stable identity of the user-initiated source load. Device-rate recovery keeps this value;
+    /// every explicit load attempt advances it even when path, rate, and frame count are equal.
+    pub source_generation: u64,
     pub committed: Option<SampleEditRecipe>,
     pub base_frames: Option<usize>,
     pub base_rate: Option<u32>,
@@ -113,6 +116,7 @@ pub struct SampleEditorContext {
 #[derive(Debug, Clone)]
 pub struct SampleEditor {
     pad: PadId,
+    source_generation: u64,
     committed: Option<SampleEditRecipe>,
     draft: SampleEditRecipe,
     committed_settings: PadSettings,
@@ -138,6 +142,7 @@ impl SampleEditor {
     ) -> Self {
         Self::open(SampleEditorContext {
             pad,
+            source_generation: 0,
             committed: Some(committed),
             base_frames: Some(base_frames),
             base_rate: Some(base_rate),
@@ -150,6 +155,7 @@ impl SampleEditor {
     pub fn open_empty(pad: PadId, settings: PadSettings) -> Self {
         Self::open(SampleEditorContext {
             pad,
+            source_generation: 0,
             committed: None,
             base_frames: None,
             base_rate: None,
@@ -162,6 +168,7 @@ impl SampleEditor {
     pub fn open(context: SampleEditorContext) -> Self {
         let mut editor = Self {
             pad: context.pad,
+            source_generation: context.source_generation,
             committed: None,
             draft: SampleEditRecipe::identity(),
             committed_settings: context.settings,
@@ -183,6 +190,11 @@ impl SampleEditor {
     pub fn sync_context(&mut self, context: SampleEditorContext) {
         let recipe_dirty = self.recipe_dirty();
         let settings_dirty = self.settings_dirty();
+        let replacement_latched = self.is_dirty()
+            && matches!(
+                self.status,
+                SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced)
+            );
         if context.pad != self.pad && (recipe_dirty || settings_dirty) {
             self.status = SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced);
             return;
@@ -192,11 +204,12 @@ impl SampleEditor {
             && context
                 .committed
                 .is_some_and(|recipe| Some(recipe) != self.committed);
-        let base_conflict = context.pad == self.pad
+        let source_conflict = context.pad == self.pad
             && (recipe_dirty || settings_dirty)
-            && (context.base_frames != self.base_frames || context.base_rate != self.base_rate);
+            && context.source_generation != self.source_generation;
         self.undo_available = matches!(context.edit_status, SampleEditStatus::UndoAvailable);
         self.pad = context.pad;
+        self.source_generation = context.source_generation;
         match (context.committed, context.base_frames, context.base_rate) {
             (Some(recipe), Some(frames), Some(rate))
                 if recipe.validate().is_ok()
@@ -243,7 +256,7 @@ impl SampleEditor {
             self.observe_error(SampleEditorError::DeviceUnavailable);
             return;
         }
-        if recipe_conflict || base_conflict {
+        if replacement_latched || recipe_conflict || source_conflict {
             self.observe_error(SampleEditorError::SelectedPadReplaced);
             return;
         }
@@ -255,7 +268,7 @@ impl SampleEditor {
             SampleEditStatus::GenerationExhausted => {
                 self.observe_error(SampleEditorError::GenerationExhausted)
             }
-            SampleEditStatus::UndoAvailable => self.status = SampleEditorStatus::UndoAvailable,
+            SampleEditStatus::UndoAvailable => self.note_draft_change(),
             SampleEditStatus::Idle => self.note_draft_change(),
         }
     }
@@ -338,8 +351,24 @@ impl SampleEditor {
         {
             return Err("frame is outside selected base".to_owned());
         }
+        let phase = frame_to_phase(frame, frames, matches!(marker, SampleMarker::End));
+        let mut candidate = self.draft;
+        match marker {
+            SampleMarker::Start => candidate.start_phase = phase,
+            SampleMarker::End => candidate.end_phase = phase,
+        }
+        let range = candidate
+            .frame_range(frames)
+            .map_err(|_| "trim marker would cross the other marker".to_owned())?;
+        let exact = match marker {
+            SampleMarker::Start => range.start == frame,
+            SampleMarker::End => range.end == frame,
+        };
+        if !exact {
+            return Err("frame is not exactly representable in selected base".to_owned());
+        }
         self.marker = marker;
-        self.set_marker_frame(frames, frame);
+        self.draft = candidate;
         self.note_draft_change();
         Ok(())
     }
@@ -718,6 +747,7 @@ mod tests {
     ) -> SampleEditorContext {
         SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(recipe),
             base_frames: Some(frames),
             base_rate: Some(rate),
@@ -881,6 +911,7 @@ mod tests {
         let mut editor = loaded(100);
         let unsupported = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some((sampler_core::SAMPLE_PHASE_SCALE as usize).saturating_add(1)),
             base_rate: Some(48_000),
@@ -990,6 +1021,7 @@ mod tests {
         assert_eq!(editor.status(), SampleEditorStatus::Clean);
         editor.sync_context(SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(recipe),
             base_frames: Some(100),
             base_rate: Some(48_000),
@@ -1034,6 +1066,7 @@ mod tests {
     fn app_context_maps_busy_failure_and_device_states_without_copying_pending_truth() {
         let context = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some(100),
             base_rate: Some(48_000),
@@ -1065,6 +1098,7 @@ mod tests {
     fn same_pad_rebase_keeps_dirty_recipe_across_rate_recovery_and_reports_external_conflicts() {
         let context = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some(1_000),
             base_rate: Some(48_000),
@@ -1085,6 +1119,7 @@ mod tests {
         assert_eq!(editor.draft().start_phase, draft_start);
         assert_eq!(editor.base_frames(), Some(900));
         assert_eq!(editor.base_rate(), Some(44_100));
+        assert_eq!(editor.status(), SampleEditorStatus::Dirty);
 
         let replacement =
             SampleEditRecipe::new(10, sampler_core::SAMPLE_PHASE_SCALE, false, false).unwrap();
@@ -1101,9 +1136,40 @@ mod tests {
     }
 
     #[test]
+    fn source_generation_fences_equal_shape_replacements_but_clean_empty_contexts_can_open() {
+        let context = SampleEditorContext {
+            pad: pad(0),
+            source_generation: 7,
+            committed: Some(SampleEditRecipe::identity()),
+            base_frames: Some(1_000),
+            base_rate: Some(48_000),
+            settings: PadSettings::default(),
+            edit_status: crate::SampleEditStatus::Idle,
+            device_available: true,
+        };
+        let mut dirty = SampleEditor::open(context);
+        dirty.toggle_reverse();
+        dirty.sync_context(SampleEditorContext {
+            source_generation: 8,
+            ..context
+        });
+        assert_eq!(
+            dirty.status(),
+            SampleEditorStatus::Error(SampleEditorError::SelectedPadReplaced)
+        );
+        assert!(dirty.draft().reversed);
+
+        let mut empty = SampleEditor::open_empty(pad(0), PadSettings::default());
+        empty.sync_context(context);
+        assert_eq!(empty.status(), SampleEditorStatus::Clean);
+        assert_eq!(empty.base_frames(), Some(1_000));
+    }
+
+    #[test]
     fn context_rebase_updates_clean_fields_and_preserves_only_dirty_settings_or_recipe_fields() {
         let context = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some(100),
             base_rate: Some(48_000),
@@ -1151,6 +1217,7 @@ mod tests {
     fn undo_is_reopened_and_enabled_only_from_app_context() {
         let context = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some(100),
             base_rate: Some(48_000),
@@ -1176,6 +1243,7 @@ mod tests {
     fn every_clean_reducer_path_keeps_app_owned_undo_available() {
         let context = SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(SampleEditRecipe::identity()),
             base_frames: Some(100),
             base_rate: Some(48_000),
@@ -1221,6 +1289,7 @@ mod tests {
         editor.observe_apply_succeeded();
         editor.sync_context(SampleEditorContext {
             pad: pad(0),
+            source_generation: 1,
             committed: Some(draft),
             base_frames: Some(100),
             base_rate: Some(48_000),

@@ -145,6 +145,7 @@ enum PendingEditKind {
 struct PendingEdit {
     generation: u64,
     base: Arc<SampleBuffer>,
+    base_preview: EditPreview,
     recipe: SampleEditRecipe,
     kind: PendingEditKind,
     phase: PendingEditPhase,
@@ -154,21 +155,26 @@ struct SampleEditCheckpoint {
     base: Arc<SampleBuffer>,
     rendered: Arc<SampleBuffer>,
     recipe: SampleEditRecipe,
-    preview: EditPreview,
+    base_preview: EditPreview,
+    rendered_preview: EditPreview,
 }
 
 struct SampleCommit {
     base: Option<Arc<SampleBuffer>>,
+    source_generation: u64,
     recipe: SampleEditRecipe,
-    preview: Option<EditPreview>,
+    base_preview: Option<EditPreview>,
+    rendered_preview: Option<EditPreview>,
 }
 
 impl Default for SampleCommit {
     fn default() -> Self {
         Self {
             base: None,
+            source_generation: 0,
             recipe: SampleEditRecipe::identity(),
-            preview: None,
+            base_preview: None,
+            rendered_preview: None,
         }
     }
 }
@@ -587,6 +593,7 @@ impl App {
                         pad: pad_from_offset(offset),
                         generation: pending.generation,
                         base: Arc::clone(&pending.base),
+                        base_preview: Arc::clone(&pending.base_preview),
                         recipe: pending.recipe,
                     };
                     self.queue_worker_request(request);
@@ -644,22 +651,28 @@ impl App {
         let checkpoint = match (
             self.sample_editor.commits[offset].base.as_ref(),
             self.pads[offset].sample.as_ref(),
-            self.sample_editor.commits[offset].preview.as_ref(),
+            self.sample_editor.commits[offset].base_preview.as_ref(),
+            self.sample_editor.commits[offset].rendered_preview.as_ref(),
         ) {
-            (Some(base), Some(sample), Some(preview)) => Some(Box::new(SampleEditCheckpoint {
-                base: Arc::clone(base),
-                rendered: Arc::clone(sample),
-                recipe: self.sample_editor.commits[offset].recipe,
-                preview: Arc::clone(preview),
-            })),
+            (Some(base), Some(sample), Some(base_preview), Some(rendered_preview)) => {
+                Some(Box::new(SampleEditCheckpoint {
+                    base: Arc::clone(base),
+                    rendered: Arc::clone(sample),
+                    recipe: self.sample_editor.commits[offset].recipe,
+                    base_preview: Arc::clone(base_preview),
+                    rendered_preview: Arc::clone(rendered_preview),
+                }))
+            }
             _ => None,
         };
         let view = &mut self.pads[offset];
         self.sample_editor.commits[offset].base = Some(pending.base);
+        self.sample_editor.commits[offset].base_preview = Some(rendered.base_preview);
         self.sample_editor.commits[offset].recipe = pending.recipe;
         view.sample = Some(rendered.rendered);
-        self.sample_editor.commits[offset].preview = Some(Arc::clone(&rendered.preview));
-        view.preview = crate::loader::downsample_preview(&rendered.preview);
+        self.sample_editor.commits[offset].rendered_preview =
+            Some(Arc::clone(&rendered.rendered_preview));
+        view.preview = crate::loader::downsample_preview(&rendered.rendered_preview);
         view.state = PadLoadState::Ready;
         self.current_session_bound[offset] = true;
         match pending.kind {
@@ -988,7 +1001,14 @@ impl App {
         let Some(base) = self.sample_editor.commits[offset].base.as_ref().cloned() else {
             return Err(SampleEditRequestError::EmptyPad);
         };
-        self.start_sample_edit(offset, base, recipe, PendingEditKind::Apply)
+        let Some(base_preview) = self.sample_editor.commits[offset]
+            .base_preview
+            .as_ref()
+            .cloned()
+        else {
+            return Err(SampleEditRequestError::EmptyPad);
+        };
+        self.start_sample_edit(offset, base, base_preview, recipe, PendingEditKind::Apply)
     }
 
     /// Re-renders and installs the previous recipe through the same worker/audio path as Apply.
@@ -1008,19 +1028,32 @@ impl App {
         // At the same device rate the checkpoint's base is the exact prior tuple. After a
         // recovery it intentionally re-renders the old recipe from the newly decoded base.
         let _retained_prior_rendered = Arc::clone(&checkpoint.rendered);
-        let _retained_prior_preview = Arc::clone(&checkpoint.preview);
-        let base = if self
+        let _retained_prior_base_preview = Arc::clone(&checkpoint.base_preview);
+        let _retained_prior_rendered_preview = Arc::clone(&checkpoint.rendered_preview);
+        let (base, base_preview) = if self
             .audio
             .as_ref()
             .is_some_and(|audio| checkpoint.base.sample_rate() == audio.sample_rate())
         {
-            Arc::clone(&checkpoint.base)
-        } else if let Some(base) = self.sample_editor.commits[offset].base.as_ref() {
-            Arc::clone(base)
+            (
+                Arc::clone(&checkpoint.base),
+                Arc::clone(&checkpoint.base_preview),
+            )
+        } else if let (Some(base), Some(base_preview)) = (
+            self.sample_editor.commits[offset].base.as_ref(),
+            self.sample_editor.commits[offset].base_preview.as_ref(),
+        ) {
+            (Arc::clone(base), Arc::clone(base_preview))
         } else {
             return Err(SampleEditRequestError::EmptyPad);
         };
-        self.start_sample_edit(offset, base, checkpoint.recipe, PendingEditKind::Undo)
+        self.start_sample_edit(
+            offset,
+            base,
+            base_preview,
+            checkpoint.recipe,
+            PendingEditKind::Undo,
+        )
     }
 
     pub fn committed_sample_recipe(&self, pad: PadId) -> Option<SampleEditRecipe> {
@@ -1035,7 +1068,9 @@ impl App {
     }
 
     pub fn edit_preview(&self, pad: PadId) -> Option<&EditPreview> {
-        self.sample_editor.commits[pad_offset(pad)].preview.as_ref()
+        self.sample_editor.commits[pad_offset(pad)]
+            .base_preview
+            .as_ref()
     }
 
     pub fn sample_edit_status(&self, pad: PadId) -> SampleEditStatus {
@@ -1062,6 +1097,7 @@ impl App {
         let base = self.base_sample(pad);
         SampleEditorContext {
             pad,
+            source_generation: self.sample_editor.commits[pad_offset(pad)].source_generation,
             committed: self.committed_sample_recipe(pad),
             base_frames: base.map(|sample| sample.frames()),
             base_rate: base.map(|sample| sample.sample_rate()),
@@ -1075,6 +1111,7 @@ impl App {
         &mut self,
         offset: usize,
         base: Arc<SampleBuffer>,
+        base_preview: EditPreview,
         recipe: SampleEditRecipe,
         kind: PendingEditKind,
     ) -> Result<(), SampleEditRequestError> {
@@ -1100,6 +1137,7 @@ impl App {
         self.sample_editor.pending[offset] = Some(Box::new(PendingEdit {
             generation,
             base: Arc::clone(&base),
+            base_preview: Arc::clone(&base_preview),
             recipe,
             kind,
             phase: PendingEditPhase::WorkerQueued,
@@ -1109,6 +1147,7 @@ impl App {
             pad: pad_from_offset(offset),
             generation,
             base,
+            base_preview,
             recipe,
         });
         Ok(())
@@ -1585,12 +1624,18 @@ impl App {
 
     fn apply_global_pattern_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Tab if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            KeyCode::Tab | KeyCode::BackTab
+                if matches!(
+                    (key.code, key.modifiers),
+                    (KeyCode::Tab, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        | (KeyCode::BackTab, KeyModifiers::SHIFT)
+                ) =>
+            {
                 if self.patterns.view() == WorkspaceView::Sample && self.editor_operation_pending()
                 {
                     return true;
                 }
-                let view = if key.modifiers == KeyModifiers::SHIFT {
+                let view = if key.code == KeyCode::BackTab || key.modifiers == KeyModifiers::SHIFT {
                     self.patterns.view().previous()
                 } else {
                     self.patterns.view().next()
@@ -2729,11 +2774,16 @@ impl App {
         let view = &mut self.pads[offset];
         view.label = label.clone();
         view.source = Some(pending.path);
+        if kind == PendingLoadKind::User {
+            self.sample_editor.commits[offset].source_generation = view.generation;
+        }
         self.sample_editor.commits[offset].base = Some(loaded.base);
         self.sample_editor.commits[offset].recipe = loaded.recipe;
         view.sample = Some(loaded.rendered);
-        self.sample_editor.commits[offset].preview = Some(Arc::clone(&loaded.preview));
-        view.preview = crate::loader::downsample_preview(&loaded.preview);
+        self.sample_editor.commits[offset].base_preview = Some(loaded.base_preview);
+        self.sample_editor.commits[offset].rendered_preview =
+            Some(Arc::clone(&loaded.rendered_preview));
+        view.preview = crate::loader::downsample_preview(&loaded.rendered_preview);
         view.state = PadLoadState::Ready;
         self.reinstall_pending[offset] = false;
         self.current_session_bound[offset] = true;
@@ -2825,7 +2875,8 @@ impl Drop for App {
         }
         for commit in &mut self.sample_editor.commits {
             commit.base = None;
-            commit.preview = None;
+            commit.base_preview = None;
+            commit.rendered_preview = None;
         }
         self.sample_editor.pending.fill_with(|| None);
         self.sample_editor.deferred_results.fill_with(|| None);
@@ -2912,6 +2963,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
@@ -2928,7 +2980,8 @@ mod tests {
 
     use crate::DirectoryScan;
     use crate::loader::{
-        LoadSampleError, LoadedSample, RenderedSample, WorkerRequest, WorkerResult, WorkerSendError,
+        LoadSampleError, LoadedSample, RenderedSample, WorkerHandle, WorkerRequest, WorkerResult,
+        WorkerSendError,
     };
 
     use super::{
@@ -3595,32 +3648,50 @@ mod tests {
             path: source.into(),
             result: Ok(LoadedSample {
                 base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
                 rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS],
+                ),
                 recipe: SampleEditRecipe::identity(),
                 source_rate: sample_rate,
                 source_frames: frames,
                 duration: std::time::Duration::from_secs_f64(
                     frames as f64 / f64::from(sample_rate),
                 ),
-                preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }
     }
 
     fn edited(
+        app: &App,
         pad: PadId,
         generation: u64,
         recipe: SampleEditRecipe,
         sample_rate: u32,
         frames: Vec<f32>,
     ) -> WorkerResult {
+        let offset = super::pad_offset(pad);
+        let base_preview = app.sample_editor.pending[offset]
+            .as_ref()
+            .map(|pending| Arc::clone(&pending.base_preview))
+            .or_else(|| {
+                app.sample_editor.commits[offset]
+                    .base_preview
+                    .as_ref()
+                    .map(Arc::clone)
+            })
+            .expect("an edit result must carry its request's base preview");
         WorkerResult::Edited {
             pad,
             generation,
             recipe,
             result: Ok(RenderedSample {
+                base_preview,
                 rendered: Arc::new(SampleBuffer::new(sample_rate, frames).unwrap()),
-                preview: Arc::new([PreviewColumn { min: -5, max: 5 }; EDIT_PREVIEW_COLUMNS]),
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -5, max: 5 }; EDIT_PREVIEW_COLUMNS],
+                ),
             }),
         }
     }
@@ -3661,9 +3732,14 @@ mod tests {
         };
         assert!(Arc::ptr_eq(base, &old_base));
         assert_eq!(*sent_recipe, recipe);
-        assert!(
-            app.apply_worker_result(edited(pad, *generation, recipe, 48_000, vec![-0.4, 0.4],))
-        );
+        assert!(app.apply_worker_result(edited(
+            &app,
+            pad,
+            *generation,
+            recipe,
+            48_000,
+            vec![-0.4, 0.4],
+        )));
 
         assert!(Arc::ptr_eq(
             app.pad(pad).sample.as_ref().unwrap(),
@@ -3682,6 +3758,10 @@ mod tests {
         assert_eq!(app.pad(pad).source, old_source);
         assert_eq!(app.pad(pad).label, old_label);
         assert_eq!(
+            app.edit_preview(pad).unwrap().as_ref(),
+            &[PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]
+        );
+        assert_eq!(
             app.pad(pad).preview,
             [PreviewColumn { min: -5, max: 5 }; PREVIEW_COLUMNS]
         );
@@ -3693,6 +3773,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             [AudioCall::Install(pad)]
         );
+    }
+
+    #[test]
+    fn identity_edit_reuses_the_base_buffer_and_preview_owners() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        let base = Arc::clone(app.base_sample(pad).unwrap());
+        let base_preview = Arc::clone(app.edit_preview(pad).unwrap());
+
+        app.request_sample_edit(pad, SampleEditRecipe::identity())
+            .unwrap();
+        let request = app.take_worker_requests().pop().unwrap();
+        let mut worker = WorkerHandle::spawn();
+        worker.try_send(request).unwrap();
+        let result = worker.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(app.apply_worker_result(result));
+        assert!(app.maintain_audio());
+
+        assert!(Arc::ptr_eq(app.base_sample(pad).unwrap(), &base));
+        assert!(Arc::ptr_eq(app.pad(pad).sample.as_ref().unwrap(), &base));
+        assert!(Arc::ptr_eq(app.edit_preview(pad).unwrap(), &base_preview));
+        assert!(Arc::ptr_eq(
+            app.sample_editor.commits[0]
+                .rendered_preview
+                .as_ref()
+                .unwrap(),
+            &base_preview
+        ));
+        worker.shutdown().unwrap();
     }
 
     #[test]
@@ -3728,6 +3842,7 @@ mod tests {
             _ => panic!("wrong request"),
         };
         assert!(!app.apply_worker_result(edited(
+            &app,
             pad,
             first_generation,
             first,
@@ -3735,6 +3850,7 @@ mod tests {
             vec![0.2, 0.2]
         )));
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             second_generation,
             second,
@@ -3781,6 +3897,7 @@ mod tests {
             _ => panic!("wrong request"),
         };
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             edit_generation,
             recipe,
@@ -3821,6 +3938,7 @@ mod tests {
             panic!("wrong request")
         };
         assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        let base_preview = Arc::clone(app.edit_preview(pad).unwrap());
         let recipe = SampleEditRecipe {
             reversed: true,
             ..SampleEditRecipe::identity()
@@ -3830,7 +3948,14 @@ mod tests {
             WorkerRequest::EditSample { generation, .. } => generation,
             _ => panic!("wrong request"),
         };
-        assert!(app.apply_worker_result(edited(pad, generation, recipe, 48_000, vec![-0.4, 0.4])));
+        assert!(app.apply_worker_result(edited(
+            &app,
+            pad,
+            generation,
+            recipe,
+            48_000,
+            vec![-0.4, 0.4],
+        )));
         assert!(app.maintain_audio());
         calls.clear();
 
@@ -3845,6 +3970,7 @@ mod tests {
         };
         assert_eq!(undo_recipe, SampleEditRecipe::identity());
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             generation,
             undo_recipe,
@@ -3852,6 +3978,7 @@ mod tests {
             vec![0.25, -0.25],
         )));
         assert!(app.maintain_audio());
+        assert!(Arc::ptr_eq(app.edit_preview(pad).unwrap(), &base_preview));
 
         assert_eq!(
             app.committed_sample_recipe(pad),
@@ -3936,6 +4063,7 @@ mod tests {
         assert_eq!(app.sample_edit_status(pad), SampleEditStatus::Failed);
         assert!(app.take_worker_requests().is_empty());
         assert!(!app.apply_worker_result(edited(
+            &app,
             pad,
             old_generation,
             recipe,
@@ -4011,9 +4139,17 @@ mod tests {
         };
         app.edit_result_advanced = true;
 
-        assert!(!app.apply_worker_result(edited(pad, u64::MAX, recipe, 48_000, vec![0.9, 0.9])));
+        assert!(!app.apply_worker_result(edited(
+            &app,
+            pad,
+            u64::MAX,
+            recipe,
+            48_000,
+            vec![0.9, 0.9],
+        )));
         assert!(app.sample_editor.deferred_results[0].is_none());
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             current_generation,
             recipe,
@@ -4047,6 +4183,7 @@ mod tests {
         };
         app.edit_result_advanced = true;
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             generation_a,
             recipe_a,
@@ -4068,18 +4205,14 @@ mod tests {
 
         // Model an already-queued stale result arriving just before maintenance. It must be
         // discarded before the one-result budget is marked consumed.
-        app.sample_editor.deferred_results[0] = Some(Box::new(edited(
-            pad,
-            generation_a,
-            recipe_a,
-            48_000,
-            vec![-0.4, 0.4],
-        )));
+        let stale_result = edited(&app, pad, generation_a, recipe_a, 48_000, vec![-0.4, 0.4]);
+        app.sample_editor.deferred_results[0] = Some(Box::new(stale_result));
         assert!(app.maintain_audio());
         assert!(!app.edit_result_advanced);
         assert!(app.sample_editor.deferred_results[0].is_none());
 
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             generation_b,
             recipe_b,
@@ -4114,6 +4247,7 @@ mod tests {
             _ => panic!("wrong request"),
         };
         assert!(app.apply_worker_result(edited(
+            &app,
             pad,
             edit_generation,
             recipe,
@@ -5749,6 +5883,40 @@ mod tests {
     }
 
     #[test]
+    fn backtab_cycles_backward_through_every_workspace_and_keeps_shift_tab_compatibility() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Pattern);
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Perform);
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+    }
+
+    #[test]
+    fn backtab_uses_the_same_dirty_sample_discard_fence_as_shift_tab() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+        assert_eq!(app.overlay(), Some(&super::Overlay::DiscardSample { pad }));
+    }
+
+    #[test]
     fn sample_apply_pending_rejects_repeated_apply_and_undo_requests() {
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
         let pad = pad(0, 0);
@@ -5804,10 +5972,10 @@ mod tests {
             generation,
             "replacement.wav",
             48_000,
-            2,
+            1,
         )));
 
-        assert_eq!(app.pad(pad).sample.as_ref().unwrap().frames(), 2);
+        assert_eq!(app.pad(pad).sample.as_ref().unwrap().frames(), 1);
         assert!(matches!(
             app.sample_editor().status(),
             crate::WorkspaceSampleEditorStatus::Error(
@@ -5838,10 +6006,99 @@ mod tests {
 
         app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.sample_editor().base_frames(), Some(2));
+        assert_eq!(app.sample_editor().base_frames(), Some(1));
         assert!(!app.sample_editor().is_dirty());
         app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
         assert!(app.sample_editor().draft().normalize);
+    }
+
+    #[test]
+    fn failed_stale_and_rejected_user_loads_keep_the_committed_source_identity() {
+        let setup = || {
+            let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+            let pad = pad(0, 0);
+            let WorkerRequest::LoadSample { generation, .. } =
+                app.begin_load(pad, "first.wav").unwrap()
+            else {
+                panic!("expected initial load");
+            };
+            assert!(app.apply_worker_result(loaded(pad, generation, "first.wav")));
+            let identity = app.sample_editor_context(pad).source_generation;
+            (app, pad, identity)
+        };
+
+        let (mut decode_failed, pad, identity) = setup();
+        let WorkerRequest::LoadSample { generation, .. } =
+            decode_failed.begin_load(pad, "decode-failed.wav").unwrap()
+        else {
+            panic!("expected replacement load");
+        };
+        assert!(decode_failed.apply_worker_result(WorkerResult::Loaded {
+            pad,
+            generation,
+            path: "decode-failed.wav".into(),
+            result: Err(LoadSampleError::Decode("bad payload".to_owned())),
+        }));
+        assert_eq!(
+            decode_failed.sample_editor_context(pad).source_generation,
+            identity
+        );
+
+        let (mut stale, pad, identity) = setup();
+        let stale_result = stale.begin_load(pad, "stale.wav").unwrap();
+        let _newer = stale.begin_load(pad, "newer.wav").unwrap();
+        let WorkerRequest::LoadSample { generation, .. } = stale_result else {
+            panic!("expected stale load");
+        };
+        assert!(!stale.apply_worker_result(loaded(pad, generation, "stale.wav")));
+        assert_eq!(stale.sample_editor_context(pad).source_generation, identity);
+
+        let (mut rejected, pad, identity) = setup();
+        let WorkerRequest::LoadSample { generation, .. } =
+            rejected.begin_load(pad, "rejected.wav").unwrap()
+        else {
+            panic!("expected replacement load");
+        };
+        rejected.audio = Some(Box::new(
+            FakeAudio::ready(48_000, 2).failing_install("install rejected"),
+        ));
+        assert!(rejected.apply_worker_result(loaded(pad, generation, "rejected.wav")));
+        assert_eq!(
+            rejected.sample_editor_context(pad).source_generation,
+            identity
+        );
+    }
+
+    #[test]
+    fn device_rate_recovery_keeps_the_committed_source_identity() {
+        let mut app = App::with_audio(Box::new(
+            FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
+        ));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected initial load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        let identity = app.sample_editor_context(pad).source_generation;
+        assert!(app.maintain_audio());
+
+        app.retry_with(Box::new(FakeAudio::ready(44_100, 2)));
+        let request = app.take_worker_requests().pop().unwrap();
+        let WorkerRequest::LoadSample {
+            generation, path, ..
+        } = request
+        else {
+            panic!("expected recovery load");
+        };
+        assert!(app.apply_worker_result(loaded_at_rate(
+            pad,
+            generation,
+            path.to_str().unwrap(),
+            44_100,
+        )));
+
+        assert_eq!(app.sample_editor_context(pad).source_generation, identity);
     }
 
     #[test]
@@ -6043,6 +6300,7 @@ mod tests {
 
         app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert_eq!(app.workspace_view(), WorkspaceView::Sample);
@@ -6051,5 +6309,75 @@ mod tests {
             app.sample_editor().status(),
             crate::WorkspaceSampleEditorStatus::Pending
         ));
+    }
+
+    #[test]
+    fn palette_exact_trim_rejects_crossing_in_both_directions_without_mutating_the_draft() {
+        for (first, crossing) in [
+            ("trim-end 3", "trim-start 4"),
+            ("trim-start 3", "trim-end 2"),
+        ] {
+            let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+            let pad = pad(0, 0);
+            let WorkerRequest::LoadSample { generation, .. } =
+                app.begin_load(pad, "seven.wav").unwrap()
+            else {
+                panic!("expected load request");
+            };
+            assert!(app.apply_worker_result(loaded_with_frames(
+                pad,
+                generation,
+                "seven.wav",
+                48_000,
+                7,
+            )));
+            app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+            app.open_palette();
+            app.apply_terminal_event(Event::Paste(first.to_owned()));
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.palette_error(), None);
+            let before = app.sample_editor().draft();
+
+            app.open_palette();
+            app.apply_terminal_event(Event::Paste(crossing.to_owned()));
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            assert_eq!(
+                app.palette_error(),
+                Some("trim marker would cross the other marker")
+            );
+            assert_eq!(app.sample_editor().draft(), before);
+        }
+    }
+
+    #[test]
+    fn palette_exact_trim_round_trips_non_divisible_frame_counts() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "seven.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded_with_frames(
+            pad,
+            generation,
+            "seven.wav",
+            48_000,
+            7,
+        )));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        for command in ["trim-start 2", "trim-end 5"] {
+            app.open_palette();
+            app.apply_terminal_event(Event::Paste(command.to_owned()));
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.palette_error(), None, "{command}");
+        }
+
+        assert_eq!(app.sample_editor().draft().frame_range(7).unwrap(), 2..5);
     }
 }

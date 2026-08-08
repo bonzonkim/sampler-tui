@@ -238,12 +238,15 @@ impl PatternHarness {
             path,
             result: Ok(LoadedSample {
                 base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],),
                 rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS],
+                ),
                 recipe: sampler_core::SampleEditRecipe::identity(),
                 source_rate: 48_000,
                 source_frames: 512,
                 duration: std::time::Duration::from_millis(11),
-                preview: Arc::new([PreviewColumn { min: -1, max: 1 }; EDIT_PREVIEW_COLUMNS]),
             }),
         }));
     }

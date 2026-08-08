@@ -617,14 +617,17 @@ impl EventLoopWorker for HarnessWorker {
                     path,
                     result: Ok(LoadedSample {
                         base: Arc::clone(&buffer),
+                        base_preview: Arc::new(
+                            [PreviewColumn::default(); sampler_tui::EDIT_PREVIEW_COLUMNS],
+                        ),
                         rendered: buffer,
+                        rendered_preview: Arc::new(
+                            [PreviewColumn::default(); sampler_tui::EDIT_PREVIEW_COLUMNS],
+                        ),
                         recipe: sampler_core::SampleEditRecipe::identity(),
                         source_rate: engine_rate,
                         source_frames: frames,
                         duration: Duration::from_secs_f64(frames as f64 / f64::from(engine_rate)),
-                        preview: Arc::new(
-                            [PreviewColumn::default(); sampler_tui::EDIT_PREVIEW_COLUMNS],
-                        ),
                     }),
                 });
             }

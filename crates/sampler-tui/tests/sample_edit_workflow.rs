@@ -73,6 +73,13 @@ impl Fixture {
         Self::write("identity.wav", 48_000, &vec![[0.5, 0.25]; 48_000])
     }
 
+    fn nonperiodic_impulses_1_024_frames() -> Self {
+        let mut frames = vec![[0.0, 0.0]; 1_024];
+        frames[300] = [1.0, 1.0];
+        frames[700] = [-1.0, -1.0];
+        Self::write("nonperiodic-impulses.wav", 48_000, &frames)
+    }
+
     fn write(name: &str, sample_rate: u32, frames: &[[f32; 2]]) -> Self {
         let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
@@ -368,6 +375,15 @@ impl Harness {
             .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn screen_symbol(&self, x: u16, y: u16) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| sampler_tui::ui::render(frame, &self.app))
+            .expect("draw");
+        terminal.backend().buffer()[(x, y)].symbol().to_owned()
     }
 }
 
@@ -702,6 +718,7 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     let second = pad(1);
     harness.load(first, &fixture.path);
     harness.load(second, &identity_fixture.path);
+    let original_base_preview = Arc::clone(harness.app.edit_preview(first).unwrap());
     harness.enter_sample();
 
     harness.palette("trim-start 12000");
@@ -719,6 +736,10 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     )
     .unwrap();
     assert_eq!(harness.app.committed_sample_recipe(first), Some(committed));
+    assert!(Arc::ptr_eq(
+        harness.app.edit_preview(first).unwrap(),
+        &original_base_preview
+    ));
 
     harness.palette("reverse on");
     let uncommitted = harness.app.sample_editor().draft();
@@ -767,6 +788,10 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
         44_100
     );
     assert_eq!(harness.app.base_sample(first).unwrap().frames(), 44_100);
+    assert!(!Arc::ptr_eq(
+        harness.app.edit_preview(first).unwrap(),
+        &original_base_preview
+    ));
     assert_eq!(
         committed
             .frame_range(harness.app.base_sample(first).unwrap().frames())
@@ -799,6 +824,10 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     );
     assert_eq!(harness.app.committed_sample_recipe(first), Some(committed));
     assert_eq!(harness.app.sample_editor().draft(), uncommitted);
+    assert_eq!(
+        harness.app.sample_editor().status(),
+        sampler_tui::WorkspaceSampleEditorStatus::Dirty
+    );
 
     assert!(harness.app.maintain_audio());
     let [second_recovery] = harness.app.take_worker_requests().try_into().unwrap();
@@ -840,6 +869,10 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     assert_eq!(harness.app.committed_sample_recipe(first), Some(committed));
     assert_eq!(harness.app.sample_editor().draft(), uncommitted);
     assert_ne!(harness.app.sample_editor().draft(), committed);
+    assert_eq!(
+        harness.app.sample_editor().status(),
+        sampler_tui::WorkspaceSampleEditorStatus::Dirty
+    );
 
     harness.app.apply(InputAction::PadPress(1));
     let mut identity_audition = Vec::new();
@@ -865,4 +898,60 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     assert_eq!(harness.engine.executed_triggers(), 2);
     assert_eq!(fixture.bytes(), source_before);
     assert_eq!(identity_fixture.bytes(), identity_source_before);
+
+    harness.app.apply(InputAction::StopAll);
+    harness.engine.render_frames(65, |_| {});
+    harness.palette("apply-sample");
+    assert!(matches!(
+        harness.app.overlay(),
+        Some(Overlay::ApplySample { pad, .. }) if *pad == first
+    ));
+    harness.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(harness.process_one_queued_request());
+    assert!(harness.app.maintain_audio());
+    harness.engine.render_frames(0, |_| {});
+    assert_eq!(
+        harness.app.committed_sample_recipe(first),
+        Some(uncommitted)
+    );
+    assert_eq!(
+        harness.app.sample_editor().status(),
+        sampler_tui::WorkspaceSampleEditorStatus::UndoAvailable
+    );
+    let applied = harness.app.pad(first).sample.as_ref().unwrap();
+    assert_eq!(stereo_frame(applied, 0), correct_last);
+    assert_eq!(stereo_frame(applied, applied.frames() - 1), correct_first);
+    assert_eq!(fixture.bytes(), source_before);
+}
+
+#[test]
+fn sample_waveform_stays_in_the_base_domain_after_trim_and_reverse_at_every_zoom_anchor() {
+    let fixture = Fixture::nonperiodic_impulses_1_024_frames();
+    let mut harness = Harness::new(48_000);
+    harness.load(pad(0), &fixture.path);
+    harness.enter_sample();
+    harness.palette("trim-start 256");
+    harness.palette("trim-end 768");
+    harness.palette("reverse on");
+    harness.palette("apply-sample");
+    harness.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(harness.process_one_queued_request());
+    assert!(harness.app.maintain_audio());
+    harness.engine.render_frames(0, |_| {});
+
+    // The 76-column waveform maps base frames 300 and 700 to absolute x=24 and x=54.
+    // A rendered-domain preview would instead place the reversed impulses near x=71 and x=11.
+    assert_eq!(harness.screen_symbol(24, 5), "+");
+    assert_eq!(harness.screen_symbol(54, 11), "-");
+
+    harness.key(KeyCode::Char('m'), KeyModifiers::NONE);
+    harness.key(KeyCode::PageUp, KeyModifiers::NONE);
+    // Start-anchored zoom is base frames 0..512; frame 300 maps to absolute x=46.
+    assert_eq!(harness.screen_symbol(46, 5), "+");
+
+    harness.key(KeyCode::Char('m'), KeyModifiers::NONE);
+    harness.key(KeyCode::PageDown, KeyModifiers::NONE);
+    harness.key(KeyCode::PageUp, KeyModifiers::NONE);
+    // End-anchored zoom is base frames 512..1024; frame 700 maps to absolute x=30.
+    assert_eq!(harness.screen_symbol(30, 11), "-");
 }

@@ -41,6 +41,7 @@ pub enum WorkerRequest {
         pad: PadId,
         generation: u64,
         base: Arc<SampleBuffer>,
+        base_preview: EditPreview,
         recipe: SampleEditRecipe,
     },
     Shutdown,
@@ -70,12 +71,15 @@ pub enum WorkerResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedSample {
     pub base: Arc<SampleBuffer>,
+    /// Fixed preview of the immutable base PCM used by the Sample editor.
+    pub base_preview: EditPreview,
     pub rendered: Arc<SampleBuffer>,
+    /// Fixed preview of rendered playback PCM used to derive the Perform waveform.
+    pub rendered_preview: EditPreview,
     pub recipe: SampleEditRecipe,
     pub source_rate: u32,
     pub source_frames: usize,
     pub duration: Duration,
-    pub preview: EditPreview,
 }
 
 /// Fixed-resolution waveform data shared by a worker result and the owning pad tuple.
@@ -83,8 +87,11 @@ pub type EditPreview = Arc<[PreviewColumn; EDIT_PREVIEW_COLUMNS]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedSample {
+    /// Preview paired with the immutable base owner in this result tuple.
+    pub base_preview: EditPreview,
     pub rendered: Arc<SampleBuffer>,
-    pub preview: EditPreview,
+    /// Fixed preview of rendered playback PCM paired with `base_preview`.
+    pub rendered_preview: EditPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,12 +254,13 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
                 pad,
                 generation,
                 base,
+                base_preview,
                 recipe,
             } => WorkerResult::Edited {
                 pad,
                 generation,
                 recipe,
-                result: render_sample_edit(&base, recipe),
+                result: render_sample_edit(&base, base_preview, recipe),
             },
             WorkerRequest::Shutdown => break,
         };
@@ -338,27 +346,32 @@ fn load_sample(
         prepare_sample_with_frame_limit(decoded, engine_rate, MAX_PREPARED_FRAMES)
             .map_err(|error| LoadSampleError::Prepare(format_error(&error)))?,
     );
-    let rendered = render_sample_edit(&base, recipe).map_err(LoadSampleError::Prepare)?;
+    let base_preview = build_preview(&base);
+    let rendered =
+        render_sample_edit(&base, base_preview, recipe).map_err(LoadSampleError::Prepare)?;
     Ok(LoadedSample {
         base,
+        base_preview: rendered.base_preview,
         rendered: rendered.rendered,
+        rendered_preview: rendered.rendered_preview,
         recipe,
         source_rate,
         source_frames,
         duration,
-        preview: rendered.preview,
     })
 }
 
 fn render_sample_edit(
     base: &Arc<SampleBuffer>,
+    base_preview: EditPreview,
     recipe: SampleEditRecipe,
 ) -> Result<RenderedSample, String> {
     recipe.validate().map_err(|error| error.to_string())?;
     if recipe == SampleEditRecipe::identity() {
         return Ok(RenderedSample {
+            rendered_preview: Arc::clone(&base_preview),
+            base_preview,
             rendered: Arc::clone(base),
-            preview: build_preview(base),
         });
     }
     let plan = apply_sample_edit(base.sample_rate(), base.data(), recipe)
@@ -368,7 +381,8 @@ fn render_sample_edit(
             .map_err(|error| error.to_string())?,
     );
     Ok(RenderedSample {
-        preview: build_preview(&rendered),
+        base_preview,
+        rendered_preview: build_preview(&rendered),
         rendered,
     })
 }
@@ -621,9 +635,10 @@ mod tests {
 
         assert_eq!(generation, 7);
         assert_eq!(sample.rendered.sample_rate(), 48_000);
-        assert_eq!(sample.preview.len(), EDIT_PREVIEW_COLUMNS);
-        assert!(sample.preview.iter().any(|column| column.max > 0));
-        assert!(sample.preview.iter().any(|column| column.min < 0));
+        assert_eq!(sample.base_preview.len(), EDIT_PREVIEW_COLUMNS);
+        assert!(sample.base_preview.iter().any(|column| column.max > 0));
+        assert!(sample.base_preview.iter().any(|column| column.min < 0));
+        assert!(Arc::ptr_eq(&sample.base_preview, &sample.rendered_preview));
         worker.shutdown().unwrap();
     }
 
@@ -635,13 +650,29 @@ mod tests {
 
         assert!(Arc::ptr_eq(&loaded.base, &loaded.rendered));
         assert_eq!(loaded.recipe, SampleEditRecipe::identity());
-        assert_eq!(loaded.preview.len(), EDIT_PREVIEW_COLUMNS);
+        assert_eq!(loaded.base_preview.len(), EDIT_PREVIEW_COLUMNS);
+        assert!(Arc::ptr_eq(&loaded.base_preview, &loaded.rendered_preview));
+    }
+
+    #[test]
+    fn edited_load_keeps_distinct_base_and_rendered_preview_domains() {
+        let fixture = wav_fixture(48_000, &[i16::MAX, 0, 0, i16::MIN]);
+        let recipe =
+            SampleEditRecipe::new(0, sampler_core::SAMPLE_PHASE_SCALE / 2, false, false).unwrap();
+
+        let loaded = load_sample(fixture.path(), 48_000, recipe).unwrap();
+
+        assert!(!Arc::ptr_eq(&loaded.base, &loaded.rendered));
+        assert!(!Arc::ptr_eq(&loaded.base_preview, &loaded.rendered_preview));
+        assert!(loaded.base_preview.iter().any(|column| column.min < 0));
+        assert!(loaded.rendered_preview.iter().all(|column| column.min >= 0));
     }
 
     #[test]
     fn edit_request_renders_the_base_not_a_previous_render() {
         let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25, 0.5, -0.5]).unwrap());
         let stale_rendered = Arc::new(SampleBuffer::new(48_000, vec![0.9, 0.9]).unwrap());
+        let base_preview = build_preview(&base);
         let recipe =
             SampleEditRecipe::new(0, sampler_core::SAMPLE_PHASE_SCALE / 2, false, false).unwrap();
         let mut worker = WorkerHandle::spawn();
@@ -651,6 +682,7 @@ mod tests {
                 pad: pad(0, 3),
                 generation: 91,
                 base: Arc::clone(&base),
+                base_preview: Arc::clone(&base_preview),
                 recipe,
             })
             .unwrap();
@@ -667,6 +699,7 @@ mod tests {
         assert_eq!(result_pad, pad(0, 3));
         assert_eq!(generation, 91);
         assert_eq!(result_recipe, recipe);
+        assert!(Arc::ptr_eq(&rendered.base_preview, &base_preview));
         assert_eq!(rendered.rendered.data(), &base.data()[..2]);
         assert_ne!(rendered.rendered.data(), stale_rendered.data());
         worker.shutdown().unwrap();
@@ -732,6 +765,7 @@ mod tests {
     #[test]
     fn saturated_edit_result_is_released_while_the_application_keeps_the_base_owner() {
         let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        let base_preview = build_preview(&base);
         let weak = Arc::downgrade(&base);
         let mut worker = worker_with_capacities(WORKER_CHANNEL_CAPACITY, 0);
 
@@ -740,6 +774,7 @@ mod tests {
                 pad: pad(0, 0),
                 generation: 1,
                 base: Arc::clone(&base),
+                base_preview,
                 recipe: SampleEditRecipe::identity(),
             })
             .unwrap();
@@ -759,6 +794,7 @@ mod tests {
         drop(result_receiver);
         let worker = thread::spawn(move || worker_loop(request_receiver, result_sender));
         let base = Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap());
+        let base_preview = build_preview(&base);
         let weak = Arc::downgrade(&base);
 
         request_sender
@@ -766,6 +802,7 @@ mod tests {
                 pad: pad(0, 0),
                 generation: 2,
                 base: Arc::clone(&base),
+                base_preview,
                 recipe: SampleEditRecipe::identity(),
             })
             .unwrap();
@@ -846,9 +883,9 @@ mod tests {
             panic!("wrong result")
         };
 
-        assert_eq!(sample.preview[0].max, 8);
+        assert_eq!(sample.base_preview[0].max, 8);
         assert!(
-            sample.preview[1..]
+            sample.base_preview[1..]
                 .iter()
                 .all(|column| column.min == 0 && column.max == 0)
         );

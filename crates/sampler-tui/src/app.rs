@@ -1797,6 +1797,13 @@ impl App {
         if self.editor_operation_pending() {
             return;
         }
+        let retry_error = matches!(
+            self.editor.status(),
+            crate::sample_editor::SampleEditorStatus::Error(_)
+        );
+        if retry_error && self.pending_loads[pad_offset(self.editor.pad())].is_some() {
+            return;
+        }
         let Some(SampleEditorIntent::Apply { pad, recipe }) = self.editor.request_apply() else {
             return;
         };
@@ -1881,13 +1888,11 @@ impl App {
                     .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
             }
             self.status = "sample changed while apply confirmation was open".to_owned();
-            self.overlay = None;
-            self.apply_sample_context = None;
+            self.reject_apply_confirmation();
             return;
         }
         let Some(SampleEditorIntent::Apply { recipe, .. }) = self.editor.confirm_apply() else {
-            self.overlay = None;
-            self.apply_sample_context = None;
+            self.reject_apply_confirmation();
             return;
         };
         match self.request_sample_edit(pad, recipe) {
@@ -1900,8 +1905,17 @@ impl App {
                 self.status = error.to_string();
                 self.editor
                     .observe_apply_failed(SampleEditorError::InstallFailed);
+                self.reject_apply_confirmation();
             }
         }
+    }
+
+    /// Applies the terminal half of every rejected Apply confirmation. This deliberately does
+    /// not call `cancel_confirmation`: the caller's typed error must remain visible with its
+    /// draft intact, while modal and token ownership always disappear together.
+    fn reject_apply_confirmation(&mut self) {
+        self.overlay = None;
+        self.apply_sample_context = None;
     }
 
     fn apply_sample_discard_key(&mut self, key: KeyEvent) {
@@ -5919,6 +5933,54 @@ mod tests {
         assert!(matches!(
             app.sample_editor().status(),
             crate::WorkspaceSampleEditorStatus::Error(crate::SampleEditorError::InstallFailed)
+        ));
+    }
+
+    #[test]
+    fn apply_rejection_while_replacement_is_pending_closes_confirmation_once_and_keeps_draft() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(pad, "first.wav").unwrap()
+        else {
+            panic!("expected initial load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "first.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.sample_editor().draft().normalize);
+
+        let replacement = app.begin_load(pad, "replacement.wav").unwrap();
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ApplySample { .. })
+        ));
+        assert!(app.apply_sample_context.is_some());
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.overlay(), None);
+        assert!(app.apply_sample_context.is_none());
+        assert!(app.sample_editor().draft().normalize);
+        assert!(app.sample_editor.pending[0].is_none());
+        let status = app.status().to_owned();
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+        assert_eq!(app.status(), status);
+
+        let WorkerRequest::LoadSample { generation, .. } = replacement else {
+            panic!("expected replacement load");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "replacement.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ApplySample { .. })
         ));
     }
 

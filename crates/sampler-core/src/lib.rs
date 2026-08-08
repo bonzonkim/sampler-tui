@@ -14,7 +14,9 @@ pub use pattern::{
     PatternSnapshot, ScheduleResult, ScheduledEvent,
 };
 pub use project::{
-    CURRENT_SCHEMA_VERSION, ProjectDocument, ProjectError, ProjectPad, ProjectPattern,
+    AssetDigest, CURRENT_SCHEMA_VERSION, LegacyProjectDocument, LegacyProjectPad,
+    LegacyProjectPattern, ParsedProjectDocument, ProjectDocument, ProjectError, ProjectId,
+    ProjectPad, ProjectPattern, ProjectPatternEvent,
 };
 pub use sample_edit::{SAMPLE_PHASE_SCALE, SampleEditPlan, SampleEditRecipe, apply_sample_edit};
 pub use transport::{Meter, Resolution, Tempo, Transport};

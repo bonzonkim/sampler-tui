@@ -237,6 +237,60 @@ impl EditablePattern {
         })
     }
 
+    pub fn from_persisted(
+        slot: PatternSlotId,
+        name: impl Into<String>,
+        transport: Transport,
+        events: Vec<(PatternEvent, Frame)>,
+        quantize_strength: f32,
+    ) -> Result<Self, PatternEditError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(PatternEditError::InvalidName);
+        }
+        if !quantize_strength.is_finite() || !(0.0..=1.0).contains(&quantize_strength) {
+            return Err(PatternEditError::InvalidQuantizeStrength);
+        }
+        if events.len() > MAX_PATTERN_EVENTS {
+            return Err(PatternEditError::Full);
+        }
+
+        let next_event_id = events
+            .iter()
+            .map(|(event, _)| event.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(PatternEditError::ArithmeticOverflow)?;
+        let mut restored_events = Pattern::new(transport.loop_frames());
+        let mut raw_frames = Vec::with_capacity(events.len());
+        for (event, raw_frame) in events {
+            validate_editable_event(&event, transport.loop_frames())?;
+            if raw_frame >= transport.loop_frames() {
+                return Err(PatternEditError::Model(ModelError::InvalidEvent));
+            }
+            let id = event.id;
+            let restored = quantize_event(event, raw_frame, transport, quantize_strength)?;
+            if restored != event {
+                return Err(PatternEditError::Model(ModelError::InvalidEvent));
+            }
+            restored_events.insert(restored)?;
+            raw_frames.push((id, raw_frame));
+        }
+
+        Ok(Self {
+            slot,
+            name,
+            transport,
+            events: restored_events,
+            raw_frames,
+            quantize_strength,
+            next_event_id,
+            generation: 0,
+            checkpoint: None,
+        })
+    }
+
     pub fn slot(&self) -> PatternSlotId {
         self.slot
     }
@@ -267,6 +321,21 @@ impl EditablePattern {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn persisted_events(&self) -> Result<Vec<(PatternEvent, Frame)>, PatternEditError> {
+        self.events
+            .events()
+            .iter()
+            .map(|event| {
+                let raw_frame = self
+                    .raw_frames
+                    .iter()
+                    .find_map(|(id, raw_frame)| (*id == event.id).then_some(*raw_frame))
+                    .ok_or(PatternEditError::MissingRawFrame)?;
+                Ok((*event, raw_frame))
+            })
+            .collect()
     }
 
     pub fn insert(&mut self, event: PatternEvent) -> Result<(), PatternEditError> {
@@ -1075,6 +1144,71 @@ mod tests {
         );
         pattern.insert(raw_event(1, 100)).unwrap();
         assert_eq!(pattern.event(EventId(1)).unwrap().frame, 100);
+    }
+
+    #[test]
+    fn persisted_restore_rebuilds_raw_ledger_and_resets_transient_state() {
+        let transport = transport();
+        let mut event = raw_event(17, 6_000);
+        event.original_offset = Some(800);
+        let mut restored = EditablePattern::from_persisted(
+            PatternSlotId::new(4).unwrap(),
+            "restored",
+            transport,
+            vec![(event, 6_800)],
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(restored.event(EventId(17)).unwrap().frame, 6_000);
+        assert_eq!(
+            restored.event(EventId(17)).unwrap().original_offset,
+            Some(800)
+        );
+        assert_eq!(restored.quantize_strength(), 1.0);
+        assert_eq!(restored.next_event_id(), EventId(18));
+        assert_eq!(restored.generation(), 0);
+        assert_eq!(restored.undo_clear(), Err(PatternEditError::NothingToUndo));
+    }
+
+    #[test]
+    fn persisted_restore_is_failure_atomic_for_invalid_raw_frames_and_max_ids() {
+        let before_loop = raw_event(1, 0);
+        assert!(matches!(
+            EditablePattern::from_persisted(
+                PatternSlotId::new(0).unwrap(),
+                "invalid",
+                transport(),
+                vec![(before_loop, u64::MAX)],
+                1.0,
+            ),
+            Err(PatternEditError::Model(ModelError::InvalidEvent))
+        ));
+
+        let max = raw_event(u64::MAX, 0);
+        assert!(matches!(
+            EditablePattern::from_persisted(
+                PatternSlotId::new(0).unwrap(),
+                "invalid",
+                transport(),
+                vec![(max, 0)],
+                0.0,
+            ),
+            Err(PatternEditError::ArithmeticOverflow)
+        ));
+
+        let mut inconsistent = raw_event(2, 6_001);
+        inconsistent.original_offset = Some(799);
+        assert!(matches!(
+            EditablePattern::from_persisted(
+                PatternSlotId::new(0).unwrap(),
+                "invalid",
+                transport(),
+                vec![(inconsistent, 6_800)],
+                1.0,
+            ),
+            Err(PatternEditError::Model(ModelError::InvalidEvent))
+        ));
     }
 
     #[test]

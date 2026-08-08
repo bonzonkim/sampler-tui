@@ -191,6 +191,31 @@ impl ProjectSession {
         }
     }
 
+    pub(crate) fn adopt_saved_project(
+        &mut self,
+        project_id: ProjectId,
+        directory: PathBuf,
+        name: String,
+        revision: u64,
+    ) {
+        self.project_id = project_id;
+        self.directory = Some(directory);
+        self.name = name;
+        self.mark_explicit_saved(revision);
+    }
+
+    pub(crate) fn mark_explicit_saved(&mut self, revision: u64) {
+        self.saved_revision = revision;
+        if self.current_revision == revision {
+            self.dirty_since = None;
+        }
+    }
+
+    pub(crate) fn mark_autosaved(&mut self, revision: u64) {
+        self.autosaved_revision = revision;
+        self.pending_autosave = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_current_revision_for_test(&mut self, revision: u64) {
         self.current_revision = revision;

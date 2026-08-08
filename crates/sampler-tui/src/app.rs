@@ -3,7 +3,7 @@ use std::fmt;
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
@@ -17,13 +17,16 @@ use crate::audio::{AudioPort, open_default_audio};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{
-    EditPreview, LoadPurpose, MAX_DIRECTORY_ENTRIES, RenderedSample, WORKER_CHANNEL_CAPACITY,
-    WorkerRequest, WorkerResult, WorkerSendError,
+    EditPreview, LoadPurpose, MAX_DIRECTORY_ENTRIES, ProjectSaveWorkerRequest, ProjectToken,
+    RenderedSample, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
 use crate::project_session::{ProjectSession, ProjectSnapshotError};
-use crate::project_store::{ProjectSavePad, ProjectSaveSnapshot, SourceFingerprint};
+use crate::project_store::{
+    ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError, SaveKind,
+    SaveReceipt, SourceFingerprint,
+};
 use crate::sample_editor::{
     SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent, SampleMarker,
 };
@@ -32,6 +35,59 @@ pub const PAD_VIEW_COUNT: usize = 160;
 /// Fixed worker-generated waveform resolution. Perform uses a bounded 64-column projection.
 pub const EDIT_PREVIEW_COLUMNS: usize = 1_024;
 pub const PREVIEW_COLUMNS: usize = 64;
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectSaveError {
+    Untitled,
+    OperationPending,
+    Snapshot(ProjectSnapshotError),
+    Entropy(String),
+    TokenExhausted,
+}
+
+impl fmt::Display for ProjectSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Untitled => formatter.write_str("untitled project requires Save As"),
+            Self::OperationPending => formatter.write_str("a project operation is already pending"),
+            Self::Snapshot(error) => error.fmt(formatter),
+            Self::Entropy(error) => {
+                write!(formatter, "could not generate project identity: {error}")
+            }
+            Self::TokenExhausted => formatter.write_str("project operation token is exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectSaveError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSaveFailure {
+    pub kind: SaveKind,
+    pub error: ProjectStoreError,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProjectSave {
+    descriptor: crate::ProjectOperationDescriptor,
+    snapshot: ProjectSaveSnapshot,
+    save_as: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryCleanup {
+    token: ProjectToken,
+    directory: PathBuf,
+    project_id: ProjectId,
+    revision: u64,
+}
+
+#[derive(Debug, Clone)]
+enum InFlightProjectOperation {
+    Save(PendingProjectSave),
+    Cleanup(RecoveryCleanup),
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreviewColumn {
@@ -276,6 +332,16 @@ pub struct App {
     pending_pattern_transport: Option<PendingPatternTransport>,
     should_quit: bool,
     project_session: ProjectSession,
+    next_project_token: u64,
+    pending_explicit_save: Option<PendingProjectSave>,
+    pending_autosave_save: Option<PendingProjectSave>,
+    in_flight_project: Option<InFlightProjectOperation>,
+    pending_recovery_cleanup: Option<RecoveryCleanup>,
+    save_as_identity: Option<(PathBuf, ProjectId, String)>,
+    project_save_error: Option<ProjectSaveFailure>,
+    recovery_cleanup_warning: Option<ProjectStoreError>,
+    autosave_retry_clock_pending: bool,
+    autosave_retry_since: Option<Instant>,
 }
 
 impl App {
@@ -363,6 +429,16 @@ impl App {
                 "Untitled",
                 0,
             ),
+            next_project_token: 1,
+            pending_explicit_save: None,
+            pending_autosave_save: None,
+            in_flight_project: None,
+            pending_recovery_cleanup: None,
+            save_as_identity: None,
+            project_save_error: None,
+            recovery_cleanup_warning: None,
+            autosave_retry_clock_pending: false,
+            autosave_retry_since: None,
         }
     }
 
@@ -496,6 +572,233 @@ impl App {
 
     pub fn project_revision(&self) -> u64 {
         self.project_session.current_revision()
+    }
+
+    pub fn request_save(&mut self) -> Result<(), ProjectSaveError> {
+        let Some(directory) = self.project_session.directory().map(Path::to_owned) else {
+            return Err(ProjectSaveError::Untitled);
+        };
+        self.ensure_project_request_available()?;
+        let snapshot = self
+            .project_snapshot()
+            .map_err(ProjectSaveError::Snapshot)?;
+        let token = self.allocate_project_token()?;
+        self.pending_explicit_save = Some(PendingProjectSave {
+            descriptor: crate::ProjectOperationDescriptor {
+                token,
+                kind: SaveKind::Explicit,
+                project_id: snapshot.project_id,
+                directory,
+                revision: snapshot.revision,
+            },
+            snapshot,
+            save_as: false,
+        });
+        Ok(())
+    }
+
+    pub fn request_save_as(
+        &mut self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<(), ProjectSaveError> {
+        self.ensure_project_request_available()?;
+        let directory = directory.into();
+        let (project_id, name) = match &self.save_as_identity {
+            Some((previous, project_id, name)) if previous == &directory => {
+                (*project_id, name.clone())
+            }
+            _ => {
+                let mut bytes = [0_u8; 16];
+                getrandom::fill(&mut bytes)
+                    .map_err(|error| ProjectSaveError::Entropy(error.to_string()))?;
+                if bytes == [0; 16] {
+                    bytes[15] = 1;
+                }
+                let name = directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Untitled")
+                    .to_owned();
+                let project_id = ProjectId::from_bytes(bytes);
+                self.save_as_identity = Some((directory.clone(), project_id, name.clone()));
+                (project_id, name)
+            }
+        };
+        let mut snapshot = self
+            .project_snapshot()
+            .map_err(ProjectSaveError::Snapshot)?;
+        snapshot.project_id = project_id;
+        snapshot.name = name;
+        let token = self.allocate_project_token()?;
+        self.pending_explicit_save = Some(PendingProjectSave {
+            descriptor: crate::ProjectOperationDescriptor {
+                token,
+                kind: SaveKind::Explicit,
+                project_id,
+                directory,
+                revision: snapshot.revision,
+            },
+            snapshot,
+            save_as: true,
+        });
+        Ok(())
+    }
+
+    pub fn maintain_project(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self.autosave_retry_clock_pending {
+            self.autosave_retry_clock_pending = false;
+            self.autosave_retry_since = Some(now);
+            changed = true;
+        }
+
+        if self.in_flight_project.is_none()
+            && self.pending_explicit_save.is_none()
+            && self.pending_autosave_save.as_ref().is_none_or(|pending| {
+                pending.descriptor.revision < self.project_session.current_revision()
+            })
+            && self.project_session.directory().is_some()
+            && self.project_session.current_revision() > self.project_session.autosaved_revision()
+            && self.project_session.current_revision() > self.project_session.saved_revision()
+        {
+            let quiet_since = match (
+                self.autosave_retry_since,
+                self.project_session.dirty_since(),
+            ) {
+                (Some(retry), Some(dirty)) => Some(retry.max(dirty)),
+                (retry, dirty) => retry.or(dirty),
+            };
+            if quiet_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= AUTOSAVE_DEBOUNCE)
+                && let Ok(snapshot) = self.project_snapshot()
+                && let Ok(token) = self.allocate_project_token()
+            {
+                let descriptor = crate::ProjectOperationDescriptor {
+                    token,
+                    kind: SaveKind::Recovery,
+                    project_id: snapshot.project_id,
+                    directory: self
+                        .project_session
+                        .directory()
+                        .expect("named project checked above")
+                        .to_owned(),
+                    revision: snapshot.revision,
+                };
+                self.project_session
+                    .set_pending_autosave(Some(crate::AutosaveDescriptor {
+                        revision: descriptor.revision,
+                    }));
+                self.pending_autosave_save = Some(PendingProjectSave {
+                    descriptor,
+                    snapshot,
+                    save_as: false,
+                });
+                changed = true;
+            }
+        }
+
+        if self.in_flight_project.is_some()
+            || self.pending_worker_requests.len() >= WORKER_CHANNEL_CAPACITY
+        {
+            return changed;
+        }
+
+        if let Some(save) = self.pending_explicit_save.take() {
+            self.enqueue_project_save(save);
+            return true;
+        }
+        if let Some(cleanup) = self.pending_recovery_cleanup.take() {
+            self.pending_worker_requests
+                .push(WorkerRequest::DiscardRecovery {
+                    token: cleanup.token,
+                    directory: cleanup.directory.clone(),
+                    project_id: cleanup.project_id,
+                    revision: cleanup.revision,
+                });
+            self.in_flight_project = Some(InFlightProjectOperation::Cleanup(cleanup));
+            return true;
+        }
+        if let Some(save) = self.pending_autosave_save.take() {
+            self.project_session.set_pending_autosave(None);
+            self.enqueue_project_save(save);
+            return true;
+        }
+        changed
+    }
+
+    pub fn project_save_error(&self) -> Option<&ProjectSaveFailure> {
+        self.project_save_error.as_ref()
+    }
+
+    pub fn recovery_cleanup_warning(&self) -> Option<&ProjectStoreError> {
+        self.recovery_cleanup_warning.as_ref()
+    }
+
+    pub fn project_header(&self) -> String {
+        let identity = if self.project_session.directory().is_some() {
+            self.project_session.name().to_owned()
+        } else {
+            "UNTITLED".to_owned()
+        };
+        let truth = match self.project_session.status() {
+            crate::ProjectStatus::Clean => "SAVED",
+            crate::ProjectStatus::Modified => "MODIFIED",
+            crate::ProjectStatus::Saving(SaveKind::Explicit) => "SAVING",
+            crate::ProjectStatus::Saving(SaveKind::Recovery) => "AUTOSAVING",
+        };
+        let mut header = format!("{identity} · {truth}");
+        if self.project_session.pending_autosave().is_some() || self.pending_autosave_save.is_some()
+        {
+            header.push_str(" · AUTOSAVE PENDING");
+        }
+        if let Some(failure) = &self.project_save_error {
+            let label = if failure.kind == SaveKind::Recovery {
+                "AUTOSAVE ERROR"
+            } else {
+                "SAVE ERROR"
+            };
+            header.push_str(&format!(" · {label}: {}", failure.error));
+        }
+        if let Some(warning) = &self.recovery_cleanup_warning {
+            header.push_str(&format!(" · RECOVERY CLEANUP WARNING: {warning}"));
+        }
+        header
+    }
+
+    fn ensure_project_request_available(&self) -> Result<(), ProjectSaveError> {
+        if self.pending_explicit_save.is_some() || self.in_flight_project.is_some() {
+            Err(ProjectSaveError::OperationPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn allocate_project_token(&mut self) -> Result<ProjectToken, ProjectSaveError> {
+        let token = ProjectToken::new(self.next_project_token);
+        self.next_project_token = self
+            .next_project_token
+            .checked_add(1)
+            .ok_or(ProjectSaveError::TokenExhausted)?;
+        Ok(token)
+    }
+
+    fn enqueue_project_save(&mut self, save: PendingProjectSave) {
+        let descriptor = save.descriptor.clone();
+        self.pending_worker_requests
+            .push(WorkerRequest::SaveProject(Box::new(
+                ProjectSaveWorkerRequest {
+                    token: descriptor.token,
+                    request: ProjectSaveRequest {
+                        directory: descriptor.directory.clone(),
+                        save_as: save.save_as,
+                        kind: descriptor.kind,
+                        snapshot: save.snapshot.clone(),
+                    },
+                },
+            )));
+        self.project_session.set_in_flight(Some(descriptor));
+        self.in_flight_project = Some(InFlightProjectOperation::Save(save));
     }
 
     pub fn project_snapshot(&self) -> Result<ProjectSaveSnapshot, ProjectSnapshotError> {
@@ -1016,10 +1319,23 @@ impl App {
                 }
                 true
             }
+            WorkerRequest::SaveProject(request) => self.restore_busy_project_save(*request, error),
+            WorkerRequest::DiscardRecovery {
+                token,
+                directory,
+                project_id,
+                revision,
+            } => self.restore_busy_recovery_cleanup(
+                RecoveryCleanup {
+                    token,
+                    directory,
+                    project_id,
+                    revision,
+                },
+                error,
+            ),
             WorkerRequest::ScanDirectory { .. }
-            | WorkerRequest::SaveProject(_)
             | WorkerRequest::ProbeProject { .. }
-            | WorkerRequest::DiscardRecovery { .. }
             | WorkerRequest::StageProjectSample(_)
             | WorkerRequest::Shutdown => false,
         };
@@ -1030,6 +1346,80 @@ impl App {
             }
         }
         applied
+    }
+
+    fn restore_busy_project_save(
+        &mut self,
+        request: ProjectSaveWorkerRequest,
+        error: WorkerSendError,
+    ) -> bool {
+        let Some(InFlightProjectOperation::Save(save)) = self.in_flight_project.as_ref() else {
+            return false;
+        };
+        let expected = &save.descriptor;
+        if request.token != expected.token
+            || request.request.kind != expected.kind
+            || request.request.snapshot.project_id != expected.project_id
+            || request.request.directory != expected.directory
+            || request.request.snapshot.revision != expected.revision
+        {
+            return false;
+        }
+        let InFlightProjectOperation::Save(save) = self
+            .in_flight_project
+            .take()
+            .expect("matching save operation is present")
+        else {
+            unreachable!()
+        };
+        self.project_session.set_in_flight(None);
+        if error == WorkerSendError::WorkerBusy {
+            match save.descriptor.kind {
+                SaveKind::Explicit => self.pending_explicit_save = Some(save),
+                SaveKind::Recovery => {
+                    self.project_session
+                        .set_pending_autosave(Some(crate::AutosaveDescriptor {
+                            revision: save.descriptor.revision,
+                        }));
+                    self.pending_autosave_save = Some(save);
+                }
+            }
+        } else {
+            self.project_save_error = Some(ProjectSaveFailure {
+                kind: save.descriptor.kind,
+                error: ProjectStoreError::Filesystem {
+                    operation: "send project save",
+                    path: save.descriptor.directory,
+                    kind: std::io::ErrorKind::BrokenPipe,
+                },
+            });
+        }
+        true
+    }
+
+    fn restore_busy_recovery_cleanup(
+        &mut self,
+        request: RecoveryCleanup,
+        error: WorkerSendError,
+    ) -> bool {
+        let Some(InFlightProjectOperation::Cleanup(expected)) = self.in_flight_project.as_ref()
+        else {
+            return false;
+        };
+        if expected != &request {
+            return false;
+        }
+        self.in_flight_project = None;
+        if error == WorkerSendError::WorkerBusy {
+            self.pending_recovery_cleanup = Some(request);
+        } else {
+            self.recovery_cleanup_warning = Some(ProjectStoreError::Filesystem {
+                operation: "send recovery cleanup",
+                path: request.directory,
+                kind: std::io::ErrorKind::BrokenPipe,
+            });
+        }
+        true
     }
 
     pub fn device_retry_requests(&self) -> usize {
@@ -1337,6 +1727,29 @@ impl App {
     }
 
     pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
+        let result = match result {
+            WorkerResult::ProjectSaved {
+                token,
+                kind,
+                project_id,
+                directory,
+                revision,
+                result,
+            } => {
+                return self
+                    .apply_project_saved(token, kind, project_id, directory, revision, result);
+            }
+            WorkerResult::RecoveryDiscarded {
+                token,
+                directory,
+                project_id,
+                revision,
+                result,
+            } => {
+                return self.apply_recovery_cleanup(token, directory, project_id, revision, result);
+            }
+            result => result,
+        };
         if let WorkerResult::Edited {
             pad,
             generation,
@@ -1442,6 +1855,139 @@ impl App {
             return true;
         }
         self.install_pending_load(offset, kind);
+        true
+    }
+
+    fn apply_project_saved(
+        &mut self,
+        token: ProjectToken,
+        kind: SaveKind,
+        project_id: ProjectId,
+        directory: PathBuf,
+        revision: u64,
+        result: Result<SaveReceipt, ProjectStoreError>,
+    ) -> bool {
+        let Some(InFlightProjectOperation::Save(save)) = self.in_flight_project.as_ref() else {
+            return false;
+        };
+        let expected = &save.descriptor;
+        if expected.token != token
+            || expected.kind != kind
+            || expected.project_id != project_id
+            || expected.directory != directory
+            || expected.revision != revision
+        {
+            return false;
+        }
+        if let Ok(receipt) = &result
+            && (receipt.kind != kind
+                || receipt.project_id != project_id
+                || receipt.revision != revision)
+        {
+            return false;
+        }
+
+        let InFlightProjectOperation::Save(save) = self
+            .in_flight_project
+            .take()
+            .expect("matching save operation is present")
+        else {
+            unreachable!()
+        };
+        self.project_session.set_in_flight(None);
+        match result {
+            Err(error) => {
+                self.project_save_error = Some(ProjectSaveFailure { kind, error });
+                if kind == SaveKind::Recovery {
+                    self.autosave_retry_clock_pending = true;
+                    self.autosave_retry_since = None;
+                }
+            }
+            Ok(receipt) => {
+                self.apply_project_asset_mappings(&save.snapshot, &receipt);
+                self.project_save_error = None;
+                self.autosave_retry_clock_pending = false;
+                self.autosave_retry_since = None;
+                match kind {
+                    SaveKind::Explicit => {
+                        if self
+                            .pending_autosave_save
+                            .as_ref()
+                            .is_some_and(|pending| pending.descriptor.revision <= revision)
+                        {
+                            self.pending_autosave_save = None;
+                            self.project_session.set_pending_autosave(None);
+                        }
+                        if save.save_as {
+                            self.project_session.adopt_saved_project(
+                                project_id,
+                                receipt.directory.clone(),
+                                save.snapshot.name,
+                                revision,
+                            );
+                            self.save_as_identity = None;
+                        } else {
+                            self.project_session.mark_explicit_saved(revision);
+                        }
+                        if let Ok(cleanup_token) = self.allocate_project_token() {
+                            self.pending_recovery_cleanup = Some(RecoveryCleanup {
+                                token: cleanup_token,
+                                directory: receipt.directory,
+                                project_id,
+                                revision: self.project_session.autosaved_revision(),
+                            });
+                        }
+                    }
+                    SaveKind::Recovery => self.project_session.mark_autosaved(revision),
+                }
+            }
+        }
+        true
+    }
+
+    fn apply_project_asset_mappings(
+        &mut self,
+        snapshot: &ProjectSaveSnapshot,
+        receipt: &SaveReceipt,
+    ) {
+        for mapping in &receipt.mappings {
+            let Some(saved_pad) = snapshot.pads.iter().find(|pad| {
+                pad.pad == mapping.pad
+                    && pad.source_generation == mapping.source_generation
+                    && pad.fingerprint == mapping.fingerprint
+            }) else {
+                continue;
+            };
+            let offset = pad_offset(saved_pad.pad);
+            if self.sample_editor.commits[offset].source_generation == mapping.source_generation
+                && self.sample_editor.commits[offset].fingerprint == Some(mapping.fingerprint)
+            {
+                self.pads[offset].source = Some(mapping.project_path.clone());
+            }
+        }
+    }
+
+    fn apply_recovery_cleanup(
+        &mut self,
+        token: ProjectToken,
+        directory: PathBuf,
+        project_id: ProjectId,
+        revision: u64,
+        result: Result<(), ProjectStoreError>,
+    ) -> bool {
+        let Some(InFlightProjectOperation::Cleanup(cleanup)) = self.in_flight_project.as_ref()
+        else {
+            return false;
+        };
+        if cleanup.token != token
+            || cleanup.directory != directory
+            || cleanup.project_id != project_id
+            || cleanup.revision != revision
+        {
+            return false;
+        }
+        self.in_flight_project = None;
+        self.recovery_cleanup_warning = result.err();
         true
     }
 
@@ -3157,9 +3703,10 @@ fn pad_from_offset(offset: usize) -> PadId {
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
@@ -3176,8 +3723,8 @@ mod tests {
 
     use crate::DirectoryScan;
     use crate::loader::{
-        LoadPurpose, LoadSampleError, LoadedSample, RenderedSample, WorkerHandle, WorkerRequest,
-        WorkerResult, WorkerSendError,
+        LoadPurpose, LoadSampleError, LoadedSample, ProjectSaveWorkerRequest, RenderedSample,
+        WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError,
     };
 
     use super::{
@@ -3185,6 +3732,7 @@ mod tests {
     };
     use crate::pattern::{PatternWorkspace, WorkspaceView};
     use crate::project_session::ProjectSnapshotError;
+    use crate::project_store::{ProjectAssetMapping, ProjectStoreError, SaveKind, SaveReceipt};
 
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
@@ -7488,5 +8036,440 @@ mod tests {
             ready_edit.project_snapshot(),
             Err(ProjectSnapshotError::PendingSampleEdit(pad))
         );
+    }
+
+    fn name_project(app: &mut App, directory: &str, now: Instant) -> sampler_core::ProjectId {
+        let project_id = sampler_core::ProjectId::from_bytes([0x51; 16]);
+        app.project_session = crate::ProjectSession::new(
+            project_id,
+            Some(directory.into()),
+            "Beat",
+            app.project_revision(),
+        );
+        app.project_session
+            .commit_project_mutation(now, || Ok::<(), ()>(()))
+            .unwrap();
+        project_id
+    }
+
+    fn take_project_save(app: &mut App) -> ProjectSaveWorkerRequest {
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::SaveProject(request)] = requests.as_slice() else {
+            panic!("expected one project save request");
+        };
+        (**request).clone()
+    }
+
+    fn save_result(
+        request: &ProjectSaveWorkerRequest,
+        mappings: Vec<ProjectAssetMapping>,
+    ) -> WorkerResult {
+        let save = &request.request;
+        WorkerResult::ProjectSaved {
+            token: request.token,
+            kind: save.kind,
+            project_id: save.snapshot.project_id,
+            directory: save.directory.clone(),
+            revision: save.snapshot.revision,
+            result: Ok(SaveReceipt {
+                directory: save.directory.clone(),
+                kind: save.kind,
+                project_id: save.snapshot.project_id,
+                revision: save.snapshot.revision,
+                canonical_toml: "saved".to_owned(),
+                mappings,
+            }),
+        }
+    }
+
+    fn save_error(request: &ProjectSaveWorkerRequest, message: &'static str) -> WorkerResult {
+        let save = &request.request;
+        WorkerResult::ProjectSaved {
+            token: request.token,
+            kind: save.kind,
+            project_id: save.snapshot.project_id,
+            directory: save.directory.clone(),
+            revision: save.snapshot.revision,
+            result: Err(ProjectStoreError::Filesystem {
+                operation: message,
+                path: save.directory.clone(),
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+        }
+    }
+
+    #[test]
+    fn project_save_refuses_untitled_dirty_draft_and_pending_operations() {
+        let now = Instant::now();
+        let mut untitled = project_app();
+        assert_eq!(
+            untitled.request_save(),
+            Err(super::ProjectSaveError::Untitled)
+        );
+
+        let mut dirty = project_app();
+        name_project(&mut dirty, "named", now);
+        dirty.editor_mut_for_test().move_marker(1, false);
+        assert!(matches!(
+            dirty.request_save(),
+            Err(super::ProjectSaveError::Snapshot(
+                ProjectSnapshotError::DirtySampleDraft(_)
+            ))
+        ));
+
+        let mut pending = project_app();
+        name_project(&mut pending, "named", now);
+        let _ = pending.begin_load(pad(0, 1), "pending.wav");
+        assert!(matches!(
+            pending.request_save(),
+            Err(super::ProjectSaveError::Snapshot(
+                ProjectSnapshotError::PendingSampleLoad(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn save_as_reuses_generated_identity_after_an_error() {
+        let now = Instant::now();
+        let mut app = project_app();
+        app.request_save_as("new-project").unwrap();
+        assert!(app.maintain_project(now));
+        let first = take_project_save(&mut app);
+        assert_ne!(first.request.snapshot.project_id.as_bytes(), &[0; 16]);
+        assert!(first.request.save_as);
+        assert!(app.apply_worker_result(save_error(&first, "save-as")));
+
+        app.request_save_as("new-project").unwrap();
+        assert!(app.maintain_project(now + Duration::from_secs(1)));
+        let retry = take_project_save(&mut app);
+        assert_eq!(
+            retry.request.snapshot.project_id,
+            first.request.snapshot.project_id
+        );
+        assert_eq!(retry.request.directory, first.request.directory);
+        assert!(retry.request.save_as);
+    }
+
+    #[test]
+    fn project_save_accepts_only_exact_worker_and_receipt_identity() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        app.request_save().unwrap();
+        app.maintain_project(now);
+        let request = take_project_save(&mut app);
+        let exact = save_result(&request, Vec::new());
+
+        let WorkerResult::ProjectSaved {
+            token,
+            kind,
+            project_id,
+            directory,
+            revision,
+            result,
+        } = exact
+        else {
+            unreachable!()
+        };
+        for stale in [
+            WorkerResult::ProjectSaved {
+                token: crate::ProjectToken::new(token.get() + 1),
+                kind,
+                project_id,
+                directory: directory.clone(),
+                revision,
+                result: result.clone(),
+            },
+            WorkerResult::ProjectSaved {
+                token,
+                kind,
+                project_id,
+                directory: "other".into(),
+                revision,
+                result: result.clone(),
+            },
+            WorkerResult::ProjectSaved {
+                token,
+                kind,
+                project_id,
+                directory: directory.clone(),
+                revision: revision + 1,
+                result: result.clone(),
+            },
+        ] {
+            assert!(!app.apply_worker_result(stale));
+        }
+        let mut wrong_receipt = result.unwrap();
+        wrong_receipt.project_id = sampler_core::ProjectId::from_bytes([0x99; 16]);
+        assert!(!app.apply_worker_result(WorkerResult::ProjectSaved {
+            token,
+            kind,
+            project_id,
+            directory: directory.clone(),
+            revision,
+            result: Ok(wrong_receipt),
+        }));
+        assert!(app.apply_worker_result(save_result(&request, Vec::new())));
+        assert_eq!(app.project_session.saved_revision(), revision);
+    }
+
+    #[test]
+    fn save_mapping_requires_exact_generation_and_fingerprint_before_path_adoption() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        let snapshot = app.project_snapshot().unwrap();
+        let saved_pad = snapshot.pads[0].clone();
+        let original = app.pad(saved_pad.pad).source.clone();
+        app.request_save().unwrap();
+        app.maintain_project(now);
+        let request = take_project_save(&mut app);
+        let stale_fingerprint = crate::SourceFingerprint::from_encoded_bytes(
+            std::path::Path::new("other.wav"),
+            b"other",
+        )
+        .unwrap();
+        assert!(app.apply_worker_result(save_result(
+            &request,
+            vec![
+                ProjectAssetMapping {
+                    pad: saved_pad.pad,
+                    source_generation: saved_pad.source_generation + 1,
+                    fingerprint: saved_pad.fingerprint,
+                    project_path: "named/audio/wrong-generation.wav".into(),
+                },
+                ProjectAssetMapping {
+                    pad: saved_pad.pad,
+                    source_generation: saved_pad.source_generation,
+                    fingerprint: stale_fingerprint,
+                    project_path: "named/audio/wrong-digest.wav".into(),
+                },
+            ],
+        )));
+        assert_eq!(app.pad(saved_pad.pad).source, original);
+    }
+
+    #[test]
+    fn explicit_and_recovery_save_adopt_current_internal_paths_but_only_explicit_is_clean() {
+        let now = Instant::now();
+        let mut recovery = project_app();
+        let project_id = name_project(&mut recovery, "named", now);
+        recovery.maintain_project(now + Duration::from_secs(2));
+        let autosave = take_project_save(&mut recovery);
+        assert_eq!(autosave.request.kind, SaveKind::Recovery);
+        let pad = autosave.request.snapshot.pads[0].clone();
+        let internal = PathBuf::from("named/audio/internal.wav");
+        assert!(recovery.apply_worker_result(save_result(
+            &autosave,
+            vec![ProjectAssetMapping {
+                pad: pad.pad,
+                source_generation: pad.source_generation,
+                fingerprint: pad.fingerprint,
+                project_path: internal.clone(),
+            }],
+        )));
+        assert_eq!(
+            recovery.pad(pad.pad).source.as_deref(),
+            Some(internal.as_path())
+        );
+        assert_eq!(
+            recovery.project_session.autosaved_revision(),
+            recovery.project_revision()
+        );
+        assert_ne!(
+            recovery.project_session.saved_revision(),
+            recovery.project_revision()
+        );
+        assert_eq!(recovery.project_session.project_id(), project_id);
+
+        recovery.request_save().unwrap();
+        recovery.maintain_project(now + Duration::from_secs(3));
+        let explicit = take_project_save(&mut recovery);
+        assert!(recovery.apply_worker_result(save_result(&explicit, Vec::new())));
+        assert_eq!(
+            recovery.project_session.saved_revision(),
+            recovery.project_revision()
+        );
+    }
+
+    #[test]
+    fn autosave_debounces_two_seconds_coalesces_when_busy_and_explicit_has_priority() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        assert!(!app.maintain_project(now + Duration::from_millis(1_999)));
+        assert!(app.take_worker_requests().is_empty());
+
+        for request_id in 0..crate::loader::WORKER_CHANNEL_CAPACITY as u64 {
+            app.pending_worker_requests
+                .push(WorkerRequest::ScanDirectory {
+                    request_id,
+                    path: PathBuf::from("."),
+                    show_hidden: false,
+                });
+        }
+        assert!(app.maintain_project(now + Duration::from_secs(2)));
+        assert!(app.project_session.pending_autosave().is_some());
+        app.pending_worker_requests.clear();
+        app.project_session
+            .commit_project_mutation(now + Duration::from_secs(3), || Ok::<(), ()>(()))
+            .unwrap();
+        app.request_save().unwrap();
+        app.maintain_project(now + Duration::from_secs(5));
+        let request = take_project_save(&mut app);
+        assert_eq!(request.request.kind, SaveKind::Explicit);
+        assert_eq!(request.request.snapshot.revision, app.project_revision());
+    }
+
+    #[test]
+    fn autosave_replaces_a_busy_pending_snapshot_with_the_newest_quiet_revision() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        for request_id in 0..crate::loader::WORKER_CHANNEL_CAPACITY as u64 {
+            app.pending_worker_requests
+                .push(WorkerRequest::ScanDirectory {
+                    request_id,
+                    path: PathBuf::from("."),
+                    show_hidden: false,
+                });
+        }
+        app.maintain_project(now + Duration::from_secs(2));
+        let first_revision = app.project_session.pending_autosave().unwrap().revision;
+
+        app.project_session
+            .commit_project_mutation(now + Duration::from_secs(3), || Ok::<(), ()>(()))
+            .unwrap();
+        app.maintain_project(now + Duration::from_secs(5));
+        assert!(app.project_revision() > first_revision);
+        assert_eq!(
+            app.project_session.pending_autosave().unwrap().revision,
+            app.project_revision()
+        );
+
+        app.pending_worker_requests.clear();
+        app.maintain_project(now + Duration::from_secs(5));
+        assert_eq!(
+            take_project_save(&mut app).request.snapshot.revision,
+            app.project_revision()
+        );
+    }
+
+    #[test]
+    fn explicit_save_cancels_covered_autosave_and_does_not_recreate_recovery_while_clean() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        for request_id in 0..crate::loader::WORKER_CHANNEL_CAPACITY as u64 {
+            app.pending_worker_requests
+                .push(WorkerRequest::ScanDirectory {
+                    request_id,
+                    path: PathBuf::from("."),
+                    show_hidden: false,
+                });
+        }
+        app.maintain_project(now + Duration::from_secs(2));
+        assert!(app.project_session.pending_autosave().is_some());
+        app.pending_worker_requests.clear();
+
+        app.request_save().unwrap();
+        app.maintain_project(now + Duration::from_secs(2));
+        let explicit = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_result(&explicit, Vec::new())));
+        assert_eq!(app.project_session.pending_autosave(), None);
+
+        app.pending_recovery_cleanup = None;
+        assert!(!app.maintain_project(now + Duration::from_secs(20)));
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn autosave_error_retries_after_another_quiet_interval_and_untitled_never_autosaves() {
+        let now = Instant::now();
+        let mut untitled = project_app();
+        assert!(!untitled.maintain_project(now + Duration::from_secs(20)));
+        assert!(untitled.take_worker_requests().is_empty());
+
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        app.maintain_project(now + Duration::from_secs(2));
+        let failed = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_error(&failed, "autosave")));
+        assert!(app.project_save_error().is_some());
+        app.apply(InputAction::PadPress(99));
+        assert!(app.status().contains("outside 0..16"));
+        assert!(app.project_header().contains("AUTOSAVE ERROR"));
+        assert!(app.maintain_project(now + Duration::from_secs(2)));
+        assert!(app.take_worker_requests().is_empty());
+        assert!(!app.maintain_project(now + Duration::from_millis(3_999)));
+        assert!(app.maintain_project(now + Duration::from_secs(4)));
+        let retry = take_project_save(&mut app);
+        assert_eq!(retry.request.kind, SaveKind::Recovery);
+        assert_eq!(
+            retry.request.snapshot.revision,
+            failed.request.snapshot.revision
+        );
+    }
+
+    #[test]
+    fn autosave_error_retry_waits_for_two_seconds_after_a_newer_mutation() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        app.maintain_project(now + Duration::from_secs(2));
+        let failed = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_error(&failed, "autosave")));
+        app.maintain_project(now + Duration::from_secs(2));
+
+        app.project_session
+            .commit_project_mutation(now + Duration::from_secs(3), || Ok::<(), ()>(()))
+            .unwrap();
+        assert!(!app.maintain_project(now + Duration::from_secs(4)));
+        assert!(app.take_worker_requests().is_empty());
+        assert!(app.maintain_project(now + Duration::from_secs(5)));
+        assert_eq!(
+            take_project_save(&mut app).request.snapshot.revision,
+            app.project_revision()
+        );
+    }
+
+    #[test]
+    fn explicit_save_cleanup_failure_is_a_warning_after_clean_truth() {
+        let now = Instant::now();
+        let mut app = project_app();
+        let project_id = name_project(&mut app, "named", now);
+        app.request_save().unwrap();
+        app.maintain_project(now);
+        let explicit = take_project_save(&mut app);
+        assert!(app.apply_worker_result(save_result(&explicit, Vec::new())));
+        assert_eq!(app.project_session.saved_revision(), app.project_revision());
+
+        app.maintain_project(now + Duration::from_secs(1));
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::DiscardRecovery {
+                token,
+                directory,
+                project_id: cleanup_project_id,
+                revision,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected recovery cleanup request");
+        };
+        assert_eq!(*cleanup_project_id, project_id);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: *token,
+            directory: directory.clone(),
+            project_id,
+            revision: *revision,
+            result: Err(ProjectStoreError::Filesystem {
+                operation: "delete recovery",
+                path: directory.clone(),
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+        }));
+        assert!(app.recovery_cleanup_warning().is_some());
+        assert_eq!(app.project_session.saved_revision(), app.project_revision());
     }
 }

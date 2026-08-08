@@ -196,6 +196,7 @@ impl<O: KeyboardEnhancementOps> Drop for KeyboardEnhancementGuard<O> {
 
 trait EventLoopApp {
     fn maintain_audio(&mut self) -> bool;
+    fn maintain_project(&mut self, now: Instant) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest>;
     fn apply_worker_send_error(&mut self, request: WorkerRequest, error: WorkerSendError) -> bool;
@@ -208,6 +209,10 @@ trait EventLoopApp {
 impl EventLoopApp for App {
     fn maintain_audio(&mut self) -> bool {
         App::maintain_audio(self)
+    }
+
+    fn maintain_project(&mut self, now: Instant) -> bool {
+        App::maintain_project(self, now)
     }
 
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
@@ -343,6 +348,8 @@ where
         state.dirty = true;
         state.next_tick = now.checked_add(TICK_INTERVAL).unwrap_or(now);
     }
+
+    state.dirty |= app.maintain_project(now);
 
     let mut requests = app.take_worker_requests().into_iter();
     while let Some(request) = requests.next() {
@@ -820,6 +827,7 @@ mod tests {
     #[derive(Default)]
     struct FakeApp {
         maintenance_calls: usize,
+        project_maintenance_times: Vec<Instant>,
         worker_results: usize,
         events_applied: usize,
         ticks: usize,
@@ -832,6 +840,11 @@ mod tests {
     impl EventLoopApp for FakeApp {
         fn maintain_audio(&mut self) -> bool {
             self.maintenance_calls += 1;
+            false
+        }
+
+        fn maintain_project(&mut self, now: Instant) -> bool {
+            self.project_maintenance_times.push(now);
             false
         }
 
@@ -947,6 +960,29 @@ mod tests {
         assert_eq!(app.events_applied, MAX_EVENTS_PER_ITERATION);
         assert_eq!(app.maintenance_calls, 1);
         assert_eq!(events.events.len(), 500 - MAX_EVENTS_PER_ITERATION);
+    }
+
+    #[test]
+    fn project_maintenance_receives_the_iteration_clock_before_drawing() {
+        let now = Instant::now();
+        let mut app = FakeApp::default();
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker::default();
+        let mut drawer = FakeDrawer::default();
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.project_maintenance_times, vec![now]);
+        assert_eq!(drawer.draws, 1);
     }
 
     #[test]

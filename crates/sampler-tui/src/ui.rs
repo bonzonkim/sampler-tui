@@ -80,7 +80,10 @@ fn render_base(frame: &mut Frame, area: Rect, app: &App) {
     };
     let outer = Block::new()
         .borders(Borders::ALL)
-        .title(Line::from(format!(" BANK {bank} · sampler-tui ")))
+        .title(Line::from(format!(
+            " BANK {bank} · sampler-tui · {} ",
+            app.project_header()
+        )))
         .title(Line::from(format!(" {format} · {state} ")).right_aligned());
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1848,5 +1851,11 @@ mod tests {
         let snapshot = render_lines(80, 24, &empty).join("\n");
         assert!(snapshot.contains("(empty directory)"));
         assert!(!snapshot.contains("Loading"));
+    }
+
+    #[test]
+    fn perform_header_renders_untitled_project_save_truth() {
+        let snapshot = render_lines(80, 24, &ready_app()).join("\n");
+        assert!(snapshot.contains("UNTITLED · SAVED"));
     }
 }

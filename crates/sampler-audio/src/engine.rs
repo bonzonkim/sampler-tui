@@ -338,6 +338,15 @@ impl PatternPlayer {
         })
     }
 
+    fn pending_generation_id(&self) -> Option<PatternGenerationId> {
+        let pending = self.pending_switch?;
+        self.installed(pending.slot)
+            .map(|pattern| PatternGenerationId {
+                slot: pattern.snapshot.slot(),
+                generation: pattern.snapshot.generation(),
+            })
+    }
+
     fn apply_fence(&mut self, fence: u64) {
         if self.playing && sequence_is_at_or_before(self.play_sequence, fence) {
             self.playing = false;
@@ -1089,9 +1098,13 @@ impl AudioEngine {
                     return;
                 };
                 let current = self.pattern_player.transport_stamp();
+                let pending = self.pattern_player.pending_generation_id();
                 if !self.sequence_is_stopped(sequence)
-                    && current
+                    && (current
                         .is_some_and(|stamp| (stamp.slot, stamp.generation) == (slot, generation))
+                        || pending.is_some_and(|target| {
+                            (target.slot, target.generation) == (slot, generation)
+                        }))
                 {
                     self.pattern_player.record_capture = Some(PatternRecordCapture {
                         slot,
@@ -2347,7 +2360,7 @@ mod tests {
             .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
             .unwrap();
         controller.play_pattern().unwrap();
-        engine.render_frames(1, |_| {});
+        engine.render_frames(3, |_| {});
         controller.stop_pattern().unwrap();
 
         engine.render_frames(0, |_| {});
@@ -2908,6 +2921,114 @@ mod tests {
         controller.set_record_capture(None).unwrap();
         engine.render_frames(0, |_| {});
         assert!(engine.pattern_player.record_capture.is_none());
+    }
+
+    #[test]
+    fn capture_admission_accepts_only_the_exact_pending_boundary_target() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        install_ready_sample(
+            &mut controller,
+            &mut engine,
+            100,
+            pad,
+            PadSettings::default(),
+            128,
+        );
+        let first = pattern_snapshot_with_triggers(0, 100, &[]);
+        let second = pattern_snapshot_with_triggers(1, 100, &[]);
+        let first_slot = PatternSlotId::new(0).unwrap();
+        let second_slot = PatternSlotId::new(1).unwrap();
+        let second_generation = second.generation();
+        controller.install_pattern(first).unwrap();
+        controller.install_pattern(second).unwrap();
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(1, |_| {});
+
+        controller
+            .select_pattern(second_slot, PatternSwitch::NextBoundary)
+            .unwrap();
+        controller
+            .set_record_capture(Some((second_slot, second_generation)))
+            .unwrap();
+        engine.render_frames(3, |_| {});
+        assert_eq!(
+            engine
+                .pattern_player
+                .record_capture
+                .map(|capture| (capture.slot, capture.generation)),
+            Some((second_slot, second_generation))
+        );
+        assert!(!controller.latest_telemetry().unwrap().pattern_recording);
+
+        engine.render_frames(96, |_| {});
+        let telemetry = controller.latest_telemetry().unwrap();
+        assert_eq!(telemetry.pattern_slot, Some(second_slot));
+        assert!(telemetry.pattern_recording);
+        let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
+        engine.render_frames(65, |_| {});
+        let mut acks = [crate::LiveAck::EMPTY; 1];
+        assert_eq!(controller.drain_live_acks(&mut acks), 1);
+        assert_eq!(acks[0].id, id);
+        assert_eq!(acks[0].transport.map(|stamp| stamp.slot), Some(second_slot));
+
+        let invalid = engine.invalid_commands();
+        controller
+            .set_record_capture(Some((first_slot, 0)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.invalid_commands(), invalid + 1);
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_none());
+    }
+
+    #[test]
+    fn superseding_a_pending_target_clears_its_capture_at_the_new_boundary() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let first = pattern_snapshot_with_triggers(0, 100, &[]);
+        let second = pattern_snapshot_with_triggers(1, 100, &[]);
+        let third = pattern_snapshot_with_triggers(2, 100, &[]);
+        let first_slot = PatternSlotId::new(0).unwrap();
+        let second_slot = PatternSlotId::new(1).unwrap();
+        let third_slot = PatternSlotId::new(2).unwrap();
+        let second_generation = second.generation();
+        controller.install_pattern(first).unwrap();
+        controller.install_pattern(second).unwrap();
+        controller.install_pattern(third).unwrap();
+        controller
+            .select_pattern(first_slot, PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(1, |_| {});
+        controller
+            .select_pattern(second_slot, PatternSwitch::NextBoundary)
+            .unwrap();
+        controller
+            .set_record_capture(Some((second_slot, second_generation)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(engine.pattern_player.record_capture.is_some());
+
+        controller
+            .select_pattern(third_slot, PatternSwitch::NextBoundary)
+            .unwrap();
+        engine.render_frames(99, |_| {});
+        assert_eq!(engine.pattern_player.selected_slot, Some(third_slot));
+        assert!(engine.pattern_player.record_capture.is_none());
+        let invalid = engine.invalid_commands();
+        controller
+            .set_record_capture(Some((second_slot, second_generation)))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.invalid_commands(), invalid + 1);
     }
 
     #[test]

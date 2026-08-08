@@ -742,6 +742,76 @@ fn real_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_tr
 }
 
 #[test]
+fn real_worker_opens_sparse_v1_pattern_as_exact_slot_zero_plus_defaults() {
+    let fixture = FixtureTree::new();
+    let source = fixture.write_wav("legacy-source.wav");
+    let project = fixture.path("legacy-project");
+    fs::create_dir_all(project.join("audio")).unwrap();
+    fs::copy(source, project.join("audio/kick.wav")).unwrap();
+    fs::write(
+        project.join("project.toml"),
+        r#"
+schema_version = 1
+name = "Legacy Sparse"
+
+[[pads]]
+audio_path = "audio/kick.wav"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[[patterns]]
+name = "Legacy Beat"
+sample_rate = 48000
+tempo = 133.0
+bars = 2
+resolution = "eighth"
+swing = 0.61
+
+[patterns.meter]
+numerator = 4
+denominator = 4
+
+[[patterns.events]]
+id = 9
+frame = 6800
+velocity = 0.75
+
+[patterns.events.pad]
+bank = 0
+index = 0
+"#,
+    )
+    .unwrap();
+
+    let mut opened = Harness::new();
+    opened.open(&project, None, Instant::now());
+    let patterns = opened.app.patterns().export_project_patterns().unwrap();
+    assert_eq!(patterns.len(), sampler_core::PATTERN_SLOT_COUNT);
+    assert_eq!(patterns[0].slot, PatternSlotId::new(0).unwrap());
+    assert_eq!(patterns[0].name, "Legacy Beat");
+    assert_eq!(patterns[0].tempo.bpm(), 133.0);
+    assert_eq!(patterns[0].bars, 2);
+    assert_eq!(patterns[0].events.len(), 1);
+    assert_eq!(patterns[0].events[0].event.frame, 6_800);
+    assert_eq!(patterns[0].events[0].raw_frame, 6_800);
+    for (index, pattern) in patterns.iter().enumerate().skip(1) {
+        assert_eq!(pattern.slot, PatternSlotId::new(index as u8).unwrap());
+        assert_eq!(pattern.name, format!("Pattern {:02}", index + 1));
+        assert!(pattern.events.is_empty());
+        assert_eq!(pattern.sample_rate, 48_000);
+        assert_eq!(pattern.tempo.bpm(), 120.0);
+    }
+}
+
+#[test]
 fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
     let fixture = FixtureTree::new();
     let wav = fixture.write_wav("source.wav");

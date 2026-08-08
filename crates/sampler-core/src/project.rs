@@ -334,6 +334,7 @@ impl ProjectDocument {
         pads: Vec<ProjectPad>,
         patterns: Vec<ProjectPattern>,
     ) -> Result<Self, ProjectError> {
+        let patterns = complete_sparse_patterns(patterns)?;
         let project = Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_id,
@@ -410,6 +411,44 @@ impl ProjectDocument {
         }
         Ok(())
     }
+}
+
+fn complete_sparse_patterns(
+    mut patterns: Vec<ProjectPattern>,
+) -> Result<Vec<ProjectPattern>, ProjectError> {
+    if patterns.len() > PATTERN_SLOT_COUNT {
+        return Err(ProjectError::TooManyPatterns);
+    }
+    let sample_rate = patterns
+        .first()
+        .map_or(48_000, |pattern| pattern.sample_rate);
+    let mut present = [false; PATTERN_SLOT_COUNT];
+    for pattern in &patterns {
+        let index = usize::from(pattern.slot.get());
+        if present[index] {
+            return Err(ProjectError::DuplicatePatternSlot(pattern.slot));
+        }
+        present[index] = true;
+    }
+    for (index, is_present) in present.into_iter().enumerate() {
+        if is_present {
+            continue;
+        }
+        patterns.push(ProjectPattern {
+            slot: PatternSlotId::new(u8::try_from(index).expect("pattern slot fits in u8"))
+                .expect("bounded pattern slot is valid"),
+            name: format!("Pattern {:02}", index + 1),
+            sample_rate,
+            tempo: Tempo::new(120.0).expect("default tempo is valid"),
+            meter: Meter::new(4, 4).expect("default meter is valid"),
+            bars: 1,
+            resolution: Resolution::Sixteenth,
+            swing: 0.5,
+            quantize_strength: 0.0,
+            events: Vec::new(),
+        });
+    }
+    Ok(patterns)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1247,6 +1286,7 @@ index = {index}
     #[test]
     fn project_rejects_more_than_one_thousand_twenty_four_events() {
         let mut project = empty_project("many-events");
+        project.patterns.clear();
         project.patterns.push(ProjectPattern {
             slot: PatternSlotId::new(0).unwrap(),
             name: "dense".into(),
@@ -1379,6 +1419,39 @@ index = 0
                 .original_offset,
             Some(800)
         );
+    }
+
+    #[test]
+    fn schema_v2_completes_sparse_patterns_without_reordering_existing_slots() {
+        let existing =
+            ProjectPattern::from_editable(&quantized_pattern(PatternSlotId::new(7).unwrap()))
+                .unwrap();
+        let project = ProjectDocument::new_v2(
+            ProjectId::from_bytes([0x4d; 16]),
+            "sparse",
+            1,
+            Vec::new(),
+            vec![existing.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(project.patterns.len(), PATTERN_SLOT_COUNT);
+        assert_eq!(project.patterns[0], existing);
+        assert_eq!(
+            project.patterns[1..]
+                .iter()
+                .map(ProjectPattern::slot)
+                .collect::<Vec<_>>(),
+            (0..PATTERN_SLOT_COUNT as u8)
+                .filter(|slot| *slot != 7)
+                .map(|slot| PatternSlotId::new(slot).unwrap())
+                .collect::<Vec<_>>()
+        );
+        for pattern in &project.patterns[1..] {
+            assert!(pattern.events.is_empty());
+            assert_eq!(pattern.sample_rate, 48_000);
+            assert_eq!(pattern.quantize_strength, 0.0);
+        }
     }
 
     #[test]

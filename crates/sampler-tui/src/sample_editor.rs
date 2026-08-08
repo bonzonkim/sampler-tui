@@ -295,12 +295,38 @@ impl SampleEditor {
         self.recipe_dirty() || self.settings_dirty()
     }
 
+    /// The single mutation fence for UI and palette reducers. A stale external replacement or
+    /// invalid source context must be explicitly discarded/reopened before any draft can change.
+    pub fn can_edit(&self) -> bool {
+        self.committed.is_some()
+            && !matches!(
+                self.status,
+                SampleEditorStatus::Empty
+                    | SampleEditorStatus::Pending
+                    | SampleEditorStatus::ApplyConfirmation
+                    | SampleEditorStatus::DiscardConfirmation
+                    | SampleEditorStatus::Error(
+                        SampleEditorError::DeviceUnavailable
+                            | SampleEditorError::GenerationExhausted
+                            | SampleEditorError::SelectedPadReplaced
+                            | SampleEditorError::UnsupportedSourceLength
+                            | SampleEditorError::InvalidSourceRate
+                    )
+            )
+    }
+
     pub fn set_marker(&mut self, marker: SampleMarker) {
+        if !self.can_edit() {
+            return;
+        }
         self.marker = marker;
     }
 
     /// Moves an endpoint to an exact source-frame boundary for palette commands.
     pub fn set_marker_to_frame(&mut self, marker: SampleMarker, frame: u64) -> Result<(), String> {
+        if !self.can_edit() {
+            return Err("sample editor context must be discarded before editing".to_owned());
+        }
         let frames = self
             .base_frames
             .ok_or_else(|| "selected pad is empty".to_owned())?;
@@ -325,6 +351,9 @@ impl SampleEditor {
     /// Fine movement is exactly one source frame. Shift movement is one hundredth of the visible
     /// window, rounded up to one source frame, all in checked Q32 integer arithmetic.
     pub fn move_marker(&mut self, direction: i8, coarse: bool) {
+        if !self.can_edit() {
+            return;
+        }
         let Some(frames) = self.base_frames else {
             return;
         };
@@ -349,14 +378,20 @@ impl SampleEditor {
     }
 
     pub fn zoom_in(&mut self) {
+        if !self.can_edit() {
+            return;
+        }
         self.zoom_by(1);
     }
     pub fn zoom_out(&mut self) {
+        if !self.can_edit() {
+            return;
+        }
         self.zoom_by(-1);
     }
 
     pub fn toggle_normalize(&mut self) {
-        if self.committed.is_none() {
+        if !self.can_edit() {
             return;
         }
         self.draft.normalize = !self.draft.normalize;
@@ -364,7 +399,7 @@ impl SampleEditor {
     }
 
     pub fn toggle_reverse(&mut self) {
-        if self.committed.is_none() {
+        if !self.can_edit() {
             return;
         }
         self.draft.reversed = !self.draft.reversed;
@@ -372,12 +407,18 @@ impl SampleEditor {
     }
 
     pub fn adjust_pitch(&mut self, semitones: i8) {
+        if !self.can_edit() {
+            return;
+        }
         self.settings.pitch_semitones =
             (self.settings.pitch_semitones + f32::from(semitones)).clamp(-24.0, 24.0);
         self.note_draft_change();
     }
 
     pub fn set_mode(&mut self, mode: PlaybackMode) {
+        if !self.can_edit() {
+            return;
+        }
         self.settings.mode = mode;
         self.note_draft_change();
     }
@@ -393,6 +434,9 @@ impl SampleEditor {
 
     pub fn request_apply(&mut self) -> Option<SampleEditorIntent> {
         self.committed?;
+        if !self.can_edit() {
+            return None;
+        }
         if matches!(
             self.status,
             SampleEditorStatus::Pending
@@ -426,6 +470,9 @@ impl SampleEditor {
     }
 
     pub fn request_undo(&mut self) -> Option<SampleEditorIntent> {
+        if !self.can_edit() {
+            return None;
+        }
         if matches!(
             self.status,
             SampleEditorStatus::Pending

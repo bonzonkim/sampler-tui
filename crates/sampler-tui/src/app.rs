@@ -1509,6 +1509,11 @@ impl App {
             self.palette_error = Some("sample edit is pending".to_owned());
             return false;
         }
+        if !self.editor.can_edit() {
+            self.palette_error =
+                Some("sample editor context must be discarded before editing".to_owned());
+            return false;
+        }
         true
     }
 
@@ -1519,6 +1524,9 @@ impl App {
         }
         if self.editor_operation_pending() {
             self.status = "sample edit is pending".to_owned();
+            return false;
+        }
+        if !self.editor.can_edit() {
             return false;
         }
         true
@@ -1694,7 +1702,7 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        if self.editor_operation_pending() {
+        if self.editor_operation_pending() && key.code == KeyCode::Esc {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1704,6 +1712,9 @@ impl App {
                 .is_empty()
             && matches!(key.code, KeyCode::Char('z' | 'Z'))
         {
+            if !self.require_sample_editor_key() {
+                return;
+            }
             self.request_editor_undo();
             return;
         }
@@ -1862,12 +1873,21 @@ impl App {
             || !context_matches
             || self.editor_operation_pending()
         {
-            self.editor
-                .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
+            if matches!(
+                self.editor.status(),
+                crate::sample_editor::SampleEditorStatus::ApplyConfirmation
+            ) {
+                self.editor
+                    .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
+            }
             self.status = "sample changed while apply confirmation was open".to_owned();
+            self.overlay = None;
+            self.apply_sample_context = None;
             return;
         }
         let Some(SampleEditorIntent::Apply { recipe, .. }) = self.editor.confirm_apply() else {
+            self.overlay = None;
+            self.apply_sample_context = None;
             return;
         };
         match self.request_sample_edit(pad, recipe) {
@@ -5641,7 +5661,7 @@ mod tests {
         app.apply_key(key('z', KeyModifiers::CONTROL, KeyEventKind::Press));
 
         assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 12), 64, 1.0)]);
-        assert_eq!(app.status(), "");
+        assert_eq!(app.status(), "selected pad is empty");
     }
 
     #[test]
@@ -5768,13 +5788,34 @@ mod tests {
                 crate::SampleEditorError::SelectedPadReplaced
             )
         ));
+        assert_eq!(app.overlay(), None);
         app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.overlay(), None);
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+        let draft = app.sample_editor().draft();
+        let settings = app.sample_editor().settings();
+        for key_code in [
+            KeyCode::Left,
+            KeyCode::Char('n'),
+            KeyCode::Up,
+            KeyCode::Char('o'),
+        ] {
+            app.apply_key(KeyEvent::new(key_code, KeyModifiers::NONE));
+        }
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("trim-start 0".into()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.sample_editor().draft(), draft);
+        assert_eq!(app.sample_editor().settings(), settings);
+        app.close_overlay();
 
         app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.sample_editor().base_frames(), Some(2));
         assert!(!app.sample_editor().is_dirty());
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        assert!(app.sample_editor().draft().normalize);
     }
 
     #[test]
@@ -5848,6 +5889,37 @@ mod tests {
                 crate::SampleEditorError::SelectedPadReplaced
             )
         ));
+        assert_eq!(app.overlay(), None);
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+    }
+
+    #[test]
+    fn apply_confirmation_with_a_changed_editor_state_closes_without_queueing_work() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.editor
+            .observe_error(crate::SampleEditorError::InstallFailed);
+        let edit_generation = app.sample_editor.generations[0];
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.sample_editor.generations[0], edit_generation);
+        assert!(app.sample_editor.pending[0].is_none());
+        assert_eq!(app.overlay(), None);
+        assert!(matches!(
+            app.sample_editor().status(),
+            crate::WorkspaceSampleEditorStatus::Error(crate::SampleEditorError::InstallFailed)
+        ));
     }
 
     #[test]
@@ -5874,6 +5946,9 @@ mod tests {
 
         assert_eq!(app.pad(pad).settings, prior);
         assert_eq!(app.sample_editor().settings(), prior);
+        assert_eq!(app.status(), "selected pad is empty");
+
+        app.apply_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
         assert_eq!(app.status(), "selected pad is empty");
     }
 

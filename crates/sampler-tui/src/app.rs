@@ -19,7 +19,9 @@ use crate::loader::{
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
-use crate::sample_editor::SampleEditorContext;
+use crate::sample_editor::{
+    SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent, SampleMarker,
+};
 
 pub const PAD_VIEW_COUNT: usize = 160;
 /// Fixed worker-generated waveform resolution. Perform uses a bounded 64-column projection.
@@ -190,6 +192,14 @@ pub enum Overlay {
         slot: PatternSlotId,
         event_count: usize,
     },
+    ApplySample {
+        pad: PadId,
+        before_frames: usize,
+        after_frames: usize,
+    },
+    DiscardSample {
+        pad: PadId,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -218,6 +228,7 @@ pub struct App {
     reinstall_pending: [bool; PAD_VIEW_COUNT],
     current_session_bound: [bool; PAD_VIEW_COUNT],
     sample_editor: Box<SampleEditorState>,
+    editor: SampleEditor,
     edit_result_advanced: bool,
     device_retry_requests: usize,
     keyboard_capabilities: KeyboardCapabilities,
@@ -278,6 +289,7 @@ impl App {
                 undo: array::from_fn(|_| None),
                 generation_exhausted: [false; PAD_VIEW_COUNT],
             }),
+            editor: SampleEditor::open_empty(PadId::first(), PadSettings::default()),
             edit_result_advanced: false,
             device_retry_requests: 0,
             keyboard_capabilities: KeyboardCapabilities::default(),
@@ -338,13 +350,25 @@ impl App {
         if key.kind == KeyEventKind::Repeat {
             return;
         }
+        if matches!(self.overlay, Some(Overlay::DeviceError(_)))
+            && key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::NONE
+            && matches!(key.code, KeyCode::Char('r' | 'R'))
+        {
+            self.device_retry_requests = self.device_retry_requests.saturating_add(1);
+            return;
+        }
         if let Some(action) = map_key(key, self.keyboard_capabilities) {
             match action {
-                InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
+                InputAction::Quit
+                | InputAction::StopAll
+                | InputAction::PadRelease(_)
+                | InputAction::PadPress(_)
+                | InputAction::PadStop(_) => {
                     self.apply(action);
                     return;
                 }
-                InputAction::PadPress(_) | InputAction::PadStop(_) | InputAction::BankDelta(_) => {}
+                InputAction::BankDelta(_) => {}
             }
         }
         if self.audio.is_none() && is_explicit_device_retry(key) {
@@ -367,6 +391,8 @@ impl App {
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
             Some(Overlay::ClearPattern { .. }) => self.apply_clear_pattern_key(key),
+            Some(Overlay::ApplySample { .. }) => self.apply_sample_apply_key(key),
+            Some(Overlay::DiscardSample { .. }) => self.apply_sample_discard_key(key),
             None => self.apply_workspace_key(key),
         }
     }
@@ -408,6 +434,10 @@ impl App {
 
     pub fn workspace_view(&self) -> WorkspaceView {
         self.patterns.view()
+    }
+
+    pub fn sample_editor(&self) -> &SampleEditor {
+        &self.editor
     }
 
     pub fn recorded_ack_count(&self) -> usize {
@@ -618,6 +648,14 @@ impl App {
         } else {
             "Applied sample edit".to_owned()
         };
+        if self.patterns.view() == WorkspaceView::Sample && self.selected_pad_id() == Some(pad) {
+            if pending.kind == PendingEditKind::Undo {
+                self.editor.observe_undo_succeeded();
+            } else {
+                self.editor.observe_apply_succeeded();
+            }
+            self.sync_editor_to_selected_pad();
+        }
         true
     }
 
@@ -1193,7 +1231,7 @@ impl App {
         let Some(pad) = self.pad_in_active_bank(index) else {
             return;
         };
-        self.selected_pad = index;
+        let _ = self.select_pad(index);
         if self.patterns.view() == WorkspaceView::Pattern {
             let step = self.patterns.cursor().step();
             self.patterns.move_cursor_to(pad, step);
@@ -1318,8 +1356,9 @@ impl App {
                 self.overlay = None;
             }
             PaletteCommand::Select(index) => {
-                self.selected_pad = index;
-                self.overlay = None;
+                if self.select_pad(index) {
+                    self.overlay = None;
+                }
             }
             PaletteCommand::StopAll => {
                 self.stop_all();
@@ -1351,7 +1390,80 @@ impl App {
             PaletteCommand::Play => self.start_pattern_playback(),
             PaletteCommand::Stop => self.stop_pattern_playback(),
             PaletteCommand::ClearPattern => self.open_clear_pattern(),
+            PaletteCommand::TrimStart(frame) => self.apply_palette_sample(|editor| {
+                editor.set_marker_to_frame(SampleMarker::Start, frame)
+            }),
+            PaletteCommand::TrimEnd(frame) => self.apply_palette_sample(|editor| {
+                editor.set_marker_to_frame(SampleMarker::End, frame)
+            }),
+            PaletteCommand::Normalize(enabled) => self.apply_palette_sample(|editor| {
+                if editor.draft().normalize != enabled {
+                    editor.toggle_normalize();
+                }
+                Ok(())
+            }),
+            PaletteCommand::Reverse(enabled) => self.apply_palette_sample(|editor| {
+                if editor.draft().reversed != enabled {
+                    editor.toggle_reverse();
+                }
+                Ok(())
+            }),
+            PaletteCommand::Pitch(pitch) => self.apply_palette_editor_settings(|settings| {
+                settings.pitch_semitones = pitch;
+            }),
+            PaletteCommand::Mode(mode) => self.apply_palette_editor_settings(|settings| {
+                settings.mode = mode;
+            }),
+            PaletteCommand::ApplySample => {
+                if self.require_sample_workspace() {
+                    self.request_editor_apply();
+                }
+            }
+            PaletteCommand::UndoSample => {
+                if self.require_sample_workspace() {
+                    self.request_editor_undo();
+                }
+            }
         }
+    }
+
+    fn apply_palette_sample(
+        &mut self,
+        reduce: impl FnOnce(&mut SampleEditor) -> Result<(), String>,
+    ) {
+        if !self.require_sample_workspace() {
+            return;
+        }
+        if let Err(error) = reduce(&mut self.editor) {
+            self.palette_error = Some(error);
+        }
+    }
+
+    fn apply_palette_editor_settings(&mut self, reduce: impl FnOnce(&mut PadSettings)) {
+        if !self.require_sample_workspace() {
+            return;
+        }
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let mut settings = self.editor.settings();
+        reduce(&mut settings);
+        match self.update_pad_settings(pad, settings) {
+            Ok(()) => self.sync_editor_to_selected_pad(),
+            Err(error) => self.palette_error = Some(error),
+        }
+    }
+
+    fn require_sample_workspace(&mut self) -> bool {
+        if self.patterns.view() != WorkspaceView::Sample {
+            self.palette_error = Some("sample command requires Sample workspace".to_owned());
+            return false;
+        }
+        if self.editor.committed().is_none() {
+            self.palette_error = Some("selected pad is empty".to_owned());
+            return false;
+        }
+        true
     }
 
     fn apply_picker_key(&mut self, key: KeyEvent) {
@@ -1389,16 +1501,22 @@ impl App {
         match self.patterns.view() {
             WorkspaceView::Perform => self.apply_perform_key(key),
             WorkspaceView::Pattern => self.apply_pattern_key(key),
-            // Task 5 installs the Sample key reducer. Keeping the new view inert here avoids
-            // assigning temporary bindings that could steal pad keys from the final routing.
-            WorkspaceView::Sample => {}
+            WorkspaceView::Sample => self.apply_sample_key(key),
         }
     }
 
     fn apply_global_pattern_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
-                self.patterns.toggle_view();
+            KeyCode::Tab if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                let view = if key.modifiers == KeyModifiers::SHIFT {
+                    self.patterns.view().previous()
+                } else {
+                    self.patterns.view().next()
+                };
+                self.patterns.set_view(view);
+                if view == WorkspaceView::Sample {
+                    self.sync_editor_to_selected_pad();
+                }
                 true
             }
             KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
@@ -1501,6 +1619,169 @@ impl App {
         }
     }
 
+    fn apply_sample_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key
+                .modifiers
+                .difference(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                .is_empty()
+            && matches!(key.code, KeyCode::Char('z' | 'Z'))
+        {
+            self.request_editor_undo();
+            return;
+        }
+        match key.code {
+            KeyCode::Char('?')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.open_help()
+            }
+            KeyCode::Char(':')
+                if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+            {
+                self.open_palette()
+            }
+            KeyCode::Left => self
+                .editor
+                .move_marker(-1, key.modifiers == KeyModifiers::SHIFT),
+            KeyCode::Right => self
+                .editor
+                .move_marker(1, key.modifiers == KeyModifiers::SHIFT),
+            KeyCode::PageUp if key.modifiers == KeyModifiers::NONE => self.editor.zoom_in(),
+            KeyCode::PageDown if key.modifiers == KeyModifiers::NONE => self.editor.zoom_out(),
+            KeyCode::Char('m') if key.modifiers == KeyModifiers::NONE => {
+                self.editor.set_marker(match self.editor.marker() {
+                    SampleMarker::Start => SampleMarker::End,
+                    SampleMarker::End => SampleMarker::Start,
+                });
+            }
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                self.editor.toggle_normalize()
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::NONE => {
+                self.editor.toggle_reverse()
+            }
+            KeyCode::Up if key.modifiers == KeyModifiers::NONE => self.adjust_editor_pitch(1),
+            KeyCode::Down if key.modifiers == KeyModifiers::NONE => self.adjust_editor_pitch(-1),
+            KeyCode::Char('o') if key.modifiers == KeyModifiers::NONE => {
+                self.set_editor_mode(PlaybackMode::OneShot)
+            }
+            KeyCode::Char('g') if key.modifiers == KeyModifiers::NONE => {
+                self.set_editor_mode(PlaybackMode::Gate)
+            }
+            KeyCode::Char('l') if key.modifiers == KeyModifiers::NONE => {
+                self.set_editor_mode(PlaybackMode::Loop)
+            }
+            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => self.request_editor_apply(),
+            KeyCode::Esc if key.modifiers == KeyModifiers::NONE => self.request_editor_escape(),
+            _ => {}
+        }
+    }
+
+    fn sync_editor_to_selected_pad(&mut self) {
+        if let Some(pad) = self.selected_pad_id() {
+            let context = self.sample_editor_context(pad);
+            self.editor.sync_context(context);
+        }
+    }
+
+    fn request_editor_apply(&mut self) {
+        let Some(SampleEditorIntent::Apply { pad, recipe }) = self.editor.request_apply() else {
+            return;
+        };
+        let Some(frames) = self.base_sample(pad).map(|sample| sample.frames()) else {
+            self.editor
+                .observe_apply_failed(SampleEditorError::SelectedPadReplaced);
+            return;
+        };
+        let before_frames = self
+            .committed_sample_recipe(pad)
+            .and_then(|before| before.frame_range(frames).ok())
+            .map_or(0, |range| range.len());
+        let after_frames = recipe.frame_range(frames).map_or(0, |range| range.len());
+        self.overlay = Some(Overlay::ApplySample {
+            pad,
+            before_frames,
+            after_frames,
+        });
+    }
+
+    fn request_editor_undo(&mut self) {
+        if let Some(SampleEditorIntent::Undo { pad }) = self.editor.request_undo()
+            && let Err(error) = self.undo_sample_edit(pad)
+        {
+            self.status = error.to_string();
+            self.editor
+                .observe_undo_failed(SampleEditorError::InstallFailed);
+        }
+    }
+
+    fn request_editor_escape(&mut self) {
+        match self.editor.escape() {
+            SampleEditorIntent::ReturnToPerform => self.patterns.set_view(WorkspaceView::Perform),
+            SampleEditorIntent::ConfirmDiscard { pad } => {
+                self.overlay = Some(Overlay::DiscardSample { pad })
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_sample_apply_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press || key.code != KeyCode::Enter {
+            return;
+        }
+        let Some(Overlay::ApplySample { pad, .. }) = self.overlay.clone() else {
+            return;
+        };
+        let recipe = self.editor.draft();
+        match self.request_sample_edit(pad, recipe) {
+            Ok(()) => {
+                self.editor.observe_pending();
+                self.overlay = None;
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                self.editor
+                    .observe_apply_failed(SampleEditorError::InstallFailed);
+            }
+        }
+    }
+
+    fn apply_sample_discard_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+            self.editor.confirm_discard();
+            self.overlay = None;
+        }
+    }
+
+    fn adjust_editor_pitch(&mut self, delta: i8) {
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let mut settings = self.editor.settings();
+        settings.pitch_semitones = (settings.pitch_semitones + f32::from(delta)).clamp(-24.0, 24.0);
+        self.admit_editor_settings(pad, settings);
+    }
+
+    fn set_editor_mode(&mut self, mode: PlaybackMode) {
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let mut settings = self.editor.settings();
+        settings.mode = mode;
+        self.admit_editor_settings(pad, settings);
+    }
+
+    fn admit_editor_settings(&mut self, pad: PadId, settings: PadSettings) {
+        match self.update_pad_settings(pad, settings) {
+            Ok(()) => self.sync_editor_to_selected_pad(),
+            Err(error) => self.status = error,
+        }
+    }
+
     fn apply_clear_pattern_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
             let Some(Overlay::ClearPattern { slot, .. }) = self.overlay.clone() else {
@@ -1522,7 +1803,25 @@ impl App {
         let column = self.selected_pad % 4;
         let row = row.saturating_add_signed(vertical).min(3);
         let column = column.saturating_add_signed(horizontal).min(3);
-        self.selected_pad = row * 4 + column;
+        self.select_pad(row * 4 + column);
+    }
+
+    fn select_pad(&mut self, index: usize) -> bool {
+        let Some(pad) = self.pad_in_active_bank(index) else {
+            return false;
+        };
+        if self.patterns.view() == WorkspaceView::Sample
+            && self.editor.pad() != pad
+            && self.editor.is_dirty()
+        {
+            self.status = "discard sample draft before selecting another pad".to_owned();
+            return false;
+        }
+        self.selected_pad = index;
+        if self.patterns.view() == WorkspaceView::Sample {
+            self.sync_editor_to_selected_pad();
+        }
+        true
     }
 
     fn move_pattern_cursor_pad(&mut self, delta: i8) {
@@ -1845,7 +2144,7 @@ impl App {
         let Some(pad) = self.pad_in_active_bank(index) else {
             return;
         };
-        self.selected_pad = index;
+        let _ = self.select_pad(index);
         let Some(audio) = self.audio.as_mut() else {
             self.report_audio_unavailable();
             return;
@@ -1885,13 +2184,21 @@ impl App {
             self.status = "already at last bank (J)".to_owned();
             return;
         }
-        let value = u8::try_from(requested).expect("bounded bank fits in u8");
-        self.active_bank = BankId::new(value).expect("bounded bank is valid");
+        let next_bank = BankId::new(u8::try_from(requested).expect("bounded bank fits in u8"))
+            .expect("bounded bank is valid");
+        if self.patterns.view() == WorkspaceView::Sample && self.editor.is_dirty() {
+            self.status = "discard sample draft before changing bank".to_owned();
+            return;
+        }
+        self.active_bank = next_bank;
         if self.patterns.view() == WorkspaceView::Pattern {
             let cursor = self.patterns.cursor();
             let pad = PadId::new(self.active_bank, cursor.pad().index())
                 .expect("existing cursor index is valid");
             self.patterns.move_cursor_to(pad, cursor.step());
+        }
+        if self.patterns.view() == WorkspaceView::Sample {
+            self.sync_editor_to_selected_pad();
         }
     }
 
@@ -2432,6 +2739,7 @@ mod tests {
     use super::{
         App, EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, SampleEditStatus,
     };
+    use crate::pattern::WorkspaceView;
 
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
@@ -2474,6 +2782,7 @@ mod tests {
         stop_pattern_error: Option<String>,
         capture_error: Option<String>,
         install_error: Option<String>,
+        update_error: Option<String>,
         calls: CallLog,
         maintenance: Rc<RefCell<Vec<&'static str>>>,
         runtime_error: Option<String>,
@@ -2498,6 +2807,7 @@ mod tests {
                 stop_pattern_error: None,
                 capture_error: None,
                 install_error: None,
+                update_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
                 runtime_error: None,
@@ -2524,6 +2834,7 @@ mod tests {
                 stop_pattern_error: None,
                 capture_error: None,
                 install_error: None,
+                update_error: None,
                 calls: CallLog(Rc::new(RefCell::new(Vec::new()))),
                 maintenance: Rc::new(RefCell::new(Vec::new())),
                 runtime_error: None,
@@ -2575,6 +2886,11 @@ mod tests {
 
         fn failing_install(mut self, error: &str) -> Self {
             self.install_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_update_once(mut self, error: &str) -> Self {
+            self.update_error = Some(error.to_owned());
             self
         }
 
@@ -2769,6 +3085,9 @@ mod tests {
         }
 
         fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            if let Some(error) = self.update_error.take() {
+                return Err(error);
+            }
             Ok(())
         }
 
@@ -4689,7 +5008,7 @@ mod tests {
     }
 
     #[test]
-    fn help_and_picker_keys_do_not_fall_through_to_pads() {
+    fn pad_presses_remain_global_over_help_and_picker_overlays() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
@@ -4700,7 +5019,13 @@ mod tests {
         app.open_picker();
         app.apply_key(key('q', KeyModifiers::NONE, KeyEventKind::Press));
 
-        assert!(calls.snapshot().is_empty());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 4), 64, 1.0),
+                AudioCall::Trigger(pad(0, 4), 64, 1.0),
+            ]
+        );
     }
 
     #[test]
@@ -4817,7 +5142,7 @@ mod tests {
         assert_eq!(app.palette_error(), error);
 
         app.apply_key(key('x', KeyModifiers::NONE, KeyEventKind::Press));
-        assert_eq!(app.palette_error(), None);
+        assert_eq!(app.palette_error(), error);
     }
 
     #[test]
@@ -5106,5 +5431,88 @@ mod tests {
 
         assert!(app.file_picker().is_scanning());
         assert_eq!(app.status(), "");
+    }
+
+    #[test]
+    fn sample_enter_confirms_apply_without_triggering_a_pad_and_escape_discards_explicitly() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
+        app.apply_key(key('n', KeyModifiers::NONE, KeyEventKind::Press));
+        calls.clear();
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.overlay(), Some(super::Overlay::ApplySample { pad: actual, .. }) if *actual == pad)
+        );
+        assert!(calls.snapshot().is_empty());
+
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), None);
+        assert!(app.sample_editor().draft().normalize);
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay(), Some(&super::Overlay::DiscardSample { pad }));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.sample_editor().draft().normalize);
+    }
+
+    #[test]
+    fn sample_plain_z_stays_a_global_pad_and_control_z_is_editor_undo() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        calls.clear();
+
+        app.apply_key(key('z', KeyModifiers::NONE, KeyEventKind::Press));
+        app.apply_key(key('z', KeyModifiers::CONTROL, KeyEventKind::Press));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 12), 64, 1.0)]);
+        assert_eq!(app.status(), "");
+    }
+
+    #[test]
+    fn failed_sample_setting_admission_keeps_pad_and_editor_settings_unchanged() {
+        let fake = FakeAudio::ready(48_000, 2).failing_update_once("settings queue full");
+        let mut app = App::with_audio(Box::new(fake));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("expected load request");
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let prior = app.pad(pad).settings;
+
+        app.apply_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.pad(pad).settings, prior);
+        assert_eq!(app.sample_editor().settings(), prior);
+        assert_eq!(app.status(), "settings queue full");
+    }
+
+    #[test]
+    fn palette_sample_commands_reject_an_empty_selected_pad() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("normalize on".into()));
+
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.palette_error(), Some("selected pad is empty"));
     }
 }

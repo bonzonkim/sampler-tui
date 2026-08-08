@@ -407,6 +407,36 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "Enter confirms · Esc cancels".to_owned(),
             ],
         ),
+        Overlay::ApplySample {
+            pad,
+            before_frames,
+            after_frames,
+        } => render_list_overlay(
+            frame,
+            area,
+            " APPLY SAMPLE EDIT ",
+            58,
+            6,
+            [
+                format!("Apply in-memory edit to pad {}?", pad.index() + 1),
+                format!(
+                    "{before_frames} frames → {after_frames} frames; source file is unchanged."
+                ),
+                "Enter confirms · Esc cancels".to_owned(),
+            ],
+        ),
+        Overlay::DiscardSample { pad } => render_list_overlay(
+            frame,
+            area,
+            " DISCARD SAMPLE DRAFT ",
+            58,
+            6,
+            [
+                format!("Discard un-applied edits for pad {}?", pad.index() + 1),
+                "The committed in-memory sample remains unchanged.".to_owned(),
+                "Enter confirms · Esc keeps editing".to_owned(),
+            ],
+        ),
     }
 }
 

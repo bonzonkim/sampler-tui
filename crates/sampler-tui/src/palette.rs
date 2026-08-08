@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sampler_core::{BankId, Resolution};
+use sampler_core::{BankId, PlaybackMode, Resolution};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
@@ -89,6 +89,14 @@ pub enum PaletteCommand {
     Play,
     Stop,
     ClearPattern,
+    TrimStart(u64),
+    TrimEnd(u64),
+    Normalize(bool),
+    Reverse(bool),
+    Pitch(f32),
+    Mode(PlaybackMode),
+    ApplySample,
+    UndoSample,
 }
 
 pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
@@ -122,7 +130,39 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "play" => no_arguments(remainder, "play", PaletteCommand::Play),
         "stop" => no_arguments(remainder, "stop", PaletteCommand::Stop),
         "clear-pattern" => no_arguments(remainder, "clear-pattern", PaletteCommand::ClearPattern),
+        "trim-start" => parse_frame(remainder).map(PaletteCommand::TrimStart),
+        "trim-end" => parse_frame(remainder).map(PaletteCommand::TrimEnd),
+        "normalize" => parse_toggle(remainder, "normalize").map(PaletteCommand::Normalize),
+        "reverse" => parse_toggle(remainder, "reverse").map(PaletteCommand::Reverse),
+        "pitch" => parse_finite_range(remainder, -24.0, 24.0, "pitch must be -24..24")
+            .map(|value| PaletteCommand::Pitch(value as f32)),
+        "mode" => parse_mode(remainder).map(PaletteCommand::Mode),
+        "apply-sample" => no_arguments(remainder, "apply-sample", PaletteCommand::ApplySample),
+        "undo-sample" => no_arguments(remainder, "undo-sample", PaletteCommand::UndoSample),
         _ => Err(format!("unknown command: {command}")),
+    }
+}
+
+fn parse_frame(input: &str) -> Result<u64, String> {
+    single_token(input, "frame must be a non-negative integer")?
+        .parse::<u64>()
+        .map_err(|_| "frame must be a non-negative integer".to_owned())
+}
+
+fn parse_toggle(input: &str, name: &str) -> Result<bool, String> {
+    match single_token(input, &format!("{name} must be on or off"))? {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{name} must be on or off")),
+    }
+}
+
+fn parse_mode(input: &str) -> Result<PlaybackMode, String> {
+    match single_token(input, "mode must be oneshot, gate, or loop")? {
+        "oneshot" => Ok(PlaybackMode::OneShot),
+        "gate" => Ok(PlaybackMode::Gate),
+        "loop" => Ok(PlaybackMode::Loop),
+        _ => Err("mode must be oneshot, gate, or loop".to_owned()),
     }
 }
 
@@ -214,7 +254,7 @@ fn no_arguments(
 mod tests {
     use std::path::PathBuf;
 
-    use sampler_core::{BankId, Resolution};
+    use sampler_core::{BankId, PlaybackMode, Resolution};
 
     use super::{LineEditor, PaletteCommand, parse_palette};
 
@@ -318,6 +358,47 @@ mod tests {
         assert_eq!(
             parse_palette("pattern 1 now"),
             Err("pattern must be 1..16".into())
+        );
+    }
+
+    #[test]
+    fn sample_commands_are_typed_and_strict() {
+        assert_eq!(
+            parse_palette("trim-start 42"),
+            Ok(PaletteCommand::TrimStart(42))
+        );
+        assert_eq!(
+            parse_palette("trim-end 99"),
+            Ok(PaletteCommand::TrimEnd(99))
+        );
+        assert_eq!(
+            parse_palette("normalize on"),
+            Ok(PaletteCommand::Normalize(true))
+        );
+        assert_eq!(
+            parse_palette("reverse off"),
+            Ok(PaletteCommand::Reverse(false))
+        );
+        assert_eq!(
+            parse_palette("pitch -12.5"),
+            Ok(PaletteCommand::Pitch(-12.5))
+        );
+        assert_eq!(
+            parse_palette("mode loop"),
+            Ok(PaletteCommand::Mode(PlaybackMode::Loop))
+        );
+        assert_eq!(
+            parse_palette("apply-sample"),
+            Ok(PaletteCommand::ApplySample)
+        );
+        assert_eq!(parse_palette("undo-sample"), Ok(PaletteCommand::UndoSample));
+        assert_eq!(
+            parse_palette("pitch NaN"),
+            Err("pitch must be -24..24".into())
+        );
+        assert_eq!(
+            parse_palette("mode loop now"),
+            Err("mode must be oneshot, gate, or loop".into())
         );
     }
 }

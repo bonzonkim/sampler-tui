@@ -288,8 +288,31 @@ impl SampleEditor {
         self.status.clone()
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.recipe_dirty() || self.settings_dirty()
+    }
+
     pub fn set_marker(&mut self, marker: SampleMarker) {
         self.marker = marker;
+    }
+
+    /// Moves an endpoint to an exact source-frame boundary for palette commands.
+    pub fn set_marker_to_frame(&mut self, marker: SampleMarker, frame: u64) -> Result<(), String> {
+        let frames = self
+            .base_frames
+            .ok_or_else(|| "selected pad is empty".to_owned())?;
+        let frame =
+            usize::try_from(frame).map_err(|_| "frame is outside selected base".to_owned())?;
+        if frame > frames
+            || (matches!(marker, SampleMarker::Start) && frame == frames)
+            || (matches!(marker, SampleMarker::End) && frame == 0)
+        {
+            return Err("frame is outside selected base".to_owned());
+        }
+        self.marker = marker;
+        self.set_marker_frame(frames, frame);
+        self.note_draft_change();
+        Ok(())
     }
 
     pub fn set_viewport(&mut self, start: u64, end: u64) {
@@ -460,10 +483,6 @@ impl SampleEditor {
             start_offscreen,
             end_offscreen,
         }
-    }
-
-    fn is_dirty(&self) -> bool {
-        self.recipe_dirty() || self.settings_dirty()
     }
 
     fn recipe_dirty(&self) -> bool {

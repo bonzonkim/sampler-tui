@@ -1155,6 +1155,7 @@ struct PendingSnapshot {
 #[derive(Debug)]
 pub struct PatternWorkspace {
     patterns: Box<[EditablePattern; PATTERN_SLOT_COUNT]>,
+    project_patterns: Box<[ProjectPattern; PATTERN_SLOT_COUNT]>,
     selected_slot: PatternSlotId,
     cursor: PatternCursor,
     selected_event: Option<SelectedEvent>,
@@ -1185,8 +1186,13 @@ impl PatternWorkspace {
             EditablePattern::new(slot, format!("Pattern {:02}", index + 1), transport)
                 .expect("default pattern is valid")
         });
+        let project_patterns = array::from_fn(|index| {
+            ProjectPattern::from_editable(&patterns[index])
+                .expect("default project pattern is valid")
+        });
         Self {
             patterns: Box::new(patterns),
+            project_patterns: Box::new(project_patterns),
             selected_slot: slot,
             cursor: PatternCursor {
                 pad,
@@ -1215,11 +1221,7 @@ impl PatternWorkspace {
     pub fn export_project_patterns(
         &self,
     ) -> Result<Vec<ProjectPattern>, ProjectPatternWorkspaceError> {
-        self.patterns
-            .iter()
-            .map(ProjectPattern::from_editable)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProjectPatternWorkspaceError::Project)
+        Ok(self.project_patterns.to_vec())
     }
 
     pub fn replace_project_patterns(
@@ -1233,14 +1235,18 @@ impl PatternWorkspace {
         }
         let mut replacement: [Option<EditablePattern>; PATTERN_SLOT_COUNT] =
             array::from_fn(|_| None);
+        let mut project_replacement: [Option<ProjectPattern>; PATTERN_SLOT_COUNT] =
+            array::from_fn(|_| None);
         for pattern in patterns {
             let index = usize::from(pattern.slot().get());
             if replacement[index].is_some() {
                 return Err(ProjectPatternWorkspaceError::DuplicateSlot(pattern.slot()));
             }
-            replacement[index] = Some(pattern.to_editable().map_err(|error| {
+            let editable = pattern.to_editable().map_err(|error| {
                 ProjectPatternWorkspaceError::Project(ProjectError::InvalidPattern(error))
-            })?);
+            })?;
+            replacement[index] = Some(editable);
+            project_replacement[index] = Some(pattern);
         }
         let Some(patterns) = replacement
             .into_iter()
@@ -1252,8 +1258,15 @@ impl PatternWorkspace {
                 found: PATTERN_SLOT_COUNT,
             });
         };
+        let project_patterns = project_replacement
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .and_then(|patterns| patterns.try_into().ok())
+            .map(Box::new)
+            .expect("sixteen unique bounded slots fill the project pattern array");
 
         self.patterns = patterns;
+        self.project_patterns = project_patterns;
         self.selected_slot = PatternSlotId::new(0).expect("first pattern slot is valid");
         self.cursor = PatternCursor {
             pad: PadId::new(BankId::new(0).expect("first bank is valid"), 0)
@@ -1386,7 +1399,7 @@ impl PatternWorkspace {
                 event_id,
             });
         }
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         Ok(())
     }
 
@@ -1397,7 +1410,7 @@ impl PatternWorkspace {
         let index = self.slot_index();
         self.patterns[index].remove(event_id)?;
         self.selected_event = None;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         Ok(())
     }
 
@@ -1415,14 +1428,14 @@ impl PatternWorkspace {
         let velocity = event.velocity;
         let index = self.slot_index();
         self.patterns[index].set_velocity(event_id, (velocity + delta).clamp(0.0, 1.0))?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         Ok(())
     }
 
     pub fn set_tempo(&mut self, tempo: Tempo) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].set_tempo(tempo)?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.clamp_cursor();
         self.refresh_selected_event();
         Ok(())
@@ -1431,7 +1444,7 @@ impl PatternWorkspace {
     pub fn set_bars(&mut self, bars: u16) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].set_bars(bars)?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.clamp_cursor();
         self.refresh_selected_event();
         Ok(())
@@ -1440,7 +1453,7 @@ impl PatternWorkspace {
     pub fn set_resolution(&mut self, resolution: Resolution) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].set_resolution(resolution)?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.clamp_cursor();
         self.refresh_selected_event();
         Ok(())
@@ -1449,7 +1462,7 @@ impl PatternWorkspace {
     pub fn set_swing(&mut self, swing: f64) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].set_swing(swing)?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.refresh_selected_event();
         Ok(())
     }
@@ -1457,7 +1470,7 @@ impl PatternWorkspace {
     pub fn set_quantize(&mut self, strength: f32) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].set_quantize_strength(strength)?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.refresh_selected_event();
         Ok(())
     }
@@ -1467,14 +1480,14 @@ impl PatternWorkspace {
         self.patterns[index].clear()?;
         self.selected_event = None;
         self.stop_recording();
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         Ok(())
     }
 
     pub fn undo_clear(&mut self) -> Result<(), PatternEditError> {
         let index = self.slot_index();
         self.patterns[index].undo_clear()?;
-        self.mark_dirty(index);
+        self.commit_project_pattern(index);
         self.refresh_selected_event();
         Ok(())
     }
@@ -1630,7 +1643,7 @@ impl PatternWorkspace {
                                 event_id,
                             });
                         }
-                        self.mark_dirty(index);
+                        self.commit_project_pattern(index);
                         true
                     }
                     Err(_) => {
@@ -1660,7 +1673,7 @@ impl PatternWorkspace {
                             event_id,
                         });
                     }
-                    self.mark_dirty(index);
+                    self.commit_project_pattern(index);
                 }
                 self.held_keys[key] = None;
                 committed
@@ -1921,6 +1934,12 @@ impl PatternWorkspace {
         {
             self.pending_snapshots[index] = None;
         }
+    }
+
+    fn commit_project_pattern(&mut self, index: usize) {
+        self.project_patterns[index] = ProjectPattern::from_editable(&self.patterns[index])
+            .expect("a validated editable pattern remains persistable after a committed edit");
+        self.mark_dirty(index);
     }
 
     fn renormalize_dirty_tickets(&mut self) {

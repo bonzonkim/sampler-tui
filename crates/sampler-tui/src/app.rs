@@ -819,6 +819,10 @@ impl App {
         if self.pads[offset].settings == settings {
             return Ok(());
         }
+        if self.pads[offset].sample.is_none() {
+            self.pads[offset].settings = settings;
+            return Ok(());
+        }
         self.ensure_project_mutation_available()?;
         let bound_in_current_session = self.current_session_bound[offset];
         if bound_in_current_session && let Some(audio) = self.audio.as_mut() {
@@ -3142,15 +3146,16 @@ fn pad_from_offset(offset: usize) -> PadId {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::Duration;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
-        AudioController, EnginePorts, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
-        PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
-        audio_channels_with_test_capacities,
+        AudioController, EnginePorts, Frame, LiveAck, LiveAckKind, LiveCommandId,
+        PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, TransportStamp,
+        audio_channels, audio_channels_with_test_capacities,
     };
     use sampler_core::{
         BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SampleEditRecipe,
@@ -3220,6 +3225,7 @@ mod tests {
         pattern_controller: AudioController,
         _pattern_ports: EnginePorts,
         drain_pattern_queue_after_backpressure: bool,
+        live_acks: VecDeque<LiveAck>,
     }
 
     impl FakeAudio {
@@ -3245,6 +3251,7 @@ mod tests {
                 pattern_controller,
                 _pattern_ports: pattern_ports,
                 drain_pattern_queue_after_backpressure: false,
+                live_acks: VecDeque::new(),
             }
         }
 
@@ -3272,6 +3279,7 @@ mod tests {
                 pattern_controller,
                 _pattern_ports: pattern_ports,
                 drain_pattern_queue_after_backpressure: false,
+                live_acks: VecDeque::new(),
             }
         }
 
@@ -3331,6 +3339,11 @@ mod tests {
 
         fn with_shutdown_log(mut self, shutdown: Rc<RefCell<Vec<&'static str>>>) -> Self {
             self.shutdown = Some(shutdown);
+            self
+        }
+
+        fn with_live_acks(mut self, acks: impl IntoIterator<Item = LiveAck>) -> Self {
+            self.live_acks.extend(acks);
             self
         }
     }
@@ -3487,8 +3500,15 @@ mod tests {
             Ok(())
         }
 
-        fn drain_live_acks(&mut self, _output: &mut [LiveAck]) -> usize {
-            0
+        fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
+            let count = output.len().min(self.live_acks.len());
+            for slot in output.iter_mut().take(count) {
+                *slot = self
+                    .live_acks
+                    .pop_front()
+                    .expect("bounded ack count was checked");
+            }
+            count
         }
 
         fn reclaim_retired_patterns(&mut self) -> usize {
@@ -6380,12 +6400,20 @@ mod tests {
             FakeAudio::ready(48_000, 2).failing_runtime("device disconnected"),
         ));
         let pad = pad(0, 0);
+        let settings = PadSettings {
+            gain_db: -2.0,
+            ..PadSettings::default()
+        };
+        app.update_pad_settings(pad, settings).unwrap();
         let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
         else {
             panic!("expected initial load");
         };
         assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
         let identity = app.sample_editor_context(pad).source_generation;
+        let revision = app.project_revision();
+        let fingerprint = app.sample_editor.commits[0].fingerprint;
+        let recipe = app.sample_editor.commits[0].recipe;
         assert!(app.maintain_audio());
 
         app.retry_with(Box::new(FakeAudio::ready(44_100, 2)));
@@ -6399,19 +6427,31 @@ mod tests {
         else {
             panic!("expected recovery load");
         };
-        assert!(
-            app.apply_worker_result(loaded_with_purpose_recipe_and_frames(
-                pad,
-                generation,
-                purpose,
-                path.to_str().unwrap(),
-                44_100,
-                1,
-                SampleEditRecipe::identity(),
-            ))
+        let mut recovery = loaded_with_purpose_recipe_and_frames(
+            pad,
+            generation,
+            purpose,
+            path.to_str().unwrap(),
+            44_100,
+            1,
+            SampleEditRecipe::identity(),
         );
+        let WorkerResult::Loaded {
+            result: Ok(loaded), ..
+        } = &mut recovery
+        else {
+            panic!("expected successful recovery result");
+        };
+        loaded.fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(std::path::Path::new("changed.wav"), &[1])
+                .unwrap();
+        assert!(app.apply_worker_result(recovery));
 
         assert_eq!(app.sample_editor_context(pad).source_generation, identity);
+        assert_eq!(app.sample_editor.commits[0].fingerprint, fingerprint);
+        assert_eq!(app.sample_editor.commits[0].recipe, recipe);
+        assert_eq!(app.pad(pad).settings, settings);
+        assert_eq!(app.project_revision(), revision);
     }
 
     #[test]
@@ -7196,5 +7236,82 @@ mod tests {
             before_pattern
         );
         assert_eq!(app.project_revision(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn device_rate_recovery_preserves_same_revision_project_snapshot() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.apply_pattern_edit(|patterns| patterns.toggle_step());
+        let before_revision = app.project_revision();
+        let before = app.project_snapshot().unwrap();
+
+        assert!(app.retry_with(Box::new(FakeAudio::ready(44_100, 2))));
+
+        assert_eq!(app.project_revision(), before_revision);
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        assert_eq!(app.patterns.sample_rates(), [44_100; 16]);
+    }
+
+    #[test]
+    fn unloaded_pad_settings_are_local_and_do_not_advance_project_revision() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let settings = PadSettings {
+            gain_db: -4.0,
+            ..PadSettings::default()
+        };
+
+        app.update_pad_settings(pad(0, 0), settings).unwrap();
+
+        assert_eq!(app.pad(pad(0, 0)).settings, settings);
+        assert_eq!(app.project_revision(), 0);
+        assert!(app.project_snapshot().unwrap().pads.is_empty());
+    }
+
+    #[test]
+    fn accepted_record_trigger_and_release_each_advance_one_revision() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let stamp = TransportStamp {
+            slot: PatternSlotId::new(0).unwrap(),
+            generation: app.patterns.selected_pattern().generation(),
+            origin: 1_000,
+            loop_frames: app.patterns.selected_pattern().transport().loop_frames(),
+        };
+        app.patterns.start_recording(stamp).unwrap();
+        app.patterns
+            .note_live_trigger(0, LiveCommandId::FIRST, pad, 1.0);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: LiveCommandId::FIRST,
+                pad,
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_120,
+                transport: Some(stamp),
+            },
+        ])));
+        let before_trigger = app.project_revision();
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), before_trigger + 1);
+
+        app.patterns.note_live_release(0, LiveCommandId::FIRST);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: LiveCommandId::FIRST,
+                pad,
+                kind: LiveAckKind::Release,
+                frame: 1_240,
+                transport: Some(stamp),
+            },
+        ])));
+        let before_release = app.project_revision();
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_revision(), before_release + 1);
+        assert_eq!(app.project_snapshot().unwrap().patterns[0].events.len(), 1);
+        assert_eq!(
+            app.project_snapshot().unwrap().patterns[0].events[0]
+                .event
+                .duration,
+            Some(120)
+        );
     }
 }

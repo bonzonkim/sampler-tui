@@ -88,13 +88,16 @@ pub struct ProjectSession {
 }
 
 impl ProjectSession {
-    pub fn new(
+    pub(crate) fn new(
         project_id: ProjectId,
         directory: Option<PathBuf>,
         name: impl Into<String>,
         revision: u64,
     ) -> Self {
-        debug_assert!(revision <= MAX_PROJECT_REVISION);
+        assert!(
+            revision <= MAX_PROJECT_REVISION,
+            "project revision is portable"
+        );
         Self {
             project_id,
             directory,

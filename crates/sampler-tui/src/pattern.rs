@@ -3,20 +3,26 @@ mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
     use sampler_audio::{
-        Frame, LiveAck, LiveAckKind, LiveCommandId, PatternSnapshotSlot, PatternSwitch,
-        SampleBuffer, SampleSlot, Telemetry, TransportStamp,
+        AudioController, AudioEngine, Frame, LiveAck, LiveAckKind, LiveCommandId,
+        PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, TransportStamp,
+        audio_channels_with_test_capacities,
     };
     use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
     use crate::AudioPort;
 
-    use super::{MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace};
+    use super::{
+        MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace,
+        RecordingIntent, RecordingState,
+    };
 
     #[derive(Default)]
     struct FakeAudio {
         acks: VecDeque<LiveAck>,
         installs: usize,
         backpressured: bool,
+        capture_error: bool,
+        capture_attempts: usize,
     }
 
     impl AudioPort for FakeAudio {
@@ -89,6 +95,103 @@ mod tests {
                 count += 1;
             }
             count
+        }
+        fn set_record_capture(
+            &mut self,
+            _capture: Option<(PatternSlotId, u64)>,
+        ) -> Result<(), String> {
+            self.capture_attempts += 1;
+            if self.capture_error {
+                Err("command queue full".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct OneSlotAudio {
+        controller: AudioController,
+        engine: AudioEngine,
+    }
+
+    impl OneSlotAudio {
+        fn new() -> Self {
+            let (controller, ports) = audio_channels_with_test_capacities(1, 256, 64);
+            Self {
+                controller,
+                engine: AudioEngine::new(100, ports).unwrap(),
+            }
+        }
+
+        fn callback(&mut self) {
+            self.engine.render_frames(0, |_| {});
+        }
+    }
+
+    impl AudioPort for OneSlotAudio {
+        fn sample_rate(&self) -> u32 {
+            100
+        }
+        fn channels(&self) -> u16 {
+            2
+        }
+        fn render_horizon(&self) -> Frame {
+            self.controller.render_horizon()
+        }
+        fn install(
+            &mut self,
+            _pad: PadId,
+            _sample: Arc<SampleBuffer>,
+            _settings: PadSettings,
+        ) -> Result<SampleSlot, String> {
+            Err("unused".into())
+        }
+        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn install_pattern(
+            &mut self,
+            snapshot: Arc<PatternSnapshot>,
+        ) -> Result<PatternSnapshotSlot, String> {
+            self.controller
+                .install_pattern(snapshot)
+                .map_err(|error| error.to_string())
+        }
+        fn select_pattern(
+            &mut self,
+            _slot: PatternSlotId,
+            _switch: PatternSwitch,
+        ) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn set_record_capture(
+            &mut self,
+            capture: Option<(PatternSlotId, u64)>,
+        ) -> Result<(), String> {
+            self.controller
+                .set_record_capture(capture)
+                .map_err(|error| error.to_string())
+        }
+        fn stop_pad(&mut self, _pad: PadId) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn stop_all(&mut self) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn reclaim_retired(&mut self) -> usize {
+            0
+        }
+        fn latest_telemetry(&mut self) -> Option<Telemetry> {
+            None
+        }
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            None
         }
     }
 
@@ -436,6 +539,114 @@ mod tests {
     }
 
     #[test]
+    fn stale_confirmed_generation_telemetry_preserves_rearming_capture_and_held_key() {
+        let previous = origin(1_000);
+        let target = TransportStamp {
+            generation: 2,
+            ..previous
+        };
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = FakeAudio::default();
+        workspace.start_recording(previous).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        workspace.note_live_trigger(key(0), command(7), pad(), 1.0);
+        workspace.recording = Some(RecordingState::Rearming {
+            previous: RecordingIntent { stamp: previous },
+            target: RecordingIntent { stamp: target },
+            capture_command_pending: false,
+        });
+
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+        assert_eq!(workspace.pending_trigger_id(key(0)), Some(command(7)));
+        workspace.maintain(&mut audio, recording_telemetry(target));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+        assert_eq!(workspace.record_capture(), Some((slot(), 2)));
+    }
+
+    #[test]
+    fn rearming_capture_retries_once_per_maintenance_after_admission_backpressure() {
+        let previous = origin(1_000);
+        let target = TransportStamp {
+            generation: 2,
+            ..previous
+        };
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = FakeAudio {
+            capture_error: true,
+            ..FakeAudio::default()
+        };
+        workspace.recording = Some(RecordingState::Rearming {
+            previous: RecordingIntent { stamp: previous },
+            target: RecordingIntent { stamp: target },
+            capture_command_pending: true,
+        });
+        workspace.dirty_patterns.fill(None);
+
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        assert_eq!(audio.capture_attempts, 1);
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+        audio.capture_error = false;
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        assert_eq!(audio.capture_attempts, 2);
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+        workspace.maintain(&mut audio, recording_telemetry(target));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+    }
+
+    #[test]
+    fn one_slot_queue_retries_rearm_after_install_consumes_admission() {
+        let previous = origin(1_000);
+        let mut workspace = PatternWorkspace::new(100);
+        let mut audio = OneSlotAudio::new();
+        workspace.dirty_patterns.fill(None);
+        workspace.start_recording(previous).unwrap();
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        workspace.move_cursor_to(pad(), 0);
+        workspace.toggle_step().unwrap();
+
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+        assert_eq!(workspace.record_capture(), Some((slot(), 1)));
+
+        audio.callback(); // drains InstallPattern, making one command slot available.
+        workspace.maintain(&mut audio, recording_telemetry(previous));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Pending)
+        );
+        audio.callback(); // drains the retry SetRecordCapture.
+        let target = TransportStamp {
+            generation: 1,
+            ..previous
+        };
+        workspace.maintain(&mut audio, recording_telemetry(target));
+        assert_eq!(
+            workspace.capture_state(),
+            Some(PatternCaptureState::Confirmed)
+        );
+    }
+
+    #[test]
     fn invalidating_a_confirmed_capture_clears_all_held_correlations() {
         let stamp = origin(1_000);
         let mut workspace = PatternWorkspace::new(100);
@@ -725,6 +936,11 @@ pub enum PatternCaptureState {
 enum RecordingState {
     Pending(RecordingIntent),
     Confirmed(RecordingIntent),
+    Rearming {
+        previous: RecordingIntent,
+        target: RecordingIntent,
+        capture_command_pending: bool,
+    },
     Disarming(RecordingIntent),
 }
 
@@ -732,12 +948,13 @@ impl RecordingState {
     fn intent(self) -> RecordingIntent {
         match self {
             Self::Pending(intent) | Self::Confirmed(intent) | Self::Disarming(intent) => intent,
+            Self::Rearming { target, .. } => target,
         }
     }
 
     fn capture_state(self) -> PatternCaptureState {
         match self {
-            Self::Pending(_) => PatternCaptureState::Pending,
+            Self::Pending(_) | Self::Rearming { .. } => PatternCaptureState::Pending,
             Self::Confirmed(_) => PatternCaptureState::Confirmed,
             Self::Disarming(_) => PatternCaptureState::Disarming,
         }
@@ -1146,17 +1363,25 @@ impl PatternWorkspace {
             self.held_keys[key] = None;
             return;
         };
-        let pending_target_matches = matches!(state, RecordingState::Pending(_))
-            && stamp.slot == intent.stamp.slot
-            && stamp.generation == intent.stamp.generation
-            && stamp.loop_frames != 0;
-        if !state.accepts_acks() || (stamp != intent.stamp && !pending_target_matches) {
+        let accepted = match state {
+            RecordingState::Pending(intent) => {
+                stamp.slot == intent.stamp.slot
+                    && stamp.generation == intent.stamp.generation
+                    && stamp.loop_frames != 0
+            }
+            RecordingState::Confirmed(intent) => stamp == intent.stamp,
+            RecordingState::Rearming {
+                previous, target, ..
+            } => stamp == previous.stamp || stamp == target.stamp,
+            RecordingState::Disarming(_) => false,
+        };
+        if !state.accepts_acks() || !accepted {
             self.held_keys[key] = None;
             return;
         }
-        if pending_target_matches && stamp != intent.stamp {
+        if matches!(state, RecordingState::Pending(_)) && stamp != intent.stamp {
             self.recording = Some(RecordingState::Pending(RecordingIntent { stamp }));
-        } else {
+        } else if !matches!(state, RecordingState::Rearming { .. }) {
             stamp = intent.stamp;
         }
 
@@ -1250,15 +1475,24 @@ impl PatternWorkspace {
             }));
             return;
         }
-        let matches_capture = telemetry.pattern_recording
-            && telemetry.pattern_slot == Some(stamp.slot)
-            && telemetry.pattern_generation == Some(stamp.generation)
-            && telemetry.pattern_origin == Some(stamp.origin);
+        let matches_stamp = |candidate: TransportStamp| {
+            telemetry.pattern_recording
+                && telemetry.pattern_slot == Some(candidate.slot)
+                && telemetry.pattern_generation == Some(candidate.generation)
+                && telemetry.pattern_origin == Some(candidate.origin)
+        };
+        let matches_capture = matches_stamp(stamp);
         let next = match state {
             RecordingState::Pending(intent) if matches_capture => {
                 Some(RecordingState::Confirmed(intent))
             }
             RecordingState::Confirmed(_) if !matches_capture => None,
+            RecordingState::Rearming {
+                previous: _,
+                target,
+                ..
+            } if matches_stamp(target.stamp) => Some(RecordingState::Confirmed(target)),
+            RecordingState::Rearming { .. } => Some(state),
             RecordingState::Disarming(_) if !matches_capture => None,
             _ => Some(state),
         };
@@ -1373,7 +1607,7 @@ impl PatternWorkspace {
                     // that exact admitted identity before the next tracked live command can be
                     // acknowledged against it; origin stays causal across a replacement.
                     if self.rebind_recording_to_admitted_generation(slot, pending_generation)
-                        && let Err(error) = audio.set_record_capture(self.record_capture())
+                        && let Err(error) = self.submit_record_capture_rearm(audio)
                     {
                         let status = PatternStatus::AudioCommandFailed { slot, error };
                         self.last_status = Some(status.clone());
@@ -1394,6 +1628,18 @@ impl PatternWorkspace {
                     result.status = Some(status);
                 }
             }
+        } else if self.rearm_capture_command_pending()
+            && let Err(error) = self.submit_record_capture_rearm(audio)
+        {
+            let slot = self
+                .recording
+                .expect("rearm requires recording")
+                .intent()
+                .stamp
+                .slot;
+            let status = PatternStatus::AudioCommandFailed { slot, error };
+            self.last_status = Some(status.clone());
+            result.status = Some(status);
         } else if let Some((index, _)) = self.next_dirty_slot() {
             let status = PatternStatus::UpdatePending {
                 slot: self.patterns[index].slot(),
@@ -1465,6 +1711,31 @@ impl PatternWorkspace {
         self.pending_snapshots.iter().position(Option::is_some)
     }
 
+    fn rearm_capture_command_pending(&self) -> bool {
+        self.recording.is_some_and(|state| {
+            matches!(
+                state,
+                RecordingState::Rearming {
+                    capture_command_pending: true,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn submit_record_capture_rearm(&mut self, audio: &mut dyn AudioPort) -> Result<(), String> {
+        let capture = self.record_capture();
+        audio.set_record_capture(capture)?;
+        if let Some(RecordingState::Rearming {
+            capture_command_pending,
+            ..
+        }) = self.recording.as_mut()
+        {
+            *capture_command_pending = false;
+        }
+        Ok(())
+    }
+
     fn rebind_recording_to_admitted_generation(
         &mut self,
         slot: PatternSlotId,
@@ -1487,10 +1758,24 @@ impl PatternWorkspace {
                 .loop_frames(),
             ..intent.stamp
         };
+        let target = RecordingIntent { stamp };
         self.recording = Some(match state {
-            RecordingState::Pending(_) => RecordingState::Pending(RecordingIntent { stamp }),
-            RecordingState::Confirmed(_) => RecordingState::Confirmed(RecordingIntent { stamp }),
-            RecordingState::Disarming(_) => RecordingState::Disarming(RecordingIntent { stamp }),
+            RecordingState::Pending(previous) => RecordingState::Rearming {
+                previous,
+                target,
+                capture_command_pending: true,
+            },
+            RecordingState::Confirmed(previous) => RecordingState::Rearming {
+                previous,
+                target,
+                capture_command_pending: true,
+            },
+            RecordingState::Rearming { previous, .. } => RecordingState::Rearming {
+                previous,
+                target,
+                capture_command_pending: true,
+            },
+            RecordingState::Disarming(intent) => RecordingState::Disarming(intent),
         });
         true
     }

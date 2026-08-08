@@ -410,13 +410,34 @@ fn recording_rebinds_to_the_admitted_generation_after_each_overdub_snapshot() {
     harness.release(KeyCode::Char('1'));
     harness.callback(65);
     harness.ui_iteration();
-    harness.callback(1_600); // installs the first recorded generation and publishes telemetry
+    harness.callback(0); // install/rearm is command-backlog split from telemetry publication
+    harness.ui_iteration();
+    assert_eq!(
+        harness.app.patterns().capture_state(),
+        Some(sampler_tui::PatternCaptureState::Pending),
+        "stale pre-rearm telemetry must not disarm capture"
+    );
+    harness.callback(1_600); // publishes the exact rearm target
     harness.ui_iteration();
     assert_eq!(
         harness.app.patterns().record_capture(),
         Some((PatternSlotId::new(0).unwrap(), 2)),
         "workspace rebinding follows the admitted snapshot"
     );
+
+    harness.key(KeyCode::Char('1'), KeyModifiers::NONE);
+    harness.callback(65);
+    harness.release(KeyCode::Char('1'));
+    harness.callback(65);
+    harness.ui_iteration();
+    harness.callback(0);
+    harness.ui_iteration();
+    assert_eq!(
+        harness.app.patterns().capture_state(),
+        Some(sampler_tui::PatternCaptureState::Pending)
+    );
+    harness.callback(1_600);
+    harness.ui_iteration();
 
     harness.key(KeyCode::Char('1'), KeyModifiers::NONE);
     harness.callback(65);
@@ -431,8 +452,8 @@ fn recording_rebinds_to_the_admitted_generation_after_each_overdub_snapshot() {
         .events();
     assert_eq!(
         events.len(),
-        2,
-        "both separated overdubs are retained: capture={:?} telemetry={:?} submissions={} acks={}",
+        3,
+        "three separated overdubs are retained: capture={:?} telemetry={:?} submissions={} acks={}",
         harness.app.patterns().capture_state(),
         harness.app.telemetry(),
         harness.app.maintain_audio_pattern_submissions(),

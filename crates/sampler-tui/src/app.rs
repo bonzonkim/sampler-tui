@@ -379,6 +379,16 @@ impl App {
         &self.pads[pad_offset(pad)]
     }
 
+    /// Updates a pad's audible settings and forwards the same validated value to audio when a
+    /// sample is already installed. This keeps callers from maintaining a second settings path.
+    pub fn update_pad_settings(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.update_pad(pad, settings)?;
+        }
+        self.pads[pad_offset(pad)].settings = settings;
+        Ok(())
+    }
+
     pub fn overlay(&self) -> Option<&Overlay> {
         self.overlay.as_ref()
     }

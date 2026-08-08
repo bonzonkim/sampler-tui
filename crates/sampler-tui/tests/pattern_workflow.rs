@@ -14,7 +14,7 @@ use sampler_audio::{
 };
 use sampler_core::{
     BankId, EditablePattern, EventId, Meter, PadId, PadSettings, PatternEvent, PatternSlotId,
-    PatternSnapshot, Resolution, Tempo, Transport,
+    PatternSnapshot, PlaybackMode, Resolution, Tempo, Transport,
 };
 use sampler_tui::{
     App, AudioPort, KeyboardCapabilities, LoadedSample, PREVIEW_COLUMNS, PreviewColumn,
@@ -25,6 +25,8 @@ struct ControllerPort {
     sample_rate: u32,
     controller: Rc<RefCell<AudioController>>,
     runtime_failure: Rc<Cell<bool>>,
+    observed_acks: Rc<RefCell<Vec<LiveAck>>>,
+    installed_settings: Rc<RefCell<Vec<PadSettings>>>,
 }
 
 impl ControllerPort {
@@ -49,6 +51,7 @@ impl AudioPort for ControllerPort {
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, String> {
+        self.installed_settings.borrow_mut().push(settings);
         self.controller()
             .install(pad, sample, settings)
             .map_err(|e| e.to_string())
@@ -108,7 +111,11 @@ impl AudioPort for ControllerPort {
             .map_err(|e| e.to_string())
     }
     fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
-        self.controller().drain_live_acks(output)
+        let drained = self.controller().drain_live_acks(output);
+        self.observed_acks
+            .borrow_mut()
+            .extend_from_slice(&output[..drained]);
+        drained
     }
     fn reclaim_retired_patterns(&mut self) -> usize {
         let mut reclaimed = 0;
@@ -146,6 +153,8 @@ struct PatternHarness {
     engine: AudioEngine,
     controller: Rc<RefCell<AudioController>>,
     runtime_failure: Rc<Cell<bool>>,
+    observed_acks: Rc<RefCell<Vec<LiveAck>>>,
+    installed_settings: Rc<RefCell<Vec<PadSettings>>>,
 }
 
 impl PatternHarness {
@@ -153,11 +162,15 @@ impl PatternHarness {
         let (controller, ports) = audio_channels();
         let controller = Rc::new(RefCell::new(controller));
         let runtime_failure = Rc::new(Cell::new(false));
+        let observed_acks = Rc::new(RefCell::new(Vec::new()));
+        let installed_settings = Rc::new(RefCell::new(Vec::new()));
         let engine = AudioEngine::new(sample_rate, ports).expect("valid test engine");
         let mut app = App::with_audio(Box::new(ControllerPort {
             sample_rate,
             controller: Rc::clone(&controller),
             runtime_failure: Rc::clone(&runtime_failure),
+            observed_acks: Rc::clone(&observed_acks),
+            installed_settings: Rc::clone(&installed_settings),
         }));
         app.set_keyboard_capabilities(KeyboardCapabilities {
             release_events: true,
@@ -167,9 +180,15 @@ impl PatternHarness {
             engine,
             controller,
             runtime_failure,
+            observed_acks,
+            installed_settings,
         };
         harness.drain_initial_patterns();
+        let gate = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+        harness.app.update_pad_settings(pad(0), gate).unwrap();
         harness.load_pad(0);
+        assert_eq!(harness.app.pad(pad(0)).settings, gate);
+        assert_eq!(harness.installed_settings.borrow().as_slice(), &[gate]);
         harness.callback(1);
         harness
     }
@@ -274,6 +293,7 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
         .pattern(PatternSlotId::new(0).unwrap())
         .events();
     assert_eq!(events.len(), 1);
+    assert_eq!(events[0].frame, 65, "ack frame 66 minus callback origin 1");
     assert_eq!(events[0].duration, Some(65));
     assert!(
         events[0].frame
@@ -284,24 +304,58 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
                 .transport()
                 .loop_frames()
     );
+    let observed = harness.observed_acks.borrow();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].frame, 66);
+    assert_eq!(observed[0].transport.unwrap().origin, 1);
+    assert_eq!(observed[1].frame, 131);
+    assert_eq!(observed[1].transport.unwrap().origin, 1);
+    drop(observed);
+    harness.callback(64);
+    assert_eq!(harness.engine.active_voices(), 0, "Gate release completed");
 
     harness.palette("quantize 100");
     harness.palette("swing 60");
     harness.key(KeyCode::Tab, KeyModifiers::NONE);
     harness.key(KeyCode::Char('-'), KeyModifiers::NONE);
+    let edited = harness.app.patterns().selected_pattern();
+    assert_eq!(edited.quantize_strength(), 1.0);
+    assert_eq!(edited.transport().swing(), 0.60);
+    assert_eq!(edited.events()[0].velocity, 0.95);
     harness.ui_iteration();
     harness.callback(0);
     harness.ui_iteration();
+    // Restart through the public transport reducer so the newly compiled snapshot has a known
+    // callback origin and its edited event must become an audible engine action.
+    harness.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    harness.callback(0);
+    harness.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    let origin = harness.engine.rendered_frame();
+    harness.callback(0);
+    let triggers_before = harness.engine.executed_triggers();
+    harness.callback(1);
+    assert!(harness.engine.executed_triggers() > triggers_before);
     harness.key(KeyCode::Char('.'), KeyModifiers::NONE);
-    harness.callback(
-        harness
+    let boundary = origin
+        + harness
             .app
             .patterns()
             .selected_pattern()
             .transport()
-            .loop_frames() as usize
-            + 1_601,
+            .loop_frames();
+    let before_boundary = usize::try_from(boundary - harness.engine.rendered_frame() - 1).unwrap();
+    harness.callback(before_boundary);
+    harness.ui_iteration();
+    assert_eq!(harness.engine.rendered_frame(), boundary - 1);
+    assert_eq!(
+        harness.app.telemetry().pattern_slot,
+        Some(PatternSlotId::new(0).unwrap())
     );
+    harness.callback(1);
+    assert_eq!(harness.engine.rendered_frame(), boundary);
+    // Telemetry is emitted at fixed callback intervals, so wait only through the next interval
+    // after crossing the exact one-frame boundary rather than rendering a whole loop blindly.
+    harness.callback(1_600 - (boundary % 1_600) as usize);
     harness.ui_iteration();
     let screen = harness.screen();
     assert!(screen.contains("PATTERN 02"), "{screen}");
@@ -334,18 +388,48 @@ fn device_rate_retry_rebuilds_all_slots_round_robin_and_keeps_edits() {
     let retry_controller = Rc::new(RefCell::new(controller));
     let retry_failure = Rc::new(Cell::new(false));
     let retry_engine = AudioEngine::new(44_100, ports).unwrap();
+    let submissions_before_retry = harness.app.maintain_audio_pattern_submissions();
     harness.app.retry_with(Box::new(ControllerPort {
         sample_rate: 44_100,
         controller: Rc::clone(&retry_controller),
         runtime_failure: Rc::clone(&retry_failure),
+        observed_acks: Rc::clone(&harness.observed_acks),
+        installed_settings: Rc::clone(&harness.installed_settings),
     }));
     harness.engine = retry_engine;
     harness.controller = retry_controller;
     harness.runtime_failure = retry_failure;
+    assert_eq!(
+        harness.app.maintain_audio_pattern_submissions(),
+        submissions_before_retry,
+        "retry only marks patterns dirty; it never synchronously submits all slots"
+    );
+    let ready_slots = |app: &App| {
+        (0..16)
+            .filter(|index| {
+                app.patterns()
+                    .is_slot_ready(PatternSlotId::new(*index).unwrap())
+            })
+            .count()
+    };
+    assert_eq!(ready_slots(&harness.app), 0);
     for _ in 0..16 {
+        let submissions_before = harness.app.maintain_audio_pattern_submissions();
+        let ready_before = ready_slots(&harness.app);
         harness.ui_iteration();
+        assert_eq!(
+            harness.app.maintain_audio_pattern_submissions(),
+            submissions_before + 1,
+            "one maintenance iteration submits exactly one rebuilt slot"
+        );
+        assert_eq!(ready_slots(&harness.app), ready_before + 1);
         harness.callback(0);
     }
+    assert_eq!(
+        harness.app.maintain_audio_pattern_submissions(),
+        submissions_before_retry + 16
+    );
+    assert_eq!(ready_slots(&harness.app), 16);
     assert_eq!(harness.app.patterns().sample_rates(), [44_100; 16]);
     assert_eq!(
         harness.app.patterns().selected_pattern().events()[0].frame,
@@ -362,6 +446,8 @@ fn dense_pattern_and_ack_overflow_are_visible_without_silent_loss() {
         sample_rate: 48_000,
         controller: Rc::clone(&controller),
         runtime_failure: Rc::new(Cell::new(false)),
+        observed_acks: Rc::new(RefCell::new(Vec::new())),
+        installed_settings: Rc::new(RefCell::new(Vec::new())),
     };
     let mut app = App::with_audio(Box::new(app_port));
     app.set_keyboard_capabilities(KeyboardCapabilities {

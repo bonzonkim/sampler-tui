@@ -549,6 +549,7 @@ impl EditablePattern {
                 &mut actions,
                 PatternAction {
                     frame: event.frame,
+                    trigger_frame: event.frame,
                     event_id: event.id,
                     pad: event.pad,
                     kind: PatternActionKind::Trigger {
@@ -566,6 +567,7 @@ impl EditablePattern {
                     &mut actions,
                     PatternAction {
                         frame: release_frame,
+                        trigger_frame: event.frame,
                         event_id: event.id,
                         pad: event.pad,
                         kind: PatternActionKind::Release,
@@ -627,6 +629,7 @@ pub enum PatternActionKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PatternAction {
     pub frame: Frame,
+    pub trigger_frame: Frame,
     pub event_id: EventId,
     pub pad: PadId,
     pub kind: PatternActionKind,
@@ -825,6 +828,27 @@ mod tests {
             snapshot.actions()[1].kind,
             PatternActionKind::Trigger { .. }
         ));
+    }
+
+    #[test]
+    fn compiled_release_retains_the_trigger_relative_frame() {
+        let mut pattern = editable(100, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        pattern
+            .insert(event_with_duration(7, loop_frames - 5, 10))
+            .unwrap();
+
+        let snapshot = pattern.compile().unwrap();
+        let release = snapshot
+            .actions()
+            .iter()
+            .find(|action| action.kind == PatternActionKind::Release)
+            .unwrap();
+
+        assert_eq!(
+            (release.event_id, release.frame, release.trigger_frame),
+            (EventId(7), 5, loop_frames - 5)
+        );
     }
 
     #[test]

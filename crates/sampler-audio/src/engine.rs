@@ -16,6 +16,7 @@ use crate::{
 
 const VOICE_COUNT: usize = 32;
 const PENDING_COUNT: usize = 128;
+const NON_LIVE_PENDING_COUNT: usize = 64;
 const MAX_COMMANDS_PER_RENDER: usize = 64;
 const MAX_PATTERN_ACTIONS_PER_CALLBACK: usize = 64;
 const PAD_COUNT: usize = 160;
@@ -310,6 +311,14 @@ impl ScheduledAction {
             }
         }
     }
+
+    fn is_live(self) -> bool {
+        match self {
+            Self::Trigger { source, .. } | Self::Release { source, .. } => {
+                matches!(source, ActionSource::Live(_))
+            }
+        }
+    }
 }
 
 pub struct AudioEngine {
@@ -321,8 +330,7 @@ pub struct AudioEngine {
     voices: [Option<AudioVoice>; VOICE_COUNT],
     pending: [Option<ScheduledAction>; PENDING_COUNT],
     pending_len: usize,
-    current_live: [Option<ScheduledAction>; MAX_COMMANDS_PER_RENDER],
-    current_live_len: usize,
+    non_live_pending: usize,
     next_command_lane: CommandLane,
     active_stop_fence: Option<u64>,
     deferred_retirement: Option<CriticalEvent>,
@@ -360,8 +368,7 @@ impl AudioEngine {
             voices: [None; VOICE_COUNT],
             pending: [None; PENDING_COUNT],
             pending_len: 0,
-            current_live: [None; MAX_COMMANDS_PER_RENDER],
-            current_live_len: 0,
+            non_live_pending: 0,
             next_command_lane: CommandLane::Immediate,
             active_stop_fence: None,
             deferred_retirement: None,
@@ -401,8 +408,6 @@ impl AudioEngine {
         let horizon = self.rendered_frame.saturating_add(frame_count_as_frame);
         self.ports.publish_render_horizon(horizon);
 
-        self.current_live.fill(None);
-        self.current_live_len = 0;
         self.flush_deferred_retirement();
         self.flush_pattern_retirement();
         self.pattern_player.advance_to(self.rendered_frame);
@@ -413,7 +418,6 @@ impl AudioEngine {
         for _ in 0..frame_count {
             self.pattern_player.advance_to(self.rendered_frame);
             self.execute_due_actions();
-            self.execute_due_live_actions();
             let frame = self.render_frame();
             self.telemetry_peak_left = self.telemetry_peak_left.max(frame[0].abs());
             self.telemetry_peak_right = self.telemetry_peak_right.max(frame[1].abs());
@@ -422,8 +426,6 @@ impl AudioEngine {
             self.pattern_player.advance_to(self.rendered_frame);
             self.emit_telemetry_if_due();
         }
-
-        debug_assert_eq!(self.current_live_len, 0);
 
         self.retire_unused_samples();
     }
@@ -497,7 +499,7 @@ impl AudioEngine {
         }
     }
 
-    fn drain_one_immediate_command(&mut self, horizon: Frame) -> bool {
+    fn drain_one_immediate_command(&mut self, _horizon: Frame) -> bool {
         self.apply_stop_fence();
         let resolved_live_frame = self
             .rendered_frame
@@ -554,7 +556,7 @@ impl AudioEngine {
 
         if let Some(action) = live_action
             && !self.action_is_stopped(action)
-            && (action.at_frame() >= horizon || self.current_live_len == MAX_COMMANDS_PER_RENDER)
+            && !self.can_admit(action)
         {
             return false;
         }
@@ -564,7 +566,7 @@ impl AudioEngine {
         };
         if let Some(action) = live_action {
             if !self.action_is_stopped(action) {
-                self.insert_current_live(action);
+                self.insert_pending(action);
             }
         } else {
             self.execute_immediate(command);
@@ -601,7 +603,7 @@ impl AudioEngine {
             Err(_) => return false,
         };
         if let Some(action) = timed_action {
-            if !self.action_is_stopped(action) && self.pending_len == PENDING_COUNT {
+            if !self.action_is_stopped(action) && !self.can_admit(action) {
                 return false;
             }
             if self.ports.commands.pop().is_err() {
@@ -804,22 +806,7 @@ impl AudioEngine {
             self.pending[index] = None;
         }
         self.pending_len = retained;
-
-        let old_live_len = self.current_live_len;
-        let mut retained_live = 0;
-        for index in 0..old_live_len {
-            let Some(action) = self.current_live[index] else {
-                continue;
-            };
-            if !self.action_is_stopped(action) {
-                self.current_live[retained_live] = Some(action);
-                retained_live += 1;
-            }
-        }
-        for index in retained_live..old_live_len {
-            self.current_live[index] = None;
-        }
-        self.current_live_len = retained_live;
+        self.refresh_non_live_pending();
     }
 
     fn cancel_pattern_actions(&mut self) {
@@ -838,6 +825,7 @@ impl AudioEngine {
             self.pending[index] = None;
         }
         self.pending_len = retained;
+        self.refresh_non_live_pending();
     }
 
     fn schedule_pattern_actions(&mut self, horizon: Frame) {
@@ -882,7 +870,9 @@ impl AudioEngine {
                 total.saturating_add(pattern_interval_action_count(&pattern.snapshot, *interval));
         }
 
-        let free_entries = PENDING_COUNT.saturating_sub(self.pending_len);
+        let free_entries = PENDING_COUNT
+            .saturating_sub(self.pending_len)
+            .min(NON_LIVE_PENDING_COUNT.saturating_sub(self.non_live_pending));
         let admitted_limit = usize::try_from(total)
             .unwrap_or(usize::MAX)
             .min(MAX_PATTERN_ACTIONS_PER_CALLBACK)
@@ -935,36 +925,29 @@ impl AudioEngine {
         }
         self.pending[insert_at] = Some(action);
         self.pending_len += 1;
+        if !action.is_live() {
+            self.non_live_pending += 1;
+        }
     }
 
-    fn insert_current_live(&mut self, action: ScheduledAction) {
-        let mut insert_at = self.current_live_len;
-        while insert_at > 0
-            && self.current_live[insert_at - 1]
-                .is_some_and(|pending| pending.at_frame() > action.at_frame())
-        {
-            self.current_live[insert_at] = self.current_live[insert_at - 1];
-            insert_at -= 1;
-        }
-        self.current_live[insert_at] = Some(action);
-        self.current_live_len += 1;
+    fn can_admit(&self, action: ScheduledAction) -> bool {
+        self.pending_len < PENDING_COUNT
+            && (action.is_live() || self.non_live_pending < NON_LIVE_PENDING_COUNT)
+    }
+
+    fn refresh_non_live_pending(&mut self) {
+        self.non_live_pending = self
+            .pending
+            .iter()
+            .take(self.pending_len)
+            .flatten()
+            .filter(|action| !action.is_live())
+            .count();
     }
 
     fn execute_due_actions(&mut self) {
         while self.pending[0].is_some_and(|action| action.at_frame() <= self.rendered_frame) {
             let Some(action) = self.remove_first_pending() else {
-                break;
-            };
-            if action.at_frame() < self.rendered_frame {
-                self.late_commands = self.late_commands.saturating_add(1);
-            }
-            self.execute_action(action);
-        }
-    }
-
-    fn execute_due_live_actions(&mut self) {
-        while self.current_live[0].is_some_and(|action| action.at_frame() <= self.rendered_frame) {
-            let Some(action) = self.remove_first_current_live() else {
                 break;
             };
             if action.at_frame() < self.rendered_frame {
@@ -981,16 +964,9 @@ impl AudioEngine {
         }
         self.pending_len -= 1;
         self.pending[self.pending_len] = None;
-        Some(action)
-    }
-
-    fn remove_first_current_live(&mut self) -> Option<ScheduledAction> {
-        let action = self.current_live[0]?;
-        for index in 1..self.current_live_len {
-            self.current_live[index - 1] = self.current_live[index];
+        if !action.is_live() {
+            self.non_live_pending -= 1;
         }
-        self.current_live_len -= 1;
-        self.current_live[self.current_live_len] = None;
         Some(action)
     }
 
@@ -1663,12 +1639,11 @@ mod tests {
             PadSettings::default(),
             1,
         );
-        for _ in 0..100 {
+        for _ in 0..36 {
             controller.trigger(pad, 10_000, 1.0).unwrap();
         }
         engine.render_frames(0, |_| {});
-        engine.render_frames(0, |_| {});
-        assert_eq!(engine.pending_actions(), 100);
+        assert_eq!(engine.pending_actions(), 36);
         let events = (0..16).map(|index| (index % 10, pad)).collect::<Vec<_>>();
         controller
             .install_pattern(pattern_snapshot_with_triggers(0, 100, &events))
@@ -1682,7 +1657,7 @@ mod tests {
 
         assert_eq!(engine.executed_triggers(), 28);
         assert_eq!(engine.last_triggered_frame, Some(15));
-        assert_eq!(engine.pending_actions(), 100);
+        assert_eq!(engine.pending_actions(), 36);
         assert_eq!(engine.pattern_overflows(), 52);
     }
 
@@ -1738,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn full_future_array_does_not_delay_live_onset_or_ack_in_a_large_block() {
+    fn live_frame_is_fixed_across_repeated_short_callbacks() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
         let pad = PadId::first();
@@ -1748,36 +1723,101 @@ mod tests {
             100,
             pad,
             PadSettings::default(),
-            1,
+            128,
         );
         arm_recording_capture(&mut controller, &mut engine, 100);
-        for _ in 0..PENDING_COUNT {
-            controller.trigger(pad, 10_000, 1.0).unwrap();
-        }
-        engine.render_frames(0, |_| {});
-        engine.render_frames(0, |_| {});
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
-        let observed_at = engine.rendered_frame();
-        controller.trigger_live_tracked(pad, 1.0).unwrap();
-        let mut callback_frame = observed_at;
-        let mut onset = None;
+        let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
 
-        engine.render_frames(128, |frame| {
-            if onset.is_none() && frame != [0.0, 0.0] {
-                onset = Some(callback_frame);
+        engine.render_frames(32, |frame| assert_eq!(frame, [0.0, 0.0]));
+        assert_eq!(engine.queued_commands(), 0);
+        assert_eq!(engine.pending_actions(), 1);
+        engine.render_frames(32, |frame| assert_eq!(frame, [0.0, 0.0]));
+        let mut onset = None;
+        engine.render_frames(1, |frame| {
+            if frame != [0.0, 0.0] {
+                onset = Some(64);
             }
-            callback_frame += 1;
         });
 
         let mut acks = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
-        assert_eq!(onset, Some(observed_at + 64));
-        assert_eq!(acks[0].frame, observed_at + 64);
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(onset, Some(64));
+        assert_eq!((acks[0].id, acks[0].frame), (id, 64));
     }
 
     #[test]
-    fn short_callbacks_defer_live_without_reusing_a_stale_resolved_frame() {
+    fn sixty_four_non_live_and_sixty_four_live_share_exactly_128_slots() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        for _ in 0..64 {
+            controller.trigger(pad, 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        for _ in 0..64 {
+            controller.trigger_live(pad, 1.0).unwrap();
+        }
+
+        engine.render_frames(0, |_| {});
+
+        assert_eq!(engine.pending_actions(), 128);
+        assert_eq!(
+            engine
+                .pending
+                .iter()
+                .flatten()
+                .filter(|action| {
+                    !matches!(
+                        action,
+                        ScheduledAction::Trigger {
+                            source: ActionSource::Live(_),
+                            ..
+                        } | ScheduledAction::Release {
+                            source: ActionSource::Live(_),
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            64
+        );
+        controller.trigger_live(pad, 1.0).unwrap();
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.pending_actions(), 128);
+        assert_eq!(engine.queued_commands(), 1);
+    }
+
+    #[test]
+    fn non_live_quota_blocks_only_the_non_live_lane_head() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        for _ in 0..65 {
+            controller.trigger(pad, 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        controller.trigger_live(pad, 1.0).unwrap();
+
+        engine.render_frames(0, |_| {});
+
+        assert_eq!(engine.pending_actions(), 65);
+        assert_eq!(engine.queued_commands(), 1);
+        assert!(engine.pending.iter().flatten().any(|action| {
+            matches!(
+                action,
+                ScheduledAction::Trigger {
+                    source: ActionSource::Live(_),
+                    ..
+                } | ScheduledAction::Release {
+                    source: ActionSource::Live(_),
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn full_non_live_quota_does_not_delay_live_onset_or_ack_in_a_large_block() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
         let pad = PadId::first();
@@ -1790,14 +1830,16 @@ mod tests {
             1,
         );
         arm_recording_capture(&mut controller, &mut engine, 100);
-        controller.trigger_live_tracked(pad, 1.0).unwrap();
-
-        engine.render_frames(64, |frame| assert_eq!(frame, [0.0, 0.0]));
-        engine.render_frames(32, |frame| assert_eq!(frame, [0.0, 0.0]));
-        assert_eq!(engine.queued_commands(), 1);
+        for _ in 0..NON_LIVE_PENDING_COUNT {
+            controller.trigger(pad, 10_000, 1.0).unwrap();
+        }
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
         let observed_at = engine.rendered_frame();
+        controller.trigger_live_tracked(pad, 1.0).unwrap();
         let mut callback_frame = observed_at;
         let mut onset = None;
+
         engine.render_frames(128, |frame| {
             if onset.is_none() && frame != [0.0, 0.0] {
                 onset = Some(callback_frame);
@@ -1809,6 +1851,40 @@ mod tests {
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
         assert_eq!(onset, Some(observed_at + 64));
         assert_eq!(acks[0].frame, observed_at + 64);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
+    }
+
+    #[test]
+    fn short_callbacks_preserve_the_initial_resolved_live_frame() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        install_ready_sample(
+            &mut controller,
+            &mut engine,
+            100,
+            pad,
+            PadSettings::default(),
+            1,
+        );
+        arm_recording_capture(&mut controller, &mut engine, 100);
+        let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
+
+        engine.render_frames(64, |frame| assert_eq!(frame, [0.0, 0.0]));
+        let mut onset = None;
+        let mut callback_frame = 64;
+        engine.render_frames(32, |frame| {
+            if onset.is_none() && frame != [0.0, 0.0] {
+                onset = Some(callback_frame);
+            }
+            callback_frame += 1;
+        });
+
+        let mut acks = [crate::LiveAck::EMPTY; 1];
+        assert_eq!(controller.drain_live_acks(&mut acks), 1);
+        assert_eq!(engine.queued_commands(), 0);
+        assert_eq!(onset, Some(64));
+        assert_eq!((acks[0].id, acks[0].frame), (id, 64));
     }
 
     #[test]
@@ -2069,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn live_trigger_runs_when_the_future_action_array_is_full() {
+    fn live_trigger_runs_when_the_non_live_quota_is_full() {
         let (mut controller, mut engine) = harness();
         controller
             .install(
@@ -2079,19 +2155,18 @@ mod tests {
             )
             .unwrap();
         engine.render_frames(1, |_| {});
-        for _ in 0..PENDING_COUNT {
+        for _ in 0..NON_LIVE_PENDING_COUNT {
             controller.trigger(PadId::first(), 10_000, 1.0).unwrap();
         }
         engine.render_frames(0, |_| {});
-        engine.render_frames(0, |_| {});
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
 
         controller.trigger_live(PadId::first(), 1.0).unwrap();
         engine.render_frames(65, |_| {});
 
         assert_eq!(engine.executed_triggers(), 1);
         assert_eq!(engine.last_triggered_frame, Some(65));
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
     }
 
     #[test]
@@ -2103,12 +2178,11 @@ mod tests {
             .install(first, constant_sample(1_024, 0.25), PadSettings::default())
             .unwrap();
         engine.render_frames(64, |_| {});
-        for _ in 0..PENDING_COUNT {
+        for _ in 0..NON_LIVE_PENDING_COUNT {
             controller.trigger(first, 10_000, 1.0).unwrap();
         }
         engine.render_frames(0, |_| {});
-        engine.render_frames(0, |_| {});
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
 
         controller.trigger(first, 20_000, 1.0).unwrap();
         controller
@@ -2127,7 +2201,7 @@ mod tests {
         assert_eq!(engine.executed_triggers(), 1);
         assert_eq!(engine.last_triggered_frame, Some(128));
         assert_eq!(engine.voices_for_pad(second), 0);
-        assert_eq!(engine.pending_actions(), PENDING_COUNT);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
         assert_eq!(engine.queued_commands(), 2);
         assert_eq!(engine.late_commands(), 0);
     }
@@ -2185,10 +2259,9 @@ mod tests {
             .install(pad, constant_sample(1_024, 0.25), settings)
             .unwrap();
         engine.render_frames(64, |_| {});
-        for _ in 0..PENDING_COUNT {
+        for _ in 0..NON_LIVE_PENDING_COUNT {
             controller.trigger(pad, 10_000, 1.0).unwrap();
         }
-        engine.render_frames(0, |_| {});
         engine.render_frames(0, |_| {});
 
         controller.trigger(pad, 20_000, 1.0).unwrap();
@@ -2284,7 +2357,7 @@ mod tests {
     }
 
     #[test]
-    fn full_pending_array_leaves_additional_actions_in_the_command_queue() {
+    fn full_non_live_quota_leaves_additional_timed_actions_in_the_command_queue() {
         let (mut controller, mut engine) = harness();
         for frame in 1000..1130 {
             controller.trigger(PadId::first(), frame, 1.0).unwrap();
@@ -2293,8 +2366,8 @@ mod tests {
         for _ in 0..3 {
             engine.render_stereo(&mut output);
         }
-        assert_eq!(engine.pending_actions(), 128);
-        assert_eq!(engine.queued_commands(), 2);
+        assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
+        assert_eq!(engine.queued_commands(), 66);
     }
 
     fn stop_all_outcome(saturate_pending: bool) -> (usize, usize, usize, usize) {
@@ -2308,13 +2381,11 @@ mod tests {
         assert_eq!(engine.active_voices(), 1);
 
         if saturate_pending {
-            for frame in 10_000..10_130 {
+            for frame in 10_000..10_066 {
                 controller.trigger(PadId::first(), frame, 1.0).unwrap();
             }
             engine.render_frames(0, |_| {});
-            engine.render_frames(0, |_| {});
-            engine.render_frames(0, |_| {});
-            assert_eq!(engine.pending_actions(), PENDING_COUNT);
+            assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
             assert_eq!(engine.queued_commands(), 2);
         }
 

@@ -514,6 +514,15 @@ mod tests {
             late_commands: 0,
             invalid_commands: 0,
             command_overflows: 0,
+            pattern_slot: None,
+            pattern_generation: None,
+            pattern_playing: false,
+            pattern_recording: false,
+            pattern_origin: None,
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
         };
 
         assert!(telemetry.is_pad_active(first));
@@ -769,6 +778,15 @@ pub struct Telemetry {
     pub late_commands: u64,
     pub invalid_commands: u64,
     pub command_overflows: u64,
+    pub pattern_slot: Option<PatternSlotId>,
+    pub pattern_generation: Option<u64>,
+    pub pattern_playing: bool,
+    pub pattern_recording: bool,
+    pub pattern_origin: Option<Frame>,
+    pub pattern_playhead: Frame,
+    pub pattern_loop_count: u64,
+    pub pattern_overflows: u64,
+    pub live_ack_overflows: u64,
 }
 
 impl Telemetry {

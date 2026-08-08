@@ -3,10 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sampler_audio::{
-    AudioController, AudioEngine, PadId, PadSettings, SampleBuffer, audio_channels,
-    audio_channels_with_test_capacities, write_frames,
+    AudioController, AudioEngine, LiveAck, PadId, PadSettings, PatternSwitch, SampleBuffer,
+    audio_channels, audio_channels_with_test_capacities, write_frames,
 };
-use sampler_core::{BankId, PlaybackMode};
+use sampler_core::{
+    BankId, EditablePattern, EventId, Meter, PatternEvent, PatternSlotId, PlaybackMode, Resolution,
+    Tempo, Transport,
+};
 
 struct CountingAllocator {
     enabled: AtomicBool,
@@ -76,6 +79,32 @@ fn looping_harness() -> (AudioController, AudioEngine) {
     (controller, engine)
 }
 
+fn pattern_snapshot(
+    slot: u8,
+    sample_rate: u32,
+    trigger_frames: &[u64],
+) -> Arc<sampler_core::PatternSnapshot> {
+    let transport = Transport::new(
+        sample_rate,
+        Tempo::new(300.0).unwrap(),
+        Meter::new(1, 8).unwrap(),
+        1,
+        Resolution::Sixteenth,
+    )
+    .unwrap();
+    let mut pattern =
+        EditablePattern::new(PatternSlotId::new(slot).unwrap(), "Pattern", transport).unwrap();
+    for (index, frame) in trigger_frames.iter().copied().enumerate() {
+        pattern
+            .insert(
+                PatternEvent::new(EventId(index as u64 + 1), PadId::first(), frame, 1.0, None)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    Arc::new(pattern.compile().unwrap())
+}
+
 fn assert_zero_callback_activity(name: &str, callback: impl FnOnce()) {
     COUNTS.reset_and_enable();
     callback();
@@ -132,7 +161,7 @@ fn measure_live_and_recovery_command_ingestion() {
     controller.release_live(PadId::first()).unwrap();
 
     assert_zero_callback_activity("live and recovery command ingestion", || {
-        engine.render_frames(1, |_| {});
+        engine.render_frames(65, |_| {});
     });
     assert_eq!(engine.executed_triggers(), 1);
 
@@ -169,7 +198,7 @@ fn measure_live_input_behind_a_full_future_action_array() {
     controller.trigger_live(pad, 1.0).unwrap();
 
     assert_zero_callback_activity("live input behind full future actions", || {
-        engine.render_frames(1, |_| {});
+        engine.render_frames(65, |_| {});
     });
     assert_eq!(engine.executed_triggers(), 1);
 }
@@ -292,6 +321,60 @@ fn measure_render_horizon_publication() {
     assert_eq!((COUNTS.allocations(), COUNTS.deallocations()), (0, 0));
 }
 
+fn measure_pattern_playback_acknowledgement_and_retirement() {
+    let (mut controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(100, ports).unwrap();
+    controller
+        .install(
+            PadId::first(),
+            Arc::new(SampleBuffer::new(100, vec![0.5; 128]).unwrap()),
+            PadSettings::default(),
+        )
+        .unwrap();
+    engine.render_frames(0, |_| {});
+
+    let slot_zero = PatternSlotId::new(0).unwrap();
+    let slot_one = PatternSlotId::new(1).unwrap();
+    let initial = pattern_snapshot(0, 100, &[2, 8]);
+    let replacement = pattern_snapshot(0, 100, &[1, 7, 9]);
+    let boundary_target = pattern_snapshot(1, 100, &[0, 6]);
+    let initial_owner = controller.install_pattern(Arc::clone(&initial)).unwrap();
+    controller
+        .install_pattern(Arc::clone(&boundary_target))
+        .unwrap();
+    controller
+        .select_pattern(slot_zero, PatternSwitch::Immediate)
+        .unwrap();
+    controller.play_pattern().unwrap();
+    controller
+        .set_record_capture(Some((slot_zero, initial.generation())))
+        .unwrap();
+    controller
+        .trigger_live_tracked(PadId::first(), 0.75)
+        .unwrap();
+
+    assert_zero_callback_activity(
+        "pattern playback, ack, switch, stop, and retirement",
+        || {
+            engine.render_frames(75, |_| {});
+            controller
+                .install_pattern(Arc::clone(&replacement))
+                .unwrap();
+            controller
+                .select_pattern(slot_one, PatternSwitch::NextBoundary)
+                .unwrap();
+            controller.release_live_tracked(PadId::first()).unwrap();
+            engine.render_frames(128, |_| {});
+            controller.stop_pattern().unwrap();
+            engine.render_frames(128, |_| {});
+        },
+    );
+
+    let mut acks = [LiveAck::EMPTY; 2];
+    assert_eq!(controller.drain_live_acks(&mut acks), 2);
+    assert_eq!(controller.reclaim_retired_pattern(), Some(initial_owner));
+}
+
 #[test]
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
@@ -305,4 +388,5 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_telemetry_full_handling();
     measure_pure_device_write_adapter();
     measure_render_horizon_publication();
+    measure_pattern_playback_acknowledgement_and_retirement();
 }

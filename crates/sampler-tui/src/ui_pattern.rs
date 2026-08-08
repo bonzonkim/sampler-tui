@@ -208,9 +208,10 @@ pub(crate) fn render_pattern(frame: &mut Frame, area: Rect, app: &App) {
         inner,
         19,
         format!(
-            "Events {}/1024 · overflow {} · updates {}",
+            "Events {}/1024 · pattern overflow {} · record ack overflow {} · updates {}",
             pattern.events().len(),
             telemetry.pattern_overflows,
+            telemetry.live_ack_overflows,
             if workspace.has_pending_snapshot(workspace.selected_slot()) {
                 "pending"
             } else {

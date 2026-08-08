@@ -16,7 +16,8 @@ pub use command::{
     audio_channels_with_test_capacities,
 };
 pub use decode::{
-    DecodeLimits, DecodedAudio, decode_bytes_with_limits, decode_path, decode_path_with_limits,
+    DecodeLimits, DecodedAudio, EncodedAudioFormat, decode_bytes_with_limits, decode_path,
+    decode_path_with_limits, decode_shared_bytes_with_limits, probe_shared_audio_format,
 };
 pub use device::{AudioSession, write_frames};
 pub use engine::AudioEngine;

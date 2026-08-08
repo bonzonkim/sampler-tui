@@ -69,6 +69,15 @@ impl SourceFingerprint {
     /// Fingerprints bytes already read by the loader without reopening `path`.
     pub fn from_encoded_bytes(path: &Path, encoded: &[u8]) -> Result<Self, ProjectStoreError> {
         let extension = SupportedAudioExtension::from_path(path)?;
+        Self::from_encoded_bytes_with_extension(path, encoded, extension)
+    }
+
+    /// Fingerprints already-read bytes with a container extension established by probing.
+    pub fn from_encoded_bytes_with_extension(
+        path: &Path,
+        encoded: &[u8],
+        extension: SupportedAudioExtension,
+    ) -> Result<Self, ProjectStoreError> {
         let mut builder = SourceFingerprintBuilder::new(path, extension);
         builder.update(encoded)?;
         Ok(builder.finish())

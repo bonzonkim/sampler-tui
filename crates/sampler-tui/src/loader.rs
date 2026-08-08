@@ -10,7 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sampler_audio::{
-    DecodeLimits, SampleBuffer, decode_bytes_with_limits, prepare_sample_with_frame_limit,
+    DecodeLimits, EncodedAudioFormat, SampleBuffer, decode_shared_bytes_with_limits,
+    prepare_sample_with_frame_limit, probe_shared_audio_format,
 };
 use sampler_core::{PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
@@ -58,6 +59,12 @@ pub struct StageProjectSampleRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProjectSaveWorkerRequest {
+    pub token: ProjectToken,
+    pub request: ProjectSaveRequest,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerRequest {
     ScanDirectory {
         request_id: u64,
@@ -79,7 +86,7 @@ pub enum WorkerRequest {
         base_preview: EditPreview,
         recipe: SampleEditRecipe,
     },
-    SaveProject(Box<ProjectSaveRequest>),
+    SaveProject(Box<ProjectSaveWorkerRequest>),
     ProbeProject {
         token: ProjectToken,
         directory: PathBuf,
@@ -115,7 +122,10 @@ pub enum WorkerResult {
         result: Result<RenderedSample, String>,
     },
     ProjectSaved {
+        token: ProjectToken,
         kind: SaveKind,
+        project_id: ProjectId,
+        directory: PathBuf,
         revision: u64,
         result: Result<SaveReceipt, ProjectStoreError>,
     },
@@ -416,12 +426,18 @@ fn worker_loop_with_store(
                 result: render_sample_edit(&base, base_preview, recipe),
             },
             WorkerRequest::SaveProject(request) => {
+                let ProjectSaveWorkerRequest { token, request } = *request;
                 let kind = request.kind;
+                let project_id = request.snapshot.project_id;
+                let directory = request.directory.clone();
                 let revision = request.snapshot.revision;
                 WorkerResult::ProjectSaved {
+                    token,
                     kind,
+                    project_id,
+                    directory,
                     revision,
-                    result: store.save(*request),
+                    result: store.save(request),
                 }
             }
             WorkerRequest::ProbeProject { token, directory } => WorkerResult::ProjectProbed {
@@ -532,9 +548,14 @@ fn load_sample(
             max_bytes: MAX_ENCODED_FILE_BYTES,
         });
     }
-    let fingerprint = SourceFingerprint::from_encoded_bytes(path, &encoded)
-        .map_err(|error| LoadSampleError::Fingerprint(error.to_string()))?;
-    let decoded = decode_bytes_with_limits(
+    let encoded = Arc::<[u8]>::from(encoded);
+    let encoded_format = probe_shared_audio_format(path, Arc::clone(&encoded))
+        .map_err(|error| LoadSampleError::Decode(format_error(&error)))?;
+    let extension = supported_extension(path, encoded_format);
+    let fingerprint =
+        SourceFingerprint::from_encoded_bytes_with_extension(path, &encoded, extension)
+            .map_err(|error| LoadSampleError::Fingerprint(error.to_string()))?;
+    let decoded = decode_shared_bytes_with_limits(
         path,
         encoded,
         DecodeLimits {
@@ -564,6 +585,25 @@ fn load_sample(
         source_frames,
         duration,
     })
+}
+
+fn supported_extension(path: &Path, format: EncodedAudioFormat) -> crate::SupportedAudioExtension {
+    use crate::SupportedAudioExtension;
+
+    match format {
+        EncodedAudioFormat::Wav => SupportedAudioExtension::Wav,
+        EncodedAudioFormat::Aiff
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("aif")) =>
+        {
+            SupportedAudioExtension::Aif
+        }
+        EncodedAudioFormat::Aiff => SupportedAudioExtension::Aiff,
+        EncodedAudioFormat::Flac => SupportedAudioExtension::Flac,
+        EncodedAudioFormat::Mp3 => SupportedAudioExtension::Mp3,
+    }
 }
 
 fn render_sample_edit(
@@ -718,17 +758,18 @@ mod tests {
 
     use sampler_audio::SampleBuffer;
     use sampler_core::{BankId, PadId, ProjectId, SampleEditRecipe};
+    use sha2::{Digest, Sha256};
 
     use super::{
         EDIT_PREVIEW_COLUMNS, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
-        ProjectStoreBackend, ProjectToken, StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY,
-        WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, build_preview,
-        downsample_preview, frame_duration, load_sample, preview_column, scan_directory,
-        try_send_request, worker_loop, worker_loop_with_store,
+        ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken, StageProjectSampleRequest,
+        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
+        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
+        preview_column, scan_directory, try_send_request, worker_loop, worker_loop_with_store,
     };
     use crate::{
         DirectoryEntry, ProjectProbe, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError,
-        SaveKind, SaveReceipt, SourceFingerprint,
+        SaveKind, SaveReceipt, SourceFingerprint, SupportedAudioExtension,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -789,6 +830,14 @@ mod tests {
         }
         writer.finalize().unwrap();
         WavFixture(path)
+    }
+
+    fn extensionless_wav_fixture(sample_rate: u32, samples: &[i16]) -> WavFixture {
+        let mut fixture = wav_fixture(sample_rate, samples);
+        let extensionless = fixture.path().with_extension("");
+        fs::rename(fixture.path(), &extensionless).unwrap();
+        fixture.0 = extensionless;
+        fixture
     }
 
     fn pad(bank: u8, index: u8) -> PadId {
@@ -853,7 +902,7 @@ mod tests {
     impl ProjectStoreBackend for ScriptedProjectStore {
         fn save(&self, request: ProjectSaveRequest) -> Result<SaveReceipt, ProjectStoreError> {
             assert_eq!(thread::current().name(), Some("sampler-loader"));
-            if request.kind == SaveKind::Recovery {
+            if request.directory.ends_with("save-error") {
                 return Err(ProjectStoreError::Filesystem {
                     operation: "scripted save",
                     path: request.directory,
@@ -963,6 +1012,68 @@ mod tests {
     }
 
     #[test]
+    fn live_and_project_workers_decode_and_fingerprint_extensionless_wav_bytes() {
+        let fixture = extensionless_wav_fixture(48_000, &[0, i16::MAX, i16::MIN]);
+        let encoded = fs::read(fixture.path()).unwrap();
+        let expected_digest =
+            sampler_core::AssetDigest::from_bytes(Sha256::digest(&encoded).into());
+        let expected_bytes = encoded.len() as u64;
+        let token = ProjectToken::new(74);
+        let project_pad = pad(1, 5);
+        let mut worker = WorkerHandle::spawn();
+
+        worker
+            .try_send(WorkerRequest::LoadSample {
+                pad: pad(0, 2),
+                generation: 22,
+                purpose: LoadPurpose::User,
+                path: fixture.path().to_owned(),
+                engine_rate: 48_000,
+                recipe: SampleEditRecipe::identity(),
+            })
+            .unwrap();
+        worker
+            .try_send(WorkerRequest::StageProjectSample(Box::new(
+                StageProjectSampleRequest {
+                    token,
+                    pad: project_pad,
+                    revision: 23,
+                    path: fixture.path().to_owned(),
+                    engine_rate: 48_000,
+                    recipe: SampleEditRecipe::identity(),
+                },
+            )))
+            .unwrap();
+
+        let WorkerResult::Loaded {
+            result: Ok(live), ..
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("extensionless live load failed")
+        };
+        let WorkerResult::ProjectSampleStaged {
+            token: result_token,
+            pad: result_pad,
+            revision,
+            result: Ok(staged),
+            ..
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("extensionless project stage failed")
+        };
+
+        for fingerprint in [live.fingerprint, staged.fingerprint] {
+            assert_eq!(fingerprint.digest, expected_digest);
+            assert_eq!(fingerprint.encoded_bytes, expected_bytes);
+            assert_eq!(fingerprint.extension, SupportedAudioExtension::Wav);
+        }
+        assert_eq!(result_token, token);
+        assert_eq!(result_pad, project_pad);
+        assert_eq!(revision, 23);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn stage_project_sample_applies_its_recipe_and_echoes_context_on_decode_error() {
         let fixture = wav_fixture(48_000, &[i16::MAX, 0, 0, i16::MIN]);
         let recipe =
@@ -1038,17 +1149,34 @@ mod tests {
     #[test]
     fn project_store_successes_and_errors_echo_operation_context() {
         let mut worker = worker_with_store(Box::new(ScriptedProjectStore));
-        let save_success = empty_save_request(SaveKind::Explicit, 31);
-        let save_error = empty_save_request(SaveKind::Recovery, 32);
+        let save_success_token = ProjectToken::new(79);
+        let save_error_token = ProjectToken::new(80);
+        let mut save_success = empty_save_request(SaveKind::Explicit, 31);
+        save_success.directory = PathBuf::from("save-success");
+        let success_project_id = save_success.snapshot.project_id;
+        let mut save_error = empty_save_request(SaveKind::Explicit, 31);
+        save_error.directory = PathBuf::from("save-error");
+        save_error.snapshot.project_id = ProjectId::from_bytes([7; 16]);
+        let error_project_id = save_error.snapshot.project_id;
         let probe_token = ProjectToken::new(81);
         let discard_token = ProjectToken::new(82);
         let project_id = ProjectId::from_bytes([9; 16]);
 
         worker
-            .try_send(WorkerRequest::SaveProject(Box::new(save_success)))
+            .try_send(WorkerRequest::SaveProject(Box::new(
+                ProjectSaveWorkerRequest {
+                    token: save_success_token,
+                    request: save_success,
+                },
+            )))
             .unwrap();
         worker
-            .try_send(WorkerRequest::SaveProject(Box::new(save_error)))
+            .try_send(WorkerRequest::SaveProject(Box::new(
+                ProjectSaveWorkerRequest {
+                    token: save_error_token,
+                    request: save_error,
+                },
+            )))
             .unwrap();
         worker
             .try_send(WorkerRequest::ProbeProject {
@@ -1082,18 +1210,28 @@ mod tests {
         assert!(matches!(
             worker.recv_timeout(Duration::from_secs(2)).unwrap(),
             WorkerResult::ProjectSaved {
+                token,
                 kind: SaveKind::Explicit,
+                project_id,
+                directory,
                 revision: 31,
                 result: Ok(_)
-            }
+            } if token == save_success_token
+                && project_id == success_project_id
+                && directory.as_path() == Path::new("save-success")
         ));
         assert!(matches!(
             worker.recv_timeout(Duration::from_secs(2)).unwrap(),
             WorkerResult::ProjectSaved {
-                kind: SaveKind::Recovery,
-                revision: 32,
+                token,
+                kind: SaveKind::Explicit,
+                project_id,
+                directory,
+                revision: 31,
                 result: Err(_)
-            }
+            } if token == save_error_token
+                && project_id == error_project_id
+                && directory.as_path() == Path::new("save-error")
         ));
         assert!(matches!(
             worker.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -1122,8 +1260,10 @@ mod tests {
         for _ in 0..WORKER_CHANNEL_CAPACITY {
             try_send_request(Some(&sender), WorkerRequest::Shutdown).unwrap();
         }
-        let request =
-            WorkerRequest::SaveProject(Box::new(empty_save_request(SaveKind::Recovery, 91)));
+        let request = WorkerRequest::SaveProject(Box::new(ProjectSaveWorkerRequest {
+            token: ProjectToken::new(91),
+            request: empty_save_request(SaveKind::Recovery, 91),
+        }));
         let failure = try_send_request(Some(&sender), request.clone()).unwrap_err();
         assert_eq!(failure.kind(), WorkerSendError::WorkerBusy);
         assert_eq!(failure.into_request(), request);

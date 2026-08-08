@@ -1,10 +1,10 @@
-use std::{fs::File, io::Cursor, path::Path};
+use std::{fs::File, io::Cursor, path::Path, sync::Arc};
 
 use symphonia::{
     core::{
         codecs::audio::AudioDecoderOptions,
         errors::Error as SymphoniaError,
-        formats::{FormatOptions, TrackType, probe::Hint},
+        formats::{FormatId, FormatOptions, FormatReader, TrackType, probe::Hint, well_known},
         io::{MediaSource, MediaSourceStream},
         meta::MetadataOptions,
     },
@@ -23,6 +23,14 @@ pub struct DecodeLimits {
 pub struct DecodedAudio {
     pub sample_rate: u32,
     pub channels: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedAudioFormat {
+    Wav,
+    Aiff,
+    Flac,
+    Mp3,
 }
 
 impl DecodedAudio {
@@ -66,7 +74,7 @@ impl DecodedAudio {
 
 pub fn decode_path(path: &Path) -> Result<DecodedAudio, DecodeError> {
     let source = open_path(path)?;
-    decode_source_inner(path, source, None)
+    decode_source_inner(path, source, None).map(|(decoded, _)| decoded)
 }
 
 pub fn decode_path_with_limits(
@@ -74,7 +82,7 @@ pub fn decode_path_with_limits(
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
     let source = open_path(path)?;
-    decode_source_inner(path, source, Some(limits))
+    decode_source_inner(path, source, Some(limits)).map(|(decoded, _)| decoded)
 }
 
 /// Decodes an already-read encoded payload using `path` only as a format/error hint.
@@ -84,6 +92,26 @@ pub fn decode_bytes_with_limits(
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
     decode_source_inner(path, Box::new(Cursor::new(encoded)), Some(limits))
+        .map(|(decoded, _)| decoded)
+}
+
+/// Probes the supported container format from already-read shared bytes.
+pub fn probe_shared_audio_format(
+    path: &Path,
+    encoded: Arc<[u8]>,
+) -> Result<EncodedAudioFormat, DecodeError> {
+    let format = probe_source(path, Box::new(Cursor::new(encoded)))?;
+    supported_audio_format(path, format.format_info().format)
+}
+
+/// Decodes already-read shared bytes without copying or opening `path`.
+pub fn decode_shared_bytes_with_limits(
+    path: &Path,
+    encoded: Arc<[u8]>,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    decode_source_inner(path, Box::new(Cursor::new(encoded)), Some(limits))
+        .map(|(decoded, _)| decoded)
 }
 
 fn open_path(path: &Path) -> Result<Box<dyn MediaSource>, DecodeError> {
@@ -99,24 +127,9 @@ fn decode_source_inner(
     path: &Path,
     source: Box<dyn MediaSource>,
     limits: Option<DecodeLimits>,
-) -> Result<DecodedAudio, DecodeError> {
-    let stream = MediaSourceStream::new(source, Default::default());
-    let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
-        hint.with_extension(&extension.to_ascii_lowercase());
-    }
-
-    let mut format = get_probe()
-        .probe(
-            &hint,
-            stream,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|error| DecodeError::Probe {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+) -> Result<(DecodedAudio, FormatId), DecodeError> {
+    let mut format = probe_source(path, source)?;
+    let encoded_format = format.format_info().format;
     let track =
         format
             .default_track(TrackType::Audio)
@@ -202,11 +215,51 @@ fn decode_source_inner(
         }
     }
 
-    match limits {
+    let decoded = match limits {
         Some(limits) => {
             DecodedAudio::new_with_limits(sample_rate.unwrap_or_default(), channels, limits)
         }
         None => DecodedAudio::new(sample_rate.unwrap_or_default(), channels),
+    }?;
+    Ok((decoded, encoded_format))
+}
+
+fn probe_source(
+    path: &Path,
+    source: Box<dyn MediaSource>,
+) -> Result<Box<dyn FormatReader>, DecodeError> {
+    let stream = MediaSourceStream::new(source, Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(&extension.to_ascii_lowercase());
+    }
+
+    get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|error| DecodeError::Probe {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+fn supported_audio_format(
+    path: &Path,
+    format: FormatId,
+) -> Result<EncodedAudioFormat, DecodeError> {
+    match format {
+        well_known::FORMAT_ID_WAVE => Ok(EncodedAudioFormat::Wav),
+        well_known::FORMAT_ID_AIFF => Ok(EncodedAudioFormat::Aiff),
+        well_known::FORMAT_ID_FLAC => Ok(EncodedAudioFormat::Flac),
+        well_known::FORMAT_ID_MP3 => Ok(EncodedAudioFormat::Mp3),
+        _ => Err(DecodeError::UnsupportedCodec {
+            path: path.to_path_buf(),
+            message: format!("unsupported project audio container {format}"),
+        }),
     }
 }
 

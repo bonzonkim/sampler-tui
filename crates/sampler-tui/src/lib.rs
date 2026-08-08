@@ -11,6 +11,7 @@ pub mod sample_editor;
 pub mod terminal;
 pub mod ui;
 mod ui_pattern;
+mod ui_sample;
 
 pub use app::{
     App, EDIT_PREVIEW_COLUMNS, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView,

@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
 use crate::ui_pattern::{live_identity, live_pattern, render_pattern, transport_bar_index};
+use crate::ui_sample::render_sample as render_sample_workspace;
 use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 
 const MIN_WIDTH: u16 = 80;
@@ -47,6 +48,10 @@ fn render_resize_message(frame: &mut Frame, area: Rect) {
 fn render_base(frame: &mut Frame, area: Rect, app: &App) {
     if app.workspace_view() == WorkspaceView::Pattern {
         render_pattern(frame, area, app);
+        return;
+    }
+    if app.workspace_view() == WorkspaceView::Sample {
+        render_sample_workspace(frame, area, app);
         return;
     }
     let bank = char::from(b'A'.saturating_add(u8::from(app.active_bank())));
@@ -363,11 +368,11 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             frame,
             area,
             " HELP ",
-            58,
-            15,
+            72,
+            20,
             [
                 "GLOBAL (Ctrl+R retries audio first when device is unavailable)",
-                "Tab                                        Perform / Pattern workspace",
+                "Tab / Shift+Tab                            cycle Perform / Pattern / Sample",
                 "Space                                      play / stop selected pattern",
                 "Ctrl+R                                     overdub record selected pattern",
                 ", / .                                     previous / next pattern (1..16)",
@@ -375,7 +380,10 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "Arrows / PgUp / PgDn                       cursor / visible bar",
                 "Enter / Delete                             toggle / remove event",
                 "+ / - / u / Ctrl+Delete                   velocity / undo / clear",
-                "PERFORM: pads 1-4/Q-R/A-F/Z-V · Shift+pad stop · [/] bank",
+                "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
+                "        Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
+                "        plain z remains pad 13; Apply is in-memory only; source unchanged",
+                "PADS: 1-4/Q-R/A-F/Z-V are global · Shift+pad stop · [/] bank",
                 "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
                 "Ctrl+Q / Ctrl+C                            quit",
                 "Esc or ?                                   close help",
@@ -415,12 +423,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             frame,
             area,
             " APPLY SAMPLE EDIT ",
-            58,
+            72,
             6,
             [
                 format!("Apply in-memory edit to pad {}?", pad.index() + 1),
                 format!(
-                    "{before_frames} frames → {after_frames} frames; source file is unchanged."
+                    "{before_frames} frames → {after_frames} frames; in-memory only; source file unchanged."
                 ),
                 "Enter confirms · Esc cancels".to_owned(),
             ],
@@ -429,11 +437,11 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             frame,
             area,
             " DISCARD SAMPLE DRAFT ",
-            58,
+            72,
             6,
             [
                 format!("Discard un-applied edits for pad {}?", pad.index() + 1),
-                "The committed in-memory sample remains unchanged.".to_owned(),
+                "Committed in-memory audio remains unchanged; source file unchanged.".to_owned(),
                 "Enter confirms · Esc keeps editing".to_owned(),
             ],
         ),
@@ -1300,6 +1308,99 @@ mod tests {
     }
 
     #[test]
+    fn sample_workspace_renders_the_bounded_editor_projection_at_minimum_size() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+
+        for expected in [
+            "SAMPLE EDITOR",
+            "PAD 01",
+            "KICK.WAV",
+            "START",
+            "END",
+            "ZOOM 0",
+            "DRAFT CLEAN",
+            "NORMALIZE OFF",
+            "REVERSE OFF",
+            "PITCH +0",
+            "MODE ONESHOT",
+            "FRAME 0..128",
+        ] {
+            assert!(screen.contains(expected), "missing {expected}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn sample_workspace_wide_layout_adds_metadata_without_losing_the_editor() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let minimum = render_lines(80, 24, &app).join("\n");
+        let wide = render_lines(110, 24, &app).join("\n");
+
+        assert!(minimum.contains("SAMPLE EDITOR"));
+        assert!(wide.contains("SAMPLE EDITOR"));
+        assert!(wide.contains("SOURCE 48kHz"));
+        assert!(wide.contains("1024 PREVIEW"));
+    }
+
+    #[test]
+    fn sample_workspace_keeps_fixed_marker_columns_and_uses_ascii_offscreen_direction() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        for width in [80, 110] {
+            assert_eq!(render_symbol(width, 24, &app, 2, 5), "S");
+            assert_eq!(render_symbol(width, 24, &app, 77, 5), "E");
+            assert!(
+                render_style(width, 24, &app, 2, 5)
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+
+        app.apply_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(render_symbol(80, 24, &app, 77, 5), ">");
+    }
+
+    #[test]
+    fn sample_workspace_uses_only_the_preview_for_visible_positive_and_negative_waveform() {
+        let mut app = loaded_states_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let waveform = render_lines(80, 24, &app)[5..12].join("\n");
+
+        assert!(waveform.contains('+'));
+        assert!(waveform.contains('-'));
+    }
+
+    #[test]
+    fn sample_confirmation_overlays_clear_and_state_that_edits_are_in_memory_only() {
+        let mut apply = loaded_states_app(FakeAudio::ready());
+        apply.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        apply.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        apply.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        apply.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let apply_screen = render_lines(80, 24, &apply).join("\n");
+        assert!(apply_screen.contains("in-memory only; source file unchanged"));
+
+        let mut discard = loaded_states_app(FakeAudio::ready());
+        discard.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        discard.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        discard.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        discard.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(render_symbol(80, 24, &discard, 4, 9), "┌");
+        let discard_screen = render_lines(80, 24, &discard).join("\n");
+        assert!(discard_screen.contains("source file unchanged"));
+    }
+
+    #[test]
     fn help_palette_picker_and_device_error_are_centered_overlays() {
         let mut help = ready_app();
         help.open_help();
@@ -1332,7 +1433,7 @@ mod tests {
         let failed = App::without_audio("device disconnected");
 
         for (app, rect) in [
-            (help, (21, 7, 58, 15)),
+            (help, (14, 5, 72, 20)),
             (palette, (19, 12, 62, 5)),
             (picker, (14, 5, 72, 19)),
             (failed, (19, 11, 62, 7)),

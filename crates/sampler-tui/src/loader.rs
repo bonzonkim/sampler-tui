@@ -13,7 +13,7 @@ use sampler_audio::{
     DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits, prepare_sample_with_frame_limit,
     probe_shared_audio_format,
 };
-use sampler_core::{PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
+use sampler_core::{AssetDigest, PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
@@ -55,6 +55,9 @@ pub struct StageProjectSampleRequest {
     pub pad: PadId,
     pub revision: u64,
     pub path: PathBuf,
+    pub project_directory: PathBuf,
+    pub asset_path: String,
+    pub expected_digest: AssetDigest,
     pub engine_rate: u32,
     pub recipe: SampleEditRecipe,
 }
@@ -187,6 +190,7 @@ pub enum LoadSampleError {
     Fingerprint(String),
     Decode(String),
     Prepare(String),
+    ProjectAsset(ProjectStoreError),
 }
 
 impl fmt::Display for LoadSampleError {
@@ -200,6 +204,7 @@ impl fmt::Display for LoadSampleError {
             Self::Fingerprint(error) => formatter.write_str(error),
             Self::Decode(error) => formatter.write_str(error),
             Self::Prepare(error) => formatter.write_str(error),
+            Self::ProjectAsset(error) => error.fmt(formatter),
         }
     }
 }
@@ -466,6 +471,9 @@ fn worker_loop_with_store(
                     pad,
                     revision,
                     path,
+                    project_directory,
+                    asset_path,
+                    expected_digest,
                     engine_rate,
                     recipe,
                 } = *request;
@@ -474,7 +482,13 @@ fn worker_loop_with_store(
                     generation,
                     pad,
                     revision,
-                    result: load_sample(&path, engine_rate, recipe),
+                    result: load_project_sample(
+                        &project_directory,
+                        &asset_path,
+                        expected_digest,
+                        engine_rate,
+                        recipe,
+                    ),
                     path,
                     recipe,
                 }
@@ -559,6 +573,35 @@ fn load_sample(
     let fingerprint =
         SourceFingerprint::from_encoded_bytes_with_extension(path, &encoded, extension)
             .map_err(|error| LoadSampleError::Fingerprint(error.to_string()))?;
+    decode_and_render_sample(path, encoded, fingerprint, engine_rate, recipe)
+}
+
+fn load_project_sample(
+    project_directory: &Path,
+    asset_path: &str,
+    expected_digest: AssetDigest,
+    engine_rate: u32,
+    recipe: SampleEditRecipe,
+) -> Result<LoadedSample, LoadSampleError> {
+    let asset = ProjectStore
+        .read_project_asset(project_directory, asset_path, expected_digest)
+        .map_err(LoadSampleError::ProjectAsset)?;
+    decode_and_render_sample(
+        &asset.path,
+        asset.encoded,
+        asset.fingerprint,
+        engine_rate,
+        recipe,
+    )
+}
+
+fn decode_and_render_sample(
+    path: &Path,
+    encoded: Arc<[u8]>,
+    fingerprint: SourceFingerprint,
+    engine_rate: u32,
+    recipe: SampleEditRecipe,
+) -> Result<LoadedSample, LoadSampleError> {
     let decoded = decode_shared_bytes_with_limits(
         path,
         encoded,
@@ -817,6 +860,21 @@ mod tests {
         WavFixture(path)
     }
 
+    fn project_asset_fixture(
+        label: &str,
+        source: &Path,
+        leaf: &str,
+    ) -> (DirectoryFixture, PathBuf, String, SourceFingerprint) {
+        let project = DirectoryFixture::new(label);
+        let audio = project.path().join("audio");
+        fs::create_dir(&audio).unwrap();
+        let relative = format!("audio/{leaf}");
+        let asset = project.path().join(&relative);
+        fs::copy(source, &asset).unwrap();
+        let fingerprint = SourceFingerprint::from_path(&asset).unwrap();
+        (project, asset, relative, fingerprint)
+    }
+
     fn extensionless_wav_fixture(sample_rate: u32, samples: &[i16]) -> WavFixture {
         let mut fixture = wav_fixture(sample_rate, samples);
         let extensionless = fixture.path().with_extension("");
@@ -1005,6 +1063,8 @@ mod tests {
         let expected_bytes = encoded.len() as u64;
         let token = ProjectToken::new(74);
         let project_pad = pad(1, 5);
+        let (project, staged_path, asset_path, staged_fingerprint) =
+            project_asset_fixture("extensionless-stage", fixture.path(), "sample.wav");
         let mut worker = WorkerHandle::spawn();
 
         worker
@@ -1024,7 +1084,10 @@ mod tests {
                     generation: 9,
                     pad: project_pad,
                     revision: 23,
-                    path: fixture.path().to_owned(),
+                    path: staged_path,
+                    project_directory: project.path().to_owned(),
+                    asset_path,
+                    expected_digest: staged_fingerprint.digest,
                     engine_rate: 48_000,
                     recipe: SampleEditRecipe::identity(),
                 },
@@ -1037,15 +1100,16 @@ mod tests {
         else {
             panic!("extensionless live load failed")
         };
+        let staged_result = worker.recv_timeout(Duration::from_secs(2)).unwrap();
         let WorkerResult::ProjectSampleStaged {
             token: result_token,
             pad: result_pad,
             revision,
             result: Ok(staged),
             ..
-        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        } = staged_result
         else {
-            panic!("extensionless project stage failed")
+            panic!("extensionless project stage failed: {staged_result:?}")
         };
 
         for fingerprint in [live.fingerprint, staged.fingerprint] {
@@ -1150,7 +1214,9 @@ mod tests {
             SampleEditRecipe::new(0, sampler_core::SAMPLE_PHASE_SCALE / 2, false, false).unwrap();
         let token = ProjectToken::new(73);
         let project_pad = pad(1, 4);
-        let missing = fixture.path().with_file_name("missing-stage.wav");
+        let (project, staged_path, asset_path, fingerprint) =
+            project_asset_fixture("recipe-stage", fixture.path(), "sample.wav");
+        let missing = project.path().join("audio/missing-stage.wav");
         let mut worker = WorkerHandle::spawn();
 
         worker
@@ -1160,7 +1226,10 @@ mod tests {
                     generation: 31,
                     pad: project_pad,
                     revision: 19,
-                    path: fixture.path().to_owned(),
+                    path: staged_path.clone(),
+                    project_directory: project.path().to_owned(),
+                    asset_path: asset_path.clone(),
+                    expected_digest: fingerprint.digest,
                     engine_rate: 48_000,
                     recipe,
                 },
@@ -1174,6 +1243,9 @@ mod tests {
                     pad: project_pad,
                     revision: 20,
                     path: missing.clone(),
+                    project_directory: project.path().to_owned(),
+                    asset_path: "audio/missing-stage.wav".to_owned(),
+                    expected_digest: fingerprint.digest,
                     engine_rate: 48_000,
                     recipe,
                 },
@@ -1196,7 +1268,7 @@ mod tests {
         assert_eq!(success_generation, 31);
         assert_eq!(success_pad, project_pad);
         assert_eq!(success_revision, 19);
-        assert_eq!(success_path, fixture.path());
+        assert_eq!(success_path, staged_path);
         assert_eq!(success_recipe, recipe);
         assert_eq!(sample.recipe, recipe);
         assert!(!Arc::ptr_eq(&sample.base, &sample.rendered));

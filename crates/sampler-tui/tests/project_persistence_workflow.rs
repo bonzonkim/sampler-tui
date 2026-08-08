@@ -868,3 +868,36 @@ fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
         old.project_id
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn probe_then_symlink_replacement_fails_secure_stage_without_replacing_old_tuple() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = FixtureTree::new();
+    let source_path = fixture.write_wav("source.wav");
+    let project = fixture.path("stage-race-project");
+    let now = Instant::now();
+    let mut source = Harness::new();
+    source.load(pad(0), &source_path);
+    source.save_as(&project, now);
+    let document = ProjectStore
+        .probe(&project)
+        .unwrap()
+        .explicit
+        .unwrap()
+        .unwrap();
+    let asset = project.join(&document.pads[0].audio_path);
+
+    let mut target = Harness::new();
+    let old = target.app.project_snapshot().unwrap();
+    target.app.request_open_project(&project).unwrap();
+    assert_eq!(target.dispatch_queued(), 1, "probe completes first");
+    fs::remove_file(&asset).unwrap();
+    symlink(&source_path, &asset).unwrap();
+    assert!(target.app.maintain_project(now));
+    assert_eq!(target.dispatch_queued(), 1, "secure stage reads next");
+
+    assert!(target.app.project_open_error().is_some());
+    assert_eq!(target.app.project_snapshot().unwrap(), old);
+}

@@ -157,6 +157,12 @@ struct ValidatedSource {
     path: PathBuf,
 }
 
+pub(crate) struct ProjectAssetBytes {
+    pub(crate) path: PathBuf,
+    pub(crate) encoded: Arc<[u8]>,
+    pub(crate) fingerprint: SourceFingerprint,
+}
+
 impl ValidatedSource {
     fn open(path: &Path) -> Result<Self, ProjectStoreError> {
         let (parent, leaf) = open_anchored_parent(path, true)?;
@@ -319,6 +325,44 @@ impl ProjectDirectory {
             .sync_all()
             .map_err(|error| filesystem_error("sync project lock", &self.path, error))?;
         Ok(ProjectLock { _file: file })
+    }
+}
+
+impl ProjectStore {
+    pub(crate) fn read_project_asset(
+        &self,
+        directory: &Path,
+        relative: &str,
+        expected_digest: AssetDigest,
+    ) -> Result<ProjectAssetBytes, ProjectStoreError> {
+        let project = ProjectDirectory::open_existing(directory)?;
+        let mut source = project.open_asset(relative)?;
+        if source.fingerprint.digest != expected_digest {
+            return Err(ProjectStoreError::AssetIntegrity { path: source.path });
+        }
+        source.rewind()?;
+        let mut encoded = Vec::with_capacity(source.fingerprint.encoded_bytes as usize);
+        source
+            .file
+            .take(MAX_ENCODED_FILE_BYTES + 1)
+            .read_to_end(&mut encoded)
+            .map_err(|error| ProjectStoreError::SourceRead {
+                path: source.path.clone(),
+                kind: error.kind(),
+            })?;
+        let fingerprint = SourceFingerprint::from_encoded_bytes_with_extension(
+            &source.path,
+            &encoded,
+            source.fingerprint.extension,
+        )?;
+        if fingerprint != source.fingerprint || fingerprint.digest != expected_digest {
+            return Err(ProjectStoreError::AssetIntegrity { path: source.path });
+        }
+        Ok(ProjectAssetBytes {
+            path: source.path,
+            encoded: Arc::from(encoded),
+            fingerprint,
+        })
     }
 }
 

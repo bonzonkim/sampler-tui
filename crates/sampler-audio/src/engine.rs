@@ -679,7 +679,7 @@ impl AudioEngine {
 
     fn apply_pattern_transition(&mut self, transition: PatternTransition) {
         let PatternTransition { outgoing, incoming } = transition;
-        self.release_pattern_generation(outgoing.slot, outgoing.generation);
+        self.release_sustained_pattern_generation(outgoing.slot, outgoing.generation);
         self.cancel_pattern_generation(outgoing.slot, outgoing.generation);
         debug_assert_eq!(self.pattern_player.current_generation_id(), Some(incoming));
     }
@@ -1446,6 +1446,18 @@ impl AudioEngine {
             if voice
                 .pattern_voice
                 .is_some_and(|id| id.slot == slot && id.generation == generation)
+            {
+                voice.envelope.begin_release();
+            }
+        }
+    }
+
+    fn release_sustained_pattern_generation(&mut self, slot: PatternSlotId, generation: u64) {
+        for voice in self.voices.iter_mut().flatten() {
+            if voice
+                .pattern_voice
+                .is_some_and(|id| id.slot == slot && id.generation == generation)
+                && matches!(voice.mode, PlaybackMode::Gate | PlaybackMode::Loop)
             {
                 voice.envelope.begin_release();
             }
@@ -2318,6 +2330,52 @@ mod tests {
     }
 
     #[test]
+    fn immediate_switch_preserves_outgoing_one_shot_tail_but_cancels_its_future_actions() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let outgoing_pad = PadId::first();
+        let incoming_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        let one_shot = PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        for pad in [outgoing_pad, incoming_pad] {
+            install_ready_sample(&mut controller, &mut engine, 100, pad, one_shot, 128);
+        }
+        let outgoing = pattern_snapshot_with_triggers(0, 100, &[(0, outgoing_pad)]);
+        let outgoing_generation = outgoing.generation();
+        controller.install_pattern(outgoing).unwrap();
+        controller
+            .install_pattern(pattern_snapshot_with_triggers(1, 100, &[(0, incoming_pad)]))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(1, |_| {});
+        engine.schedule_pattern_actions(30);
+
+        controller
+            .select_pattern(PatternSlotId::new(1).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        engine.render_frames(0, |_| {});
+
+        assert!(
+            engine.voices.iter().flatten().any(|voice| {
+                voice.pad == outgoing_pad && voice.envelope.release_frame.is_none()
+            })
+        );
+        assert!(
+            !engine
+                .pending
+                .iter()
+                .take(engine.pending_len)
+                .flatten()
+                .any(|action| action.pattern_voice_id().is_some_and(|id| {
+                    id.slot == PatternSlotId::new(0).unwrap()
+                        && id.generation == outgoing_generation
+                }))
+        );
+    }
+
+    #[test]
     fn boundary_switch_cleans_exact_outgoing_actions_and_gate_or_loop_voices() {
         for mode in [PlaybackMode::Gate, PlaybackMode::Loop] {
             let (mut controller, ports) = audio_channels();
@@ -2392,6 +2450,52 @@ mod tests {
                     ))
             );
         }
+    }
+
+    #[test]
+    fn boundary_switch_preserves_outgoing_one_shot_tail_but_cancels_its_future_actions() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let outgoing_pad = PadId::first();
+        let incoming_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        let one_shot = PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        for pad in [outgoing_pad, incoming_pad] {
+            install_ready_sample(&mut controller, &mut engine, 100, pad, one_shot, 128);
+        }
+        let outgoing = pattern_snapshot_with_triggers(0, 100, &[(0, outgoing_pad)]);
+        let outgoing_generation = outgoing.generation();
+        controller.install_pattern(outgoing).unwrap();
+        controller
+            .install_pattern(pattern_snapshot_with_triggers(1, 100, &[(0, incoming_pad)]))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(1, |_| {});
+        engine.schedule_pattern_actions(30);
+
+        controller
+            .select_pattern(PatternSlotId::new(1).unwrap(), PatternSwitch::NextBoundary)
+            .unwrap();
+        engine.render_frames(10, |_| {});
+
+        assert!(
+            engine.voices.iter().flatten().any(|voice| {
+                voice.pad == outgoing_pad && voice.envelope.release_frame.is_none()
+            })
+        );
+        assert!(
+            !engine
+                .pending
+                .iter()
+                .take(engine.pending_len)
+                .flatten()
+                .any(|action| action.pattern_voice_id().is_some_and(|id| {
+                    id.slot == PatternSlotId::new(0).unwrap()
+                        && id.generation == outgoing_generation
+                }))
+        );
     }
 
     #[test]

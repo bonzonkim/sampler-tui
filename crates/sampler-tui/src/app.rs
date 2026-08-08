@@ -19,6 +19,7 @@ use crate::loader::{
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
+use crate::sample_editor::SampleEditorContext;
 
 pub const PAD_VIEW_COUNT: usize = 160;
 /// Fixed worker-generated waveform resolution. Perform uses a bounded 64-column projection.
@@ -972,6 +973,21 @@ impl App {
         }
     }
 
+    /// Read-only state for the Sample workspace. The editor intentionally cannot observe or
+    /// manipulate generations, buffers, or worker queues through this projection.
+    pub fn sample_editor_context(&self, pad: PadId) -> SampleEditorContext {
+        let base = self.base_sample(pad);
+        SampleEditorContext {
+            pad,
+            committed: self.committed_sample_recipe(pad),
+            base_frames: base.map(|sample| sample.frames()),
+            base_rate: base.map(|sample| sample.sample_rate()),
+            settings: self.pad(pad).settings,
+            edit_status: self.sample_edit_status(pad),
+            device_available: self.audio.is_some(),
+        }
+    }
+
     fn start_sample_edit(
         &mut self,
         offset: usize,
@@ -1373,6 +1389,9 @@ impl App {
         match self.patterns.view() {
             WorkspaceView::Perform => self.apply_perform_key(key),
             WorkspaceView::Pattern => self.apply_pattern_key(key),
+            // Task 5 installs the Sample key reducer. Keeping the new view inert here avoids
+            // assigning temporary bindings that could steal pad keys from the final routing.
+            WorkspaceView::Sample => {}
         }
     }
 
@@ -1735,7 +1754,7 @@ impl App {
         }
     }
 
-    fn selected_pad_id(&self) -> Option<PadId> {
+    pub fn selected_pad_id(&self) -> Option<PadId> {
         let index = u8::try_from(self.selected_pad).ok()?;
         PadId::new(self.active_bank, index).ok()
     }

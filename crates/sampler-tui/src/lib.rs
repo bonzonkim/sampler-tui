@@ -7,6 +7,7 @@ pub mod input;
 pub mod loader;
 pub mod palette;
 pub mod pattern;
+pub mod sample_editor;
 pub mod terminal;
 pub mod ui;
 mod ui_pattern;
@@ -27,6 +28,11 @@ pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{
     MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCaptureState, PatternCursor,
     PatternMaintenance, PatternStatus, PatternWorkspace, WorkspaceView,
+};
+pub use sample_editor::{
+    OffscreenDirection, SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent,
+    SampleEditorStatus as WorkspaceSampleEditorStatus, SampleMarker, SampleProjection,
+    SampleViewport,
 };
 pub use sampler_audio::{LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch};
 pub use sampler_core::{PatternSlotId, PatternSnapshot};

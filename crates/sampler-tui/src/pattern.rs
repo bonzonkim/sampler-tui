@@ -825,6 +825,25 @@ pub const MAX_ACKS_PER_MAINTENANCE: usize = 64;
 pub enum WorkspaceView {
     Perform,
     Pattern,
+    Sample,
+}
+
+impl WorkspaceView {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Perform => Self::Pattern,
+            Self::Pattern => Self::Sample,
+            Self::Sample => Self::Perform,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Perform => Self::Sample,
+            Self::Pattern => Self::Perform,
+            Self::Sample => Self::Pattern,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1096,10 +1115,7 @@ impl PatternWorkspace {
     }
 
     pub fn toggle_view(&mut self) {
-        self.view = match self.view {
-            WorkspaceView::Perform => WorkspaceView::Pattern,
-            WorkspaceView::Pattern => WorkspaceView::Perform,
-        };
+        self.view = self.view.next();
     }
 
     pub fn selected_slot(&self) -> PatternSlotId {

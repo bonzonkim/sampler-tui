@@ -1119,7 +1119,9 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 struct AnchoredTemp {
     directory: File,
+    identity: File,
     leaf: std::ffi::OsString,
+    path: PathBuf,
     armed: bool,
 }
 
@@ -1127,11 +1129,56 @@ impl AnchoredTemp {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn verify_path_identity(&self) -> Result<(), ProjectStoreError> {
+        let current = rustix::fs::openat(
+            &self.directory,
+            &self.leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| ProjectStoreError::Filesystem {
+            operation: "verify temporary file identity",
+            path: self.path.clone(),
+            kind: io::Error::from(error).kind(),
+        })?;
+        let expected = rustix::fs::fstat(&self.identity).map_err(|error| {
+            filesystem_error(
+                "inspect opened temporary file",
+                &self.path,
+                io::Error::from(error),
+            )
+        })?;
+        let actual = rustix::fs::fstat(&current).map_err(|error| {
+            filesystem_error(
+                "inspect current temporary file",
+                &self.path,
+                io::Error::from(error),
+            )
+        })?;
+        if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
+            return Err(ProjectStoreError::Filesystem {
+                operation: "verify temporary file identity",
+                path: self.path.clone(),
+                kind: io::ErrorKind::Other,
+            });
+        }
+        Ok(())
+    }
+
+    fn unlink_owned(&mut self) -> Result<(), ProjectStoreError> {
+        self.verify_path_identity()?;
+        rustix::fs::unlinkat(&self.directory, &self.leaf, rustix::fs::AtFlags::empty()).map_err(
+            |error| filesystem_error("remove temporary file", &self.path, io::Error::from(error)),
+        )?;
+        self.disarm();
+        Ok(())
+    }
 }
 
 impl Drop for AnchoredTemp {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && self.verify_path_identity().is_ok() {
             let _ = rustix::fs::unlinkat(&self.directory, &self.leaf, rustix::fs::AtFlags::empty());
         }
     }
@@ -1320,6 +1367,7 @@ where
     drop(file);
     checkpoint(hook, AtomicWritePoint::OwnerBeforePublish, &path, false)?;
     project.revalidate_path_identity()?;
+    temporary.verify_path_identity()?;
     match rustix::fs::linkat(
         &project.file,
         &temporary.leaf,
@@ -1342,10 +1390,7 @@ where
             ));
         }
     }
-    rustix::fs::unlinkat(&project.file, &temporary.leaf, rustix::fs::AtFlags::empty()).map_err(
-        |error| filesystem_error("remove save-as owner temp", &path, io::Error::from(error)),
-    )?;
-    temporary.disarm();
+    let _ = temporary.unlink_owned();
     checkpoint(hook, AtomicWritePoint::OwnerAfterPublish, &path, true)?;
     project
         .file
@@ -1385,13 +1430,19 @@ fn create_anchored_temp(
             Mode::from_raw_mode(0o600),
         ) {
             Ok(owned) => {
+                let file = File::from(owned);
+                let identity = file.try_clone().map_err(|error| {
+                    filesystem_error("retain temporary file identity", destination, error)
+                })?;
                 let directory = directory.try_clone().map_err(|error| {
                     filesystem_error("clone directory handle", directory_path, error)
                 })?;
                 return Ok((
-                    File::from(owned),
+                    file,
                     AnchoredTemp {
                         directory,
+                        identity,
+                        path: directory_path.join(&leaf),
                         leaf,
                         armed: true,
                     },
@@ -1497,6 +1548,7 @@ where
     drop(file);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
     project.revalidate_path_identity()?;
+    temporary.verify_path_identity()?;
     match publication {
         MetadataPublication::Replace => {
             rustix::fs::renameat(&project.file, &temporary.leaf, &project.file, leaf).map_err(
@@ -1520,15 +1572,7 @@ where
                 rustix::fs::AtFlags::empty(),
             ) {
                 Ok(()) => {
-                    if rustix::fs::unlinkat(
-                        &project.file,
-                        &temporary.leaf,
-                        rustix::fs::AtFlags::empty(),
-                    )
-                    .is_ok()
-                    {
-                        temporary.disarm();
-                    }
+                    let _ = temporary.unlink_owned();
                 }
                 Err(rustix::io::Errno::EXIST) => {
                     return Err(ProjectStoreError::SaveAsTargetNotEmpty {
@@ -1683,6 +1727,7 @@ where
     })?;
     drop(output);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
+    temporary.verify_path_identity()?;
     match rustix::fs::linkat(
         &audio.file,
         &temporary.leaf,
@@ -1691,16 +1736,7 @@ where
         rustix::fs::AtFlags::empty(),
     ) {
         Ok(()) => {
-            rustix::fs::unlinkat(&audio.file, &temporary.leaf, rustix::fs::AtFlags::empty())
-                .map_err(|error| {
-                    atomic_error(
-                        destination,
-                        AtomicWritePoint::BeforeDirectorySync,
-                        io::Error::from(error).kind(),
-                        true,
-                    )
-                })?;
-            temporary.disarm();
+            let _ = temporary.unlink_owned();
         }
         Err(rustix::io::Errno::EXIST) => {
             verify_existing_asset(audio, leaf, destination, expected)?;
@@ -2028,6 +2064,93 @@ mod tests {
             assert_eq!(read(&fixture.directory.join("project.toml")), before);
             assert!(fixture.temp_entries().is_empty());
         }
+    }
+
+    #[test]
+    fn metadata_commit_rejects_replaced_temp_without_deleting_foreign_replacement() {
+        use std::cell::RefCell;
+
+        let fixture = ProjectFixture::new();
+        fixture
+            .store
+            .save(fixture.request(1, SaveKind::Explicit))
+            .unwrap();
+        let before = read(&fixture.directory.join("project.toml"));
+        let foreign = ProjectDocument::new_v2(
+            ProjectId::from_bytes([0x7f; 16]),
+            "foreign temp",
+            90,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        let replaced = RefCell::new(None);
+
+        let result =
+            fixture
+                .store
+                .save_with_hook(fixture.request(2, SaveKind::Explicit), |point| {
+                    if point == AtomicWritePoint::BeforeRename {
+                        let temp = fixture
+                            .temp_entries()
+                            .into_iter()
+                            .find(|path| {
+                                path.file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .starts_with(".project.toml.sampler-tui-tmp-")
+                            })
+                            .unwrap();
+                        fs::remove_file(&temp).unwrap();
+                        fs::write(&temp, &foreign).unwrap();
+                        *replaced.borrow_mut() = Some(temp);
+                    }
+                    None
+                });
+
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        assert_eq!(read(&fixture.directory.join("project.toml")), before);
+        let replacement = replaced.into_inner().unwrap();
+        assert_eq!(fs::read_to_string(replacement).unwrap(), foreign);
+    }
+
+    #[test]
+    fn asset_publication_rejects_replaced_temp_without_deleting_foreign_replacement() {
+        use std::cell::RefCell;
+
+        let fixture = ProjectFixture::new();
+        let request = fixture.request(1, SaveKind::Explicit);
+        let fingerprint = request.snapshot.pads[0].fingerprint;
+        let final_asset = fixture.directory.join(format!(
+            "audio/{}.{}",
+            fingerprint.digest,
+            fingerprint.extension.as_str()
+        ));
+        let foreign = b"foreign asset temp";
+        let replaced = RefCell::new(None);
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::BeforeRename {
+                let temp = fixture
+                    .temp_entries()
+                    .into_iter()
+                    .find(|path| {
+                        path.parent()
+                            .is_some_and(|parent| parent.ends_with("audio"))
+                    })
+                    .unwrap();
+                fs::remove_file(&temp).unwrap();
+                fs::write(&temp, foreign).unwrap();
+                *replaced.borrow_mut() = Some(temp);
+            }
+            None
+        });
+
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        assert!(!final_asset.exists());
+        assert_eq!(fs::read(replaced.into_inner().unwrap()).unwrap(), foreign);
     }
 
     #[test]
@@ -2823,6 +2946,52 @@ pitch_semitones = 0.0
             Err(ProjectStoreError::SaveAsTargetNotEmpty { .. })
         ));
         assert_eq!(fs::read(target.join(SAVE_AS_OWNER)).unwrap(), attacker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_publication_rejects_symlinked_temp_without_deleting_attacker_link() {
+        use std::{cell::RefCell, os::unix::fs::symlink};
+
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("owner-temp-symlink");
+        let outside = fixture.root.join("outside-owner-temp");
+        fs::write(&outside, b"attacker bytes").unwrap();
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.pads.clear();
+        let replaced = RefCell::new(None);
+
+        let result = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::OwnerBeforePublish {
+                let temp = fs::read_dir(&target)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .contains("save-as-owner.sampler-tui-tmp")
+                    })
+                    .unwrap();
+                fs::remove_file(&temp).unwrap();
+                symlink(&outside, &temp).unwrap();
+                *replaced.borrow_mut() = Some(temp);
+            }
+            None
+        });
+
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        assert!(!target.join(SAVE_AS_OWNER).exists());
+        let replacement = replaced.into_inner().unwrap();
+        assert!(
+            fs::symlink_metadata(replacement)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(outside).unwrap(), b"attacker bytes");
     }
 
     #[test]

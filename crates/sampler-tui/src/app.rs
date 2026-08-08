@@ -1,4 +1,5 @@
 use std::array;
+use std::fmt;
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -91,8 +92,39 @@ pub enum SampleEditStatus {
     Rendering,
     ReadyToInstall,
     Failed,
+    GenerationExhausted,
     UndoAvailable,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SampleEditRequestError {
+    InvalidRecipe(String),
+    AudioUnavailable(String),
+    LoadPending,
+    EmptyPad,
+    NoUndo,
+    RecoveryPending,
+    GenerationExhausted,
+}
+
+impl fmt::Display for SampleEditRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRecipe(error) | Self::AudioUnavailable(error) => {
+                formatter.write_str(error)
+            }
+            Self::LoadPending => formatter.write_str("sample load is pending"),
+            Self::EmptyPad => formatter.write_str("pad has no committed sample to edit"),
+            Self::NoUndo => formatter.write_str("no sample edit to undo"),
+            Self::RecoveryPending => {
+                formatter.write_str("sample is waiting for device-rate recovery")
+            }
+            Self::GenerationExhausted => formatter.write_str("sample edit generation is exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for SampleEditRequestError {}
 
 enum PendingEditPhase {
     AwaitingWorker,
@@ -144,6 +176,7 @@ struct SampleEditorState {
     pending: [Option<Box<PendingEdit>>; PAD_VIEW_COUNT],
     deferred_results: [Option<Box<WorkerResult>>; PAD_VIEW_COUNT],
     undo: [Option<Box<SampleEditCheckpoint>>; PAD_VIEW_COUNT],
+    generation_exhausted: [bool; PAD_VIEW_COUNT],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +275,7 @@ impl App {
                 pending: array::from_fn(|_| None),
                 deferred_results: array::from_fn(|_| None),
                 undo: array::from_fn(|_| None),
+                generation_exhausted: [false; PAD_VIEW_COUNT],
             }),
             edit_result_advanced: false,
             device_retry_requests: 0,
@@ -844,36 +878,40 @@ impl App {
         &mut self,
         pad: PadId,
         recipe: SampleEditRecipe,
-    ) -> Result<(), String> {
-        recipe.validate().map_err(|error| error.to_string())?;
+    ) -> Result<(), SampleEditRequestError> {
+        recipe
+            .validate()
+            .map_err(|error| SampleEditRequestError::InvalidRecipe(error.to_string()))?;
         let offset = pad_offset(pad);
         if self.audio.is_none() {
-            return Err(self
-                .audio_unavailable_message
-                .clone()
-                .unwrap_or_else(|| "audio device is unavailable".to_owned()));
+            return Err(SampleEditRequestError::AudioUnavailable(
+                self.audio_unavailable_message
+                    .clone()
+                    .unwrap_or_else(|| "audio device is unavailable".to_owned()),
+            ));
         }
         if self.pending_loads[offset].is_some() {
-            return Err("sample load is pending".to_owned());
+            return Err(SampleEditRequestError::LoadPending);
         }
         let Some(base) = self.sample_editor.commits[offset].base.as_ref().cloned() else {
-            return Err("pad has no committed sample to edit".to_owned());
+            return Err(SampleEditRequestError::EmptyPad);
         };
         self.start_sample_edit(offset, base, recipe, PendingEditKind::Apply)
     }
 
     /// Re-renders and installs the previous recipe through the same worker/audio path as Apply.
     /// The checkpoint remains available until that replacement is admitted.
-    pub fn undo_sample_edit(&mut self, pad: PadId) -> Result<(), String> {
+    pub fn undo_sample_edit(&mut self, pad: PadId) -> Result<(), SampleEditRequestError> {
         let offset = pad_offset(pad);
         if self.audio.is_none() {
-            return Err(self
-                .audio_unavailable_message
-                .clone()
-                .unwrap_or_else(|| "audio device is unavailable".to_owned()));
+            return Err(SampleEditRequestError::AudioUnavailable(
+                self.audio_unavailable_message
+                    .clone()
+                    .unwrap_or_else(|| "audio device is unavailable".to_owned()),
+            ));
         }
         let Some(checkpoint) = self.sample_editor.undo[offset].as_ref() else {
-            return Err("no sample edit to undo".to_owned());
+            return Err(SampleEditRequestError::NoUndo);
         };
         // At the same device rate the checkpoint's base is the exact prior tuple. After a
         // recovery it intentionally re-renders the old recipe from the newly decoded base.
@@ -888,7 +926,7 @@ impl App {
         } else if let Some(base) = self.sample_editor.commits[offset].base.as_ref() {
             Arc::clone(base)
         } else {
-            return Err("pad has no committed sample to undo".to_owned());
+            return Err(SampleEditRequestError::EmptyPad);
         };
         self.start_sample_edit(offset, base, checkpoint.recipe, PendingEditKind::Undo)
     }
@@ -914,6 +952,9 @@ impl App {
             .as_ref()
             .map(|pending| &pending.phase)
         {
+            _ if self.sample_editor.generation_exhausted[offset] => {
+                SampleEditStatus::GenerationExhausted
+            }
             Some(PendingEditPhase::AwaitingWorker) => SampleEditStatus::AwaitingWorker,
             Some(PendingEditPhase::WorkerQueued) => SampleEditStatus::Rendering,
             Some(PendingEditPhase::Ready(_)) => SampleEditStatus::ReadyToInstall,
@@ -929,18 +970,25 @@ impl App {
         base: Arc<SampleBuffer>,
         recipe: SampleEditRecipe,
         kind: PendingEditKind,
-    ) -> Result<(), String> {
+    ) -> Result<(), SampleEditRequestError> {
         let sample_rate = self
             .audio
             .as_ref()
             .map(|audio| audio.sample_rate())
-            .ok_or_else(|| "audio device is unavailable".to_owned())?;
+            .ok_or_else(|| {
+                SampleEditRequestError::AudioUnavailable("audio device is unavailable".to_owned())
+            })?;
         if base.sample_rate() != sample_rate {
-            return Err("sample is waiting for device-rate recovery".to_owned());
+            return Err(SampleEditRequestError::RecoveryPending);
         }
-        self.sample_editor.generations[offset] =
-            self.sample_editor.generations[offset].wrapping_add(1);
-        let generation = self.sample_editor.generations[offset];
+        let Some(generation) = self.sample_editor.generations[offset].checked_add(1) else {
+            self.sample_editor.generation_exhausted[offset] = true;
+            let error = SampleEditRequestError::GenerationExhausted;
+            self.status = error.to_string();
+            return Err(error);
+        };
+        self.sample_editor.generations[offset] = generation;
+        self.sample_editor.generation_exhausted[offset] = false;
         self.sample_editor.pending[offset] = Some(Box::new(PendingEdit {
             generation,
             base: Arc::clone(&base),
@@ -960,7 +1008,7 @@ impl App {
 
     fn invalidate_pending_edit(&mut self, offset: usize) {
         self.sample_editor.generations[offset] =
-            self.sample_editor.generations[offset].wrapping_add(1);
+            self.sample_editor.generations[offset].saturating_add(1);
         self.sample_editor.pending[offset] = None;
         self.sample_editor.deferred_results[offset] = None;
     }
@@ -968,7 +1016,7 @@ impl App {
     fn suspend_pending_sample_edits(&mut self) {
         for offset in 0..PAD_VIEW_COUNT {
             self.sample_editor.generations[offset] =
-                self.sample_editor.generations[offset].wrapping_add(1);
+                self.sample_editor.generations[offset].saturating_add(1);
             self.sample_editor.deferred_results[offset] = None;
             if let Some(pending) = self.sample_editor.pending[offset].as_mut() {
                 pending.phase = PendingEditPhase::Failed;
@@ -984,27 +1032,27 @@ impl App {
             result,
         } = result
         {
-            if self.edit_result_advanced {
-                let offset = pad_offset(pad);
-                let replace = self.sample_editor.deferred_results[offset]
+            let offset = pad_offset(pad);
+            let matches_current =
+                self.sample_editor.pending[offset]
                     .as_ref()
-                    .and_then(|queued| match queued.as_ref() {
-                        WorkerResult::Edited {
-                            generation: queued, ..
-                        } => Some(generation >= *queued),
-                        _ => None,
-                    })
-                    .unwrap_or(true);
-                if replace {
-                    self.sample_editor.deferred_results[offset] =
-                        Some(Box::new(WorkerResult::Edited {
-                            pad,
-                            generation,
-                            recipe,
-                            result,
-                        }));
-                }
-                return replace;
+                    .is_some_and(|pending| {
+                        pending.generation == generation
+                            && pending.recipe == recipe
+                            && matches!(pending.phase, PendingEditPhase::WorkerQueued)
+                    });
+            if !matches_current {
+                return false;
+            }
+            if self.edit_result_advanced {
+                self.sample_editor.deferred_results[offset] =
+                    Some(Box::new(WorkerResult::Edited {
+                        pad,
+                        generation,
+                        recipe,
+                        result,
+                    }));
+                return true;
             }
             self.edit_result_advanced = true;
             return self.apply_edited_worker_result(pad, generation, recipe, result);
@@ -3350,6 +3398,128 @@ mod tests {
         assert_eq!(
             app.committed_sample_recipe(pad),
             Some(SampleEditRecipe::identity())
+        );
+    }
+
+    #[test]
+    fn edit_generation_exhaustion_never_reuses_zero_or_replaces_the_live_request() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.sample_editor.generations[0] = u64::MAX - 1;
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe).unwrap();
+        let WorkerRequest::EditSample {
+            generation: max_generation,
+            ..
+        } = app.take_worker_requests().pop().unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert_eq!(max_generation, u64::MAX);
+
+        assert_eq!(
+            app.request_sample_edit(pad, SampleEditRecipe::identity()),
+            Err(super::SampleEditRequestError::GenerationExhausted)
+        );
+        assert_eq!(app.sample_editor.generations[0], u64::MAX);
+        assert_eq!(
+            app.sample_editor.pending[0]
+                .as_ref()
+                .map(|pending| pending.generation),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            app.sample_edit_status(pad),
+            SampleEditStatus::GenerationExhausted
+        );
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn deferred_edit_results_accept_only_the_exact_current_generation() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        app.sample_editor.generations[0] = 0;
+        let recipe = SampleEditRecipe {
+            normalize: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe).unwrap();
+        let current_generation = match app.take_worker_requests().pop().unwrap() {
+            WorkerRequest::EditSample { generation, .. } => generation,
+            _ => panic!("wrong request"),
+        };
+        app.edit_result_advanced = true;
+
+        assert!(!app.apply_worker_result(edited(pad, u64::MAX, recipe, 48_000, vec![0.9, 0.9])));
+        assert!(app.sample_editor.deferred_results[0].is_none());
+        assert!(app.apply_worker_result(edited(
+            pad,
+            current_generation,
+            recipe,
+            48_000,
+            vec![0.4, 0.4]
+        )));
+        assert!(app.sample_editor.deferred_results[0].is_some());
+
+        assert!(app.maintain_audio());
+        assert_eq!(app.sample_edit_status(pad), SampleEditStatus::UndoAvailable);
+        assert_eq!(app.pad(pad).sample.as_ref().unwrap().data(), &[0.4, 0.4]);
+    }
+
+    #[test]
+    fn exhausted_undo_generation_preserves_the_checkpoint_and_current_tuple() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        let recipe = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe).unwrap();
+        let edit_generation = match app.take_worker_requests().pop().unwrap() {
+            WorkerRequest::EditSample { generation, .. } => generation,
+            _ => panic!("wrong request"),
+        };
+        assert!(app.apply_worker_result(edited(
+            pad,
+            edit_generation,
+            recipe,
+            48_000,
+            vec![-0.4, 0.4]
+        )));
+        assert!(app.maintain_audio());
+        let current = Arc::clone(app.pad(pad).sample.as_ref().unwrap());
+        app.sample_editor.generations[0] = u64::MAX;
+
+        assert_eq!(
+            app.undo_sample_edit(pad),
+            Err(super::SampleEditRequestError::GenerationExhausted)
+        );
+        assert!(Arc::ptr_eq(app.pad(pad).sample.as_ref().unwrap(), &current));
+        assert_eq!(app.committed_sample_recipe(pad), Some(recipe));
+        assert!(app.sample_editor.undo[0].is_some());
+        assert!(app.sample_editor.pending[0].is_none());
+        assert_eq!(
+            app.sample_edit_status(pad),
+            SampleEditStatus::GenerationExhausted
         );
     }
 

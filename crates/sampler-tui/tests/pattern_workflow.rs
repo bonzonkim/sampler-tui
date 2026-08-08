@@ -64,6 +64,7 @@ impl AudioPort for ControllerPort {
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, String> {
+        self.installed_settings.borrow_mut().push(settings);
         self.controller()
             .install_recovery(pad, sample, settings)
             .map_err(|e| e.to_string())
@@ -492,6 +493,47 @@ fn pad_settings_update_is_validated_and_audio_atomic() {
     harness.app.update_pad_settings(pad(0), gate).unwrap();
     assert_eq!(harness.update_calls.get(), calls + 2);
     assert_eq!(harness.app.pad(pad(0)).settings, gate);
+}
+
+#[test]
+fn retrying_pad_settings_wait_for_their_current_session_binding() {
+    let mut harness = PatternHarness::new(48_000);
+    harness.load_pad(1);
+    harness.callback(0);
+    harness.runtime_failure.set(true);
+    harness.ui_iteration();
+    let (controller, ports) = audio_channels();
+    let retry_controller = Rc::new(RefCell::new(controller));
+    let retry_failure = Rc::new(Cell::new(false));
+    harness.app.retry_with(Box::new(ControllerPort {
+        sample_rate: 48_000,
+        controller: Rc::clone(&retry_controller),
+        runtime_failure: Rc::clone(&retry_failure),
+        observed_acks: Rc::clone(&harness.observed_acks),
+        installed_settings: Rc::clone(&harness.installed_settings),
+        update_calls: Rc::clone(&harness.update_calls),
+        reject_updates: Rc::clone(&harness.reject_updates),
+    }));
+    harness.engine = AudioEngine::new(48_000, ports).unwrap();
+    harness.controller = retry_controller;
+    harness.runtime_failure = retry_failure;
+    let calls = harness.update_calls.get();
+    let b_settings = PadSettings::new(PlaybackMode::Gate, -6.0, 0.0, 0.0, None).unwrap();
+    harness.app.update_pad_settings(pad(1), b_settings).unwrap();
+    assert_eq!(harness.update_calls.get(), calls);
+    let a_settings = PadSettings::new(PlaybackMode::Gate, -3.0, 0.0, 0.0, None).unwrap();
+    harness.app.update_pad_settings(pad(0), a_settings).unwrap();
+    assert_eq!(harness.update_calls.get(), calls + 1);
+    for _ in 0..2 {
+        harness.app.maintain_audio();
+        harness.callback(0);
+    }
+    assert_eq!(harness.app.pad(pad(1)).settings, b_settings);
+    assert_eq!(
+        harness.installed_settings.borrow().last(),
+        Some(&b_settings)
+    );
+    assert_eq!(harness.engine.invalid_commands(), 0);
 }
 
 #[test]

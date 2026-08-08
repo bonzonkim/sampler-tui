@@ -384,9 +384,10 @@ impl App {
     pub fn update_pad_settings(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
         settings.validate().map_err(|error| error.to_string())?;
         let offset = pad_offset(pad);
-        if self.pads[offset].sample.is_some()
-            && let Some(audio) = self.audio.as_mut()
-        {
+        let bound_in_current_session = self.pads[offset].sample.is_some()
+            && !self.reinstall_pending[offset]
+            && self.pads[offset].state == PadLoadState::Ready;
+        if bound_in_current_session && let Some(audio) = self.audio.as_mut() {
             audio.update_pad(pad, settings)?;
         }
         self.pads[offset].settings = settings;

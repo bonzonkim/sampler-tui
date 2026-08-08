@@ -967,7 +967,7 @@ impl ProjectStore {
         )?;
         project.revalidate_path_identity()?;
         if request.save_as {
-            remove_save_as_owner(&project)?;
+            let _ = remove_save_as_owner(&project);
         }
         project.revalidate_path_identity()?;
 
@@ -2652,6 +2652,35 @@ pitch_semitones = 0.0
         assert_eq!(
             fs::read_to_string(target.join("project.toml")).unwrap(),
             foreign
+        );
+    }
+
+    #[test]
+    fn durable_save_as_succeeds_when_owner_cleanup_finds_the_claim_missing() {
+        let fixture = ProjectFixture::new();
+        let target = fixture.root.join("missing-owner-cleanup");
+        let mut request = fixture.request(1, SaveKind::Explicit);
+        request.directory = target.clone();
+        request.save_as = true;
+        request.snapshot.pads.clear();
+
+        let receipt = fixture.store.save_with_hook(request, |point| {
+            if point == AtomicWritePoint::BeforeDirectorySync {
+                fs::remove_file(target.join(SAVE_AS_OWNER)).unwrap();
+            }
+            None
+        });
+
+        let receipt = receipt.expect("durable metadata must define Save-As success");
+        assert_eq!(receipt.directory, fs::canonicalize(&target).unwrap());
+        assert!(target.join("project.toml").is_file());
+        assert!(
+            ProjectStore
+                .probe(&target)
+                .unwrap()
+                .explicit
+                .unwrap()
+                .is_ok()
         );
     }
 

@@ -2,10 +2,14 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use rustix::fs::{FileType as RustixFileType, FlockOperation, Mode, OFlags};
+use sampler_audio::{EncodedAudioFormat, probe_shared_audio_format};
 use sampler_core::{
     AssetDigest, LegacyProjectDocument, PadId, PadSettings, ParsedProjectDocument, ProjectDocument,
     ProjectId, ProjectPattern, SampleEditRecipe,
@@ -50,6 +54,23 @@ impl SupportedAudioExtension {
             Self::Aiff => "aiff",
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
+        }
+    }
+
+    pub(crate) fn from_encoded_format(path: &Path, format: EncodedAudioFormat) -> Self {
+        match format {
+            EncodedAudioFormat::Wav => Self::Wav,
+            EncodedAudioFormat::Aiff
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("aif")) =>
+            {
+                Self::Aif
+            }
+            EncodedAudioFormat::Aiff => Self::Aiff,
+            EncodedAudioFormat::Flac => Self::Flac,
+            EncodedAudioFormat::Mp3 => Self::Mp3,
         }
     }
 }
@@ -138,7 +159,6 @@ struct ValidatedSource {
 
 impl ValidatedSource {
     fn open(path: &Path) -> Result<Self, ProjectStoreError> {
-        let extension = SupportedAudioExtension::from_path(path)?;
         let (parent, leaf) = open_anchored_parent(path, true)?;
         let owned = rustix::fs::openat(
             &parent,
@@ -149,7 +169,7 @@ impl ValidatedSource {
         .map_err(|error| open_source_error(path, error))?;
         ensure_fd_type(&owned, path, RustixFileType::RegularFile)?;
         let mut file = File::from(owned);
-        let fingerprint = hash_validated_handle(&mut file, path, extension)?;
+        let fingerprint = fingerprint_validated_audio_handle(&mut file, path)?;
         Ok(Self {
             file,
             fingerprint,
@@ -531,6 +551,41 @@ fn hash_validated_handle(
     Ok(builder.finish())
 }
 
+fn fingerprint_validated_audio_handle(
+    file: &mut File,
+    path: &Path,
+) -> Result<SourceFingerprint, ProjectStoreError> {
+    let mut encoded = Vec::new();
+    file.take(MAX_ENCODED_FILE_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|error| ProjectStoreError::SourceRead {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+    if encoded.len() as u64 > MAX_ENCODED_FILE_BYTES {
+        return Err(ProjectStoreError::SourceTooLarge {
+            path: path.to_path_buf(),
+            bytes: encoded.len() as u64,
+            max_bytes: MAX_ENCODED_FILE_BYTES,
+        });
+    }
+    let encoded = Arc::<[u8]>::from(encoded);
+    let format = probe_shared_audio_format(path, Arc::clone(&encoded)).map_err(|_| {
+        ProjectStoreError::UnsupportedExtension {
+            path: path.to_path_buf(),
+        }
+    })?;
+    let extension = SupportedAudioExtension::from_encoded_format(path, format);
+    let fingerprint =
+        SourceFingerprint::from_encoded_bytes_with_extension(path, &encoded, extension)?;
+    file.rewind()
+        .map_err(|error| ProjectStoreError::SourceRead {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+    Ok(fingerprint)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectSaveSnapshot {
     pub project_id: ProjectId,
@@ -762,7 +817,14 @@ impl ProjectStore {
         let mut mappings = Vec::with_capacity(request.snapshot.pads.len());
 
         for pad in &request.snapshot.pads {
-            let mut source = ValidatedSource::open(&pad.source_path)?;
+            let mut source = match ValidatedSource::open(&pad.source_path) {
+                Err(ProjectStoreError::UnsupportedExtension { .. }) => {
+                    return Err(ProjectStoreError::SourceChanged {
+                        path: pad.source_path.clone(),
+                    });
+                }
+                result => result?,
+            };
             if source.fingerprint != pad.fingerprint {
                 return Err(ProjectStoreError::SourceChanged {
                     path: pad.source_path.clone(),
@@ -1405,6 +1467,7 @@ where
 mod tests {
     use std::{
         fs,
+        io::Cursor,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1415,6 +1478,28 @@ mod tests {
     use super::*;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    fn wav_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut bytes);
+            let mut writer = hound::WavWriter::new(
+                cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 48_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for sample in [0_i16, i16::MAX, 0, i16::MIN] {
+                writer.write_sample(sample).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        bytes
+    }
 
     struct ProjectFixture {
         root: PathBuf,
@@ -1435,7 +1520,7 @@ mod tests {
             let directory = root.join("project");
             fs::create_dir(&directory).unwrap();
             let source = root.join("kick.WAV");
-            let source_bytes = b"exact encoded source bytes".to_vec();
+            let source_bytes = wav_bytes();
             fs::write(&source, &source_bytes).unwrap();
             Self {
                 root,
@@ -1775,6 +1860,12 @@ mod tests {
         wrong_extension.snapshot.pads[0].fingerprint.extension = SupportedAudioExtension::Aiff;
         assert!(matches!(
             fixture.store.save(wrong_extension),
+            Err(ProjectStoreError::SourceChanged { .. })
+        ));
+        let mut forged_digest = fixture.request(1, SaveKind::Explicit);
+        forged_digest.snapshot.pads[0].fingerprint.digest = AssetDigest::from_bytes([0xa5; 32]);
+        assert!(matches!(
+            fixture.store.save(forged_digest),
             Err(ProjectStoreError::SourceChanged { .. })
         ));
         assert!(!fixture.directory.join("project.toml").exists());

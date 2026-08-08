@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sampler_audio::{
-    DecodeLimits, EncodedAudioFormat, SampleBuffer, decode_shared_bytes_with_limits,
-    prepare_sample_with_frame_limit, probe_shared_audio_format,
+    DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits, prepare_sample_with_frame_limit,
+    probe_shared_audio_format,
 };
 use sampler_core::{PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
@@ -551,7 +551,7 @@ fn load_sample(
     let encoded = Arc::<[u8]>::from(encoded);
     let encoded_format = probe_shared_audio_format(path, Arc::clone(&encoded))
         .map_err(|error| LoadSampleError::Decode(format_error(&error)))?;
-    let extension = supported_extension(path, encoded_format);
+    let extension = crate::SupportedAudioExtension::from_encoded_format(path, encoded_format);
     let fingerprint =
         SourceFingerprint::from_encoded_bytes_with_extension(path, &encoded, extension)
             .map_err(|error| LoadSampleError::Fingerprint(error.to_string()))?;
@@ -585,25 +585,6 @@ fn load_sample(
         source_frames,
         duration,
     })
-}
-
-fn supported_extension(path: &Path, format: EncodedAudioFormat) -> crate::SupportedAudioExtension {
-    use crate::SupportedAudioExtension;
-
-    match format {
-        EncodedAudioFormat::Wav => SupportedAudioExtension::Wav,
-        EncodedAudioFormat::Aiff
-            if path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("aif")) =>
-        {
-            SupportedAudioExtension::Aif
-        }
-        EncodedAudioFormat::Aiff => SupportedAudioExtension::Aiff,
-        EncodedAudioFormat::Flac => SupportedAudioExtension::Flac,
-        EncodedAudioFormat::Mp3 => SupportedAudioExtension::Mp3,
-    }
 }
 
 fn render_sample_edit(
@@ -757,7 +738,7 @@ mod tests {
     use std::time::Duration;
 
     use sampler_audio::SampleBuffer;
-    use sampler_core::{BankId, PadId, ProjectId, SampleEditRecipe};
+    use sampler_core::{BankId, PadId, PadSettings, ProjectId, SampleEditRecipe};
     use sha2::{Digest, Sha256};
 
     use super::{
@@ -768,8 +749,8 @@ mod tests {
         preview_column, scan_directory, try_send_request, worker_loop, worker_loop_with_store,
     };
     use crate::{
-        DirectoryEntry, ProjectProbe, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError,
-        SaveKind, SaveReceipt, SourceFingerprint, SupportedAudioExtension,
+        DirectoryEntry, ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot,
+        ProjectStoreError, SaveKind, SaveReceipt, SourceFingerprint, SupportedAudioExtension,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -1070,6 +1051,90 @@ mod tests {
         assert_eq!(result_token, token);
         assert_eq!(result_pad, project_pad);
         assert_eq!(revision, 23);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn extensionless_loaded_fingerprint_saves_as_a_canonical_wav_asset() {
+        let fixture = DirectoryFixture::new("extensionless-save");
+        let source_fixture = extensionless_wav_fixture(48_000, &[0, i16::MAX, i16::MIN]);
+        let source = fixture.path().join("source");
+        fs::rename(source_fixture.path(), &source).unwrap();
+        let project = fixture.path().join("saved-project");
+        let pad = pad(0, 6);
+        let token = ProjectToken::new(75);
+        let project_id = ProjectId::from_bytes([5; 16]);
+        let mut worker = WorkerHandle::spawn();
+
+        worker
+            .try_send(WorkerRequest::LoadSample {
+                pad,
+                generation: 24,
+                purpose: LoadPurpose::User,
+                path: source.clone(),
+                engine_rate: 48_000,
+                recipe: SampleEditRecipe::identity(),
+            })
+            .unwrap();
+        let WorkerResult::Loaded {
+            result: Ok(loaded), ..
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("extensionless source did not load")
+        };
+        let fingerprint = loaded.fingerprint;
+        worker
+            .try_send(WorkerRequest::SaveProject(Box::new(
+                ProjectSaveWorkerRequest {
+                    token,
+                    request: ProjectSaveRequest {
+                        directory: project.clone(),
+                        save_as: true,
+                        kind: SaveKind::Explicit,
+                        snapshot: ProjectSaveSnapshot {
+                            project_id,
+                            name: "extensionless".to_owned(),
+                            revision: 25,
+                            pads: vec![ProjectSavePad {
+                                pad,
+                                source_path: source,
+                                source_generation: 24,
+                                fingerprint,
+                                settings: PadSettings::default(),
+                                recipe: SampleEditRecipe::identity(),
+                            }],
+                            patterns: Vec::new(),
+                        },
+                    },
+                },
+            )))
+            .unwrap();
+
+        let WorkerResult::ProjectSaved {
+            token: result_token,
+            kind,
+            project_id: result_project_id,
+            directory,
+            revision,
+            result,
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong extensionless save result")
+        };
+        let receipt = result.unwrap();
+        assert_eq!(result_token, token);
+        assert_eq!(kind, SaveKind::Explicit);
+        assert_eq!(result_project_id, project_id);
+        assert_eq!(directory, project);
+        assert_eq!(revision, 25);
+        assert_eq!(receipt.mappings.len(), 1);
+        assert_eq!(receipt.mappings[0].fingerprint, fingerprint);
+        let asset = project.join(format!("audio/{}.wav", fingerprint.digest));
+        assert_eq!(
+            fs::read(&asset).unwrap().len() as u64,
+            fingerprint.encoded_bytes
+        );
+        assert_eq!(SourceFingerprint::from_path(&asset).unwrap(), fingerprint);
         worker.shutdown().unwrap();
     }
 

@@ -493,28 +493,36 @@ impl App {
     }
 
     fn advance_one_deferred_edit_result(&mut self) -> bool {
-        let Some(offset) = self
-            .sample_editor
-            .deferred_results
-            .iter()
-            .position(Option::is_some)
-        else {
-            return false;
-        };
-        let Some(result) = self.sample_editor.deferred_results[offset].take() else {
-            return false;
-        };
-        let WorkerResult::Edited {
-            pad,
-            generation,
-            recipe,
-            result,
-        } = *result
-        else {
-            return false;
-        };
-        self.edit_result_advanced = true;
-        self.apply_edited_worker_result(pad, generation, recipe, result)
+        for offset in 0..PAD_VIEW_COUNT {
+            let Some(result) = self.sample_editor.deferred_results[offset].take() else {
+                continue;
+            };
+            let WorkerResult::Edited {
+                pad,
+                generation,
+                recipe,
+                result,
+            } = *result
+            else {
+                continue;
+            };
+            if !self.pending_edit_matches(pad, generation, recipe) {
+                continue;
+            }
+            self.edit_result_advanced = true;
+            return self.apply_edited_worker_result(pad, generation, recipe, result);
+        }
+        false
+    }
+
+    fn pending_edit_matches(&self, pad: PadId, generation: u64, recipe: SampleEditRecipe) -> bool {
+        self.sample_editor.pending[pad_offset(pad)]
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.generation == generation
+                    && pending.recipe == recipe
+                    && matches!(pending.phase, PendingEditPhase::WorkerQueued)
+            })
     }
 
     fn pump_pending_sample_edit(&mut self) -> bool {
@@ -989,6 +997,7 @@ impl App {
         };
         self.sample_editor.generations[offset] = generation;
         self.sample_editor.generation_exhausted[offset] = false;
+        self.sample_editor.deferred_results[offset] = None;
         self.sample_editor.pending[offset] = Some(Box::new(PendingEdit {
             generation,
             base: Arc::clone(&base),
@@ -1032,19 +1041,11 @@ impl App {
             result,
         } = result
         {
-            let offset = pad_offset(pad);
-            let matches_current =
-                self.sample_editor.pending[offset]
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.generation == generation
-                            && pending.recipe == recipe
-                            && matches!(pending.phase, PendingEditPhase::WorkerQueued)
-                    });
-            if !matches_current {
+            if !self.pending_edit_matches(pad, generation, recipe) {
                 return false;
             }
             if self.edit_result_advanced {
+                let offset = pad_offset(pad);
                 self.sample_editor.deferred_results[offset] =
                     Some(Box::new(WorkerResult::Edited {
                         pad,
@@ -3478,6 +3479,74 @@ mod tests {
         assert!(app.maintain_audio());
         assert_eq!(app.sample_edit_status(pad), SampleEditStatus::UndoAvailable);
         assert_eq!(app.pad(pad).sample.as_ref().unwrap().data(), &[0.4, 0.4]);
+    }
+
+    #[test]
+    fn newer_edit_discards_deferred_prior_result_without_spending_next_maintenance_budget() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pad = pad(0, 0);
+        let WorkerRequest::LoadSample { generation, .. } = app.begin_load(pad, "kick.wav").unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(app.apply_worker_result(loaded(pad, generation, "kick.wav")));
+        let recipe_a = SampleEditRecipe {
+            reversed: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe_a).unwrap();
+        let generation_a = match app.take_worker_requests().pop().unwrap() {
+            WorkerRequest::EditSample { generation, .. } => generation,
+            _ => panic!("wrong request"),
+        };
+        app.edit_result_advanced = true;
+        assert!(app.apply_worker_result(edited(
+            pad,
+            generation_a,
+            recipe_a,
+            48_000,
+            vec![-0.4, 0.4]
+        )));
+        assert!(app.sample_editor.deferred_results[0].is_some());
+
+        let recipe_b = SampleEditRecipe {
+            normalize: true,
+            ..SampleEditRecipe::identity()
+        };
+        app.request_sample_edit(pad, recipe_b).unwrap();
+        let generation_b = match app.take_worker_requests().pop().unwrap() {
+            WorkerRequest::EditSample { generation, .. } => generation,
+            _ => panic!("wrong request"),
+        };
+        assert!(app.sample_editor.deferred_results[0].is_none());
+
+        // Model an already-queued stale result arriving just before maintenance. It must be
+        // discarded before the one-result budget is marked consumed.
+        app.sample_editor.deferred_results[0] = Some(Box::new(edited(
+            pad,
+            generation_a,
+            recipe_a,
+            48_000,
+            vec![-0.4, 0.4],
+        )));
+        assert!(app.maintain_audio());
+        assert!(!app.edit_result_advanced);
+        assert!(app.sample_editor.deferred_results[0].is_none());
+
+        assert!(app.apply_worker_result(edited(
+            pad,
+            generation_b,
+            recipe_b,
+            48_000,
+            vec![0.4, 0.4]
+        )));
+        assert!(matches!(
+            app.sample_editor.pending[0]
+                .as_ref()
+                .map(|pending| &pending.phase),
+            Some(super::PendingEditPhase::Ready(_))
+        ));
+        assert!(app.sample_editor.deferred_results[0].is_none());
     }
 
     #[test]

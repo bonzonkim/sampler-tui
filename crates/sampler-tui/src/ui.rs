@@ -401,6 +401,18 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "r retry · Esc browse without audio".to_owned(),
             ],
         ),
+        Overlay::ProjectOpenProgress => render_list_overlay(
+            frame,
+            area,
+            " OPEN PROJECT ",
+            62,
+            6,
+            [
+                app.status().to_owned(),
+                "Project state remains unchanged while validation runs.".to_owned(),
+                "Esc cancels before audio admission begins.".to_owned(),
+            ],
+        ),
         Overlay::ClearPattern { slot, event_count } => render_list_overlay(
             frame,
             area,

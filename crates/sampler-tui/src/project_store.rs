@@ -2190,6 +2190,80 @@ pitch_semitones = 0.0
     }
 
     #[test]
+    fn project_open_probe_isolates_two_real_projects_across_corrupt_missing_and_digest_errors() {
+        let project_a = ProjectFixture::new();
+        let project_b = ProjectFixture::new();
+        project_a
+            .store
+            .save(project_a.request(1, SaveKind::Explicit))
+            .unwrap();
+        let saved_b = project_b
+            .store
+            .save(project_b.request(2, SaveKind::Explicit))
+            .unwrap();
+        let project_a_toml = read(&project_a.directory.join("project.toml"));
+
+        fs::write(project_b.directory.join("project.toml"), "not = [valid").unwrap();
+        assert!(
+            project_b
+                .store
+                .probe(&project_b.directory)
+                .unwrap()
+                .explicit
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            read(&project_a.directory.join("project.toml")),
+            project_a_toml
+        );
+        assert!(
+            project_a
+                .store
+                .probe(&project_a.directory)
+                .unwrap()
+                .explicit
+                .unwrap()
+                .is_ok()
+        );
+
+        fs::write(
+            project_b.directory.join("project.toml"),
+            &saved_b.canonical_toml,
+        )
+        .unwrap();
+        fs::remove_file(&saved_b.mappings[0].project_path).unwrap();
+        assert!(
+            project_b
+                .store
+                .probe(&project_b.directory)
+                .unwrap()
+                .explicit
+                .unwrap()
+                .is_err()
+        );
+
+        fs::write(
+            &saved_b.mappings[0].project_path,
+            b"different encoded audio bytes",
+        )
+        .unwrap();
+        assert!(matches!(
+            project_b
+                .store
+                .probe(&project_b.directory)
+                .unwrap()
+                .explicit
+                .unwrap(),
+            Err(ProjectStoreError::AssetIntegrity { .. })
+        ));
+        assert_eq!(
+            read(&project_a.directory.join("project.toml")),
+            project_a_toml
+        );
+    }
+
+    #[test]
     fn concurrent_save_as_requests_cannot_overwrite_the_first_winner() {
         use std::sync::{Arc, Barrier};
 

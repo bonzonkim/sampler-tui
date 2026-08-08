@@ -10,6 +10,78 @@ use crate::{ProjectToken, SaveKind};
 pub const MAX_PROJECT_REVISION: u64 = i64::MAX as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    Restore,
+    Discard,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectOpenPhase {
+    Probing,
+    AwaitingRecoveryChoice,
+    Staging,
+    Admitting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectOpenStage {
+    pub token: ProjectToken,
+    pub directory: PathBuf,
+    pub project_id: Option<ProjectId>,
+    pub revision: Option<u64>,
+    pub phase: ProjectOpenPhase,
+    pub staged_pads: usize,
+    pub total_pads: usize,
+    pub admitted_actions: usize,
+    pub total_actions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectOpenError {
+    OperationPending,
+    TokenExhausted,
+    AudioUnavailable,
+    NoUsableDocument,
+    RecoveryMismatch,
+    UnresolvedState(String),
+    Probe(String),
+    InvalidPatterns(String),
+    Stage { pad: PadId, message: String },
+    Admission(String),
+}
+
+impl std::fmt::Display for ProjectOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OperationPending => formatter.write_str("a project operation is already pending"),
+            Self::TokenExhausted => formatter.write_str("project operation token is exhausted"),
+            Self::AudioUnavailable => formatter.write_str("audio device is unavailable"),
+            Self::NoUsableDocument => formatter.write_str("project has no usable document"),
+            Self::RecoveryMismatch => {
+                formatter.write_str("recovery identity does not match the explicit project")
+            }
+            Self::UnresolvedState(message) => {
+                write!(
+                    formatter,
+                    "current project state must be resolved before open: {message}"
+                )
+            }
+            Self::Probe(message) => write!(formatter, "project probe failed: {message}"),
+            Self::InvalidPatterns(message) => {
+                write!(formatter, "project patterns are invalid: {message}")
+            }
+            Self::Stage { pad, message } => {
+                write!(formatter, "could not stage pad {pad:?}: {message}")
+            }
+            Self::Admission(message) => write!(formatter, "audio admission failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectOpenError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectStatus {
     Clean,
     Modified,
@@ -106,6 +178,31 @@ impl ProjectSession {
             saved_revision: revision,
             autosaved_revision: revision,
             dirty_since: None,
+            in_flight: None,
+            pending_autosave: None,
+        }
+    }
+
+    pub(crate) fn opened(
+        project_id: ProjectId,
+        directory: PathBuf,
+        name: impl Into<String>,
+        current_revision: u64,
+        saved_revision: u64,
+        autosaved_revision: u64,
+        dirty_since: Option<Instant>,
+    ) -> Self {
+        assert!(current_revision <= MAX_PROJECT_REVISION);
+        assert!(saved_revision <= MAX_PROJECT_REVISION);
+        assert!(autosaved_revision <= MAX_PROJECT_REVISION);
+        Self {
+            project_id,
+            directory: Some(directory),
+            name: name.into(),
+            current_revision,
+            saved_revision,
+            autosaved_revision,
+            dirty_since,
             in_flight: None,
             pending_autosave: None,
         }

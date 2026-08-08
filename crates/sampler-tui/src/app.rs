@@ -10,7 +10,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, ProjectId, SampleEditRecipe,
+    BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, ProjectDocument, ProjectId,
+    SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -19,14 +20,18 @@ use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{
     EditPreview, LoadPurpose, MAX_DIRECTORY_ENTRIES, ProjectSaveWorkerRequest, ProjectToken,
-    RenderedSample, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
+    RenderedSample, StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY, WorkerRequest,
+    WorkerResult, WorkerSendError,
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
-use crate::project_session::{ProjectSession, ProjectSnapshotError};
+use crate::project_session::{
+    ProjectOpenError, ProjectOpenPhase, ProjectOpenStage, ProjectSession, ProjectSnapshotError,
+    RecoveryChoice,
+};
 use crate::project_store::{
-    ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError, SaveKind,
-    SaveReceipt, SourceFingerprint,
+    ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot, ProjectStoreError,
+    SaveKind, SaveReceipt, SourceFingerprint,
 };
 use crate::sample_editor::{
     SampleEditor, SampleEditorContext, SampleEditorError, SampleEditorIntent, SampleMarker,
@@ -88,6 +93,48 @@ struct RecoveryCleanup {
 enum InFlightProjectOperation {
     Save(PendingProjectSave),
     Cleanup(RecoveryCleanup),
+}
+
+struct StagedProjectPad {
+    path: PathBuf,
+    settings: PadSettings,
+    loaded: crate::LoadedSample,
+}
+
+enum ProjectAdmission {
+    StopAll,
+    Pads(usize),
+    Patterns(usize),
+    Complete,
+}
+
+struct ProjectOpenCandidate {
+    progress: ProjectOpenStage,
+    document: ProjectDocument,
+    patterns: PatternWorkspace,
+    staged_pads: [Option<Box<StagedProjectPad>>; PAD_VIEW_COUNT],
+    next_decode: usize,
+    decode_in_flight: Option<PadId>,
+    saved_revision: u64,
+    restored_recovery: bool,
+    admission: ProjectAdmission,
+}
+
+enum ProjectOpenOperation {
+    Probing {
+        progress: ProjectOpenStage,
+        worker_queued: bool,
+    },
+    ChoosingRecovery(Box<ProjectRecoveryChoiceState>),
+    Staging(Box<ProjectOpenCandidate>),
+}
+
+struct ProjectRecoveryChoiceState {
+    progress: ProjectOpenStage,
+    explicit: Option<ProjectDocument>,
+    recovery: ProjectDocument,
+    discard_requested: bool,
+    discard_queued: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -269,6 +316,7 @@ pub enum Overlay {
     Palette,
     FilePicker,
     DeviceError(String),
+    ProjectOpenProgress,
     ClearPattern {
         slot: PatternSlotId,
         event_count: usize,
@@ -343,6 +391,8 @@ pub struct App {
     recovery_cleanup_warning: Option<ProjectStoreError>,
     autosave_retry_clock_pending: bool,
     autosave_retry_since: Option<Instant>,
+    project_open: Option<ProjectOpenOperation>,
+    project_open_error: Option<ProjectOpenError>,
 }
 
 impl App {
@@ -440,10 +490,17 @@ impl App {
             recovery_cleanup_warning: None,
             autosave_retry_clock_pending: false,
             autosave_retry_since: None,
+            project_open: None,
+            project_open_error: None,
         }
     }
 
     pub fn apply(&mut self, action: InputAction) {
+        if self.project_open_is_admitting()
+            && !matches!(action, InputAction::StopAll | InputAction::PadRelease(_))
+        {
+            return;
+        }
         match action {
             InputAction::PadPress(index) => self.press_pad(index),
             InputAction::PadRelease(index) => self.release_pad(index),
@@ -506,6 +563,7 @@ impl App {
 
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
+            Some(Overlay::ProjectOpenProgress) => {}
             Some(Overlay::Palette) => self.apply_palette_key(key),
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
@@ -647,6 +705,9 @@ impl App {
     }
 
     pub fn maintain_project(&mut self, now: Instant) -> bool {
+        if self.project_open.is_some() {
+            return self.maintain_project_open(now);
+        }
         let mut changed = false;
         if self.autosave_retry_clock_pending {
             self.autosave_retry_clock_pending = false;
@@ -733,6 +794,694 @@ impl App {
             return true;
         }
         changed
+    }
+
+    pub fn request_open_project(
+        &mut self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<ProjectToken, ProjectOpenError> {
+        if self.project_open.is_some()
+            || self.in_flight_project.is_some()
+            || self.pending_explicit_save.is_some()
+            || self.pending_autosave_save.is_some()
+        {
+            return Err(ProjectOpenError::OperationPending);
+        }
+        self.project_snapshot()
+            .map_err(|error| ProjectOpenError::UnresolvedState(error.to_string()))?;
+        let token = self
+            .allocate_project_token()
+            .map_err(|_| ProjectOpenError::TokenExhausted)?;
+        let directory = directory.into();
+        self.project_open_error = None;
+        let progress = ProjectOpenStage {
+            token,
+            directory: directory.clone(),
+            project_id: None,
+            revision: None,
+            phase: ProjectOpenPhase::Probing,
+            staged_pads: 0,
+            total_pads: 0,
+            admitted_actions: 0,
+            total_actions: 0,
+        };
+        let worker_queued =
+            self.queue_worker_request(WorkerRequest::ProbeProject { token, directory });
+        self.project_open = Some(ProjectOpenOperation::Probing {
+            progress,
+            worker_queued,
+        });
+        self.overlay = Some(Overlay::ProjectOpenProgress);
+        self.status = "Validating project metadata…".to_owned();
+        Ok(token)
+    }
+
+    pub fn project_open_stage(&self) -> Option<&ProjectOpenStage> {
+        match self.project_open.as_ref()? {
+            ProjectOpenOperation::Probing { progress, .. } => Some(progress),
+            ProjectOpenOperation::ChoosingRecovery(choice) => Some(&choice.progress),
+            ProjectOpenOperation::Staging(candidate) => Some(&candidate.progress),
+        }
+    }
+
+    pub fn project_open_error(&self) -> Option<&ProjectOpenError> {
+        self.project_open_error.as_ref()
+    }
+
+    pub fn cancel_project_open(&mut self) -> bool {
+        let Some(operation) = self.project_open.as_ref() else {
+            return false;
+        };
+        if matches!(operation, ProjectOpenOperation::Staging(candidate) if candidate.progress.phase == ProjectOpenPhase::Admitting)
+        {
+            return false;
+        }
+        self.project_open = None;
+        self.project_open_error = None;
+        if self.overlay == Some(Overlay::ProjectOpenProgress) {
+            self.overlay = None;
+        }
+        self.status = "Project open cancelled".to_owned();
+        true
+    }
+
+    fn maintain_project_open(&mut self, now: Instant) -> bool {
+        let Some(mut operation) = self.project_open.take() else {
+            return false;
+        };
+        let mut changed = false;
+        match &mut operation {
+            ProjectOpenOperation::Probing {
+                progress,
+                worker_queued,
+            } => {
+                if !*worker_queued && self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY {
+                    self.pending_worker_requests
+                        .push(WorkerRequest::ProbeProject {
+                            token: progress.token,
+                            directory: progress.directory.clone(),
+                        });
+                    *worker_queued = true;
+                    changed = true;
+                }
+            }
+            ProjectOpenOperation::ChoosingRecovery(choice) => {
+                if choice.discard_requested
+                    && !choice.discard_queued
+                    && self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY
+                {
+                    self.pending_worker_requests
+                        .push(WorkerRequest::DiscardRecovery {
+                            token: choice.progress.token,
+                            directory: choice.progress.directory.clone(),
+                            project_id: choice.recovery.project_id,
+                            revision: choice.recovery.revision,
+                        });
+                    choice.discard_queued = true;
+                    changed = true;
+                }
+            }
+            ProjectOpenOperation::Staging(candidate) => {
+                if candidate.decode_in_flight.is_none()
+                    && candidate.next_decode < candidate.document.pads.len()
+                    && self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY
+                {
+                    let pad = &candidate.document.pads[candidate.next_decode];
+                    let path = candidate.progress.directory.join(&pad.audio_path);
+                    self.pending_worker_requests
+                        .push(WorkerRequest::StageProjectSample(Box::new(
+                            StageProjectSampleRequest {
+                                token: candidate.progress.token,
+                                pad: pad.pad,
+                                revision: candidate.document.revision,
+                                path,
+                                engine_rate: self
+                                    .audio_format
+                                    .expect("staging starts only with an audio device")
+                                    .0,
+                                recipe: pad.recipe,
+                            },
+                        )));
+                    candidate.decode_in_flight = Some(pad.pad);
+                    changed = true;
+                } else if candidate.decode_in_flight.is_none()
+                    && candidate.next_decode == candidate.document.pads.len()
+                {
+                    let Some(audio) = self.audio.as_mut() else {
+                        self.project_open = Some(operation);
+                        return false;
+                    };
+                    match candidate.admission {
+                        ProjectAdmission::StopAll => match audio.stop_all() {
+                            Ok(()) => {
+                                candidate.progress.phase = ProjectOpenPhase::Admitting;
+                                candidate.progress.admitted_actions = 1;
+                                candidate.admission = ProjectAdmission::Pads(0);
+                                self.held_pad_by_key.fill(None);
+                                changed = true;
+                            }
+                            Err(error) => self.status = error,
+                        },
+                        ProjectAdmission::Pads(offset) => {
+                            let pad = pad_from_offset(offset);
+                            let result =
+                                if let Some(staged) = candidate.staged_pads[offset].as_ref() {
+                                    audio
+                                        .install(
+                                            pad,
+                                            Arc::clone(&staged.loaded.rendered),
+                                            staged.settings,
+                                        )
+                                        .map(|_| ())
+                                } else {
+                                    audio.remove_sample(pad)
+                                };
+                            match result {
+                                Ok(()) => {
+                                    let next = offset + 1;
+                                    candidate.progress.admitted_actions += 1;
+                                    candidate.admission = if next == PAD_VIEW_COUNT {
+                                        ProjectAdmission::Patterns(0)
+                                    } else {
+                                        ProjectAdmission::Pads(next)
+                                    };
+                                    changed = true;
+                                }
+                                Err(error) => self.status = error,
+                            }
+                        }
+                        ProjectAdmission::Patterns(submitted) => {
+                            let maintenance =
+                                candidate.patterns.maintain(audio.as_mut(), self.telemetry);
+                            if maintenance.submitted_slot.is_some() {
+                                let next = submitted + 1;
+                                candidate.progress.admitted_actions += 1;
+                                candidate.admission = if next == sampler_core::PATTERN_SLOT_COUNT {
+                                    ProjectAdmission::Complete
+                                } else {
+                                    ProjectAdmission::Patterns(next)
+                                };
+                                changed = true;
+                            }
+                            if let Some(status) = maintenance.status {
+                                self.status = pattern_status_text(&status);
+                            }
+                        }
+                        ProjectAdmission::Complete => {}
+                    }
+                }
+            }
+        }
+        if matches!(&operation, ProjectOpenOperation::Staging(candidate) if matches!(candidate.admission, ProjectAdmission::Complete))
+        {
+            let ProjectOpenOperation::Staging(candidate) = operation else {
+                unreachable!()
+            };
+            self.commit_project_open(candidate, now);
+            return true;
+        }
+        self.project_open = Some(operation);
+        changed
+    }
+
+    fn project_open_is_admitting(&self) -> bool {
+        matches!(
+            self.project_open.as_ref(),
+            Some(ProjectOpenOperation::Staging(candidate))
+                if candidate.progress.phase == ProjectOpenPhase::Admitting
+        )
+    }
+
+    fn commit_project_open(&mut self, mut candidate: Box<ProjectOpenCandidate>, now: Instant) {
+        let mut pads: [PadView; PAD_VIEW_COUNT] = array::from_fn(|_| PadView::default());
+        let mut commits: [SampleCommit; PAD_VIEW_COUNT] =
+            array::from_fn(|_| SampleCommit::default());
+        for offset in 0..PAD_VIEW_COUNT {
+            let Some(staged) = candidate.staged_pads[offset].take() else {
+                continue;
+            };
+            let StagedProjectPad {
+                path,
+                settings,
+                loaded,
+            } = *staged;
+            let label = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned();
+            pads[offset] = PadView {
+                source: Some(path),
+                label,
+                settings,
+                generation: 1,
+                state: PadLoadState::Ready,
+                sample: Some(loaded.rendered),
+                preview: crate::loader::downsample_preview(&loaded.rendered_preview),
+                active: false,
+            };
+            commits[offset] = SampleCommit {
+                base: Some(loaded.base),
+                source_generation: 1,
+                fingerprint: Some(loaded.fingerprint),
+                recipe: loaded.recipe,
+                base_preview: Some(loaded.base_preview),
+                rendered_preview: Some(loaded.rendered_preview),
+            };
+        }
+
+        let dirty_since = candidate.restored_recovery.then_some(now);
+        let autosaved_revision = if candidate.restored_recovery {
+            candidate.document.revision
+        } else {
+            candidate.saved_revision
+        };
+        self.pads = pads;
+        self.patterns = candidate.patterns;
+        self.project_session = ProjectSession::opened(
+            candidate.document.project_id,
+            candidate.progress.directory,
+            candidate.document.name,
+            candidate.document.revision,
+            candidate.saved_revision,
+            autosaved_revision,
+            dirty_since,
+        );
+        self.pending_loads.fill_with(|| None);
+        self.committed_recovery_loads.fill_with(|| None);
+        self.reinstall_pending.fill(false);
+        self.current_session_bound = array::from_fn(|index| self.pads[index].sample.is_some());
+        *self.sample_editor = SampleEditorState {
+            commits,
+            generations: [1; PAD_VIEW_COUNT],
+            pending: array::from_fn(|_| None),
+            deferred_results: array::from_fn(|_| None),
+            undo: array::from_fn(|_| None),
+            generation_exhausted: [false; PAD_VIEW_COUNT],
+        };
+        self.active_bank = BankId::new(0).expect("first bank is valid");
+        self.selected_pad = 0;
+        self.apply_sample_context = None;
+        self.held_pad_by_key.fill(None);
+        self.pending_pattern_transport = None;
+        self.editor = SampleEditor::open_empty(PadId::first(), self.pads[0].settings);
+        self.sync_editor_to_selected_pad();
+        self.overlay = None;
+        self.project_open_error = None;
+        self.status = format!("Opened {}", self.project_session.name());
+    }
+
+    fn apply_project_probe(
+        &mut self,
+        token: ProjectToken,
+        directory: PathBuf,
+        result: Result<ProjectProbe, ProjectStoreError>,
+    ) -> bool {
+        let Some(ProjectOpenOperation::Probing {
+            progress,
+            worker_queued: true,
+        }) = self.project_open.as_ref()
+        else {
+            return false;
+        };
+        if progress.token != token || progress.directory != directory {
+            return false;
+        }
+        self.project_open = None;
+        let probe = match result {
+            Ok(probe) => probe,
+            Err(error) => {
+                self.status = ProjectOpenError::Probe(error.to_string()).to_string();
+                self.overlay = None;
+                return true;
+            }
+        };
+        let explicit = match probe.explicit {
+            Some(Ok(document)) => Some(document),
+            Some(Err(error)) => {
+                if probe
+                    .recovery
+                    .as_ref()
+                    .is_none_or(|recovery| recovery.is_err())
+                {
+                    self.status = ProjectOpenError::Probe(error.to_string()).to_string();
+                    self.overlay = None;
+                    return true;
+                }
+                None
+            }
+            None => None,
+        };
+        let recovery = match probe.recovery {
+            Some(Ok(document)) => Some(document),
+            Some(Err(error)) => {
+                self.status = ProjectOpenError::Probe(error.to_string()).to_string();
+                self.overlay = None;
+                return true;
+            }
+            None => None,
+        };
+
+        if let (Some(explicit), Some(recovery)) = (&explicit, &recovery)
+            && explicit.project_id != recovery.project_id
+        {
+            let error = ProjectOpenError::RecoveryMismatch;
+            self.status = error.to_string();
+            self.project_open_error = Some(error);
+            self.overlay = None;
+            return true;
+        }
+        if let Some(recovery) = recovery
+            && explicit
+                .as_ref()
+                .is_none_or(|explicit| recovery.revision > explicit.revision)
+        {
+            let progress = ProjectOpenStage {
+                token,
+                directory: probe.directory,
+                project_id: Some(recovery.project_id),
+                revision: Some(recovery.revision),
+                phase: ProjectOpenPhase::AwaitingRecoveryChoice,
+                staged_pads: 0,
+                total_pads: recovery.pads.len(),
+                admitted_actions: 0,
+                total_actions: 1 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
+            };
+            self.project_open = Some(ProjectOpenOperation::ChoosingRecovery(Box::new(
+                ProjectRecoveryChoiceState {
+                    progress,
+                    explicit,
+                    recovery,
+                    discard_requested: false,
+                    discard_queued: false,
+                },
+            )));
+            self.status = "A newer recovery is available".to_owned();
+            return true;
+        }
+        let Some(document) = explicit else {
+            self.status = ProjectOpenError::NoUsableDocument.to_string();
+            self.overlay = None;
+            return true;
+        };
+        match self.build_project_open_candidate(
+            token,
+            probe.directory,
+            document.clone(),
+            document.revision,
+            false,
+        ) {
+            Ok(operation) => self.project_open = Some(operation),
+            Err(error) => {
+                self.status = error.to_string();
+                self.overlay = None;
+                return true;
+            }
+        }
+        self.status = "Staging project audio…".to_owned();
+        true
+    }
+
+    fn build_project_open_candidate(
+        &self,
+        token: ProjectToken,
+        directory: PathBuf,
+        mut document: ProjectDocument,
+        saved_revision: u64,
+        restored_recovery: bool,
+    ) -> Result<ProjectOpenOperation, ProjectOpenError> {
+        let Some((sample_rate, _)) = self.audio_format else {
+            return Err(ProjectOpenError::AudioUnavailable);
+        };
+        let mut patterns = PatternWorkspace::new(sample_rate);
+        patterns
+            .replace_project_patterns(document.patterns.clone())
+            .map_err(|error| ProjectOpenError::InvalidPatterns(error.to_string()))?;
+        patterns
+            .rebuild_sample_rate(sample_rate)
+            .map_err(|error| ProjectOpenError::InvalidPatterns(error.to_string()))?;
+        document.pads.sort_by_key(|pad| pad_offset(pad.pad));
+        let progress = ProjectOpenStage {
+            token,
+            directory,
+            project_id: Some(document.project_id),
+            revision: Some(document.revision),
+            phase: ProjectOpenPhase::Staging,
+            staged_pads: 0,
+            total_pads: document.pads.len(),
+            admitted_actions: 0,
+            total_actions: 1 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
+        };
+        Ok(ProjectOpenOperation::Staging(Box::new(
+            ProjectOpenCandidate {
+                progress,
+                document,
+                patterns,
+                staged_pads: array::from_fn(|_| None),
+                next_decode: 0,
+                decode_in_flight: None,
+                saved_revision,
+                restored_recovery,
+                admission: ProjectAdmission::StopAll,
+            },
+        )))
+    }
+
+    pub fn choose_project_recovery(
+        &mut self,
+        choice: RecoveryChoice,
+    ) -> Result<(), ProjectOpenError> {
+        let Some(ProjectOpenOperation::ChoosingRecovery(state)) = self.project_open.take() else {
+            return Err(ProjectOpenError::OperationPending);
+        };
+        let ProjectRecoveryChoiceState {
+            progress,
+            explicit,
+            recovery,
+            discard_requested,
+            discard_queued,
+        } = *state;
+        match choice {
+            RecoveryChoice::Cancel => {
+                self.overlay = None;
+                self.status = "Project open cancelled".to_owned();
+            }
+            RecoveryChoice::Restore => {
+                let saved_revision = explicit
+                    .as_ref()
+                    .map_or_else(|| recovery.revision.saturating_sub(1), |doc| doc.revision);
+                self.project_open = Some(self.build_project_open_candidate(
+                    progress.token,
+                    progress.directory,
+                    recovery,
+                    saved_revision,
+                    true,
+                )?);
+                self.status = "Staging recovered project audio…".to_owned();
+            }
+            RecoveryChoice::Discard => {
+                if explicit.is_none() {
+                    self.project_open = Some(ProjectOpenOperation::ChoosingRecovery(Box::new(
+                        ProjectRecoveryChoiceState {
+                            progress,
+                            explicit,
+                            recovery,
+                            discard_requested,
+                            discard_queued,
+                        },
+                    )));
+                    return Err(ProjectOpenError::NoUsableDocument);
+                }
+                let discard_queued = if self.pending_worker_requests.len() < WORKER_CHANNEL_CAPACITY
+                {
+                    self.pending_worker_requests
+                        .push(WorkerRequest::DiscardRecovery {
+                            token: progress.token,
+                            directory: progress.directory.clone(),
+                            project_id: recovery.project_id,
+                            revision: recovery.revision,
+                        });
+                    true
+                } else {
+                    false
+                };
+                self.project_open = Some(ProjectOpenOperation::ChoosingRecovery(Box::new(
+                    ProjectRecoveryChoiceState {
+                        progress,
+                        explicit,
+                        recovery,
+                        discard_requested: true,
+                        discard_queued,
+                    },
+                )));
+                self.status = "Discarding exact recovery…".to_owned();
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_project_sample_staged(
+        &mut self,
+        token: ProjectToken,
+        pad: PadId,
+        revision: u64,
+        path: PathBuf,
+        recipe: SampleEditRecipe,
+        result: Result<crate::LoadedSample, crate::LoadSampleError>,
+    ) -> bool {
+        let Some(ProjectOpenOperation::Staging(candidate)) = self.project_open.as_ref() else {
+            return false;
+        };
+        let Some(expected) = candidate.document.pads.get(candidate.next_decode) else {
+            return false;
+        };
+        let expected_settings = expected.settings;
+        let expected_path = candidate.progress.directory.join(&expected.audio_path);
+        if candidate.progress.token != token
+            || candidate.decode_in_flight != Some(pad)
+            || expected.pad != pad
+            || candidate.document.revision != revision
+            || expected_path != path
+            || expected.recipe != recipe
+        {
+            return false;
+        }
+
+        let loaded = match result {
+            Ok(loaded)
+                if loaded.fingerprint.digest == expected.asset_digest
+                    && loaded.recipe == recipe
+                    && self.audio_format.is_some_and(|(sample_rate, _)| {
+                        loaded.rendered.sample_rate() == sample_rate
+                    }) =>
+            {
+                loaded
+            }
+            Ok(loaded) => {
+                let message = if loaded.fingerprint.digest != expected.asset_digest {
+                    "asset digest changed during staging".to_owned()
+                } else if loaded.recipe != recipe {
+                    "staged recipe context changed".to_owned()
+                } else {
+                    "audio device rate changed during staging".to_owned()
+                };
+                self.project_open = None;
+                self.overlay = None;
+                let error = ProjectOpenError::Stage { pad, message };
+                self.status = error.to_string();
+                self.project_open_error = Some(error);
+                return true;
+            }
+            Err(error) => {
+                self.project_open = None;
+                self.overlay = None;
+                let error = ProjectOpenError::Stage {
+                    pad,
+                    message: error.to_string(),
+                };
+                self.status = error.to_string();
+                self.project_open_error = Some(error);
+                return true;
+            }
+        };
+
+        let ProjectOpenOperation::Staging(candidate) = self
+            .project_open
+            .as_mut()
+            .expect("matching project stage remains present")
+        else {
+            unreachable!()
+        };
+        candidate.staged_pads[pad_offset(pad)] = Some(Box::new(StagedProjectPad {
+            path,
+            settings: expected_settings,
+            loaded,
+        }));
+        candidate.next_decode += 1;
+        candidate.decode_in_flight = None;
+        candidate.progress.staged_pads = candidate.next_decode;
+        self.status = format!(
+            "Staged {}/{} project samples",
+            candidate.progress.staged_pads, candidate.progress.total_pads
+        );
+        true
+    }
+
+    fn apply_project_recovery_discarded(
+        &mut self,
+        token: ProjectToken,
+        directory: PathBuf,
+        project_id: ProjectId,
+        revision: u64,
+        result: Result<(), ProjectStoreError>,
+    ) -> Option<bool> {
+        let ProjectOpenOperation::ChoosingRecovery(choice) = self.project_open.as_ref()? else {
+            return Some(false);
+        };
+        if !choice.discard_requested
+            || !choice.discard_queued
+            || choice.progress.token != token
+            || choice.progress.directory != directory
+            || choice.recovery.project_id != project_id
+            || choice.recovery.revision != revision
+        {
+            return Some(false);
+        }
+        let explicit = choice
+            .explicit
+            .clone()
+            .expect("recovery discard is offered only with an explicit document");
+        self.project_open = None;
+        if let Err(error) = result {
+            self.status = ProjectOpenError::Probe(error.to_string()).to_string();
+            self.overlay = None;
+            return Some(true);
+        }
+        match self.build_project_open_candidate(
+            token,
+            directory,
+            explicit.clone(),
+            explicit.revision,
+            false,
+        ) {
+            Ok(operation) => {
+                self.project_open = Some(operation);
+                self.status = "Staging project audio…".to_owned();
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                self.overlay = None;
+            }
+        }
+        Some(true)
+    }
+
+    fn restore_busy_project_recovery_discard(
+        &mut self,
+        token: ProjectToken,
+        directory: &Path,
+        project_id: ProjectId,
+        revision: u64,
+        error: WorkerSendError,
+    ) -> Option<bool> {
+        let ProjectOpenOperation::ChoosingRecovery(choice) = self.project_open.as_mut()? else {
+            return Some(false);
+        };
+        if !choice.discard_requested
+            || choice.progress.token != token
+            || choice.progress.directory != directory
+            || choice.recovery.project_id != project_id
+            || choice.recovery.revision != revision
+        {
+            return Some(false);
+        }
+        if error == WorkerSendError::WorkerBusy {
+            choice.discard_queued = false;
+        } else {
+            self.project_open = None;
+            self.overlay = None;
+        }
+        Some(true)
     }
 
     pub fn project_save_error(&self) -> Option<&ProjectSaveFailure> {
@@ -913,6 +1662,8 @@ impl App {
         if let Some(error) = runtime_error {
             self.fail_audio(error);
             true
+        } else if self.project_open.is_some() {
+            changed
         } else {
             changed |= self.pump_recovery_requests();
             changed |= self.pump_pending_sample_edit();
@@ -1223,6 +1974,10 @@ impl App {
     }
 
     fn cancel_overlay(&mut self) {
+        if self.overlay == Some(Overlay::ProjectOpenProgress) {
+            self.cancel_project_open();
+            return;
+        }
         self.close_overlay();
     }
 
@@ -1336,19 +2091,52 @@ impl App {
                 directory,
                 project_id,
                 revision,
-            } => self.restore_busy_recovery_cleanup(
-                RecoveryCleanup {
-                    token,
-                    directory,
-                    project_id,
-                    revision,
-                },
-                error,
-            ),
-            WorkerRequest::ScanDirectory { .. }
-            | WorkerRequest::ProbeProject { .. }
-            | WorkerRequest::StageProjectSample(_)
-            | WorkerRequest::Shutdown => false,
+            } => {
+                if let Some(applied) = self.restore_busy_project_recovery_discard(
+                    token, &directory, project_id, revision, error,
+                ) {
+                    applied
+                } else {
+                    self.restore_busy_recovery_cleanup(
+                        RecoveryCleanup {
+                            token,
+                            directory,
+                            project_id,
+                            revision,
+                        },
+                        error,
+                    )
+                }
+            }
+            WorkerRequest::ProbeProject { token, directory } => {
+                let Some(ProjectOpenOperation::Probing {
+                    progress,
+                    worker_queued,
+                }) = self.project_open.as_mut()
+                else {
+                    return false;
+                };
+                if progress.token != token || progress.directory != directory {
+                    return false;
+                }
+                *worker_queued = false;
+                true
+            }
+            WorkerRequest::StageProjectSample(request) => {
+                let Some(ProjectOpenOperation::Staging(candidate)) = self.project_open.as_mut()
+                else {
+                    return false;
+                };
+                if candidate.progress.token != request.token
+                    || candidate.decode_in_flight != Some(request.pad)
+                    || candidate.document.revision != request.revision
+                {
+                    return false;
+                }
+                candidate.decode_in_flight = None;
+                true
+            }
+            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => false,
         };
         if applied {
             self.status = message;
@@ -1739,6 +2527,22 @@ impl App {
 
     pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
         let result = match result {
+            WorkerResult::ProjectProbed {
+                token,
+                directory,
+                result,
+            } => return self.apply_project_probe(token, directory, result),
+            WorkerResult::ProjectSampleStaged {
+                token,
+                pad,
+                revision,
+                path,
+                recipe,
+                result,
+            } => {
+                return self
+                    .apply_project_sample_staged(token, pad, revision, path, recipe, result);
+            }
             WorkerResult::ProjectSaved {
                 token,
                 kind,
@@ -1757,6 +2561,15 @@ impl App {
                 revision,
                 result,
             } => {
+                if let Some(applied) = self.apply_project_recovery_discarded(
+                    token,
+                    directory.clone(),
+                    project_id,
+                    revision,
+                    result.clone(),
+                ) {
+                    return applied;
+                }
                 return self.apply_recovery_cleanup(token, directory, project_id, revision, result);
             }
             result => result,
@@ -3259,6 +4072,43 @@ impl App {
         self.reinstall_pending.fill(false);
         self.current_session_bound.fill(false);
         self.pending_pattern_transport = None;
+        if let Some(ProjectOpenOperation::Staging(candidate)) = self.project_open.as_mut() {
+            let staged_rate_matches = candidate
+                .staged_pads
+                .iter()
+                .flatten()
+                .all(|staged| staged.loaded.rendered.sample_rate() == sample_rate);
+            if !staged_rate_matches {
+                candidate.staged_pads.fill_with(|| None);
+                candidate.next_decode = 0;
+                candidate.decode_in_flight = None;
+                candidate.progress.staged_pads = 0;
+            }
+            let mut patterns = PatternWorkspace::new(sample_rate);
+            let rebuild = patterns
+                .replace_project_patterns(candidate.document.patterns.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    patterns
+                        .rebuild_sample_rate(sample_rate)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = rebuild {
+                self.status = error;
+            } else {
+                candidate.patterns = patterns;
+            }
+            candidate.admission = ProjectAdmission::StopAll;
+            candidate.progress.admitted_actions = 0;
+            self.overlay = Some(Overlay::ProjectOpenProgress);
+            self.status = if staged_rate_matches {
+                "Audio reconnected; restarting project admission".to_owned()
+            } else {
+                "Audio rate changed; restaging project audio".to_owned()
+            };
+            self.sync_editor_to_selected_pad();
+            return;
+        }
         if let Err(error) = self.patterns.rebuild_sample_rate(sample_rate) {
             self.status = error.to_string();
         }
@@ -3752,6 +4602,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     enum AudioCall {
         Install(PadId),
+        RemoveSample(PadId),
         Trigger(PadId, Frame, f32),
         Release(PadId, Frame),
         StopPad(PadId),
@@ -4093,6 +4944,11 @@ mod tests {
                 return Err(error);
             }
             self.calls.0.borrow_mut().push(AudioCall::StopPad(pad));
+            Ok(())
+        }
+
+        fn remove_sample(&mut self, pad: PadId) -> Result<(), String> {
+            self.calls.0.borrow_mut().push(AudioCall::RemoveSample(pad));
             Ok(())
         }
 
@@ -8132,6 +8988,625 @@ mod tests {
                 kind: std::io::ErrorKind::PermissionDenied,
             }),
         }
+    }
+
+    fn project_open_document(
+        project_id: sampler_core::ProjectId,
+        name: &str,
+        revision: u64,
+        pads: Vec<sampler_core::ProjectPad>,
+    ) -> sampler_core::ProjectDocument {
+        sampler_core::ProjectDocument::new_v2(
+            project_id,
+            name,
+            revision,
+            pads,
+            PatternWorkspace::new(48_000)
+                .export_project_patterns()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn project_open_pad(pad: PadId, settings: PadSettings) -> sampler_core::ProjectPad {
+        let fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+        sampler_core::ProjectPad::new(
+            pad,
+            format!("audio/{}.wav", fingerprint.digest),
+            fingerprint.digest,
+            settings,
+            SampleEditRecipe::identity(),
+        )
+        .unwrap()
+    }
+
+    fn staged_project_result(
+        request: &crate::StageProjectSampleRequest,
+        fingerprint: crate::SourceFingerprint,
+    ) -> WorkerResult {
+        let rendered = Arc::new(SampleBuffer::new(request.engine_rate, vec![0.25, -0.25]).unwrap());
+        WorkerResult::ProjectSampleStaged {
+            token: request.token,
+            pad: request.pad,
+            revision: request.revision,
+            path: request.path.clone(),
+            recipe: request.recipe,
+            result: Ok(LoadedSample {
+                fingerprint,
+                base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
+                rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS],
+                ),
+                recipe: request.recipe,
+                source_rate: request.engine_rate,
+                source_frames: 1,
+                duration: Duration::from_secs_f64(1.0 / f64::from(request.engine_rate)),
+            }),
+        }
+    }
+
+    fn stage_project_open(app: &mut App, directory: &str, document: sampler_core::ProjectDocument) {
+        let token = app.request_open_project(directory).unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: directory.into(),
+            result: Ok(crate::ProjectProbe {
+                directory: directory.into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+        let fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+        while app.project_open_stage().unwrap().staged_pads
+            < app.project_open_stage().unwrap().total_pads
+        {
+            assert!(app.maintain_project(Instant::now()));
+            let requests = app.take_worker_requests();
+            let [WorkerRequest::StageProjectSample(request)] = requests.as_slice() else {
+                panic!("expected one staged decode request");
+            };
+            assert!(app.apply_worker_result(staged_project_result(request, fingerprint)));
+        }
+    }
+
+    #[test]
+    fn project_open_stale_probe_and_cancel_preserve_the_complete_old_tuple() {
+        let mut app = project_app();
+        let before = app.project_snapshot().unwrap();
+        let token = app.request_open_project("project-b").unwrap();
+        let stale = crate::ProjectToken::new(token.get() + 1);
+        let candidate = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x72; 16]),
+            "Project B",
+            9,
+            Vec::new(),
+        );
+
+        assert!(!app.apply_worker_result(WorkerResult::ProjectProbed {
+            token: stale,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(candidate.clone())),
+                recovery: None,
+            }),
+        }));
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        assert!(app.cancel_project_open());
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        assert!(!app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(candidate)),
+                recovery: None,
+            }),
+        }));
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn project_open_refuses_unresolved_sample_state_before_allocating_a_probe() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let pending_pad = pad(0, 2);
+        assert!(app.begin_load(pending_pad, "pending.wav").is_some());
+
+        assert!(matches!(
+            app.request_open_project("project-b"),
+            Err(crate::ProjectOpenError::UnresolvedState(_))
+        ));
+        assert!(app.project_open_stage().is_none());
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn project_open_stages_one_asset_per_maintenance_without_audio_commands() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let project_id = sampler_core::ProjectId::from_bytes([0x73; 16]);
+        let pads = vec![
+            project_open_pad(pad(0, 0), PadSettings::default()),
+            project_open_pad(
+                pad(0, 1),
+                PadSettings::new(PlaybackMode::Gate, -3.0, 0.25, 2.0, None).unwrap(),
+            ),
+        ];
+        let document = project_open_document(project_id, "Project B", 4, pads);
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(first)] = requests.as_slice() else {
+            panic!("expected exactly one staged decode request");
+        };
+        assert_eq!(first.pad, pad(0, 0));
+        assert!(calls.snapshot().is_empty());
+        assert!(!app.maintain_project(Instant::now()));
+        assert!(app.take_worker_requests().is_empty());
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_open_rejects_stale_and_digest_mismatched_stage_results_atomically() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let before = app.project_snapshot().unwrap();
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x74; 16]),
+            "Project B",
+            5,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+        );
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(request)] = requests.as_slice() else {
+            panic!("expected staged decode request");
+        };
+        let mut stale_request = (**request).clone();
+        stale_request.token = crate::ProjectToken::new(token.get() + 1);
+        let exact_fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+        assert!(
+            !app.apply_worker_result(staged_project_result(&stale_request, exact_fingerprint,))
+        );
+        assert!(app.project_open_stage().is_some());
+
+        let mut mismatched = exact_fingerprint;
+        mismatched.digest = sampler_core::AssetDigest::from_bytes([0x99; 32]);
+        assert!(app.apply_worker_result(staged_project_result(request, mismatched)));
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_open_collects_all_exact_stage_results_before_audio_admission() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x75; 16]),
+            "Project B",
+            6,
+            vec![
+                project_open_pad(pad(0, 0), PadSettings::default()),
+                project_open_pad(pad(0, 1), PadSettings::default()),
+            ],
+        );
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+        let fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+        for expected in [pad(0, 0), pad(0, 1)] {
+            assert!(app.maintain_project(Instant::now()));
+            let requests = app.take_worker_requests();
+            let [WorkerRequest::StageProjectSample(request)] = requests.as_slice() else {
+                panic!("expected one staged decode request");
+            };
+            assert_eq!(request.pad, expected);
+            assert!(app.apply_worker_result(staged_project_result(request, fingerprint)));
+            assert!(calls.snapshot().is_empty());
+        }
+        let stage = app.project_open_stage().unwrap();
+        assert_eq!(stage.staged_pads, 2);
+        assert_eq!(stage.phase, crate::ProjectOpenPhase::Staging);
+        assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_open_recovery_prompts_only_for_same_id_higher_revision_and_cancel_preserves() {
+        let mut app = project_app();
+        let before = app.project_snapshot().unwrap();
+        let project_id = sampler_core::ProjectId::from_bytes([0x76; 16]);
+        let explicit = project_open_document(project_id, "Explicit", 4, Vec::new());
+        let recovery = project_open_document(project_id, "Recovery", 6, Vec::new());
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(explicit)),
+                recovery: Some(Ok(recovery)),
+            }),
+        }));
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::AwaitingRecoveryChoice
+        );
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        app.choose_project_recovery(crate::RecoveryChoice::Cancel)
+            .unwrap();
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(app.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn project_open_recovery_lower_is_ignored_and_other_identity_is_rejected() {
+        let project_id = sampler_core::ProjectId::from_bytes([0x77; 16]);
+        let mut lower = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let token = lower.request_open_project("project-b").unwrap();
+        lower.take_worker_requests();
+        assert!(lower.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(project_open_document(
+                    project_id,
+                    "Explicit",
+                    7,
+                    Vec::new(),
+                ))),
+                recovery: Some(Ok(project_open_document(
+                    project_id,
+                    "Recovery",
+                    6,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+        assert_eq!(lower.project_open_stage().unwrap().revision, Some(7));
+        assert_eq!(
+            lower.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::Staging
+        );
+
+        let mut mismatch = project_app();
+        let before = mismatch.project_snapshot().unwrap();
+        let token = mismatch.request_open_project("project-c").unwrap();
+        mismatch.take_worker_requests();
+        assert!(mismatch.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-c".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-c".into(),
+                explicit: Some(Ok(project_open_document(
+                    project_id,
+                    "Explicit",
+                    7,
+                    Vec::new(),
+                ))),
+                recovery: Some(Ok(project_open_document(
+                    sampler_core::ProjectId::from_bytes([0x78; 16]),
+                    "Other",
+                    8,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+        assert!(mismatch.project_open_stage().is_none());
+        assert_eq!(
+            mismatch.project_open_error(),
+            Some(&crate::ProjectOpenError::RecoveryMismatch)
+        );
+        assert!(mismatch.status().contains("recovery identity"));
+        assert_eq!(mismatch.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn project_open_discard_waits_for_exact_recovery_deletion_before_staging_explicit() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let project_id = sampler_core::ProjectId::from_bytes([0x79; 16]);
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(project_open_document(
+                    project_id,
+                    "Explicit",
+                    4,
+                    Vec::new(),
+                ))),
+                recovery: Some(Ok(project_open_document(
+                    project_id,
+                    "Recovery",
+                    6,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+
+        app.choose_project_recovery(crate::RecoveryChoice::Discard)
+            .unwrap();
+        let requests = app.take_worker_requests();
+        let [
+            WorkerRequest::DiscardRecovery {
+                token: discard_token,
+                directory,
+                project_id: discarded_id,
+                revision,
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("expected exact recovery discard");
+        };
+        assert_eq!(*discard_token, token);
+        assert_eq!(directory, path("project-b"));
+        assert_eq!(*discarded_id, project_id);
+        assert_eq!(*revision, 6);
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::AwaitingRecoveryChoice
+        );
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token,
+            directory: "project-b".into(),
+            project_id,
+            revision: 6,
+            result: Ok(()),
+        }));
+        assert_eq!(app.project_open_stage().unwrap().revision, Some(4));
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::Staging
+        );
+    }
+
+    #[test]
+    fn project_open_admits_stop_pads_and_patterns_one_per_maintenance_then_commits() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let project_id = sampler_core::ProjectId::from_bytes([0x7a; 16]);
+        let settings = PadSettings::new(PlaybackMode::Gate, -4.0, 0.25, 3.0, None).unwrap();
+        let document = project_open_document(
+            project_id,
+            "Project B",
+            12,
+            vec![project_open_pad(pad(0, 1), settings)],
+        );
+        let old_snapshot = app.project_snapshot().unwrap();
+        stage_project_open(&mut app, "project-b", document);
+
+        app.maintain_audio();
+        assert!(calls.snapshot().is_empty());
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::Admitting
+        );
+        app.apply(InputAction::PadPress(0));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+
+        for offset in 0..super::PAD_VIEW_COUNT {
+            let before = calls.snapshot().len();
+            assert!(app.maintain_project(Instant::now()));
+            let after = calls.snapshot();
+            assert_eq!(after.len(), before + 1);
+            let expected_pad = super::pad_from_offset(offset);
+            if offset == 1 {
+                assert_eq!(after.last(), Some(&AudioCall::Install(expected_pad)));
+            } else {
+                assert_eq!(after.last(), Some(&AudioCall::RemoveSample(expected_pad)));
+            }
+            assert!(app.project_open_stage().is_some());
+            assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+        }
+
+        for index in 0..sampler_core::PATTERN_SLOT_COUNT {
+            let before = calls.snapshot().len();
+            assert!(app.maintain_project(Instant::now()));
+            let after = calls.snapshot();
+            assert_eq!(after.len(), before + 1);
+            assert_eq!(after.last(), Some(&AudioCall::InstallPattern));
+            if index + 1 < sampler_core::PATTERN_SLOT_COUNT {
+                assert!(app.project_open_stage().is_some());
+                assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+            }
+        }
+
+        assert!(app.project_open_stage().is_none());
+        assert!(app.overlay().is_none());
+        assert_eq!(app.project_revision(), 12);
+        assert_eq!(app.project_header(), "Project B · SAVED");
+        assert_eq!(app.pad(pad(0, 1)).settings, settings);
+        assert_eq!(app.pad(pad(0, 1)).state, PadLoadState::Ready);
+        assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Empty);
+    }
+
+    #[test]
+    fn project_open_admission_backpressure_retries_the_exact_same_pad_action() {
+        let audio = FakeAudio::ready(48_000, 2).failing_install("command queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x7b; 16]),
+            "Project B",
+            13,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+        );
+        stage_project_open(&mut app, "project-b", document);
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+
+        assert!(!app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
+        assert!(app.status().contains("command queue full"));
+
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::StopAll, AudioCall::Install(pad(0, 0))]
+        );
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+    }
+
+    #[test]
+    fn project_open_device_retry_restarts_admission_on_the_empty_engine() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device lost");
+        let old_calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let old_snapshot = app.project_snapshot().unwrap();
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x7c; 16]),
+            "Project B",
+            14,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+        );
+        stage_project_open(&mut app, "project-b", document);
+        assert!(app.maintain_project(Instant::now()));
+        assert!(app.maintain_project(Instant::now()));
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(
+            old_calls.snapshot(),
+            [
+                AudioCall::StopAll,
+                AudioCall::Install(pad(0, 0)),
+                AudioCall::RemoveSample(pad(0, 1)),
+            ]
+        );
+        assert!(app.maintain_audio());
+        assert_eq!(app.audio_format(), None);
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+
+        let replacement = FakeAudio::ready(48_000, 2);
+        let replacement_calls = replacement.call_log();
+        assert!(app.retry_with(Box::new(replacement)));
+        replacement_calls.clear();
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(replacement_calls.snapshot(), [AudioCall::StopAll]);
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(
+            replacement_calls.snapshot(),
+            [AudioCall::StopAll, AudioCall::Install(pad(0, 0))]
+        );
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+    }
+
+    #[test]
+    fn project_open_restore_commits_recovery_as_modified_against_explicit_revision() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let project_id = sampler_core::ProjectId::from_bytes([0x7d; 16]);
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Ok(project_open_document(
+                    project_id,
+                    "Explicit",
+                    4,
+                    Vec::new(),
+                ))),
+                recovery: Some(Ok(project_open_document(
+                    project_id,
+                    "Recovery",
+                    6,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+        app.choose_project_recovery(crate::RecoveryChoice::Restore)
+            .unwrap();
+        while app.project_open_stage().is_some() {
+            assert!(app.maintain_project(Instant::now()));
+        }
+
+        assert_eq!(app.project_revision(), 6);
+        assert_eq!(app.project_session.saved_revision(), 4);
+        assert_eq!(app.project_session.autosaved_revision(), 6);
+        assert_eq!(app.project_header(), "Recovery · MODIFIED");
+    }
+
+    #[test]
+    fn project_open_can_restore_valid_recovery_when_explicit_document_is_corrupt() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let project_id = sampler_core::ProjectId::from_bytes([0x7e; 16]);
+        let token = app.request_open_project("project-b").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-b".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-b".into(),
+                explicit: Some(Err(ProjectStoreError::DocumentInvalid {
+                    path: "project-b/project.toml".into(),
+                    message: "corrupt TOML".to_owned(),
+                })),
+                recovery: Some(Ok(project_open_document(
+                    project_id,
+                    "Recovery",
+                    3,
+                    Vec::new(),
+                ))),
+            }),
+        }));
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::AwaitingRecoveryChoice
+        );
+        app.choose_project_recovery(crate::RecoveryChoice::Restore)
+            .unwrap();
+        assert_eq!(app.project_open_stage().unwrap().revision, Some(3));
     }
 
     #[test]

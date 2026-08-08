@@ -8,9 +8,9 @@ pub mod voice;
 pub use error::{PatternCompileError, PatternEditError};
 pub use pad::{BankId, ChokeGroup, ModelError, PadId, PadSettings, PlaybackMode};
 pub use pattern::{
-    EditablePattern, EventId, MAX_PATTERN_ACTIONS, MAX_PATTERN_EVENTS, PATTERN_SLOT_COUNT, Pattern,
-    PatternAction, PatternActionKind, PatternEvent, PatternSlotId, PatternSnapshot, ScheduleResult,
-    ScheduledEvent,
+    EditablePattern, EventId, FIRST_LOOP_VALID_MASK_WORDS, MAX_PATTERN_ACTIONS, MAX_PATTERN_EVENTS,
+    PATTERN_SLOT_COUNT, Pattern, PatternAction, PatternActionKind, PatternEvent, PatternSlotId,
+    PatternSnapshot, ScheduleResult, ScheduledEvent,
 };
 pub use project::{
     CURRENT_SCHEMA_VERSION, ProjectDocument, ProjectError, ProjectPad, ProjectPattern,

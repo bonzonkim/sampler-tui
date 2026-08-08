@@ -676,6 +676,28 @@ impl PatternSnapshot {
     pub fn first_loop_valid_word(&self, word_index: usize) -> u64 {
         self.first_loop_valid.get(word_index).copied().unwrap_or(0)
     }
+
+    pub fn first_loop_valid_count(&self, start: usize, end: usize) -> usize {
+        let start = start.min(self.actions.len());
+        let end = end.min(self.actions.len());
+        if start >= end {
+            return 0;
+        }
+        let first_word = start / u64::BITS as usize;
+        let last_word = (end - 1) / u64::BITS as usize;
+        (first_word..=last_word)
+            .map(|word_index| {
+                let mut word = self.first_loop_valid[word_index];
+                if word_index == first_word {
+                    word &= u64::MAX << (start % u64::BITS as usize);
+                }
+                if word_index == last_word && !end.is_multiple_of(u64::BITS as usize) {
+                    word &= (1_u64 << (end % u64::BITS as usize)) - 1;
+                }
+                word.count_ones() as usize
+            })
+            .sum()
+    }
 }
 
 fn validate_compilable_event(

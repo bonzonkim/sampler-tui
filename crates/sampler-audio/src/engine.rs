@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use rtrb::PushError;
 use sampler_core::{
-    EventId, Frame, PATTERN_SLOT_COUNT, PadId, PadSettings, PatternAction, PatternActionKind,
-    PatternSlotId, PatternSnapshot, PlaybackMode, VoiceAllocator, VoiceId, VoiceRequest,
+    EventId, FIRST_LOOP_VALID_MASK_WORDS, Frame, PATTERN_SLOT_COUNT, PadId, PadSettings,
+    PatternAction, PatternActionKind, PatternSlotId, PatternSnapshot, PlaybackMode, VoiceAllocator,
+    VoiceId, VoiceRequest,
 };
 
 use crate::{
@@ -318,6 +319,90 @@ struct PatternInterval {
     end: Frame,
 }
 
+struct PatternIntervalCursor {
+    origin: Frame,
+    start: Frame,
+    end: Frame,
+    loop_frames: Frame,
+    loop_index: u128,
+    action_index: usize,
+    first_loop_word: usize,
+    first_loop_bits: u64,
+}
+
+impl PatternIntervalCursor {
+    fn new(snapshot: &PatternSnapshot, interval: PatternInterval) -> Option<Self> {
+        let start = interval.start.max(interval.origin);
+        let loop_frames = snapshot.loop_frames();
+        if loop_frames == 0 || start >= interval.end || snapshot.actions().is_empty() {
+            return None;
+        }
+        let relative_start = start - interval.origin;
+        let loop_index = u128::from(relative_start / loop_frames);
+        let start_phase = relative_start % loop_frames;
+        let action_index = snapshot
+            .actions()
+            .partition_point(|action| action.frame < start_phase);
+        let first_loop_word = action_index / u64::BITS as usize;
+        let first_loop_bits = if loop_index == 0 && first_loop_word < FIRST_LOOP_VALID_MASK_WORDS {
+            snapshot.first_loop_valid_word(first_loop_word)
+                & (u64::MAX << (action_index % u64::BITS as usize))
+        } else {
+            0
+        };
+        Some(Self {
+            origin: interval.origin,
+            start,
+            end: interval.end,
+            loop_frames,
+            loop_index,
+            action_index,
+            first_loop_word,
+            first_loop_bits,
+        })
+    }
+
+    fn next(&mut self, snapshot: &PatternSnapshot) -> Option<(PatternAction, Frame, u128)> {
+        let actions = snapshot.actions();
+        loop {
+            if self.loop_index == 0 {
+                while self.first_loop_bits == 0 {
+                    self.first_loop_word += 1;
+                    if self.first_loop_word >= FIRST_LOOP_VALID_MASK_WORDS
+                        || self.first_loop_word * u64::BITS as usize >= actions.len()
+                    {
+                        self.loop_index = 1;
+                        self.action_index = 0;
+                        break;
+                    }
+                    self.first_loop_bits = snapshot.first_loop_valid_word(self.first_loop_word);
+                }
+                if self.loop_index == 0 {
+                    let bit = self.first_loop_bits.trailing_zeros() as usize;
+                    self.first_loop_bits &= self.first_loop_bits - 1;
+                    self.action_index = self.first_loop_word * u64::BITS as usize + bit;
+                }
+            } else if self.action_index == actions.len() {
+                self.loop_index = self.loop_index.checked_add(1)?;
+                self.action_index = 0;
+            }
+
+            let action = *actions.get(self.action_index)?;
+            self.action_index += 1;
+            let absolute = u128::from(self.origin)
+                .checked_add(self.loop_index.checked_mul(u128::from(self.loop_frames))?)?
+                .checked_add(u128::from(action.frame))?;
+            if absolute >= u128::from(self.end) {
+                return None;
+            }
+            if absolute < u128::from(self.start) {
+                continue;
+            }
+            return Some((action, Frame::try_from(absolute).ok()?, self.loop_index));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CommandLane {
     Immediate,
@@ -399,6 +484,10 @@ pub struct AudioEngine {
     telemetry_peak_left: f32,
     telemetry_peak_right: f32,
     next_telemetry_frame: Frame,
+    #[cfg(test)]
+    pattern_action_reads: usize,
+    #[cfg(test)]
+    pattern_mask_word_reads: usize,
 }
 
 impl AudioEngine {
@@ -437,6 +526,10 @@ impl AudioEngine {
             telemetry_peak_left: 0.0,
             telemetry_peak_right: 0.0,
             next_telemetry_frame: telemetry_interval,
+            #[cfg(test)]
+            pattern_action_reads: 0,
+            #[cfg(test)]
+            pattern_mask_word_reads: 0,
         })
     }
 
@@ -979,6 +1072,12 @@ impl AudioEngine {
             let Some(pattern) = self.pattern_player.installed(interval.slot) else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                self.pattern_mask_word_reads = self.pattern_mask_word_reads.saturating_add(
+                    pattern_interval_first_loop_mask_words(&pattern.snapshot, *interval),
+                );
+            }
             total =
                 total.saturating_add(pattern_interval_action_count(&pattern.snapshot, *interval));
         }
@@ -990,22 +1089,51 @@ impl AudioEngine {
             .unwrap_or(usize::MAX)
             .min(MAX_PATTERN_ACTIONS_PER_CALLBACK)
             .min(free_entries);
-        let mut admitted = [None; MAX_PATTERN_ACTIONS_PER_CALLBACK];
         let mut admitted_len = 0;
         let sequence = self.pattern_player.play_sequence;
         for interval in intervals.iter().take(interval_len).flatten() {
             if admitted_len == admitted_limit {
                 break;
             }
-            let Some(pattern) = self.pattern_player.installed(interval.slot) else {
+            let Some((slot, generation, loop_frames, mut cursor)) = self
+                .pattern_player
+                .installed(interval.slot)
+                .and_then(|pattern| {
+                    Some((
+                        pattern.snapshot.slot(),
+                        pattern.snapshot.generation(),
+                        pattern.snapshot.loop_frames(),
+                        PatternIntervalCursor::new(&pattern.snapshot, *interval)?,
+                    ))
+                })
+            else {
                 continue;
             };
-            admitted_len += enumerate_pattern_interval(
-                &pattern.snapshot,
-                *interval,
-                sequence,
-                &mut admitted[admitted_len..admitted_limit],
-            );
+            while admitted_len < admitted_limit {
+                let next = self
+                    .pattern_player
+                    .installed(interval.slot)
+                    .and_then(|pattern| cursor.next(&pattern.snapshot));
+                let Some((action, at_frame, loop_index)) = next else {
+                    break;
+                };
+                #[cfg(test)]
+                {
+                    self.pattern_action_reads = self.pattern_action_reads.saturating_add(1);
+                }
+                let Some(id) = pattern_voice_id(
+                    slot,
+                    generation,
+                    loop_frames,
+                    interval.origin,
+                    action,
+                    loop_index,
+                ) else {
+                    continue;
+                };
+                self.insert_pending(scheduled_pattern_action(action, at_frame, sequence, id));
+                admitted_len += 1;
+            }
         }
 
         let dropped = total.saturating_sub(admitted_len as u128);
@@ -1013,9 +1141,6 @@ impl AudioEngine {
             .pattern_player
             .overflow_count
             .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-        for action in admitted.into_iter().take(admitted_len).flatten() {
-            self.insert_pending(action);
-        }
     }
 
     fn action_is_stopped(&self, action: ScheduledAction) -> bool {
@@ -1440,6 +1565,9 @@ fn pattern_interval_action_count(snapshot: &PatternSnapshot, interval: PatternIn
     }
 
     let loop_frames = snapshot.loop_frames();
+    if loop_frames == 0 {
+        return 0;
+    }
     let relative_start = start - interval.origin;
     let relative_end = interval.end - interval.origin;
     let first_loop = relative_start / loop_frames;
@@ -1448,87 +1576,59 @@ fn pattern_interval_action_count(snapshot: &PatternSnapshot, interval: PatternIn
     let end_phase = relative_end % loop_frames;
     let first_index = actions.partition_point(|action| action.frame < start_phase);
 
-    let count = if first_loop == end_loop {
+    if first_loop == end_loop {
         let end_index = actions.partition_point(|action| action.frame < end_phase);
-        end_index.saturating_sub(first_index) as u128
-    } else {
-        let first_count = actions.len().saturating_sub(first_index) as u128;
-        let middle_loops = end_loop.saturating_sub(first_loop).saturating_sub(1);
-        let middle_count = u128::from(middle_loops).saturating_mul(actions.len() as u128);
-        let last_count = actions.partition_point(|action| action.frame < end_phase) as u128;
-        first_count
-            .saturating_add(middle_count)
-            .saturating_add(last_count)
-    };
-    if first_loop != 0 {
-        return count;
+        return if first_loop == 0 {
+            snapshot.first_loop_valid_count(first_index, end_index) as u128
+        } else {
+            end_index.saturating_sub(first_index) as u128
+        };
     }
-    let loop_zero_end = if end_loop == 0 {
+
+    let first_count = if first_loop == 0 {
+        snapshot.first_loop_valid_count(first_index, actions.len()) as u128
+    } else {
+        actions.len().saturating_sub(first_index) as u128
+    };
+    let middle_loops = end_loop.saturating_sub(first_loop).saturating_sub(1);
+    let middle_count = u128::from(middle_loops).saturating_mul(actions.len() as u128);
+    let last_count = actions.partition_point(|action| action.frame < end_phase) as u128;
+    first_count
+        .saturating_add(middle_count)
+        .saturating_add(last_count)
+}
+
+#[cfg(test)]
+fn pattern_interval_first_loop_mask_words(
+    snapshot: &PatternSnapshot,
+    interval: PatternInterval,
+) -> usize {
+    let start = interval.start.max(interval.origin);
+    let actions = snapshot.actions();
+    let loop_frames = snapshot.loop_frames();
+    if actions.is_empty() || loop_frames == 0 || start >= interval.end {
+        return 0;
+    }
+    let relative_start = start - interval.origin;
+    if relative_start / loop_frames != 0 {
+        return 0;
+    }
+    let relative_end = interval.end - interval.origin;
+    let start_phase = relative_start % loop_frames;
+    let end_phase = relative_end % loop_frames;
+    let first = actions.partition_point(|action| action.frame < start_phase);
+    let last = if relative_end / loop_frames == 0 {
         actions.partition_point(|action| action.frame < end_phase)
     } else {
         actions.len()
     };
-    let nonexistent_wrapped_releases = actions[first_index..loop_zero_end]
-        .iter()
-        .filter(|action| is_nonexistent_wrapped_release(**action, 0))
-        .count() as u128;
-    count.saturating_sub(nonexistent_wrapped_releases)
-}
-
-fn enumerate_pattern_interval(
-    snapshot: &PatternSnapshot,
-    interval: PatternInterval,
-    sequence: u64,
-    output: &mut [Option<ScheduledAction>],
-) -> usize {
-    let start = interval.start.max(interval.origin);
-    let actions = snapshot.actions();
-    if output.is_empty() || actions.is_empty() || start >= interval.end {
-        return 0;
+    if first >= last {
+        0
+    } else {
+        let first_word = first / u64::BITS as usize;
+        let last_word = (last - 1) / u64::BITS as usize;
+        last_word - first_word + 1
     }
-
-    let loop_frames = snapshot.loop_frames();
-    let relative_start = start - interval.origin;
-    let mut loop_index = u128::from(relative_start / loop_frames);
-    let start_phase = relative_start % loop_frames;
-    let mut action_index = actions.partition_point(|action| action.frame < start_phase);
-    let mut written = 0;
-    while written < output.len() {
-        if action_index == actions.len() {
-            loop_index = loop_index.saturating_add(1);
-            action_index = 0;
-        }
-        let Some(loop_offset) = loop_index.checked_mul(u128::from(loop_frames)) else {
-            break;
-        };
-        let Some(absolute) = u128::from(interval.origin)
-            .checked_add(loop_offset)
-            .and_then(|base| base.checked_add(u128::from(actions[action_index].frame)))
-        else {
-            break;
-        };
-        if absolute >= u128::from(interval.end) {
-            break;
-        }
-        if absolute >= u128::from(start)
-            && !is_nonexistent_wrapped_release(actions[action_index], loop_index)
-        {
-            let at_frame = Frame::try_from(absolute).unwrap_or(Frame::MAX);
-            if let Some(id) =
-                pattern_voice_id(snapshot, interval.origin, actions[action_index], loop_index)
-            {
-                output[written] = Some(scheduled_pattern_action(
-                    actions[action_index],
-                    at_frame,
-                    sequence,
-                    id,
-                ));
-                written += 1;
-            }
-        }
-        action_index += 1;
-    }
-    written
 }
 
 fn scheduled_pattern_action(
@@ -1554,31 +1654,21 @@ fn scheduled_pattern_action(
     }
 }
 
-fn is_nonexistent_wrapped_release(action: PatternAction, loop_index: u128) -> bool {
-    matches!(action.kind, PatternActionKind::Release)
-        && action.frame < action.trigger_frame
-        && loop_index == 0
-}
-
 fn pattern_voice_id(
-    snapshot: &PatternSnapshot,
+    slot: PatternSlotId,
+    generation: u64,
+    loop_frames: Frame,
     origin: Frame,
     action: PatternAction,
     loop_index: u128,
 ) -> Option<PatternVoiceId> {
-    let occurrence_loop = if matches!(action.kind, PatternActionKind::Release)
-        && action.frame < action.trigger_frame
-    {
-        loop_index.checked_sub(1)?
-    } else {
-        loop_index
-    };
+    let occurrence_loop = loop_index.checked_sub(u128::from(action.trigger_loop_delta))?;
     let occurrence_start = u128::from(origin)
-        .checked_add(occurrence_loop.checked_mul(u128::from(snapshot.loop_frames()))?)?
+        .checked_add(occurrence_loop.checked_mul(u128::from(loop_frames))?)?
         .checked_add(u128::from(action.trigger_frame))?;
     Some(PatternVoiceId {
-        slot: snapshot.slot(),
-        generation: snapshot.generation(),
+        slot,
+        generation,
         event_id: action.event_id,
         occurrence_start: Frame::try_from(occurrence_start).ok()?,
     })
@@ -1890,6 +1980,76 @@ mod tests {
             .filter(|voice| voice.envelope.release_frame.is_none())
             .count();
         assert_eq!((releasing, sustained), (1, 1));
+    }
+
+    #[test]
+    fn duration_equal_to_loop_releases_the_prior_occurrence_despite_equal_phases() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        install_ready_sample(&mut controller, &mut engine, 100, pad, looping, 64);
+        let snapshot = pattern_snapshot_with_durations(0, 100, &[(2, pad, 10)]);
+        assert_eq!(snapshot.loop_frames(), 10);
+        controller.install_pattern(snapshot).unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+
+        engine.render_frames(3, |_| {});
+        assert_eq!(engine.voices_for_pad(pad), 1);
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .all(|voice| voice.envelope.release_frame.is_none())
+        );
+
+        engine.render_frames(10, |_| {});
+        let releasing = engine
+            .voices
+            .iter()
+            .flatten()
+            .filter(|voice| voice.envelope.release_frame.is_some())
+            .count();
+        let sustained = engine
+            .voices
+            .iter()
+            .flatten()
+            .filter(|voice| voice.envelope.release_frame.is_none())
+            .count();
+        assert_eq!((releasing, sustained), (1, 1));
+    }
+
+    #[test]
+    fn first_loop_enumeration_bounds_reads_before_the_earliest_valid_triggers() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pad = PadId::first();
+        let events = vec![(9, pad, 1); sampler_core::MAX_PATTERN_EVENTS];
+        controller
+            .install_pattern(pattern_snapshot_with_durations(0, 100, &events))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(0, |_| {});
+
+        engine.schedule_pattern_actions(10);
+
+        let event_ids = engine
+            .pending
+            .iter()
+            .take(engine.pending_len)
+            .flatten()
+            .filter_map(|action| action.pattern_voice_id().map(|id| id.event_id.0))
+            .collect::<Vec<_>>();
+        assert_eq!(event_ids, (1..=64).collect::<Vec<_>>());
+        assert!(engine.pattern_action_reads <= MAX_PATTERN_ACTIONS_PER_CALLBACK);
+        assert!(engine.pattern_mask_word_reads <= sampler_core::FIRST_LOOP_VALID_MASK_WORDS);
     }
 
     #[test]

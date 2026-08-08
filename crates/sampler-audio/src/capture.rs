@@ -96,7 +96,7 @@ pub struct CaptureSendFailure {
 }
 
 impl CaptureSendFailure {
-    fn new(error: CaptureError, command: CaptureCommand) -> Self {
+    pub(crate) fn new(error: CaptureError, command: CaptureCommand) -> Self {
         Self { error, command }
     }
 

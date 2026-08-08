@@ -10,9 +10,9 @@ use sampler_core::{
 };
 
 use crate::{
-    AudioCommand, CriticalEvent, EngineError, EnginePorts, LiveAck, LiveAckKind, LiveCommandId,
-    PatternRetirement, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT, SampleBuffer,
-    SampleSlot, Telemetry, TransportStamp,
+    AudioCommand, CaptureState, CriticalEvent, EngineError, EnginePorts, LiveAck, LiveAckKind,
+    LiveCommandId, PatternRetirement, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT,
+    SampleBuffer, SampleSlot, Telemetry, TransportStamp,
 };
 
 const VOICE_COUNT: usize = 32;
@@ -757,7 +757,7 @@ impl AudioEngine {
     }
 
     pub fn render_frames(&mut self, frame_count: usize, write_frame: impl FnMut([f32; 2])) {
-        self.render_frames_inner(frame_count, || {}, write_frame);
+        self.render_frames_inner(frame_count, || {}, || {}, write_frame);
     }
 
     #[cfg(test)]
@@ -767,13 +767,24 @@ impl AudioEngine {
         after_initial_fence_poll: impl FnOnce(),
         write_frame: impl FnMut([f32; 2]),
     ) {
-        self.render_frames_inner(frame_count, after_initial_fence_poll, write_frame);
+        self.render_frames_inner(frame_count, after_initial_fence_poll, || {}, write_frame);
+    }
+
+    #[cfg(test)]
+    fn render_frames_with_capture_progress_fence_hook(
+        &mut self,
+        frame_count: usize,
+        capture_progress_fence: impl FnMut(),
+        write_frame: impl FnMut([f32; 2]),
+    ) {
+        self.render_frames_inner(frame_count, || {}, capture_progress_fence, write_frame);
     }
 
     fn render_frames_inner(
         &mut self,
         frame_count: usize,
         after_initial_fence_poll: impl FnOnce(),
+        mut capture_progress_fence: impl FnMut(),
         mut write_frame: impl FnMut([f32; 2]),
     ) {
         let frame_count_as_frame = Frame::try_from(frame_count).unwrap_or(Frame::MAX);
@@ -787,11 +798,18 @@ impl AudioEngine {
         after_initial_fence_poll();
         self.drain_commands(horizon);
         self.schedule_pattern_actions(horizon);
+        self.ports.capture.poll_commands();
 
         for _ in 0..frame_count {
             self.advance_pattern_to(self.rendered_frame);
             self.execute_due_actions();
             let frame = self.render_frame();
+            let capture_was_recording = self.ports.capture.state() == CaptureState::Recording;
+            if capture_was_recording {
+                self.ports.capture_progress.record_frame(frame);
+            }
+            capture_progress_fence();
+            self.ports.capture.push_frame(frame);
             self.telemetry_peak_left = self.telemetry_peak_left.max(frame[0].abs());
             self.telemetry_peak_right = self.telemetry_peak_right.max(frame[1].abs());
             write_frame(frame);
@@ -1986,11 +2004,13 @@ fn settings_are_valid(settings: PadSettings) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Weak};
+    use std::sync::{Arc, Barrier, Weak};
 
     use super::*;
     use crate::{
-        AudioController, PadId, PadSettings, PatternSwitch, SampleBuffer, audio_channels,
+        AudioController, CaptureBuffer, CaptureCommand, CaptureOutcome, CaptureSource,
+        CaptureState, ControlError, PadId, PadSettings, PatternSwitch, SampleBuffer,
+        audio_channels,
         command::{RECOVERY_COMMAND_CAPACITY, audio_channels_with_capacities},
     };
     use sampler_core::{
@@ -2105,6 +2125,300 @@ mod tests {
             .install(pad, constant_sample_at(sample_rate, frames, 0.5), settings)
             .unwrap();
         engine.render_frames(0, |_| {});
+    }
+
+    fn resample_buffer(
+        token: u64,
+        target: PadId,
+        sample_rate: u32,
+        max_frames: usize,
+    ) -> CaptureBuffer {
+        CaptureBuffer::try_new(
+            token,
+            target,
+            CaptureSource::Resample,
+            sample_rate,
+            max_frames,
+        )
+        .unwrap()
+    }
+
+    fn flatten_frames(frames: &[[f32; 2]]) -> Vec<f32> {
+        frames.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn resample_capture_matches_mixed_live_and_pattern_master_between_start_and_stop() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let pattern_pad = PadId::first();
+        let live_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        install_ready_sample(&mut controller, &mut engine, 100, pattern_pad, looping, 128);
+        controller
+            .install(live_pad, constant_sample_at(100, 128, -0.25), looping)
+            .unwrap();
+        controller
+            .install_pattern(pattern_snapshot_with_triggers(0, 100, &[(2, pattern_pad)]))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        controller.trigger_live(live_pad, 1.0).unwrap();
+        engine.render_frames(1, |_| {});
+
+        controller
+            .arm_capture(resample_buffer(101, live_pad, 100, 128))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        let mut before_start = Vec::new();
+        engine.render_frames(3, |frame| before_start.push(frame));
+
+        controller.start_capture(101).unwrap();
+        let mut expected = Vec::new();
+        engine.render_frames(70, |frame| expected.push(frame));
+
+        controller.stop_capture(101).unwrap();
+        let mut stop_frame = None;
+        engine.render_frames(1, |frame| stop_frame = Some(frame));
+
+        let CaptureOutcome::Completed(completion) = controller
+            .try_capture_completion()
+            .expect("capture completion")
+        else {
+            panic!("stop must complete the resample take");
+        };
+        assert!(before_start.iter().any(|frame| *frame != [0.0, 0.0]));
+        assert_ne!(stop_frame, Some([0.0, 0.0]));
+        assert_eq!(completion.stereo, flatten_frames(&expected));
+        assert_eq!(completion.stereo.len(), expected.len() * 2);
+        assert_eq!(completion.token, 101);
+        assert_eq!(completion.target, live_pad);
+        assert_eq!(completion.source, CaptureSource::Resample);
+        assert!(!completion.hard_limit);
+    }
+
+    #[test]
+    fn resample_capture_status_is_copy_only_and_hard_limit_stops_exactly() {
+        fn assert_copy<T: Copy>(_: T) {}
+
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let target = PadId::first();
+        install_ready_sample(
+            &mut controller,
+            &mut engine,
+            100,
+            target,
+            PadSettings::default(),
+            16,
+        );
+        controller
+            .trigger(target, engine.rendered_frame(), 1.0)
+            .unwrap();
+        controller
+            .arm_capture(resample_buffer(102, target, 100, 3))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+
+        let armed = controller.capture_status().expect("armed status");
+        assert_copy(armed);
+        assert_eq!(armed.token, 102);
+        assert_eq!(armed.source, CaptureSource::Resample);
+        assert_eq!(armed.target, target);
+        assert_eq!(armed.state, CaptureState::Armed);
+        assert_eq!(armed.frames, 0);
+        assert_eq!(armed.max_frames, 3);
+        assert_eq!(armed.peak, 0.0);
+        assert!(!armed.hard_limit);
+
+        controller.start_capture(102).unwrap();
+        let mut rendered = Vec::new();
+        engine.render_frames(2, |frame| rendered.push(frame));
+        let recording = controller.capture_status().expect("recording status");
+        assert_eq!(recording.state, CaptureState::Recording);
+        assert_eq!(recording.frames, 2);
+        assert!(recording.peak > 0.0);
+        assert!(!recording.hard_limit);
+
+        engine.render_frames(2, |frame| rendered.push(frame));
+        let limited = controller.capture_status().expect("limited status");
+        assert_eq!(limited.frames, 3);
+        assert_eq!(limited.max_frames, 3);
+        assert!(limited.hard_limit);
+
+        let CaptureOutcome::Completed(completion) = controller
+            .try_capture_completion()
+            .expect("hard-limit completion")
+        else {
+            panic!("hard limit must complete the capture");
+        };
+        assert_eq!(completion.stereo, flatten_frames(&rendered[..3]));
+        assert!(completion.hard_limit);
+        assert_eq!(completion.peak, limited.peak);
+        assert_eq!(controller.capture_status(), None);
+    }
+
+    #[test]
+    fn resample_capture_hard_limit_progress_is_published_before_rearm() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let target = PadId::first();
+        controller
+            .arm_capture(resample_buffer(106, target, 100, 1))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        controller.start_capture(106).unwrap();
+
+        let next = resample_buffer(107, target, 100, 2);
+        let next_allocation = next.stereo().as_ptr();
+        let progress_fence = Arc::new(Barrier::new(2));
+        let arm_finished = Arc::new(Barrier::new(2));
+        let thread_progress_fence = Arc::clone(&progress_fence);
+        let thread_arm_finished = Arc::clone(&arm_finished);
+        let (mut controller, arm_result) = std::thread::scope(|scope| {
+            let arm = scope.spawn(move || {
+                thread_progress_fence.wait();
+                let result = controller.arm_capture(next);
+                thread_arm_finished.wait();
+                (controller, result)
+            });
+            engine.render_frames_with_capture_progress_fence_hook(
+                1,
+                || {
+                    progress_fence.wait();
+                    arm_finished.wait();
+                },
+                |_| {},
+            );
+            arm.join().unwrap()
+        });
+
+        let failure = arm_result.expect_err("rearm cannot enter before final progress publishes");
+        assert_eq!(failure.error(), crate::CaptureError::InvalidState);
+        let CaptureCommand::Arm(returned) = failure.into_command() else {
+            panic!("rearm rejection must return the exact buffer");
+        };
+        assert_eq!(returned.stereo().as_ptr(), next_allocation);
+
+        assert!(matches!(
+            controller.try_capture_completion(),
+            Some(CaptureOutcome::Completed(completion)) if completion.token == 106
+        ));
+        controller.arm_capture(returned).unwrap();
+        let fresh = controller.capture_status().expect("fresh arm status");
+        assert_eq!(fresh.token, 107);
+        assert_eq!(fresh.frames, 0);
+        assert_eq!(fresh.peak, 0.0);
+        assert!(!fresh.hard_limit);
+        engine.render_frames(0, |_| {});
+        controller.cancel_capture(107).unwrap();
+        engine.render_frames(0, |_| {});
+        assert!(matches!(
+            controller.try_capture_completion(),
+            Some(CaptureOutcome::Cancelled(buffer)) if buffer.stereo().as_ptr() == next_allocation
+        ));
+    }
+
+    #[test]
+    fn resample_capture_completion_backpressure_keeps_rendering_and_buffer_ownership() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let target = PadId::first();
+
+        controller
+            .arm_capture(resample_buffer(103, target, 100, 1))
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        controller.start_capture(103).unwrap();
+        engine.render_frames(1, |_| {});
+
+        let second = resample_buffer(104, target, 100, 1);
+        let second_allocation = second.stereo().as_ptr();
+        controller.arm_capture(second).unwrap();
+        engine.render_frames(0, |_| {});
+        controller.start_capture(104).unwrap();
+        engine.render_frames(1, |_| {});
+        assert_eq!(
+            controller.capture_status().expect("pending status").state,
+            CaptureState::CompletionPending
+        );
+
+        let before = engine.rendered_frame();
+        let mut rendered = 0;
+        engine.render_frames(32, |_| rendered += 1);
+        assert_eq!(rendered, 32);
+        assert_eq!(engine.rendered_frame(), before + 32);
+
+        assert!(matches!(
+            controller.try_capture_completion(),
+            Some(CaptureOutcome::Completed(completion)) if completion.token == 103
+        ));
+        engine.render_frames(0, |_| {});
+        let CaptureOutcome::Completed(second) = controller
+            .try_capture_completion()
+            .expect("pending capture must flush after one later poll")
+        else {
+            panic!("second capture must complete");
+        };
+        assert_eq!(second.token, 104);
+        assert_eq!(second.stereo.as_ptr(), second_allocation);
+        assert_eq!(second.stereo.len(), 2);
+    }
+
+    #[test]
+    fn resample_capture_lane_is_bounded_typed_and_independent_of_normal_saturation() {
+        let (mut controller, ports) = audio_channels_with_capacities(1, 1, 1);
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let target = PadId::first();
+        controller.stop_pad(target).unwrap();
+        assert_eq!(
+            controller.stop_pad(target),
+            Err(ControlError::CommandQueueFull)
+        );
+
+        let buffer = resample_buffer(105, target, 100, 8);
+        let allocation = buffer.stereo().as_ptr();
+        controller.arm_capture(buffer).unwrap();
+        for _ in 1..crate::command::CAPTURE_COMMAND_CAPACITY {
+            controller.start_capture(105).unwrap();
+        }
+        let failure = controller.start_capture(105).unwrap_err();
+        assert_eq!(failure.error(), crate::CaptureError::CommandFull);
+        assert!(matches!(
+            failure.into_command(),
+            CaptureCommand::Start { token: 105 }
+        ));
+
+        engine.render_frames(0, |_| {});
+        assert_eq!(
+            controller
+                .capture_status()
+                .expect("arm is the sole capture poll")
+                .state,
+            CaptureState::Armed
+        );
+        engine.render_frames(0, |_| {});
+        assert_eq!(
+            controller
+                .capture_status()
+                .expect("start is the next capture poll")
+                .state,
+            CaptureState::Recording
+        );
+        for _ in 2..crate::command::CAPTURE_COMMAND_CAPACITY {
+            engine.render_frames(0, |_| {});
+        }
+        controller.cancel_capture(105).unwrap();
+        engine.render_frames(0, |_| {});
+        let CaptureOutcome::Cancelled(returned) = controller
+            .try_capture_completion()
+            .expect("cancelled ownership must drain through the audio controller")
+        else {
+            panic!("cancel must return the original capture buffer");
+        };
+        assert_eq!(returned.stereo().as_ptr(), allocation);
     }
 
     #[test]

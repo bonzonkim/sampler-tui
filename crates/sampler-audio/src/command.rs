@@ -3,7 +3,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{PadId, PadSettings, SampleBuffer};
+    use crate::{CaptureBuffer, CaptureCommand, CaptureSource, PadId, PadSettings, SampleBuffer};
     use sampler_core::{EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport};
 
     fn snapshot(slot: u8) -> Arc<sampler_core::PatternSnapshot> {
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn runtime_failure_closes_every_controller_operation() {
-        let (mut controller, ports) = audio_channels_with_capacities(8, 256, 8);
+        let (mut controller, mut ports) = audio_channels_with_capacities(8, 256, 8);
         ports.shared.mark_failed();
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
         let pad = PadId::first();
@@ -620,6 +620,47 @@ mod tests {
         );
         assert_eq!(controller.stop_pad(pad), Err(ControlError::ClosedSession));
         assert_eq!(controller.stop_all(), Err(ControlError::ClosedSession));
+
+        let capture = CaptureBuffer::try_new(9, pad, CaptureSource::Resample, 48_000, 1).unwrap();
+        let allocation = capture.stereo().as_ptr();
+        let failure = controller.arm_capture(capture).unwrap_err();
+        assert_eq!(failure.error(), crate::CaptureError::CommandClosed);
+        let CaptureCommand::Arm(returned) = failure.into_command() else {
+            panic!("closed arm must return the exact owned command");
+        };
+        assert_eq!(returned.stereo().as_ptr(), allocation);
+
+        for (failure, expected) in [
+            (
+                controller.start_capture(9).unwrap_err(),
+                CaptureCommand::Start { token: 9 },
+            ),
+            (
+                controller.stop_capture(9).unwrap_err(),
+                CaptureCommand::Stop { token: 9 },
+            ),
+            (
+                controller.cancel_capture(9).unwrap_err(),
+                CaptureCommand::Cancel { token: 9 },
+            ),
+        ] {
+            assert_eq!(failure.error(), crate::CaptureError::CommandClosed);
+            assert!(matches!(
+                (failure.into_command(), expected),
+                (
+                    CaptureCommand::Start { token: 9 },
+                    CaptureCommand::Start { token: 9 }
+                ) | (
+                    CaptureCommand::Stop { token: 9 },
+                    CaptureCommand::Stop { token: 9 }
+                ) | (
+                    CaptureCommand::Cancel { token: 9 },
+                    CaptureCommand::Cancel { token: 9 }
+                )
+            ));
+        }
+        ports.capture.poll_commands();
+        assert_eq!(ports.capture.state(), CaptureState::Idle);
         assert_eq!(ports.commands.slots(), 0);
         assert_eq!(ports.immediate_commands.slots(), 0);
         assert_eq!(ports.queued_commands(), 0);
@@ -641,12 +682,16 @@ mod tests {
 }
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, PeekError, PopError, Producer, RingBuffer};
 use sampler_core::{Frame, PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
-use crate::{ControlError, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
+use crate::{
+    CaptureBuffer, CaptureCommand, CaptureController, CaptureCore, CaptureError, CaptureOutcome,
+    CaptureSendFailure, CaptureSource, CaptureState, ControlError, SAMPLE_SLOT_COUNT, SampleBuffer,
+    SampleSlot, capture_channels,
+};
 
 pub const COMMAND_CAPACITY: usize = 1024;
 pub const RECOVERY_COMMAND_CAPACITY: usize = 32;
@@ -655,6 +700,8 @@ pub const TELEMETRY_CAPACITY: usize = 64;
 pub const LIVE_ACK_CAPACITY: usize = 256;
 pub const PATTERN_SNAPSHOT_SLOT_COUNT: usize = 32;
 pub const PATTERN_RETIREMENT_CAPACITY: usize = 32;
+pub(crate) const CAPTURE_COMMAND_CAPACITY: usize = 4;
+const CAPTURE_COMPLETION_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LiveCommandId(NonZeroU64);
@@ -884,6 +931,77 @@ pub struct AudioController {
     next_live_id: Option<NonZeroU64>,
     pattern_owners: [Option<PatternSnapshotOwner>; PATTERN_SNAPSHOT_SLOT_COUNT],
     pattern_generations: [u64; PATTERN_SNAPSHOT_SLOT_COUNT],
+    capture: CaptureController,
+    capture_identity: Option<CaptureIdentity>,
+    capture_progress: Arc<CaptureProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureStatus {
+    pub token: u64,
+    pub source: CaptureSource,
+    pub target: PadId,
+    pub state: CaptureState,
+    pub frames: usize,
+    pub max_frames: usize,
+    pub peak: f32,
+    pub hard_limit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureIdentity {
+    token: u64,
+    source: CaptureSource,
+    target: PadId,
+    max_frames: usize,
+}
+
+pub(crate) struct CaptureProgress {
+    frames: AtomicUsize,
+    max_frames: AtomicUsize,
+    peak_bits: AtomicU32,
+    hard_limit: AtomicBool,
+}
+
+impl CaptureProgress {
+    fn new() -> Self {
+        Self {
+            frames: AtomicUsize::new(0),
+            max_frames: AtomicUsize::new(0),
+            peak_bits: AtomicU32::new(0.0_f32.to_bits()),
+            hard_limit: AtomicBool::new(false),
+        }
+    }
+
+    fn reset(&self, max_frames: usize) {
+        self.frames.store(0, Ordering::Release);
+        self.max_frames.store(max_frames, Ordering::Release);
+        self.peak_bits.store(0.0_f32.to_bits(), Ordering::Release);
+        self.hard_limit.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn record_frame(&self, frame: [f32; 2]) {
+        let frames = self.frames.fetch_add(1, Ordering::AcqRel) + 1;
+        let frame_peak = frame[0].abs().max(frame[1].abs());
+        let peak = f32::from_bits(self.peak_bits.load(Ordering::Acquire)).max(frame_peak);
+        self.peak_bits.store(peak.to_bits(), Ordering::Release);
+        if frames == self.max_frames.load(Ordering::Acquire) {
+            self.hard_limit.store(true, Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self, identity: CaptureIdentity, state: CaptureState) -> CaptureStatus {
+        CaptureStatus {
+            token: identity.token,
+            source: identity.source,
+            target: identity.target,
+            state,
+            frames: self.frames.load(Ordering::Acquire),
+            max_frames: identity.max_frames,
+            peak: f32::from_bits(self.peak_bits.load(Ordering::Acquire)),
+            hard_limit: self.hard_limit.load(Ordering::Acquire),
+        }
+    }
 }
 
 /// A command lane that returns controller admission credit when a command is consumed.
@@ -922,6 +1040,8 @@ pub struct EnginePorts {
     pub live_acks: Producer<LiveAck>,
     pub pattern_retirements: Producer<PatternRetirement>,
     pub telemetry: Producer<Telemetry>,
+    pub capture: CaptureCore,
+    pub(crate) capture_progress: Arc<CaptureProgress>,
     pub(crate) shared: Arc<SharedControlState>,
 }
 
@@ -1076,6 +1196,9 @@ fn audio_channels_with_capacity_values(
     let (pattern_retirement_producer, pattern_retirement_consumer) =
         RingBuffer::new(PATTERN_RETIREMENT_CAPACITY);
     let (telemetry_producer, telemetry_consumer) = RingBuffer::new(telemetry_capacity);
+    let (capture_controller, capture_core) =
+        capture_channels(CAPTURE_COMMAND_CAPACITY, CAPTURE_COMPLETION_CAPACITY);
+    let capture_progress = Arc::new(CaptureProgress::new());
     let shared = Arc::new(SharedControlState::new(command_capacity));
 
     (
@@ -1092,6 +1215,9 @@ fn audio_channels_with_capacity_values(
             next_live_id: Some(NonZeroU64::MIN),
             pattern_owners: std::array::from_fn(|_| None),
             pattern_generations: [0; PATTERN_SNAPSHOT_SLOT_COUNT],
+            capture: capture_controller,
+            capture_identity: None,
+            capture_progress: Arc::clone(&capture_progress),
         },
         EnginePorts {
             commands: CommandConsumer::new(command_consumer, Arc::clone(&shared)),
@@ -1103,12 +1229,86 @@ fn audio_channels_with_capacity_values(
             live_acks: live_ack_producer,
             pattern_retirements: pattern_retirement_producer,
             telemetry: telemetry_producer,
+            capture: capture_core,
+            capture_progress,
             shared,
         },
     )
 }
 
 impl AudioController {
+    pub fn arm_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
+        if self.shared.is_failed() {
+            return Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                CaptureCommand::Arm(buffer),
+            ));
+        }
+        let identity = CaptureIdentity {
+            token: buffer.token(),
+            source: buffer.source(),
+            target: buffer.target(),
+            max_frames: buffer.max_frames(),
+        };
+        self.capture.arm(buffer)?;
+        self.capture_progress.reset(identity.max_frames);
+        self.capture_identity = Some(identity);
+        Ok(())
+    }
+
+    pub fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        if self.shared.is_failed() {
+            return Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                CaptureCommand::Start { token },
+            ));
+        }
+        self.capture.start(token)
+    }
+
+    pub fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        if self.shared.is_failed() {
+            return Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                CaptureCommand::Stop { token },
+            ));
+        }
+        self.capture.stop(token)
+    }
+
+    pub fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        if self.shared.is_failed() {
+            return Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                CaptureCommand::Cancel { token },
+            ));
+        }
+        self.capture.cancel(token)
+    }
+
+    pub fn try_capture_completion(&mut self) -> Option<CaptureOutcome> {
+        let outcome = self.capture.try_next_outcome()?;
+        let token = match &outcome {
+            CaptureOutcome::Completed(completion) => completion.token,
+            CaptureOutcome::Cancelled(buffer) => buffer.token(),
+        };
+        if self.capture.state() == CaptureState::Idle
+            && self
+                .capture_identity
+                .is_some_and(|identity| identity.token == token)
+        {
+            self.capture_identity = None;
+        }
+        Some(outcome)
+    }
+
+    pub fn capture_status(&self) -> Option<CaptureStatus> {
+        self.capture_identity.map(|identity| {
+            self.capture_progress
+                .snapshot(identity, self.capture.state())
+        })
+    }
+
     pub fn render_horizon(&self) -> Frame {
         self.shared.render_horizon()
     }

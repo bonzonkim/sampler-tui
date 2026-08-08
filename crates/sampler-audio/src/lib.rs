@@ -15,11 +15,11 @@ pub use capture::{
     capture_channels,
 };
 pub use command::{
-    AudioCommand, AudioController, COMMAND_CAPACITY, CommandConsumer, CriticalEvent, EnginePorts,
-    LIVE_ACK_CAPACITY, LiveAck, LiveAckKind, LiveCommandId, PATTERN_RETIREMENT_CAPACITY,
-    PATTERN_SNAPSHOT_SLOT_COUNT, PatternRetirement, PatternSnapshotSlot, PatternSwitch,
-    RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry, TransportStamp, audio_channels,
-    audio_channels_with_test_capacities,
+    AudioCommand, AudioController, COMMAND_CAPACITY, CaptureStatus, CommandConsumer, CriticalEvent,
+    EnginePorts, LIVE_ACK_CAPACITY, LiveAck, LiveAckKind, LiveCommandId,
+    PATTERN_RETIREMENT_CAPACITY, PATTERN_SNAPSHOT_SLOT_COUNT, PatternRetirement,
+    PatternSnapshotSlot, PatternSwitch, RETIREMENT_CAPACITY, TELEMETRY_CAPACITY, Telemetry,
+    TransportStamp, audio_channels, audio_channels_with_test_capacities,
 };
 pub use decode::{
     DecodeLimits, DecodedAudio, EncodedAudioFormat, decode_bytes_with_limits, decode_path,

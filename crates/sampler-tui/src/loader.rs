@@ -432,10 +432,12 @@ pub fn downsample_preview(preview: &EditPreview) -> [PreviewColumn; PREVIEW_COLU
         else {
             return PreviewColumn::default();
         };
-        preview[start..end]
-            .iter()
+        let Some((&first, rest)) = preview[start..end].split_first() else {
+            return PreviewColumn::default();
+        };
+        rest.iter()
             .copied()
-            .fold(PreviewColumn::default(), |combined, item| PreviewColumn {
+            .fold(first, |combined, item| PreviewColumn {
                 min: combined.min.min(item.min),
                 max: combined.max.max(item.max),
             })
@@ -684,6 +686,42 @@ mod tests {
         assert!(preview.iter().all(|column| column.min <= column.max));
         assert!(perform.iter().all(|column| column.min <= column.max));
         assert_eq!(perform[0], crate::PreviewColumn { min: -8, max: 8 });
+    }
+
+    #[test]
+    fn perform_downsample_preserves_unipolar_and_mixed_extrema() {
+        let positive = Arc::new([crate::PreviewColumn { min: 2, max: 4 }; EDIT_PREVIEW_COLUMNS]);
+        let negative = Arc::new([crate::PreviewColumn { min: -4, max: -2 }; EDIT_PREVIEW_COLUMNS]);
+        let mixed = Arc::new(std::array::from_fn(|index| {
+            if index.is_multiple_of(2) {
+                crate::PreviewColumn { min: -3, max: -1 }
+            } else {
+                crate::PreviewColumn { min: 2, max: 4 }
+            }
+        }));
+
+        assert_eq!(
+            downsample_preview(&positive),
+            [crate::PreviewColumn { min: 2, max: 4 }; crate::PREVIEW_COLUMNS]
+        );
+        assert_eq!(
+            downsample_preview(&negative),
+            [crate::PreviewColumn { min: -4, max: -2 }; crate::PREVIEW_COLUMNS]
+        );
+        assert_eq!(
+            downsample_preview(&mixed),
+            [crate::PreviewColumn { min: -3, max: 4 }; crate::PREVIEW_COLUMNS]
+        );
+    }
+
+    #[test]
+    fn perform_downsample_keeps_an_empty_preview_empty() {
+        let empty = Arc::new([crate::PreviewColumn::default(); EDIT_PREVIEW_COLUMNS]);
+
+        assert_eq!(
+            downsample_preview(&empty),
+            [crate::PreviewColumn::default(); crate::PREVIEW_COLUMNS]
+        );
     }
 
     #[test]

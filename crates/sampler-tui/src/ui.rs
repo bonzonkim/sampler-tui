@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
-use crate::ui_pattern::render_pattern;
+use crate::ui_pattern::{live_pattern, render_pattern};
 use crate::{App, Overlay, PREVIEW_COLUMNS, PadLoadState, PadView};
 
 const MIN_WIDTH: u16 = 80;
@@ -298,29 +298,35 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn perform_pattern_summary(app: &App) -> String {
-    let patterns = app.patterns();
     let telemetry = app.telemetry();
-    let state = if patterns.is_recording() || telemetry.pattern_recording {
+    let Some((slot, pattern)) = live_pattern(app) else {
+        return format!("P{:02} STOP", app.patterns().selected_slot().get() + 1);
+    };
+    let state = if telemetry.pattern_recording {
         "REC"
-    } else if patterns.is_playing() || telemetry.pattern_playing {
+    } else if telemetry.pattern_playing {
         "PLAY"
     } else {
         "STOP"
     };
-    let transport = patterns.selected_pattern().transport();
-    let bar = if telemetry.pattern_playing && transport.loop_frames() != 0 {
-        let frames_per_bar = transport.loop_frames() / u64::from(transport.bars());
-        (telemetry.pattern_playhead / frames_per_bar.max(1))
-            .saturating_add(1)
-            .min(u64::from(transport.bars()))
-    } else {
-        1
-    };
-    format!(
-        "P{:02} {state} {bar}/{}",
-        patterns.selected_slot().get() + 1,
-        transport.bars()
-    )
+    if state == "STOP" {
+        return format!("P{:02} STOP", slot.get() + 1);
+    }
+    let transport = pattern.transport();
+    let bar = pattern_bar(
+        telemetry.pattern_playhead,
+        transport.loop_frames(),
+        transport.bars(),
+    );
+    format!("P{:02} {state} {bar}/{}", slot.get() + 1, transport.bars())
+}
+
+fn pattern_bar(playhead: u64, loop_frames: u64, bars: u16) -> u64 {
+    if loop_frames == 0 || bars == 0 {
+        return 1;
+    }
+    (u128::from(playhead % loop_frames) * u128::from(bars) / u128::from(loop_frames) + 1)
+        .min(u128::from(bars)) as u64
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -703,7 +709,7 @@ mod tests {
     use crate::loader::{LoadSampleError, LoadedSample, WorkerResult};
     use crate::{App, DirectoryEntry, DirectoryEntryKind, Overlay, PREVIEW_COLUMNS, PreviewColumn};
 
-    use super::render;
+    use super::{pattern_bar, render};
 
     struct FakeAudio {
         stop_error: Option<String>,
@@ -977,7 +983,28 @@ mod tests {
 
     #[test]
     fn pattern_playhead_and_cursor_are_distinct_fixed_width_cells() {
-        let mut app = ready_app();
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 0,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(0),
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        app.tick();
         app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
@@ -1004,8 +1031,8 @@ mod tests {
             late_commands: 0,
             invalid_commands: 0,
             command_overflows: 0,
-            pattern_slot: None,
-            pattern_generation: None,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(1),
             pattern_playing: true,
             pattern_recording: false,
             pattern_origin: Some(0),
@@ -1025,6 +1052,113 @@ mod tests {
                 .join("\n")
                 .contains("P01 PLAY 2/4")
         );
+    }
+
+    #[test]
+    fn pending_slot_switch_keeps_the_perform_summary_on_the_live_generation() {
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 0,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(0),
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("pattern 2".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.close_overlay();
+        app.tick();
+
+        let screen = render_lines(80, 24, &app).join("\n");
+        assert!(screen.contains("P01 PLAY 1/1"));
+        assert!(!screen.contains("P02 PLAY"));
+    }
+
+    #[test]
+    fn rational_bar_boundary_handles_non_divisible_three_bar_loops() {
+        let transport = sampler_core::Transport::new(
+            48_000,
+            sampler_core::Tempo::new(20.1).unwrap(),
+            sampler_core::Meter::new(4, 4).unwrap(),
+            3,
+            sampler_core::Resolution::Sixteenth,
+        )
+        .unwrap();
+        let boundary = transport.loop_frames().div_ceil(3);
+
+        assert_eq!(pattern_bar(boundary - 1, transport.loop_frames(), 3), 1);
+        assert_eq!(pattern_bar(boundary, transport.loop_frames(), 3), 2);
+    }
+
+    #[test]
+    fn eighth_note_second_bar_cursor_is_visible_in_the_first_of_sixteen_columns() {
+        let mut app = ready_app();
+        for command in ["bars 2", "resolution 1/8"] {
+            app.open_palette();
+            app.apply_terminal_event(Event::Paste(command.to_owned()));
+            app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+        assert!(screen.contains("BAR 2/2 · 1/8"));
+        assert!(
+            render_style(80, 24, &app, 6, 4)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn pattern_view_labels_a_pending_slot_switch_without_borrowing_the_live_playhead() {
+        let telemetry = Telemetry {
+            active_pads: [0; 3],
+            rendered_frame: 0,
+            last_triggered_frame: None,
+            peak_left: 0.0,
+            peak_right: 0.0,
+            active_voices: 0,
+            late_commands: 0,
+            invalid_commands: 0,
+            command_overflows: 0,
+            pattern_slot: Some(sampler_core::PatternSlotId::new(0).unwrap()),
+            pattern_generation: Some(0),
+            pattern_playing: true,
+            pattern_recording: false,
+            pattern_origin: Some(0),
+            pattern_playhead: 0,
+            pattern_loop_count: 0,
+            pattern_overflows: 0,
+            live_ack_overflows: 0,
+        };
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_telemetry(telemetry)));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("pattern 2".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.close_overlay();
+        app.tick();
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let screen = render_lines(80, 24, &app).join("\n");
+        assert!(screen.contains("PATTERN 02"));
+        assert!(screen.contains("P01 PLAY"));
+        assert!(!screen.contains("P02 PLAY"));
+        assert_eq!(render_symbol(80, 24, &app, 6, 4), ".");
     }
 
     #[test]

@@ -508,6 +508,18 @@ mod tests {
             sampler_core::MAX_PATTERN_EVENTS
         );
     }
+
+    #[test]
+    fn exact_generation_lookup_does_not_substitute_a_newer_edit() {
+        let mut workspace = PatternWorkspace::new(48_000);
+        let slot = slot();
+        assert!(workspace.pattern_for_generation(slot, 0).is_some());
+
+        workspace.toggle_step().unwrap();
+
+        assert!(workspace.pattern_for_generation(slot, 0).is_none());
+        assert!(workspace.pattern_for_generation(slot, 1).is_some());
+    }
 }
 
 use std::{array, sync::Arc};
@@ -740,6 +752,17 @@ impl PatternWorkspace {
 
     pub fn pattern(&self, slot: PatternSlotId) -> &EditablePattern {
         &self.patterns[usize::from(slot.get())]
+    }
+
+    /// Returns a pattern only when the caller's callback-visible generation still describes the
+    /// editable slot. UI telemetry must not be rendered against a newer selected edit.
+    pub fn pattern_for_generation(
+        &self,
+        slot: PatternSlotId,
+        generation: u64,
+    ) -> Option<&EditablePattern> {
+        let pattern = self.pattern(slot);
+        (pattern.generation() == generation).then_some(pattern)
     }
 
     pub fn sample_rates(&self) -> [u32; PATTERN_SLOT_COUNT] {

@@ -62,6 +62,9 @@ impl PatternEvent {
     }
 
     pub fn quantized(mut self, transport: &Transport, strength: f32) -> Self {
+        if self.frame >= transport.loop_frames() {
+            return self;
+        }
         let strength = if strength.is_finite() {
             strength.clamp(0.0, 1.0)
         } else {
@@ -71,11 +74,17 @@ impl PatternEvent {
             .map(|step| transport.step_frame(step))
             .min_by_key(|frame| frame.abs_diff(self.frame))
             .unwrap_or(0);
-        let delta = target as i128 - self.frame as i128;
-        let shifted = self.frame as i128 + (delta as f64 * f64::from(strength)).round() as i128;
-        self.original_offset
-            .get_or_insert(self.frame as i64 - target as i64);
-        self.frame = (shifted.max(0) as Frame) % transport.loop_frames();
+        let delta = i128::from(target) - i128::from(self.frame);
+        let shifted = i128::from(self.frame) + (delta as f64 * f64::from(strength)).round() as i128;
+        if self.original_offset.is_none() {
+            self.original_offset = i64::try_from(self.frame)
+                .ok()
+                .zip(i64::try_from(target).ok())
+                .and_then(|(frame, target)| frame.checked_sub(target));
+        }
+        if let Ok(shifted) = Frame::try_from(shifted.max(0)) {
+            self.frame = shifted % transport.loop_frames();
+        }
         self
     }
 }
@@ -182,8 +191,14 @@ impl Pattern {
     }
 }
 
-#[derive(Debug)]
-struct PatternCheckpoint;
+#[derive(Debug, Clone)]
+struct PatternCheckpoint {
+    transport: Transport,
+    events: Pattern,
+    raw_frames: Vec<(EventId, Frame)>,
+    quantize_strength: f32,
+    next_event_id: u64,
+}
 
 #[derive(Debug)]
 pub struct EditablePattern {
@@ -195,7 +210,6 @@ pub struct EditablePattern {
     quantize_strength: f32,
     next_event_id: u64,
     generation: u64,
-    #[allow(dead_code)]
     checkpoint: Option<Box<PatternCheckpoint>>,
 }
 
@@ -258,34 +272,116 @@ impl EditablePattern {
         if self.events.events().len() >= MAX_PATTERN_EVENTS {
             return Err(PatternEditError::Full);
         }
+        validate_editable_event(&event, self.transport.loop_frames())?;
+        let next_event_id = event
+            .id
+            .0
+            .checked_add(1)
+            .ok_or(PatternEditError::ArithmeticOverflow)?;
+        let generation = self.next_generation()?;
         let raw_frame = event.frame;
-        let event = quantize_event(event, raw_frame, self.transport, self.quantize_strength);
-        self.events.insert(event)?;
-        self.raw_frames.push((event.id, raw_frame));
-        self.next_event_id = self.next_event_id.max(
-            event
-                .id
-                .0
-                .checked_add(1)
-                .ok_or(PatternEditError::ArithmeticOverflow)?,
-        );
-        self.generation = self.generation.wrapping_add(1);
+        let event = quantize_event(event, raw_frame, self.transport, self.quantize_strength)?;
+        let mut events = self.events.clone();
+        events.insert(event)?;
+        let mut raw_frames = self.raw_frames.clone();
+        raw_frames.push((event.id, raw_frame));
+        self.events = events;
+        self.raw_frames = raw_frames;
+        self.next_event_id = self.next_event_id.max(next_event_id);
+        self.generation = generation;
         Ok(())
+    }
+
+    pub fn insert_new(
+        &mut self,
+        pad: PadId,
+        frame: Frame,
+        velocity: f32,
+        duration: Option<Frame>,
+    ) -> Result<EventId, PatternEditError> {
+        self.next_event_id
+            .checked_add(1)
+            .ok_or(PatternEditError::ArithmeticOverflow)?;
+        let id = EventId(self.next_event_id);
+        let event = PatternEvent::new(id, pad, frame, velocity, duration)?;
+        self.insert(event)?;
+        Ok(id)
+    }
+
+    pub fn remove(&mut self, id: EventId) -> Result<PatternEvent, PatternEditError> {
+        let event = *self.event(id).ok_or(PatternEditError::EventNotFound(id))?;
+        let raw_index = self
+            .raw_frames
+            .iter()
+            .position(|(event_id, _)| *event_id == id)
+            .ok_or(PatternEditError::MissingRawFrame)?;
+        let generation = self.next_generation()?;
+        let mut events = self.events.clone();
+        let removed = events
+            .remove(id)
+            .ok_or(PatternEditError::EventNotFound(id))?;
+        let mut raw_frames = self.raw_frames.clone();
+        raw_frames.remove(raw_index);
+        self.events = events;
+        self.raw_frames = raw_frames;
+        self.generation = generation;
+        debug_assert_eq!(removed, event);
+        Ok(removed)
+    }
+
+    pub fn set_velocity(&mut self, id: EventId, velocity: f32) -> Result<(), PatternEditError> {
+        if !velocity.is_finite() || !(0.0..=1.0).contains(&velocity) {
+            return Err(PatternEditError::InvalidVelocity);
+        }
+        let index = self
+            .events
+            .events
+            .iter()
+            .position(|event| event.id == id)
+            .ok_or(PatternEditError::EventNotFound(id))?;
+        let generation = self.next_generation()?;
+        let mut events = self.events.clone();
+        events.events[index].velocity = velocity;
+        self.events = events;
+        self.generation = generation;
+        Ok(())
+    }
+
+    pub fn toggle_at(
+        &mut self,
+        pad: PadId,
+        raw_frame: Frame,
+        velocity: f32,
+    ) -> Result<Option<EventId>, PatternEditError> {
+        let existing = self.events.events().iter().find_map(|event| {
+            (event.pad == pad)
+                .then(|| {
+                    self.raw_frames.iter().find_map(|(id, frame)| {
+                        (*id == event.id && *frame == raw_frame).then_some(event.id)
+                    })
+                })
+                .flatten()
+        });
+        if let Some(id) = existing {
+            self.remove(id)?;
+            return Ok(None);
+        }
+        self.insert_new(pad, raw_frame, velocity, None).map(Some)
     }
 
     pub fn set_quantize_strength(&mut self, strength: f32) -> Result<(), PatternEditError> {
         if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
             return Err(PatternEditError::InvalidQuantizeStrength);
         }
+        let generation = self.next_generation()?;
         let events = self.requantized_events(self.transport, &self.raw_frames, strength)?;
         self.quantize_strength = strength;
         self.events = events;
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = generation;
         Ok(())
     }
 
     pub fn rebuild_sample_rate(&mut self, sample_rate: u32) -> Result<(), PatternEditError> {
-        let old_loop_frames = self.transport.loop_frames();
         let transport = Transport::new(
             sample_rate,
             self.transport.tempo(),
@@ -294,6 +390,130 @@ impl EditablePattern {
             self.transport.resolution(),
         )?
         .with_swing(self.transport.swing())?;
+        self.replace_transport(transport)
+    }
+
+    pub fn set_tempo(&mut self, tempo: crate::Tempo) -> Result<(), PatternEditError> {
+        self.replace_transport(self.transport_with(
+            self.transport.sample_rate(),
+            tempo,
+            self.transport.meter(),
+            self.transport.bars(),
+            self.transport.resolution(),
+            self.transport.swing(),
+        )?)
+    }
+
+    pub fn set_meter(&mut self, meter: crate::Meter) -> Result<(), PatternEditError> {
+        self.replace_transport(self.transport_with(
+            self.transport.sample_rate(),
+            self.transport.tempo(),
+            meter,
+            self.transport.bars(),
+            self.transport.resolution(),
+            self.transport.swing(),
+        )?)
+    }
+
+    pub fn set_bars(&mut self, bars: u16) -> Result<(), PatternEditError> {
+        self.replace_transport(self.transport_with(
+            self.transport.sample_rate(),
+            self.transport.tempo(),
+            self.transport.meter(),
+            bars,
+            self.transport.resolution(),
+            self.transport.swing(),
+        )?)
+    }
+
+    pub fn set_resolution(
+        &mut self,
+        resolution: crate::Resolution,
+    ) -> Result<(), PatternEditError> {
+        self.replace_transport(self.transport_with(
+            self.transport.sample_rate(),
+            self.transport.tempo(),
+            self.transport.meter(),
+            self.transport.bars(),
+            resolution,
+            self.transport.swing(),
+        )?)
+    }
+
+    pub fn set_swing(&mut self, swing: f64) -> Result<(), PatternEditError> {
+        self.replace_transport(self.transport_with(
+            self.transport.sample_rate(),
+            self.transport.tempo(),
+            self.transport.meter(),
+            self.transport.bars(),
+            self.transport.resolution(),
+            swing,
+        )?)
+    }
+
+    pub fn clear(&mut self) -> Result<(), PatternEditError> {
+        let generation = self.next_generation()?;
+        let checkpoint = PatternCheckpoint {
+            transport: self.transport,
+            events: self.events.clone(),
+            raw_frames: self.raw_frames.clone(),
+            quantize_strength: self.quantize_strength,
+            next_event_id: self.next_event_id,
+        };
+        self.events = Pattern::new(self.transport.loop_frames());
+        self.raw_frames = Vec::new();
+        self.checkpoint = Some(Box::new(checkpoint));
+        self.generation = generation;
+        Ok(())
+    }
+
+    pub fn undo_clear(&mut self) -> Result<(), PatternEditError> {
+        let generation = self.next_generation()?;
+        let checkpoint = self
+            .checkpoint
+            .take()
+            .ok_or(PatternEditError::NothingToUndo)?;
+        self.transport = checkpoint.transport;
+        self.events = checkpoint.events;
+        self.raw_frames = checkpoint.raw_frames;
+        self.quantize_strength = checkpoint.quantize_strength;
+        self.next_event_id = checkpoint.next_event_id;
+        self.generation = generation;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_generation_for_test(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    fn replace_transport(&mut self, transport: Transport) -> Result<(), PatternEditError> {
+        let generation = self.next_generation()?;
+        let (events, raw_frames) = self.rebuilt_events(transport)?;
+        self.transport = transport;
+        self.raw_frames = raw_frames;
+        self.events = events;
+        self.generation = generation;
+        Ok(())
+    }
+
+    fn transport_with(
+        &self,
+        sample_rate: u32,
+        tempo: crate::Tempo,
+        meter: crate::Meter,
+        bars: u16,
+        resolution: crate::Resolution,
+        swing: f64,
+    ) -> Result<Transport, PatternEditError> {
+        Ok(Transport::new(sample_rate, tempo, meter, bars, resolution)?.with_swing(swing)?)
+    }
+
+    fn rebuilt_events(
+        &self,
+        transport: Transport,
+    ) -> Result<(Pattern, Vec<(EventId, Frame)>), PatternEditError> {
+        let old_loop_frames = self.transport.loop_frames();
         let new_loop_frames = transport.loop_frames();
         let raw_frames = self
             .raw_frames
@@ -311,11 +531,13 @@ impl EditablePattern {
                     Some(scale_frame_phase(duration, old_loop_frames, new_loop_frames)?.max(1));
             }
         }
-        self.transport = transport;
-        self.raw_frames = raw_frames;
-        self.events = events;
-        self.generation = self.generation.wrapping_add(1);
-        Ok(())
+        Ok((events, raw_frames))
+    }
+
+    fn next_generation(&self) -> Result<u64, PatternEditError> {
+        self.generation
+            .checked_add(1)
+            .ok_or(PatternEditError::GenerationOverflow)
     }
 
     pub fn compile(&self) -> Result<PatternSnapshot, PatternCompileError> {
@@ -377,7 +599,7 @@ impl EditablePattern {
                 .iter()
                 .find_map(|(id, frame)| (*id == event.id).then_some(*frame))
                 .ok_or(PatternEditError::MissingRawFrame)?;
-            events.insert(quantize_event(*event, raw_frame, transport, strength))?;
+            events.insert(quantize_event(*event, raw_frame, transport, strength)?)?;
         }
         Ok(events)
     }
@@ -467,15 +689,45 @@ fn action_kind_order(kind: PatternActionKind) -> u8 {
     }
 }
 
+fn validate_editable_event(
+    event: &PatternEvent,
+    loop_frames: Frame,
+) -> Result<(), PatternEditError> {
+    (event.id.0 != 0
+        && event.frame < loop_frames
+        && event.velocity.is_finite()
+        && (0.0..=1.0).contains(&event.velocity)
+        && event.duration != Some(0))
+    .then_some(())
+    .ok_or(PatternEditError::Model(ModelError::InvalidEvent))
+}
+
 fn quantize_event(
     mut event: PatternEvent,
     raw_frame: Frame,
     transport: Transport,
     strength: f32,
-) -> PatternEvent {
+) -> Result<PatternEvent, PatternEditError> {
+    if raw_frame >= transport.loop_frames() {
+        return Err(PatternEditError::Model(ModelError::InvalidEvent));
+    }
+    let target = (0..=transport.step_count())
+        .map(|step| transport.step_frame(step))
+        .min_by_key(|frame| frame.abs_diff(raw_frame))
+        .unwrap_or(0);
+    let raw = i64::try_from(raw_frame).map_err(|_| PatternEditError::ArithmeticOverflow)?;
+    let target_offset = i64::try_from(target).map_err(|_| PatternEditError::ArithmeticOverflow)?;
+    let original_offset = raw
+        .checked_sub(target_offset)
+        .ok_or(PatternEditError::ArithmeticOverflow)?;
+    let delta = i128::from(target) - i128::from(raw_frame);
+    let shifted = i128::from(raw_frame) + (delta as f64 * f64::from(strength)).round() as i128;
     event.frame = raw_frame;
-    event.original_offset = None;
-    event.quantized(&transport, strength)
+    event.original_offset = Some(original_offset);
+    event.frame = Frame::try_from(shifted.max(0))
+        .map_err(|_| PatternEditError::ArithmeticOverflow)?
+        % transport.loop_frames();
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -602,6 +854,190 @@ mod tests {
     }
 
     #[test]
+    fn failed_maximum_event_id_insert_leaves_the_pattern_retryable() {
+        let mut pattern = editable(48_000, 1);
+        let before_generation = pattern.generation();
+        let event = raw_event(u64::MAX, 100);
+
+        assert_eq!(
+            pattern.insert(event),
+            Err(PatternEditError::ArithmeticOverflow)
+        );
+        assert!(pattern.events().is_empty());
+        assert_eq!(pattern.next_event_id(), EventId(1));
+        assert_eq!(pattern.generation(), before_generation);
+        assert_eq!(
+            pattern.insert(event),
+            Err(PatternEditError::ArithmeticOverflow)
+        );
+        pattern.insert(raw_event(1, 100)).unwrap();
+        assert_eq!(pattern.event(EventId(1)).unwrap().frame, 100);
+    }
+
+    #[test]
+    fn insert_rejects_out_of_loop_raw_frames_without_wrapping_them() {
+        let mut pattern = editable(48_000, 1);
+        let loop_frames = pattern.transport().loop_frames();
+        for frame in [loop_frames, u64::MAX] {
+            assert_eq!(
+                pattern.insert(raw_event(1, frame)),
+                Err(PatternEditError::Model(ModelError::InvalidEvent))
+            );
+            assert!(pattern.events().is_empty());
+            assert_eq!(pattern.next_event_id(), EventId(1));
+        }
+    }
+
+    #[test]
+    fn failed_zero_loop_rate_rebuild_preserves_every_editable_field() {
+        let mut pattern = editable(48_000, 1);
+        pattern.insert(raw_event(1, 6_800)).unwrap();
+        pattern.set_tempo(Tempo::new(300.0).unwrap()).unwrap();
+        pattern.set_meter(Meter::new(1, 16).unwrap()).unwrap();
+        let before_transport = pattern.transport();
+        let before_event = *pattern.event(EventId(1)).unwrap();
+        let before_generation = pattern.generation();
+
+        assert_eq!(
+            pattern.rebuild_sample_rate(1),
+            Err(PatternEditError::Model(ModelError::InvalidTransport))
+        );
+        assert_eq!(pattern.transport(), before_transport);
+        assert_eq!(pattern.event(EventId(1)), Some(&before_event));
+        assert_eq!(pattern.generation(), before_generation);
+    }
+
+    #[test]
+    fn editing_operations_keep_raw_events_and_one_clear_checkpoint_aligned() {
+        let mut pattern = editable(48_000, 1);
+        let first = pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        let second = pattern.insert_new(pad(), 12_100, 0.8, None).unwrap();
+        pattern.set_quantize_strength(1.0).unwrap();
+
+        let removed = pattern.remove(first).unwrap();
+        assert_eq!(removed.id, first);
+        assert_eq!(pattern.event(first), None);
+        pattern.set_velocity(second, 0.35).unwrap();
+        assert_eq!(pattern.event(second).unwrap().velocity, 0.35);
+        pattern.set_swing(0.60).unwrap();
+        assert_eq!(pattern.event(second).unwrap().frame, 12_000);
+
+        pattern.clear().unwrap();
+        assert!(pattern.events().is_empty());
+        pattern.undo_clear().unwrap();
+        assert_eq!(pattern.event(second).unwrap().frame, 12_000);
+        assert_eq!(pattern.event(second).unwrap().velocity, 0.35);
+        assert_eq!(pattern.undo_clear(), Err(PatternEditError::NothingToUndo));
+    }
+
+    #[test]
+    fn removing_an_event_removes_its_raw_position() {
+        let mut pattern = editable(48_000, 1);
+        let id = pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        pattern.remove(id).unwrap();
+        pattern.set_quantize_strength(1.0).unwrap();
+        assert!(pattern.events().is_empty());
+    }
+
+    #[test]
+    fn velocity_updates_are_visible_without_moving_the_event() {
+        let mut pattern = editable(48_000, 1);
+        let id = pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        pattern.set_velocity(id, 0.35).unwrap();
+        assert_eq!(
+            (
+                pattern.event(id).unwrap().frame,
+                pattern.event(id).unwrap().velocity
+            ),
+            (6_800, 0.35)
+        );
+    }
+
+    #[test]
+    fn changing_swing_requantizes_from_the_retained_raw_frame() {
+        let mut pattern = editable(48_000, 1);
+        let id = pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        pattern.set_quantize_strength(1.0).unwrap();
+        assert_eq!(pattern.event(id).unwrap().frame, 6_000);
+        pattern.set_swing(0.60).unwrap();
+        assert_eq!(pattern.event(id).unwrap().frame, 7_200);
+        pattern.set_quantize_strength(0.0).unwrap();
+        assert_eq!(pattern.event(id).unwrap().frame, 6_800);
+    }
+
+    #[test]
+    fn clear_and_undo_restore_a_single_complete_checkpoint() {
+        let mut pattern = editable(48_000, 1);
+        let id = pattern.insert_new(pad(), 6_800, 0.4, None).unwrap();
+        pattern.set_quantize_strength(1.0).unwrap();
+        pattern.set_swing(0.60).unwrap();
+        pattern.clear().unwrap();
+        assert!(pattern.events().is_empty());
+        pattern.undo_clear().unwrap();
+        assert_eq!(pattern.event(id).unwrap().frame, 7_200);
+        assert_eq!(pattern.event(id).unwrap().velocity, 0.4);
+        assert_eq!(pattern.undo_clear(), Err(PatternEditError::NothingToUndo));
+    }
+
+    #[test]
+    fn toggling_a_raw_step_inserts_then_removes_the_same_event() {
+        let mut pattern = editable(48_000, 1);
+        let inserted = pattern.toggle_at(pad(), 6_000, 0.9).unwrap();
+        assert_eq!(inserted, Some(EventId(1)));
+        assert_eq!(pattern.events().len(), 1);
+        assert_eq!(pattern.toggle_at(pad(), 6_000, 0.9).unwrap(), None);
+        assert!(pattern.events().is_empty());
+    }
+
+    #[test]
+    fn tempo_bars_and_resolution_changes_preserve_phase_or_requantize_raw_timing() {
+        let mut pattern = editable(100, 1);
+        pattern.insert_new(pad(), 100, 1.0, None).unwrap();
+        pattern.set_tempo(Tempo::new(60.0).unwrap()).unwrap();
+        assert_eq!(pattern.event(EventId(1)).unwrap().frame, 200);
+        pattern.set_bars(2).unwrap();
+        assert_eq!(pattern.event(EventId(1)).unwrap().frame, 400);
+        pattern.set_quantize_strength(1.0).unwrap();
+        pattern.set_resolution(Resolution::Quarter).unwrap();
+        assert_eq!(pattern.event(EventId(1)).unwrap().frame, 400);
+    }
+
+    #[test]
+    fn meter_change_preserves_event_loop_phase() {
+        let mut pattern = editable(100, 1);
+        pattern.insert_new(pad(), 100, 1.0, None).unwrap();
+        pattern.set_meter(Meter::new(2, 4).unwrap()).unwrap();
+        assert_eq!(pattern.event(EventId(1)).unwrap().frame, 50);
+    }
+
+    #[test]
+    fn invalid_transport_change_leaves_the_editable_pattern_unchanged() {
+        let mut pattern = editable(48_000, 1);
+        pattern.insert_new(pad(), 6_800, 1.0, None).unwrap();
+        let before_transport = pattern.transport();
+        let before_event = *pattern.event(EventId(1)).unwrap();
+        let before_generation = pattern.generation();
+        assert_eq!(
+            pattern.set_bars(0),
+            Err(PatternEditError::Model(ModelError::InvalidTransport))
+        );
+        assert_eq!(pattern.transport(), before_transport);
+        assert_eq!(pattern.event(EventId(1)), Some(&before_event));
+        assert_eq!(pattern.generation(), before_generation);
+    }
+
+    #[test]
+    fn generation_overflow_rejects_an_edit_without_mutating_state() {
+        let mut pattern = editable(48_000, 1);
+        pattern.set_generation_for_test(u64::MAX);
+        assert_eq!(
+            pattern.insert(raw_event(1, 100)),
+            Err(PatternEditError::GenerationOverflow)
+        );
+        assert!(pattern.events().is_empty());
+    }
+
+    #[test]
     fn quantization_preserves_original_offset() {
         let event = PatternEvent::new(EventId(1), pad(), 6_800, 1.0, None).unwrap();
         let quantized = event.quantized(&transport(), 1.0);
@@ -614,6 +1050,16 @@ mod tests {
         let event = PatternEvent::new(EventId(1), pad(), 6_800, 1.0, None).unwrap();
         assert_eq!(event.quantized(&transport(), 0.5).frame, 6_400);
         assert_eq!(event.quantized(&transport(), -1.0).frame, 6_800);
+    }
+
+    #[test]
+    fn direct_quantization_does_not_wrap_an_out_of_loop_frame() {
+        let event =
+            PatternEvent::new(EventId(1), pad(), transport().loop_frames(), 1.0, None).unwrap();
+        assert_eq!(
+            event.quantized(&transport(), 1.0).frame,
+            transport().loop_frames()
+        );
     }
 
     #[test]

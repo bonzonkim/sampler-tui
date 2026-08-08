@@ -1,4 +1,4 @@
-use crate::ModelError;
+use crate::{EventId, ModelError};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PatternEditError {
@@ -14,6 +14,14 @@ pub enum PatternEditError {
     MissingRawFrame,
     #[error("pattern frame arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("pattern generation overflowed")]
+    GenerationOverflow,
+    #[error("pattern event {0:?} does not exist")]
+    EventNotFound(EventId),
+    #[error("pattern event velocity must be finite and in 0.0..=1.0")]
+    InvalidVelocity,
+    #[error("pattern has no clear checkpoint to restore")]
+    NothingToUndo,
     #[error(transparent)]
     Model(#[from] ModelError),
 }

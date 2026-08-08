@@ -5,8 +5,8 @@ use std::{collections::HashSet, path::Component, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BankId, ChokeGroup, EventId, Meter, ModelError, PadId, PadSettings, PatternEvent, PlaybackMode,
-    Resolution, Tempo, Transport,
+    BankId, ChokeGroup, EventId, MAX_PATTERN_EVENTS, Meter, ModelError, PATTERN_SLOT_COUNT, PadId,
+    PadSettings, PatternEvent, PlaybackMode, Resolution, Tempo, Transport,
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -29,6 +29,10 @@ pub enum ProjectError {
     DuplicatePad(PadId),
     #[error("pattern name appears more than once: {0}")]
     DuplicatePattern(String),
+    #[error("project has more than {PATTERN_SLOT_COUNT} patterns")]
+    TooManyPatterns,
+    #[error("pattern {pattern} has more than {MAX_PATTERN_EVENTS} events")]
+    TooManyPatternEvents { pattern: String },
     #[error("invalid project model: {0}")]
     InvalidModel(ModelError),
 }
@@ -268,6 +272,9 @@ impl ProjectDocument {
         if self.name.trim().is_empty() {
             return Err(ProjectError::InvalidName);
         }
+        if self.patterns.len() > PATTERN_SLOT_COUNT {
+            return Err(ProjectError::TooManyPatterns);
+        }
 
         let mut pads = HashSet::with_capacity(self.pads.len());
         for pad in &self.pads {
@@ -343,6 +350,11 @@ impl ProjectPattern {
     fn validate(&self) -> Result<(), ProjectError> {
         if self.name.trim().is_empty() {
             return Err(ProjectError::InvalidName);
+        }
+        if self.events.len() > MAX_PATTERN_EVENTS {
+            return Err(ProjectError::TooManyPatternEvents {
+                pattern: self.name.clone(),
+            });
         }
         let transport = Transport::new(
             self.sample_rate,
@@ -531,5 +543,48 @@ index = {index}
                 ProjectError::InvalidModel(expected)
             );
         }
+    }
+
+    #[test]
+    fn project_rejects_more_than_sixteen_patterns() {
+        let mut project = ProjectDocument::empty("many");
+        project.patterns = (0..17)
+            .map(|index| ProjectPattern {
+                name: format!("pattern-{index}"),
+                sample_rate: 48_000,
+                tempo: Tempo::new(120.0).unwrap(),
+                meter: Meter::new(4, 4).unwrap(),
+                bars: 1,
+                resolution: Resolution::Sixteenth,
+                swing: 0.5,
+                events: Vec::new(),
+            })
+            .collect();
+        assert_eq!(project.to_toml(), Err(ProjectError::TooManyPatterns));
+    }
+
+    #[test]
+    fn project_rejects_more_than_one_thousand_twenty_four_events() {
+        let mut project = ProjectDocument::empty("many-events");
+        project.patterns.push(ProjectPattern {
+            name: "dense".into(),
+            sample_rate: 48_000,
+            tempo: Tempo::new(120.0).unwrap(),
+            meter: Meter::new(4, 4).unwrap(),
+            bars: 1,
+            resolution: Resolution::Sixteenth,
+            swing: 0.5,
+            events: (1..=1_025)
+                .map(|id| {
+                    PatternEvent::new(EventId(id), PadId::first(), id - 1, 1.0, None).unwrap()
+                })
+                .collect(),
+        });
+        assert_eq!(
+            project.to_toml(),
+            Err(ProjectError::TooManyPatternEvents {
+                pattern: "dense".into()
+            })
+        );
     }
 }

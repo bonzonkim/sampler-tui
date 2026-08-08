@@ -96,7 +96,7 @@ impl Transport {
         if sample_rate == 0 || !(1..=64).contains(&bars) {
             return Err(ModelError::InvalidTransport);
         }
-        Ok(Self {
+        let transport = Self {
             sample_rate,
             tempo,
             meter,
@@ -106,7 +106,10 @@ impl Transport {
             absolute_frame: 0,
             playhead: 0,
             playing: false,
-        })
+        };
+        (transport.loop_frames() > 0)
+            .then_some(transport)
+            .ok_or(ModelError::InvalidTransport)
     }
 
     pub fn with_swing(mut self, swing: f64) -> Result<Self, ModelError> {
@@ -297,5 +300,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(transport.with_swing(0.49), Err(ModelError::SwingOutOfRange));
+    }
+
+    #[test]
+    fn transport_rejects_a_configuration_that_rounds_to_zero_loop_frames() {
+        assert_eq!(
+            Transport::new(
+                1,
+                Tempo::new(300.0).unwrap(),
+                Meter::new(1, 16).unwrap(),
+                1,
+                Resolution::Sixteenth,
+            ),
+            Err(ModelError::InvalidTransport)
+        );
     }
 }

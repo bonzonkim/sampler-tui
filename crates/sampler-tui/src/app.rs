@@ -63,21 +63,21 @@ mod mixer_task6_tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use sampler_audio::{
         CaptureCompletion, CaptureSource, Frame, SampleBuffer, SampleSlot, Telemetry,
     };
     use sampler_core::{
         BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
-        PlaybackMode, ReverbSettings, SampleEditRecipe,
+        PlaybackMode, ProjectDocument, ProjectId, ReverbSettings, SampleEditRecipe,
     };
 
     use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, pad_offset};
     use crate::audio::{AudioPort, CaptureSupport};
     use crate::capture::CapturePhase;
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
-    use crate::loader::LoadedSample;
+    use crate::loader::{LoadedSample, ProjectToken, WorkerRequest, WorkerResult};
     use crate::project_store::SourceFingerprint;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,8 @@ mod mixer_task6_tests {
     struct MixerAudioState {
         calls: Vec<MixerAudioCall>,
         fail_next: Option<MixerAudioCallKind>,
+        fail_install_number: Option<usize>,
+        install_attempts: usize,
         runtime_error: Option<String>,
         installed: Vec<(PadId, PadMixSettings)>,
         master: Option<MasterMixSettings>,
@@ -118,6 +120,12 @@ mod mixer_task6_tests {
 
         fn fail_device(&self, message: &str) {
             self.0.borrow_mut().runtime_error = Some(message.to_owned());
+        }
+
+        fn fail_install_number(&self, number: usize) {
+            let mut state = self.0.borrow_mut();
+            state.fail_install_number = Some(number);
+            state.install_attempts = 0;
         }
 
         fn installed_mix(&self, pad: PadId) -> Option<PadMixSettings> {
@@ -141,6 +149,8 @@ mod mixer_task6_tests {
             let probe = MixerProbe(Rc::new(RefCell::new(MixerAudioState {
                 calls: Vec::new(),
                 fail_next: None,
+                fail_install_number: None,
+                install_attempts: 0,
                 runtime_error: None,
                 installed: Vec::new(),
                 master: None,
@@ -151,6 +161,13 @@ mod mixer_task6_tests {
         fn admit(&self, kind: MixerAudioCallKind, call: MixerAudioCall) -> Result<(), String> {
             let mut state = self.0.0.borrow_mut();
             state.calls.push(call);
+            if kind == MixerAudioCallKind::Install {
+                state.install_attempts += 1;
+                if state.fail_install_number == Some(state.install_attempts) {
+                    state.fail_install_number = None;
+                    return Err(format!("install {} failed", state.install_attempts));
+                }
+            }
             if state.fail_next == Some(kind) {
                 state.fail_next = None;
                 Err(format!("{kind:?} failed"))
@@ -435,6 +452,108 @@ mod mixer_task6_tests {
     }
 
     #[test]
+    fn mixer_task6_candidate_failures_preserve_the_old_app_and_audio_session_tuple() {
+        for failure in [
+            MixerAudioCallKind::UpdateMasterMix,
+            MixerAudioCallKind::Install,
+            MixerAudioCallKind::UpdatePad,
+        ] {
+            let (mut app, old_probe, first_pad) = loaded_mixer_app();
+            let second_pad = pad(1);
+            install_loaded_pad(
+                &mut app,
+                second_pad,
+                PadMixSettings::new(false, 0.4, 0.6).unwrap(),
+            );
+            let master = nondefault_master_mix();
+            app.update_master_mix(master).unwrap();
+            let before = (
+                app.pad_mix(first_pad),
+                app.pad_mix(second_pad),
+                app.master_mix(),
+                app.project_revision(),
+            );
+
+            let (candidate, candidate_probe) = MixerAudio::new();
+            match failure {
+                MixerAudioCallKind::UpdateMasterMix => {
+                    candidate_probe.fail_next(MixerAudioCallKind::UpdateMasterMix)
+                }
+                MixerAudioCallKind::Install => candidate_probe.fail_install_number(1),
+                MixerAudioCallKind::UpdatePad => candidate_probe.fail_install_number(2),
+                MixerAudioCallKind::UpdatePadMix => unreachable!(),
+            }
+            assert!(app.retry_with(Box::new(candidate)));
+            assert_eq!(
+                (
+                    app.pad_mix(first_pad),
+                    app.pad_mix(second_pad),
+                    app.master_mix(),
+                    app.project_revision(),
+                ),
+                before
+            );
+
+            let admitted = PadMixSettings::new(true, 0.3, 0.7).unwrap();
+            app.update_pad_mix(first_pad, admitted).unwrap();
+            assert_eq!(
+                old_probe.calls().last(),
+                Some(&MixerAudioCall::UpdatePadMix(first_pad, admitted)),
+                "candidate {failure:?} failure must preserve the old audio session"
+            );
+        }
+    }
+
+    #[test]
+    fn mixer_task6_project_open_admits_default_master_before_commit_and_retries_atomically() {
+        let (mut app, probe, _) = loaded_mixer_app();
+        let nondefault = nondefault_master_mix();
+        app.update_master_mix(nondefault).unwrap();
+        let old_project_id = app.project_session.project_id();
+        let document = ProjectDocument::new_v3(
+            ProjectId::from_bytes([0x61; 16]),
+            "Mixer open",
+            7,
+            Vec::new(),
+            app.patterns.export_project_patterns().unwrap(),
+            MasterMixSettings::default(),
+        )
+        .unwrap();
+        app.project_open = Some(
+            app.build_project_open_candidate(
+                ProjectToken::new(91),
+                PathBuf::from("mixer-open"),
+                document,
+                7,
+                false,
+            )
+            .unwrap(),
+        );
+
+        assert!(app.maintain_project(Instant::now()));
+        probe.fail_next(MixerAudioCallKind::UpdateMasterMix);
+        assert!(!app.maintain_project(Instant::now()));
+        assert_eq!(app.master_mix(), nondefault);
+        assert_eq!(app.project_session.project_id(), old_project_id);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdateMasterMix(
+                MasterMixSettings::default()
+            ))
+        );
+
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdateMasterMix(
+                MasterMixSettings::default()
+            ))
+        );
+    }
+
+    #[test]
     fn capture_target_fence_rejects_ready_take_after_mix_or_choke_changes() {
         for change_mix in [true, false] {
             let (mut app, probe, target, managed_id) = ready_capture_target_fixture();
@@ -470,6 +589,23 @@ mod mixer_task6_tests {
             assert_eq!(installs_after, installs_before);
             assert_eq!(app.capture_session().managed_capture_id(), Some(managed_id));
             assert_eq!(app.pending_managed_releases.back(), Some(&managed_id));
+            app.cancel_capture().unwrap();
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+            );
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: managed_id,
+                    result: Ok(()),
+                })
+            );
+            assert!(app.maintain_capture());
+            assert_eq!(app.capture_session().phase(), None);
+            assert_eq!(app.capture_session().managed_capture_id(), None);
+            assert_eq!(app.managed_release_in_flight(), None);
+            assert!(app.pending_managed_releases.is_empty());
         }
     }
 }
@@ -661,6 +797,19 @@ mod capture_task7_tests {
             Ok(())
         }
         fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Ok(())
+        }
+        fn update_pad_mix(
+            &mut self,
+            _pad: PadId,
+            _settings: sampler_core::PadMixSettings,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn update_master_mix(
+            &mut self,
+            _settings: sampler_core::MasterMixSettings,
+        ) -> Result<(), String> {
             Ok(())
         }
         fn reclaim_retired(&mut self) -> usize {
@@ -3657,6 +3806,7 @@ struct StagedProjectPad {
 
 enum ProjectAdmission {
     StopAll,
+    Master,
     Pads(usize),
     Patterns(usize),
     Complete,
@@ -6023,12 +6173,22 @@ impl App {
                             Ok(()) => {
                                 candidate.progress.phase = ProjectOpenPhase::Admitting;
                                 candidate.progress.admitted_actions = 1;
-                                candidate.admission = ProjectAdmission::Pads(0);
+                                candidate.admission = ProjectAdmission::Master;
                                 self.held_pad_by_key.fill(None);
                                 changed = true;
                             }
                             Err(error) => self.status = error,
                         },
+                        ProjectAdmission::Master => {
+                            match audio.update_master_mix(MasterMixSettings::default()) {
+                                Ok(()) => {
+                                    candidate.progress.admitted_actions += 1;
+                                    candidate.admission = ProjectAdmission::Pads(0);
+                                    changed = true;
+                                }
+                                Err(error) => self.status = error,
+                            }
+                        }
                         ProjectAdmission::Pads(offset) => {
                             let pad = pad_from_offset(offset);
                             let result =
@@ -6322,7 +6482,7 @@ impl App {
             staged_pads: 0,
             total_pads: document.pads.len(),
             admitted_actions: 0,
-            total_actions: 1 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
+            total_actions: 2 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
         };
         Ok(ProjectOpenOperation::Staging(Box::new(
             ProjectOpenCandidate {
@@ -10414,6 +10574,21 @@ mod tests {
             if let Some(error) = self.update_error.take() {
                 return Err(error);
             }
+            Ok(())
+        }
+
+        fn update_pad_mix(
+            &mut self,
+            _pad: PadId,
+            _settings: sampler_core::PadMixSettings,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_master_mix(
+            &mut self,
+            _settings: sampler_core::MasterMixSettings,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -15716,6 +15891,11 @@ mod tests {
         assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
         assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
 
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+
         for offset in 0..super::PAD_VIEW_COUNT {
             let before = calls.snapshot().len();
             assert!(app.maintain_project(Instant::now()));
@@ -15843,9 +16023,13 @@ mod tests {
         assert!(app.maintain_project(Instant::now()));
         assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
 
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+
         assert!(!app.maintain_project(Instant::now()));
         assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
         assert!(app.status().contains("command queue full"));
 
         assert!(app.maintain_project(Instant::now()));
@@ -15853,7 +16037,7 @@ mod tests {
             calls.snapshot(),
             [AudioCall::StopAll, AudioCall::Install(pad(0, 0))]
         );
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 3);
     }
 
     #[test]
@@ -15869,6 +16053,7 @@ mod tests {
             vec![project_open_pad(pad(0, 0), PadSettings::default())],
         );
         stage_project_open(&mut app, "project-b", document);
+        assert!(app.maintain_project(Instant::now()));
         assert!(app.maintain_project(Instant::now()));
         assert!(app.maintain_project(Instant::now()));
         assert!(app.maintain_project(Instant::now()));
@@ -15888,6 +16073,8 @@ mod tests {
         let replacement_calls = replacement.call_log();
         assert!(app.retry_with(Box::new(replacement)));
         replacement_calls.clear();
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(replacement_calls.snapshot(), [AudioCall::StopAll]);
         assert!(app.maintain_project(Instant::now()));
         assert_eq!(replacement_calls.snapshot(), [AudioCall::StopAll]);
         assert!(app.maintain_project(Instant::now()));

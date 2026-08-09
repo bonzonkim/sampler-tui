@@ -255,6 +255,25 @@ impl AudioPort for ControllerPort {
             .map_err(|error| error.to_string())
     }
 
+    fn update_pad_mix(
+        &mut self,
+        pad: PadId,
+        settings: sampler_core::PadMixSettings,
+    ) -> Result<(), String> {
+        self.controller()
+            .update_pad_mix(pad, settings)
+            .map_err(|error| error.to_string())
+    }
+
+    fn update_master_mix(
+        &mut self,
+        settings: sampler_core::MasterMixSettings,
+    ) -> Result<(), String> {
+        self.controller()
+            .update_master_mix(settings)
+            .map_err(|error| error.to_string())
+    }
+
     fn reclaim_retired(&mut self) -> usize {
         self.controller().reclaim_retired()
     }

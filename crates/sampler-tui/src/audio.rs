@@ -156,12 +156,8 @@ pub trait AudioPort {
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String>;
     fn stop_all(&mut self) -> Result<(), String>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String>;
-    fn update_pad_mix(&mut self, _pad: PadId, _settings: PadMixSettings) -> Result<(), String> {
-        Ok(())
-    }
-    fn update_master_mix(&mut self, _settings: MasterMixSettings) -> Result<(), String> {
-        Ok(())
-    }
+    fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String>;
+    fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), String>;
     fn reclaim_retired(&mut self) -> usize;
     fn latest_telemetry(&mut self) -> Option<Telemetry>;
     fn poll_runtime_error(&mut self) -> Option<String>;
@@ -306,17 +302,10 @@ trait SessionLike {
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), Self::CommandError>;
     fn update_pad_mix(
         &mut self,
-        _pad: PadId,
-        _settings: PadMixSettings,
-    ) -> Result<(), Self::CommandError> {
-        Ok(())
-    }
-    fn update_master_mix(
-        &mut self,
-        _settings: MasterMixSettings,
-    ) -> Result<(), Self::CommandError> {
-        Ok(())
-    }
+        pad: PadId,
+        settings: PadMixSettings,
+    ) -> Result<(), Self::CommandError>;
+    fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), Self::CommandError>;
     fn reclaim_retired_slot(&mut self) -> Option<SampleSlot> {
         None
     }
@@ -1076,8 +1065,8 @@ mod tests {
         SampleSlot, Telemetry, audio_channels, capture_channels,
     };
     use sampler_core::{
-        EditablePattern, Meter, PadId, PadSettings, PatternSlotId, PatternSnapshot, Resolution,
-        Tempo, Transport,
+        DelaySettings, EditablePattern, MasterMixSettings, Meter, PadId, PadMixSettings,
+        PadSettings, PatternSlotId, PatternSnapshot, Resolution, ReverbSettings, Tempo, Transport,
     };
 
     use super::{
@@ -1206,6 +1195,8 @@ mod tests {
         capture_polls: Rc<Cell<usize>>,
         runtime_errors: VecDeque<ControlError>,
         capture_output_completion: Option<OwnershipCompletionProbe>,
+        mixer_calls: Rc<RefCell<Vec<MixerForwardCall>>>,
+        mixer_failure: Rc<RefCell<Option<MixerForwardKind>>>,
     }
 
     #[derive(Clone)]
@@ -1219,6 +1210,18 @@ mod tests {
         TrackedTrigger(LiveCommandId, PadId),
         Select(PatternSlotId, PatternSwitch),
         Play,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MixerForwardKind {
+        Pad,
+        Master,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum MixerForwardCall {
+        Pad(PadId, PadMixSettings),
+        Master(MasterMixSettings),
     }
 
     #[derive(Clone)]
@@ -1247,6 +1250,8 @@ mod tests {
                 capture_polls: Rc::new(Cell::new(0)),
                 runtime_errors: VecDeque::new(),
                 capture_output_completion: None,
+                mixer_calls: Rc::new(RefCell::new(Vec::new())),
+                mixer_failure: Rc::new(RefCell::new(None)),
             }
         }
 
@@ -1489,6 +1494,35 @@ mod tests {
             Ok(())
         }
 
+        fn update_pad_mix(
+            &mut self,
+            pad: PadId,
+            settings: PadMixSettings,
+        ) -> Result<(), Self::CommandError> {
+            self.mixer_calls
+                .borrow_mut()
+                .push(MixerForwardCall::Pad(pad, settings));
+            if self.mixer_failure.borrow_mut().take() == Some(MixerForwardKind::Pad) {
+                Err(ControlError::CommandQueueFull)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn update_master_mix(
+            &mut self,
+            settings: MasterMixSettings,
+        ) -> Result<(), Self::CommandError> {
+            self.mixer_calls
+                .borrow_mut()
+                .push(MixerForwardCall::Master(settings));
+            if self.mixer_failure.borrow_mut().take() == Some(MixerForwardKind::Master) {
+                Err(ControlError::CommandQueueFull)
+            } else {
+                Ok(())
+            }
+        }
+
         fn reclaim_retired(&mut self) -> usize {
             self.retired
         }
@@ -1602,6 +1636,52 @@ mod tests {
         fn poll_error(&mut self) -> Option<String> {
             self.errors.pop_front().map(|error| error.to_string())
         }
+    }
+
+    #[test]
+    fn mixer_task6_session_audio_port_forwards_exact_values_and_propagates_each_failure() {
+        let session = FakeSession::ready(48_000, 2);
+        let calls = Rc::clone(&session.mixer_calls);
+        let failure = Rc::clone(&session.mixer_failure);
+        let mut port = SessionAudioPort::new(session);
+        let pad = PadId::first();
+        let pad_mix = PadMixSettings::new(true, 0.25, 0.75).unwrap();
+        let master = MasterMixSettings::new(
+            -4.0,
+            DelaySettings::new(true, 40, 0.3, -8.0).unwrap(),
+            ReverbSettings::new(true, 0.6, 0.4, -10.0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(port.update_pad_mix(pad, pad_mix), Ok(()));
+        assert_eq!(port.update_master_mix(master), Ok(()));
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                MixerForwardCall::Pad(pad, pad_mix),
+                MixerForwardCall::Master(master),
+            ]
+        );
+
+        *failure.borrow_mut() = Some(MixerForwardKind::Pad);
+        assert_eq!(
+            port.update_pad_mix(pad, PadMixSettings::default()),
+            Err(ControlError::CommandQueueFull.to_string())
+        );
+        *failure.borrow_mut() = Some(MixerForwardKind::Master);
+        assert_eq!(
+            port.update_master_mix(MasterMixSettings::default()),
+            Err(ControlError::CommandQueueFull.to_string())
+        );
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                MixerForwardCall::Pad(pad, pad_mix),
+                MixerForwardCall::Master(master),
+                MixerForwardCall::Pad(pad, PadMixSettings::default()),
+                MixerForwardCall::Master(MasterMixSettings::default()),
+            ]
+        );
     }
 
     fn fake_input_session(
@@ -2300,6 +2380,21 @@ mod tests {
         }
 
         fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_pad_mix(
+            &mut self,
+            _pad: PadId,
+            _settings: sampler_core::PadMixSettings,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_master_mix(
+            &mut self,
+            _settings: sampler_core::MasterMixSettings,
+        ) -> Result<(), String> {
             Ok(())
         }
 

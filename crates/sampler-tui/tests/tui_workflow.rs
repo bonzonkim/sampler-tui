@@ -189,6 +189,21 @@ impl AudioPort for FakeAudio {
         self.accept_command(AudioCall::UpdatePad(pad))
     }
 
+    fn update_pad_mix(
+        &mut self,
+        _pad: PadId,
+        _settings: sampler_core::PadMixSettings,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn update_master_mix(
+        &mut self,
+        _settings: sampler_core::MasterMixSettings,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn reclaim_retired(&mut self) -> usize {
         let mut state = self.state.borrow_mut();
         state.maintenance_calls = state.maintenance_calls.saturating_add(1);

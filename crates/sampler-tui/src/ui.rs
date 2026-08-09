@@ -1234,6 +1234,19 @@ mod tests {
         fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
             Ok(())
         }
+        fn update_pad_mix(
+            &mut self,
+            _pad: PadId,
+            _settings: sampler_core::PadMixSettings,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn update_master_mix(
+            &mut self,
+            _settings: sampler_core::MasterMixSettings,
+        ) -> Result<(), String> {
+            Ok(())
+        }
 
         fn reclaim_retired(&mut self) -> usize {
             0

@@ -1,0 +1,427 @@
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use hound::{SampleFormat, WavSpec, WavWriter};
+use sampler_core::{
+    BankId, EventId, MasterMixSettings, Meter, PadId, PadMixSettings, PadSettings, PatternEvent,
+    PatternSlotId, ProjectDocument, ProjectId, ProjectPad, ProjectPattern, ProjectPatternEvent,
+    Resolution, SampleEditRecipe, Tempo, Transport,
+};
+use sampler_tui::export::stage_export_samples;
+use sampler_tui::{
+    EXPORT_SAMPLE_RATE, ExportPatternSlot, OfflineExportError, OfflineExportSnapshot, ProjectStore,
+    SourceFingerprint,
+};
+
+fn pad(index: u8) -> PadId {
+    PadId::new(BankId::new(0).unwrap(), index).unwrap()
+}
+
+struct Fixture {
+    directory: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let directory = std::env::temp_dir().join(format!(
+            "sampler-tui-export-snapshot-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("audio")).unwrap();
+        Self { directory }
+    }
+
+    fn add_wav(&self, seed: f32) -> (String, sampler_core::AssetDigest) {
+        let source = self.directory.join(format!("source-{seed}.wav"));
+        let mut writer = WavWriter::create(
+            &source,
+            WavSpec {
+                channels: 2,
+                sample_rate: 44_100,
+                bits_per_sample: 32,
+                sample_format: SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for frame in [[seed, -seed], [seed * 0.5, -seed * 0.5], [0.0, 0.0]] {
+            writer.write_sample(frame[0]).unwrap();
+            writer.write_sample(frame[1]).unwrap();
+        }
+        writer.finalize().unwrap();
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let relative = format!("audio/{}.wav", fingerprint.digest);
+        fs::rename(&source, self.directory.join(&relative)).unwrap();
+        (relative, fingerprint.digest)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn pattern(slot: PatternSlotId, pads: &[PadId]) -> ProjectPattern {
+    let tempo = Tempo::new(120.0).unwrap();
+    let meter = Meter::new(4, 4).unwrap();
+    let transport = Transport::new(44_100, tempo, meter, 1, Resolution::Sixteenth)
+        .unwrap()
+        .with_swing(0.5)
+        .unwrap();
+    ProjectPattern {
+        slot,
+        name: format!("Pattern {}", slot.get() + 1),
+        sample_rate: 44_100,
+        tempo,
+        meter,
+        bars: 1,
+        resolution: Resolution::Sixteenth,
+        swing: 0.5,
+        quantize_strength: 0.0,
+        events: pads
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, pad)| {
+                let raw_frame = 1_000 + index as u64;
+                ProjectPatternEvent {
+                    event: PatternEvent::new(EventId(index as u64 + 1), pad, raw_frame, 1.0, None)
+                        .unwrap()
+                        .quantized(&transport, 0.0),
+                    raw_frame,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn document(pads: Vec<ProjectPad>, selected: ProjectPattern) -> ProjectDocument {
+    ProjectDocument::new_v4(
+        ProjectId::from_bytes([7; 16]),
+        "export snapshot",
+        42,
+        pads,
+        vec![selected],
+        MasterMixSettings::default(),
+        sampler_core::MidiSettings::default(),
+    )
+    .unwrap()
+}
+
+fn project_pad(pad: PadId, asset: (String, sampler_core::AssetDigest)) -> ProjectPad {
+    ProjectPad::new(
+        pad,
+        asset.0,
+        asset.1,
+        PadSettings::default(),
+        PadMixSettings::default(),
+        SampleEditRecipe::identity(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn snapshot_owns_only_referenced_committed_pads_and_revision() {
+    let fixture = Fixture::new("referenced");
+    let first = project_pad(pad(1), fixture.add_wav(0.25));
+    let seventh = project_pad(pad(7), fixture.add_wav(0.75));
+    let unused = project_pad(pad(3), fixture.add_wav(0.5));
+    let document = document(
+        vec![first, seventh, unused],
+        pattern(PatternSlotId::new(2).unwrap(), &[pad(1), pad(7)]),
+    );
+
+    let snapshot = OfflineExportSnapshot::from_document(
+        &fixture.directory,
+        &document,
+        ExportPatternSlot::try_from(3).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(snapshot.project_id(), document.project_id);
+    assert_eq!(snapshot.revision(), document.revision);
+    assert_eq!(snapshot.sample_rate(), EXPORT_SAMPLE_RATE);
+    assert_eq!(
+        snapshot
+            .pads()
+            .iter()
+            .map(|pad| pad.pad)
+            .collect::<Vec<_>>(),
+        vec![pad(1), pad(7)]
+    );
+    assert_eq!(snapshot.pattern().sample_rate, EXPORT_SAMPLE_RATE);
+    assert!(snapshot.loop_frames().unwrap() > 0);
+}
+
+#[test]
+fn snapshot_rejects_empty_or_unresolved_patterns() {
+    let fixture = Fixture::new("rejected");
+    let selected = PatternSlotId::new(0).unwrap();
+    let empty = document(Vec::new(), pattern(selected, &[]));
+    assert_eq!(
+        OfflineExportSnapshot::from_document(
+            &fixture.directory,
+            &empty,
+            ExportPatternSlot::try_from(1).unwrap(),
+        ),
+        Err(OfflineExportError::EmptyPattern)
+    );
+
+    let unresolved = document(Vec::new(), pattern(selected, &[pad(1)]));
+    assert!(matches!(
+        OfflineExportSnapshot::from_document(
+            &fixture.directory,
+            &unresolved,
+            ExportPatternSlot::try_from(1).unwrap(),
+        ),
+        Err(OfflineExportError::MissingPadSource { .. })
+    ));
+}
+
+#[test]
+fn staging_resamples_referenced_pads_at_the_canonical_rate() {
+    let fixture = Fixture::new("staged");
+    let committed = project_pad(pad(1), fixture.add_wav(0.25));
+    let document = document(
+        vec![committed],
+        pattern(PatternSlotId::new(0).unwrap(), &[pad(1)]),
+    );
+    let snapshot = OfflineExportSnapshot::from_document(
+        &fixture.directory,
+        &document,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .unwrap();
+
+    let staged = stage_export_samples(&snapshot, &AtomicBool::new(false)).unwrap();
+
+    assert_eq!(staged.len(), 1);
+    assert_eq!(staged[0].pad, pad(1));
+    assert_eq!(staged[0].sample.sample_rate(), EXPORT_SAMPLE_RATE);
+}
+
+#[test]
+fn staging_rejects_mutated_assets_and_pre_decode_cancellation() {
+    let fixture = Fixture::new("mutation");
+    let committed = project_pad(pad(1), fixture.add_wav(0.25));
+    let asset = fixture.directory.join(&committed.audio_path);
+    let document = document(
+        vec![committed],
+        pattern(PatternSlotId::new(0).unwrap(), &[pad(1)]),
+    );
+    let snapshot = OfflineExportSnapshot::from_document(
+        &fixture.directory,
+        &document,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .unwrap();
+
+    fs::write(&asset, b"mutated").unwrap();
+    assert!(matches!(
+        stage_export_samples(&snapshot, &AtomicBool::new(false)),
+        Err(OfflineExportError::ProjectStore(_))
+    ));
+    assert!(matches!(
+        stage_export_samples(&snapshot, &AtomicBool::new(true)),
+        Err(OfflineExportError::Cancelled)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_rejects_a_symlink_substituted_after_snapshot_without_creating_output() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("symlink");
+    let committed = project_pad(pad(1), fixture.add_wav(0.25));
+    let asset = fixture.directory.join(&committed.audio_path);
+    let document = document(
+        vec![committed],
+        pattern(PatternSlotId::new(0).unwrap(), &[pad(1)]),
+    );
+    let snapshot = OfflineExportSnapshot::from_document(
+        &fixture.directory,
+        &document,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .unwrap();
+    let replacement = fixture.directory.join("replacement.wav");
+    fs::copy(&asset, &replacement).unwrap();
+    fs::remove_file(&asset).unwrap();
+    symlink(&replacement, &asset).unwrap();
+    let output = fixture.directory.join("must-not-exist.wav");
+
+    assert!(matches!(
+        stage_export_samples(&snapshot, &AtomicBool::new(false)),
+        Err(OfflineExportError::ProjectStore(
+            sampler_tui::ProjectStoreError::SymlinkRejected { .. }
+        ))
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn migrated_v1_v2_and_v3_patterns_snapshot_at_48khz() {
+    let fixture = Fixture::new("legacy-rates");
+    let (asset_path, digest) = fixture.add_wav(0.25);
+    let asset = fixture.directory.join(&asset_path);
+    let digest = digest.to_string();
+    let legacy = fixture.directory.join("audio/legacy.wav");
+    fs::copy(&asset, &legacy).unwrap();
+    fs::write(
+        fixture.directory.join("project.toml"),
+        r#"schema_version = 1
+name = "legacy"
+
+[[pads]]
+audio_path = "audio/legacy.wav"
+
+[pads.pad]
+bank = 0
+index = 1
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[[patterns]]
+name = "legacy pattern"
+sample_rate = 44100
+tempo = 120.0
+bars = 1
+resolution = "sixteenth"
+swing = 0.5
+
+[patterns.meter]
+numerator = 4
+denominator = 4
+
+[[patterns.events]]
+id = 1
+frame = 0
+velocity = 1.0
+
+[patterns.events.pad]
+bank = 0
+index = 1
+"#,
+    )
+    .unwrap();
+    let v1 = ProjectStore
+        .probe(&fixture.directory)
+        .unwrap()
+        .explicit
+        .unwrap()
+        .unwrap();
+
+    let v2 = current_document_from_legacy_toml(2, &asset_path, &digest);
+    let v3 = current_document_from_legacy_toml(3, &asset_path, &digest);
+    for document in [v1, v2, v3] {
+        let snapshot = OfflineExportSnapshot::from_document(
+            &fixture.directory,
+            &document,
+            ExportPatternSlot::try_from(1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.sample_rate(), EXPORT_SAMPLE_RATE);
+        assert_eq!(snapshot.pattern().sample_rate, EXPORT_SAMPLE_RATE);
+        assert!(snapshot.loop_frames().unwrap() > 0);
+    }
+}
+
+fn current_document_from_legacy_toml(
+    schema: u8,
+    asset_path: &str,
+    digest: &str,
+) -> ProjectDocument {
+    let mix = (schema == 3).then_some(
+        r#"
+[master_mix]
+gain_db = 0.0
+
+[master_mix.delay]
+enabled = false
+time_ms = 320
+feedback = 0.0
+return_db = 0.0
+
+[master_mix.reverb]
+enabled = false
+room_size = 0.5
+damping = 0.5
+return_db = 0.0
+"#,
+    );
+    let pad_mix = (schema == 3).then_some(
+        r#"
+[pads.mix]
+muted = false
+delay_send = 0.0
+reverb_send = 0.0
+"#,
+    );
+    let source = format!(
+        r#"schema_version = {schema}
+project_id = "07070707070707070707070707070707"
+name = "legacy current"
+revision = 4
+{mix}
+[[pads]]
+audio_path = "{asset_path}"
+asset_digest = "{digest}"
+
+[pads.pad]
+bank = 0
+index = 1
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+{pad_mix}
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false
+
+[[patterns]]
+slot = 0
+name = "legacy current pattern"
+sample_rate = 44100
+tempo = 120.0
+bars = 1
+resolution = "sixteenth"
+swing = 0.5
+quantize_strength = 0.0
+
+[patterns.meter]
+numerator = 4
+denominator = 4
+
+[[patterns.events]]
+id = 1
+frame = 0
+raw_frame = 0
+velocity = 1.0
+original_offset = 0
+
+[patterns.events.pad]
+bank = 0
+index = 1
+"#,
+        mix = mix.unwrap_or_default(),
+        pad_mix = pad_mix.unwrap_or_default(),
+    );
+    let sampler_core::ParsedProjectDocument::Current(document) =
+        ProjectDocument::from_toml(&source).unwrap()
+    else {
+        panic!("schema v{schema} must migrate to a current document");
+    };
+    document
+}

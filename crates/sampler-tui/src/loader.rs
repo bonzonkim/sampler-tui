@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -13,7 +14,9 @@ use sampler_audio::{
     CaptureSource, DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits,
     prepare_sample_with_frame_limit, probe_shared_audio_format, resample_stereo_with_frame_limit,
 };
-use sampler_core::{AssetDigest, PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
+use sampler_core::{
+    AssetDigest, PadId, ProjectId, ProjectPad, SampleEditRecipe, apply_sample_edit,
+};
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::capture_store::{CaptureStore, CaptureStoreError, ManagedCapture, ManagedCaptureId};
@@ -739,20 +742,80 @@ fn load_project_sample(
     recipe: SampleEditRecipe,
     asset_hook: Option<&ProjectAssetOpenHook>,
 ) -> Result<LoadedSample, LoadSampleError> {
-    let asset = ProjectStore
-        .read_project_asset_after_open(project_directory, asset_path, expected_digest, || {
+    let cancelled = AtomicBool::new(false);
+    decode_committed_project_asset(
+        project_directory,
+        asset_path,
+        expected_digest,
+        engine_rate,
+        recipe,
+        &cancelled,
+        || {
             if let Some(hook) = asset_hook {
                 hook();
             }
-        })
-        .map_err(LoadSampleError::ProjectAsset)?;
-    decode_and_render_sample(
-        &asset.path,
-        asset.encoded,
-        asset.fingerprint,
-        engine_rate,
-        recipe,
+        },
     )
+    .map_err(LoadSampleError::ProjectAsset)
+}
+
+/// Opens, verifies, decodes, edits, and resamples one committed project pad.
+///
+/// This is the shared project-asset pipeline used by project-open and offline export staging.
+/// It intentionally delegates the filesystem fence to `ProjectStore` and the PCM pipeline to
+/// `decode_and_render_sample`; callers must not add a second, weaker export decoder.
+pub(crate) fn decode_committed_project_pad(
+    directory: &Path,
+    pad: &ProjectPad,
+    target_rate: u32,
+    cancelled: &AtomicBool,
+) -> Result<LoadedSample, ProjectStoreError> {
+    decode_committed_project_asset(
+        directory,
+        &pad.audio_path,
+        pad.asset_digest,
+        target_rate,
+        pad.recipe,
+        cancelled,
+        || {},
+    )
+}
+
+fn decode_committed_project_asset<F>(
+    directory: &Path,
+    asset_path: &str,
+    expected_digest: AssetDigest,
+    target_rate: u32,
+    recipe: SampleEditRecipe,
+    cancelled: &AtomicBool,
+    after_open: F,
+) -> Result<LoadedSample, ProjectStoreError>
+where
+    F: FnOnce(),
+{
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    let asset = ProjectStore.read_project_asset_after_open(
+        directory,
+        asset_path,
+        expected_digest,
+        after_open,
+    )?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    let path = asset.path.clone();
+    let sample =
+        decode_and_render_sample(&path, asset.encoded, asset.fingerprint, target_rate, recipe)
+            .map_err(|error| ProjectStoreError::Decode {
+                path,
+                message: error.to_string(),
+            })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    Ok(sample)
 }
 
 fn decode_and_render_sample(

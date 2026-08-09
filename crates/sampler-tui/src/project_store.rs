@@ -774,6 +774,10 @@ pub enum ProjectStoreError {
     SymlinkRejected { path: PathBuf },
     #[error("existing content-addressed asset failed integrity verification: {path}")]
     AssetIntegrity { path: PathBuf },
+    #[error("could not decode committed project asset {path}: {message}")]
+    Decode { path: PathBuf, message: String },
+    #[error("committed project asset staging was cancelled")]
+    Cancelled,
     #[error("save-as target is not empty: {path}")]
     SaveAsTargetNotEmpty { path: PathBuf },
     #[error("atomic write failed for {path} at {point:?}: {kind:?}")]

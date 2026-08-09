@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audio;
+mod capture_store;
 pub mod cli;
 pub mod diagnostic;
 pub mod file_picker;
@@ -21,13 +22,15 @@ pub use app::{
     SampleEditStatus,
 };
 pub use audio::AudioPort;
+pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};
 pub use loader::{
-    EditPreview, LoadPurpose, LoadSampleError, LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES,
-    MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, ProjectSaveWorkerRequest,
-    ProjectToken, RenderedSample, StageProjectSampleRequest, WorkerHandle, WorkerPanicked,
-    WorkerRequest, WorkerResult, WorkerSendError, WorkerSendFailure, downsample_preview,
+    CaptureFinalizeError, EditPreview, FinalizeCaptureRequest, LoadPurpose, LoadSampleError,
+    LoadedSample, MAX_DECODED_BYTES, MAX_DECODED_FRAMES, MAX_DIRECTORY_ENTRIES,
+    MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, ProjectSaveWorkerRequest, ProjectToken,
+    RenderedSample, StageProjectSampleRequest, WorkerHandle, WorkerPanicked, WorkerRequest,
+    WorkerResult, WorkerSendError, WorkerSendFailure, downsample_preview,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{

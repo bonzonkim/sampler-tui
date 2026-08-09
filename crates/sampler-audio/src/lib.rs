@@ -33,6 +33,8 @@ pub use error::{
     InputBufferError, InputDeviceError, PrepareError, SampleError,
 };
 pub use input::{InputCaptureSession, write_input_device};
-pub use resample::{prepare_sample, prepare_sample_with_frame_limit};
+pub use resample::{
+    prepare_sample, prepare_sample_with_frame_limit, resample_stereo_with_frame_limit,
+};
 pub use sample::{SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
 pub use sampler_core::{Frame, PadId, PadSettings};

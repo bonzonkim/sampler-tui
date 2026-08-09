@@ -998,6 +998,8 @@ mod tests {
             | crate::WorkerRequest::ProbeProject { .. }
             | crate::WorkerRequest::DiscardRecovery { .. }
             | crate::WorkerRequest::StageProjectSample(_)
+            | crate::WorkerRequest::FinalizeCapture(_)
+            | crate::WorkerRequest::ReleaseManagedCapture { .. }
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
@@ -1045,6 +1047,8 @@ mod tests {
             | crate::WorkerRequest::ProbeProject { .. }
             | crate::WorkerRequest::DiscardRecovery { .. }
             | crate::WorkerRequest::StageProjectSample(_)
+            | crate::WorkerRequest::FinalizeCapture(_)
+            | crate::WorkerRequest::ReleaseManagedCapture { .. }
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }

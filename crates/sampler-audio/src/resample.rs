@@ -59,6 +59,29 @@ pub fn prepare_sample_with_frame_limit(
     Ok(SampleBuffer::new(target_rate, output)?)
 }
 
+pub fn resample_stereo_with_frame_limit(
+    source_rate: u32,
+    stereo: &[f32],
+    target_rate: u32,
+    max_output_frames: usize,
+) -> Result<SampleBuffer, PrepareError> {
+    if !stereo.len().is_multiple_of(2) {
+        return Ok(SampleBuffer::new(source_rate, stereo.to_vec())?);
+    }
+    let frames = stereo.len() / 2;
+    let mut left = Vec::with_capacity(frames);
+    let mut right = Vec::with_capacity(frames);
+    for frame in stereo.chunks_exact(2) {
+        left.push(frame[0]);
+        right.push(frame[1]);
+    }
+    prepare_sample_with_frame_limit(
+        DecodedAudio::new(source_rate, vec![left, right])?,
+        target_rate,
+        max_output_frames,
+    )
+}
+
 fn enforce_frame_limit(frames: usize, max_frames: usize) -> Result<(), PrepareError> {
     if frames > max_frames {
         Err(PrepareError::FrameLimitExceeded { frames, max_frames })
@@ -115,5 +138,38 @@ mod tests {
         let result = prepare_sample_with_frame_limit(decoded, 48_000, 2);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn checked_stereo_equal_rate_path_is_bit_exact() {
+        let stereo = [0.0, -0.0, 0.25, -0.25, 1.0, -1.0];
+
+        let sample = resample_stereo_with_frame_limit(48_000, &stereo, 48_000, 3).unwrap();
+
+        assert_eq!(sample.sample_rate(), 48_000);
+        assert_eq!(sample.data(), stereo);
+    }
+
+    #[test]
+    fn checked_stereo_resampling_enforces_the_prepared_frame_limit() {
+        let stereo = (0..441)
+            .flat_map(|frame| {
+                let value = frame as f32 / 441.0;
+                [value, -value]
+            })
+            .collect::<Vec<_>>();
+
+        let error = resample_stereo_with_frame_limit(44_100, &stereo, 48_000, 480).unwrap_err();
+
+        let PrepareError::FrameLimitExceeded { frames, max_frames } = error else {
+            panic!("wrong error: {error:?}")
+        };
+        assert_eq!((frames, max_frames), (1_786, 480));
+    }
+
+    #[test]
+    fn checked_stereo_rejects_malformed_and_non_finite_input() {
+        assert!(resample_stereo_with_frame_limit(48_000, &[0.0], 48_000, 1).is_err());
+        assert!(resample_stereo_with_frame_limit(48_000, &[f32::NAN, 0.0], 48_000, 1).is_err());
     }
 }

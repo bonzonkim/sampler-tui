@@ -2366,6 +2366,8 @@ impl App {
             | WorkerRequest::ProbeProject { .. }
             | WorkerRequest::DiscardRecovery { .. }
             | WorkerRequest::StageProjectSample(_)
+            | WorkerRequest::FinalizeCapture(_)
+            | WorkerRequest::ReleaseManagedCapture { .. }
             | WorkerRequest::Shutdown => None,
         };
         let message = error.to_string();
@@ -2477,7 +2479,10 @@ impl App {
                 candidate.decode_in_flight = None;
                 true
             }
-            WorkerRequest::ScanDirectory { .. } | WorkerRequest::Shutdown => false,
+            WorkerRequest::FinalizeCapture(_)
+            | WorkerRequest::ReleaseManagedCapture { .. }
+            | WorkerRequest::ScanDirectory { .. }
+            | WorkerRequest::Shutdown => false,
         };
         if applied {
             self.status = message;

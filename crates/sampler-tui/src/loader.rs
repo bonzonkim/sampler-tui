@@ -10,12 +10,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sampler_audio::{
-    DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits, prepare_sample_with_frame_limit,
-    probe_shared_audio_format,
+    CaptureSource, DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits,
+    prepare_sample_with_frame_limit, probe_shared_audio_format, resample_stereo_with_frame_limit,
 };
 use sampler_core::{AssetDigest, PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
+use crate::capture_store::{CaptureStore, CaptureStoreError, ManagedCapture, ManagedCaptureId};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 use crate::project_store::{
     ProjectProbe, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind, SaveReceipt,
@@ -69,7 +70,48 @@ pub struct ProjectSaveWorkerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct FinalizeCaptureRequest {
+    pub token: u64,
+    pub generation: u64,
+    pub target: PadId,
+    pub source: CaptureSource,
+    pub source_rate: u32,
+    pub engine_rate: u32,
+    pub stereo: Arc<[f32]>,
+    pub hard_limit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureFinalizeError {
+    ResampleRateMismatch { source_rate: u32, engine_rate: u32 },
+    Prepare(String),
+    Store(CaptureStoreError),
+}
+
+impl fmt::Display for CaptureFinalizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResampleRateMismatch {
+                source_rate,
+                engine_rate,
+            } => write!(
+                formatter,
+                "resampled output capture rate {source_rate} does not match engine rate {engine_rate}"
+            ),
+            Self::Prepare(message) => write!(formatter, "could not prepare capture: {message}"),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CaptureFinalizeError {}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerRequest {
+    FinalizeCapture(FinalizeCaptureRequest),
+    ReleaseManagedCapture {
+        id: ManagedCaptureId,
+    },
     ScanDirectory {
         request_id: u64,
         path: PathBuf,
@@ -107,6 +149,21 @@ pub enum WorkerRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerResult {
+    CaptureFinalized {
+        token: u64,
+        generation: u64,
+        target: PadId,
+        source: CaptureSource,
+        source_rate: u32,
+        engine_rate: u32,
+        stereo: Arc<[f32]>,
+        hard_limit: bool,
+        result: Result<ManagedCapture, CaptureFinalizeError>,
+    },
+    ManagedCaptureReleased {
+        id: ManagedCaptureId,
+        result: Result<(), CaptureStoreError>,
+    },
     Scanned {
         request_id: u64,
         path: PathBuf,
@@ -428,8 +485,46 @@ fn worker_loop_with_store_and_asset_hook(
     store: Box<dyn ProjectStoreBackend>,
     asset_hook: Option<ProjectAssetOpenHook>,
 ) {
+    let mut capture_store = CaptureStore::new();
     while let Ok(request) = requests.recv() {
         let result = match request {
+            WorkerRequest::FinalizeCapture(request) => {
+                let FinalizeCaptureRequest {
+                    token,
+                    generation,
+                    target,
+                    source,
+                    source_rate,
+                    engine_rate,
+                    stereo,
+                    hard_limit,
+                } = request;
+                let result = finalize_capture(
+                    &mut capture_store,
+                    source,
+                    source_rate,
+                    engine_rate,
+                    &stereo,
+                );
+                WorkerResult::CaptureFinalized {
+                    token,
+                    generation,
+                    target,
+                    source,
+                    source_rate,
+                    engine_rate,
+                    stereo,
+                    hard_limit,
+                    result,
+                }
+            }
+            WorkerRequest::ReleaseManagedCapture { id } => {
+                let result = match &mut capture_store {
+                    Ok(store) => store.release(id),
+                    Err(error) => Err(error.clone()),
+                };
+                WorkerResult::ManagedCaptureReleased { id, result }
+            }
             WorkerRequest::ScanDirectory {
                 request_id,
                 path,
@@ -532,6 +627,30 @@ fn worker_loop_with_store_and_asset_hook(
         if results.send(result).is_err() {
             break;
         }
+    }
+}
+
+fn finalize_capture(
+    store: &mut Result<CaptureStore, CaptureStoreError>,
+    source: CaptureSource,
+    source_rate: u32,
+    engine_rate: u32,
+    stereo: &[f32],
+) -> Result<ManagedCapture, CaptureFinalizeError> {
+    if source == CaptureSource::Resample && source_rate != engine_rate {
+        return Err(CaptureFinalizeError::ResampleRateMismatch {
+            source_rate,
+            engine_rate,
+        });
+    }
+    let sample =
+        resample_stereo_with_frame_limit(source_rate, stereo, engine_rate, MAX_PREPARED_FRAMES)
+            .map_err(|error| CaptureFinalizeError::Prepare(format_error(&error)))?;
+    match store {
+        Ok(store) => store
+            .finalize_sample(sample)
+            .map_err(CaptureFinalizeError::Store),
+        Err(error) => Err(CaptureFinalizeError::Store(error.clone())),
     }
 }
 
@@ -720,7 +839,7 @@ fn frame_duration(frames: u128, sample_rate: u32) -> Duration {
     }
 }
 
-fn build_preview(buffer: &SampleBuffer) -> EditPreview {
+pub(crate) fn build_preview(buffer: &SampleBuffer) -> EditPreview {
     Arc::new(std::array::from_fn(|column| {
         let Some((start, end)) = preview_bin_bounds(buffer.frames(), EDIT_PREVIEW_COLUMNS, column)
         else {
@@ -823,16 +942,17 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use sampler_audio::SampleBuffer;
+    use sampler_audio::{CaptureSource, SampleBuffer};
     use sampler_core::{BankId, PadId, PadSettings, ProjectId, SampleEditRecipe};
     use sha2::{Digest, Sha256};
 
     use super::{
-        EDIT_PREVIEW_COLUMNS, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
-        ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken, StageProjectSampleRequest,
-        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
-        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
-        preview_column, scan_directory, try_send_request, worker_loop, worker_loop_with_store,
+        EDIT_PREVIEW_COLUMNS, FinalizeCaptureRequest, LoadPurpose, MAX_DIRECTORY_ENTRIES,
+        MAX_ENCODED_FILE_BYTES, ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken,
+        StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked,
+        WorkerRequest, WorkerResult, WorkerSendError, build_preview, downsample_preview,
+        frame_duration, load_sample, preview_column, scan_directory, try_send_request, worker_loop,
+        worker_loop_with_store,
     };
     use crate::{
         DirectoryEntry, ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot,
@@ -1812,6 +1932,206 @@ mod tests {
         let failure = try_send_request(None, WorkerRequest::Shutdown).unwrap_err();
         assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
         assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
+    }
+
+    #[test]
+    fn capture_finalize_input_resamples_and_echoes_exact_request_ownership() {
+        let stereo = Arc::<[f32]>::from(
+            (0..441)
+                .flat_map(|frame| {
+                    let value = frame as f32 / 441.0;
+                    [value, -value]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut worker = WorkerHandle::spawn();
+
+        worker
+            .try_send(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+                token: 17,
+                generation: 23,
+                target: pad(2, 3),
+                source: CaptureSource::Input,
+                source_rate: 44_100,
+                engine_rate: 48_000,
+                stereo: Arc::clone(&stereo),
+                hard_limit: true,
+            }))
+            .unwrap();
+        let WorkerResult::CaptureFinalized {
+            token,
+            generation,
+            target,
+            source,
+            source_rate,
+            engine_rate,
+            stereo: returned,
+            hard_limit,
+            result: Ok(capture),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result")
+        };
+
+        assert_eq!((token, generation, target), (17, 23, pad(2, 3)));
+        assert_eq!(source, CaptureSource::Input);
+        assert_eq!(
+            (source_rate, engine_rate, hard_limit),
+            (44_100, 48_000, true)
+        );
+        assert!(Arc::ptr_eq(&returned, &stereo));
+        assert_eq!(capture.sample.base.sample_rate(), 48_000);
+        assert_eq!(capture.sample.base.frames(), 481);
+        assert!(capture.path.is_file());
+        let managed_path = capture.path.clone();
+
+        worker
+            .try_send(WorkerRequest::ReleaseManagedCapture { id: capture.id })
+            .unwrap();
+        assert!(matches!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WorkerResult::ManagedCaptureReleased {
+                id,
+                result: Ok(())
+            } if id == capture.id
+        ));
+        assert!(!managed_path.exists());
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn capture_finalize_resample_keeps_equal_rate_pcm_and_preview_exact() {
+        let stereo = Arc::<[f32]>::from([0.0, 0.5, -0.25, 0.25, 1.0, -1.0]);
+        let mut worker = WorkerHandle::spawn();
+        worker
+            .try_send(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+                token: 5,
+                generation: 8,
+                target: pad(0, 1),
+                source: CaptureSource::Resample,
+                source_rate: 48_000,
+                engine_rate: 48_000,
+                stereo: Arc::clone(&stereo),
+                hard_limit: false,
+            }))
+            .unwrap();
+
+        let WorkerResult::CaptureFinalized {
+            result: Ok(capture),
+            ..
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result")
+        };
+        assert_eq!(capture.sample.base.data(), stereo.as_ref());
+        assert!(Arc::ptr_eq(&capture.sample.base, &capture.sample.rendered));
+        assert_eq!(
+            capture.sample.base_preview.as_ref(),
+            build_preview(&capture.sample.base).as_ref()
+        );
+        assert!(Arc::ptr_eq(
+            &capture.sample.base_preview,
+            &capture.sample.rendered_preview
+        ));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn capture_finalize_error_echoes_every_identity_and_exact_source_arc() {
+        let stereo = Arc::<[f32]>::from([0.25]);
+        let mut worker = WorkerHandle::spawn();
+        worker
+            .try_send(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+                token: 29,
+                generation: 31,
+                target: pad(4, 5),
+                source: CaptureSource::Input,
+                source_rate: 44_100,
+                engine_rate: 48_000,
+                stereo: Arc::clone(&stereo),
+                hard_limit: false,
+            }))
+            .unwrap();
+
+        let WorkerResult::CaptureFinalized {
+            token,
+            generation,
+            target,
+            source,
+            source_rate,
+            engine_rate,
+            stereo: returned,
+            hard_limit,
+            result: Err(_),
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result")
+        };
+        assert_eq!((token, generation, target), (29, 31, pad(4, 5)));
+        assert_eq!(source, CaptureSource::Input);
+        assert_eq!(
+            (source_rate, engine_rate, hard_limit),
+            (44_100, 48_000, false)
+        );
+        assert!(Arc::ptr_eq(&returned, &stereo));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn saturated_worker_request_returns_the_exact_capture_source_arc() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        try_send_request(Some(&sender), WorkerRequest::Shutdown).unwrap();
+        let stereo = Arc::<[f32]>::from([0.25, -0.25]);
+        let request = WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+            token: 37,
+            generation: 41,
+            target: pad(6, 7),
+            source: CaptureSource::Resample,
+            source_rate: 48_000,
+            engine_rate: 48_000,
+            stereo: Arc::clone(&stereo),
+            hard_limit: false,
+        });
+
+        let failure = try_send_request(Some(&sender), request).unwrap_err();
+
+        let WorkerRequest::FinalizeCapture(returned) = failure.into_request() else {
+            panic!("wrong request")
+        };
+        assert_eq!((returned.token, returned.generation), (37, 41));
+        assert_eq!(returned.target, pad(6, 7));
+        assert_eq!(returned.source, CaptureSource::Resample);
+        assert!(Arc::ptr_eq(&returned.stereo, &stereo));
+    }
+
+    #[test]
+    fn unreleased_capture_remains_readable_until_worker_shutdown() {
+        let mut worker = WorkerHandle::spawn();
+        worker
+            .try_send(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+                token: 43,
+                generation: 47,
+                target: pad(0, 0),
+                source: CaptureSource::Resample,
+                source_rate: 48_000,
+                engine_rate: 48_000,
+                stereo: Arc::from([0.25, -0.25]),
+                hard_limit: false,
+            }))
+            .unwrap();
+        let WorkerResult::CaptureFinalized {
+            result: Ok(capture),
+            ..
+        } = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong result")
+        };
+        let path = capture.path;
+        assert!(path.is_file());
+
+        worker.shutdown().unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]

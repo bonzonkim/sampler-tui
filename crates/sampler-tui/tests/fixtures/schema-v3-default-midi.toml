@@ -1,0 +1,45 @@
+schema_version = 3
+project_id = "__PROJECT_ID__"
+name = "schema-v3-default-midi"
+revision = 41
+patterns = []
+
+[master_mix]
+gain_db = 0.0
+
+[master_mix.delay]
+enabled = false
+time_ms = 250
+feedback = 0.35
+return_db = -12.0
+
+[master_mix.reverb]
+enabled = false
+room_size = 0.5
+damping = 0.5
+return_db = -12.0
+
+[[pads]]
+audio_path = "__AUDIO_PATH__"
+asset_digest = "__ASSET_DIGEST__"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[pads.mix]
+muted = false
+delay_send = 0.0
+reverb_send = 0.0
+
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false

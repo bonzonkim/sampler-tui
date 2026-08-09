@@ -42,6 +42,8 @@ The automated suite uses the real audio engine/controller, input callback adapte
 
 Delivery slice 8 Mixer/FX and choke control is implemented with automated cross-layer evidence. Each pad has mute, a 1–16/off choke group, and independent delay/reverb sends; the master has level plus bounded delay and reverb parameters. Changes are available from the Mixer workspace and strict palette commands, ramp over 64 rendered frames, persist in schema v3 explicit and recovery saves, and default exactly dry when a schema v2 project is opened. Resample records the exact post-master wet frames and installs them transactionally. Automated evidence covers deterministic dry/wet rendering, active polyphonic ramps, same-group choke release, queue/open/device-failure rollback, portable Save As/open, recovery Restore, exact legacy defaults, Unicode-safe 80×24 child layouts, and callback allocation gates. It does not establish physical audibility, live-control feel, effect-tail quality, or device-loss behavior on real hardware; every macOS and Linux row remains unchecked in [`docs/manual-mixer-fx-checklist.md`](docs/manual-mixer-fx-checklist.md).
 
+Delivery slice 9 MIDI input and mapping has automated cross-layer evidence through virtual ingress, the real App/controller/engine, worker, project store, and filesystem. The suite covers discovery and explicit connection, velocity-sensitive triggering, exact engine-acknowledged Gate recording, trigger-time ownership across bank changes, distinct per-bank Learn maps, bounded overflow quarantine and held-note release, disappearance/reconnect, portable Save As/open, recovery Restore, schema v3 default migration, bitwise-stable dry rendering, and callback allocation bounds. These are automated claims only: physical USB/virtual-port behavior, perceived latency and feel, audibility, long-session hardware behavior, and terminal restoration remain unchecked on macOS and Linux in [`docs/manual-midi-checklist.md`](docs/manual-midi-checklist.md).
+
 ## Build and test
 
 Rust 1.95.0 is selected by `rust-toolchain.toml`.
@@ -64,6 +66,6 @@ The interactive loader is deliberately bounded: a directory view keeps the first
 1. Add offline mixing, sample decoding/resampling, real device output, and responsive pad triggering.
 2. Harden the implemented 80×24 performance TUI with recorded macOS/Linux interactive and hardware acceptance.
 3. Record manual cross-platform acceptance for project save/open, recovery, and dirty-quit workflows.
-4. Add MIDI, export, device selection, optional input monitoring, and cross-platform release hardening.
+4. Add export, device selection, optional input monitoring, and cross-platform release hardening.
 
 The approved product design is in [`docs/superpowers/specs/2026-08-07-sampler-tui-design.md`](docs/superpowers/specs/2026-08-07-sampler-tui-design.md), and the slice 1 execution plan is in [`docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md`](docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md).

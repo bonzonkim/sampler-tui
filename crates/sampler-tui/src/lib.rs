@@ -32,7 +32,7 @@ pub use audio::{AudioPort, CaptureSupport};
 pub use capture::{CaptureError, CaptureFailureCause, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use export::{
-    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportPatternSlot, ExportToken,
+    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportCancel, ExportPatternSlot, ExportToken,
     OfflineExportCancellation, OfflineExportError, OfflineExportReceipt, OfflineExportRequest,
     OfflineExportSnapshot, validate_wav_destination,
 };

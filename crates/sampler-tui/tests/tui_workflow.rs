@@ -677,6 +677,7 @@ impl EventLoopWorker for HarnessWorker {
             WorkerRequest::FinalizeCapture(_) | WorkerRequest::ReleaseManagedCapture { .. } => {
                 panic!("event loop must not send capture requests yet")
             }
+            WorkerRequest::Export(_) => panic!("event loop must not send export requests yet"),
             WorkerRequest::Shutdown => panic!("event loop must not send worker shutdown"),
         }
         Ok(())

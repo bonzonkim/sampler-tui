@@ -8475,6 +8475,7 @@ impl App {
             | WorkerRequest::StageProjectSample(_)
             | WorkerRequest::FinalizeCapture(_)
             | WorkerRequest::ReleaseManagedCapture { .. }
+            | WorkerRequest::Export(_)
             | WorkerRequest::Shutdown => None,
         };
         let message = error.to_string();
@@ -8611,6 +8612,7 @@ impl App {
             }
             WorkerRequest::ReleaseManagedCapture { .. }
             | WorkerRequest::ScanDirectory { .. }
+            | WorkerRequest::Export(_)
             | WorkerRequest::Shutdown => false,
         };
         if applied {

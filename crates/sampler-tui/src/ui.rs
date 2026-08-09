@@ -1386,6 +1386,7 @@ mod tests {
             | crate::WorkerRequest::StageProjectSample(_)
             | crate::WorkerRequest::FinalizeCapture(_)
             | crate::WorkerRequest::ReleaseManagedCapture { .. }
+            | crate::WorkerRequest::Export(_)
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }
@@ -1435,6 +1436,7 @@ mod tests {
             | crate::WorkerRequest::StageProjectSample(_)
             | crate::WorkerRequest::FinalizeCapture(_)
             | crate::WorkerRequest::ReleaseManagedCapture { .. }
+            | crate::WorkerRequest::Export(_)
             | crate::WorkerRequest::Shutdown => {
                 unreachable!()
             }

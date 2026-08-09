@@ -4,9 +4,9 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -20,6 +20,12 @@ use sampler_core::{
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::capture_store::{CaptureStore, CaptureStoreError, ManagedCapture, ManagedCaptureId};
+use crate::export::{
+    EXPORT_CHUNK_FRAMES, ExportCancel, ExportToken, OfflineExportError, OfflineExportReceipt,
+    OfflineExportRequest, stage_export_samples_with_observers,
+};
+use crate::export_file::AtomicWavPublisher;
+use crate::export_render::{OfflineFrameSink, render_offline};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 use crate::project_store::{
     ProjectProbe, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind, SaveReceipt,
@@ -27,6 +33,7 @@ use crate::project_store::{
 };
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
+pub const PROGRESS_CHANNEL_CAPACITY: usize = 1;
 pub const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 pub const MAX_ENCODED_FILE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_DECODED_FRAMES: usize = 8_388_608;
@@ -147,6 +154,7 @@ pub enum WorkerRequest {
         revision: u64,
     },
     StageProjectSample(Box<StageProjectSampleRequest>),
+    Export(OfflineExportRequest),
     Shutdown,
 }
 
@@ -215,6 +223,18 @@ pub enum WorkerResult {
         path: PathBuf,
         recipe: SampleEditRecipe,
         result: Result<LoadedSample, LoadSampleError>,
+    },
+    ExportProgress {
+        token: ExportToken,
+        completed_units: u64,
+        total_units: u64,
+    },
+    ExportFinished {
+        token: ExportToken,
+        project_id: ProjectId,
+        revision: u64,
+        destination: PathBuf,
+        result: Result<OfflineExportReceipt, OfflineExportError>,
     },
 }
 
@@ -333,10 +353,117 @@ impl fmt::Display for WorkerPanicked {
 
 impl Error for WorkerPanicked {}
 
+#[derive(Default)]
+struct CoalescedExportProgress {
+    sequence: AtomicU64,
+    token: AtomicU64,
+    completed_units: AtomicU64,
+    total_units: AtomicU64,
+    consumed_sequence: AtomicU64,
+    #[cfg(test)]
+    consumer_gate: Mutex<()>,
+}
+
+impl CoalescedExportProgress {
+    fn publish(&self, result: WorkerResult) {
+        let WorkerResult::ExportProgress {
+            token,
+            completed_units,
+            total_units,
+        } = result
+        else {
+            debug_assert!(false, "progress slot accepts only export progress");
+            return;
+        };
+        let writing = self.sequence.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        self.token.store(token.get(), Ordering::Relaxed);
+        self.completed_units
+            .store(completed_units, Ordering::Relaxed);
+        self.total_units.store(total_units, Ordering::Relaxed);
+        self.sequence
+            .store(writing.wrapping_add(1), Ordering::Release);
+    }
+
+    fn take(&self) -> Option<WorkerResult> {
+        #[cfg(test)]
+        let _consumer = self
+            .consumer_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for _ in 0..4 {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence == 0 || !sequence.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let consumed = self.consumed_sequence.load(Ordering::Acquire);
+            if sequence == consumed {
+                return None;
+            }
+            let token = ExportToken::new(self.token.load(Ordering::Relaxed));
+            let completed_units = self.completed_units.load(Ordering::Relaxed);
+            let total_units = self.total_units.load(Ordering::Relaxed);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .consumed_sequence
+                .compare_exchange(consumed, sequence, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(WorkerResult::ExportProgress {
+                    token,
+                    completed_units,
+                    total_units,
+                });
+            }
+        }
+        None
+    }
+}
+
+#[derive(Default)]
+struct InFlightExportCancels {
+    active: Mutex<Vec<ExportCancel>>,
+}
+
+impl InFlightExportCancels {
+    fn register(&self, cancel: ExportCancel) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(cancel);
+    }
+
+    fn remove(&self, cancel: &ExportCancel) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = active.iter().position(|candidate| candidate == cancel) {
+            active.swap_remove(index);
+        }
+    }
+
+    fn cancel_all(&self) {
+        for cancel in self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+        {
+            cancel.cancel();
+        }
+    }
+}
+
 pub struct WorkerHandle {
     requests: Option<SyncSender<WorkerRequest>>,
     results: Receiver<WorkerResult>,
     worker: Option<JoinHandle<()>>,
+    export_progress: Arc<CoalescedExportProgress>,
+    export_cancels: Arc<InFlightExportCancels>,
 }
 
 impl WorkerHandle {
@@ -355,19 +482,46 @@ impl WorkerHandle {
     fn spawn_with_asset_hook(hook: Option<ProjectAssetOpenHook>) -> Self {
         let (requests, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
         let (result_sender, results) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let export_progress = Arc::new(CoalescedExportProgress::default());
+        let worker_progress = Arc::clone(&export_progress);
+        let export_cancels = Arc::new(InFlightExportCancels::default());
+        let worker_cancels = Arc::clone(&export_cancels);
         let worker = thread::Builder::new()
             .name("sampler-loader".to_owned())
-            .spawn(move || worker_loop_with_asset_hook(request_receiver, result_sender, hook))
+            .spawn(move || {
+                worker_loop_with_asset_hook(
+                    request_receiver,
+                    result_sender,
+                    hook,
+                    worker_progress,
+                    worker_cancels,
+                )
+            })
             .expect("loader worker thread can be spawned");
         Self {
             requests: Some(requests),
             results,
             worker: Some(worker),
+            export_progress,
+            export_cancels,
         }
     }
 
     pub fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
-        try_send_request(self.requests.as_ref(), request)
+        let cancel = match &request {
+            WorkerRequest::Export(request) => Some(request.cancellation()),
+            _ => None,
+        };
+        if let Some(cancel) = cancel.as_ref() {
+            self.export_cancels.register(cancel.clone());
+        }
+        let result = try_send_request(self.requests.as_ref(), request);
+        if result.is_err()
+            && let Some(cancel) = cancel.as_ref()
+        {
+            self.export_cancels.remove(cancel);
+        }
+        result
     }
 
     pub fn try_recv(&self) -> Result<WorkerResult, mpsc::TryRecvError> {
@@ -378,7 +532,12 @@ impl WorkerHandle {
         self.results.recv_timeout(timeout)
     }
 
+    pub fn try_recv_export_progress(&self) -> Option<WorkerResult> {
+        self.export_progress.take()
+    }
+
     pub fn request_shutdown(&mut self) {
+        self.export_cancels.cancel_all();
         if let Some(sender) = self.requests.take() {
             let _ = sender.try_send(WorkerRequest::Shutdown);
             drop(sender);
@@ -386,6 +545,7 @@ impl WorkerHandle {
     }
 
     pub fn join(&mut self) -> Result<(), WorkerPanicked> {
+        self.request_shutdown();
         if let Some(worker) = self.worker.take() {
             loop {
                 match self.results.recv_timeout(Duration::from_millis(10)) {
@@ -432,7 +592,13 @@ impl Drop for WorkerHandle {
 
 #[cfg(test)]
 fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResult>) {
-    worker_loop_with_asset_hook(requests, results, None);
+    worker_loop_with_asset_hook(
+        requests,
+        results,
+        None,
+        Arc::new(CoalescedExportProgress::default()),
+        Arc::new(InFlightExportCancels::default()),
+    );
 }
 
 type ProjectAssetOpenHook = Arc<dyn Fn() + Send + Sync>;
@@ -441,8 +607,17 @@ fn worker_loop_with_asset_hook(
     requests: Receiver<WorkerRequest>,
     results: SyncSender<WorkerResult>,
     hook: Option<ProjectAssetOpenHook>,
+    export_progress: Arc<CoalescedExportProgress>,
+    export_cancels: Arc<InFlightExportCancels>,
 ) {
-    worker_loop_with_store_and_asset_hook(requests, results, Box::new(ProjectStore), hook);
+    worker_loop_with_store_and_asset_hook(
+        requests,
+        results,
+        Box::new(ProjectStore),
+        hook,
+        export_progress,
+        export_cancels,
+    );
 }
 
 trait ProjectStoreBackend: Send {
@@ -481,7 +656,14 @@ fn worker_loop_with_store(
     results: SyncSender<WorkerResult>,
     store: Box<dyn ProjectStoreBackend>,
 ) {
-    worker_loop_with_store_and_asset_hook(requests, results, store, None);
+    worker_loop_with_store_and_asset_hook(
+        requests,
+        results,
+        store,
+        None,
+        Arc::new(CoalescedExportProgress::default()),
+        Arc::new(InFlightExportCancels::default()),
+    );
 }
 
 fn worker_loop_with_store_and_asset_hook(
@@ -489,6 +671,8 @@ fn worker_loop_with_store_and_asset_hook(
     results: SyncSender<WorkerResult>,
     store: Box<dyn ProjectStoreBackend>,
     asset_hook: Option<ProjectAssetOpenHook>,
+    export_progress: Arc<CoalescedExportProgress>,
+    export_cancels: Arc<InFlightExportCancels>,
 ) {
     let mut capture_store = CaptureStore::new();
     while let Ok(request) = requests.recv() {
@@ -627,12 +811,114 @@ fn worker_loop_with_store_and_asset_hook(
                     recipe,
                 }
             }
+            WorkerRequest::Export(request) => {
+                let token = request.token();
+                let project_id = request.snapshot().project_id();
+                let revision = request.snapshot().revision();
+                let destination = request.destination().to_path_buf();
+                let cancel = request.cancellation();
+                let result = run_export(request, &export_progress, asset_hook.as_ref());
+                export_cancels.remove(&cancel);
+                WorkerResult::ExportFinished {
+                    token,
+                    project_id,
+                    revision,
+                    destination,
+                    result,
+                }
+            }
             WorkerRequest::Shutdown => break,
         };
         if results.send(result).is_err() {
             break;
         }
     }
+}
+
+struct ExportProgressSink<'a> {
+    publisher: &'a mut AtomicWavPublisher,
+    progress: &'a CoalescedExportProgress,
+    token: ExportToken,
+    completed_units: u64,
+    total_units: u64,
+}
+
+impl OfflineFrameSink for ExportProgressSink<'_> {
+    fn write_frames(&mut self, frames: &[[f32; 2]]) -> Result<(), OfflineExportError> {
+        self.publisher.write_frames(frames)?;
+        self.completed_units = self
+            .completed_units
+            .checked_add(1)
+            .ok_or(OfflineExportError::Arithmetic)?;
+        self.progress.publish(WorkerResult::ExportProgress {
+            token: self.token,
+            completed_units: self.completed_units,
+            total_units: self.total_units,
+        });
+        Ok(())
+    }
+}
+
+fn run_export(
+    request: OfflineExportRequest,
+    progress: &CoalescedExportProgress,
+    asset_hook: Option<&ProjectAssetOpenHook>,
+) -> Result<OfflineExportReceipt, OfflineExportError> {
+    let (token, destination, snapshot, cancel) = request.into_parts();
+    let loop_frames = snapshot.loop_frames()?;
+    let render_units = loop_frames.div_ceil(EXPORT_CHUNK_FRAMES as u64);
+    let stage_units =
+        u64::try_from(snapshot.pads().len()).map_err(|_| OfflineExportError::Arithmetic)?;
+    let total_units = stage_units
+        .checked_add(render_units)
+        .and_then(|units| units.checked_add(1))
+        .ok_or(OfflineExportError::Arithmetic)?;
+    progress.publish(WorkerResult::ExportProgress {
+        token,
+        completed_units: 0,
+        total_units,
+    });
+
+    let mut completed_units = 0_u64;
+    let staged = stage_export_samples_with_observers(
+        &snapshot,
+        cancel.as_atomic(),
+        || {
+            if let Some(hook) = asset_hook {
+                hook();
+            }
+        },
+        || {
+            completed_units += 1;
+            progress.publish(WorkerResult::ExportProgress {
+                token,
+                completed_units,
+                total_units,
+            });
+        },
+    )?;
+    if cancel.is_cancelled() {
+        return Err(OfflineExportError::Cancelled);
+    }
+
+    let mut publisher = AtomicWavPublisher::prepare(&destination)?;
+    let summary = {
+        let mut sink = ExportProgressSink {
+            publisher: &mut publisher,
+            progress,
+            token,
+            completed_units,
+            total_units,
+        };
+        render_offline(&snapshot, &staged, &mut sink, cancel.as_atomic())?
+    };
+    let receipt = publisher.publish(token, &snapshot, summary, cancel.as_atomic())?;
+    progress.publish(WorkerResult::ExportProgress {
+        token,
+        completed_units: total_units,
+        total_units,
+    });
+    Ok(receipt)
 }
 
 fn finalize_capture(
@@ -770,6 +1056,19 @@ pub(crate) fn decode_committed_project_pad(
     target_rate: u32,
     cancelled: &AtomicBool,
 ) -> Result<LoadedSample, ProjectStoreError> {
+    decode_committed_project_pad_after_open(directory, pad, target_rate, cancelled, || {})
+}
+
+pub(crate) fn decode_committed_project_pad_after_open<F>(
+    directory: &Path,
+    pad: &ProjectPad,
+    target_rate: u32,
+    cancelled: &AtomicBool,
+    after_open: F,
+) -> Result<LoadedSample, ProjectStoreError>
+where
+    F: FnOnce(),
+{
     decode_committed_project_asset(
         directory,
         &pad.audio_path,
@@ -777,7 +1076,7 @@ pub(crate) fn decode_committed_project_pad(
         target_rate,
         pad.recipe,
         cancelled,
-        || {},
+        after_open,
     )
 }
 
@@ -1012,12 +1311,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        EDIT_PREVIEW_COLUMNS, FinalizeCaptureRequest, LoadPurpose, MAX_DIRECTORY_ENTRIES,
-        MAX_ENCODED_FILE_BYTES, ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken,
-        StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked,
-        WorkerRequest, WorkerResult, WorkerSendError, build_preview, downsample_preview,
-        frame_duration, load_sample, preview_column, scan_directory, try_send_request, worker_loop,
-        worker_loop_with_store,
+        CoalescedExportProgress, EDIT_PREVIEW_COLUMNS, FinalizeCaptureRequest,
+        InFlightExportCancels, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
+        ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken, StageProjectSampleRequest,
+        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
+        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
+        preview_column, scan_directory, try_send_request, worker_loop, worker_loop_with_store,
     };
     use crate::{
         DirectoryEntry, ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot,
@@ -1119,6 +1418,8 @@ mod tests {
             requests: Some(requests),
             results,
             worker: Some(worker),
+            export_progress: Arc::new(CoalescedExportProgress::default()),
+            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1133,6 +1434,8 @@ mod tests {
             requests: Some(requests),
             results,
             worker: Some(worker),
+            export_progress: Arc::new(CoalescedExportProgress::default()),
+            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1146,6 +1449,8 @@ mod tests {
             requests: Some(requests),
             results,
             worker: Some(worker),
+            export_progress: Arc::new(CoalescedExportProgress::default()),
+            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1239,6 +1544,33 @@ mod tests {
         ) -> Result<(), ProjectStoreError> {
             panic!("injected project store panic")
         }
+    }
+
+    #[test]
+    fn coalesced_export_progress_retains_the_latest_update_under_consumer_contention() {
+        let progress = CoalescedExportProgress::default();
+        progress.publish(WorkerResult::ExportProgress {
+            token: crate::ExportToken::new(1),
+            completed_units: 1,
+            total_units: 8,
+        });
+        let held = progress.consumer_gate.lock().unwrap();
+
+        progress.publish(WorkerResult::ExportProgress {
+            token: crate::ExportToken::new(2),
+            completed_units: 7,
+            total_units: 8,
+        });
+        drop(held);
+
+        assert_eq!(
+            progress.take(),
+            Some(WorkerResult::ExportProgress {
+                token: crate::ExportToken::new(2),
+                completed_units: 7,
+                total_units: 8,
+            })
+        );
     }
 
     #[test]

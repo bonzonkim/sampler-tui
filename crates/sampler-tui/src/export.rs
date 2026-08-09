@@ -60,18 +60,26 @@ impl ExportToken {
 
 /// A cooperative cancellation handle shared by the caller and offline worker.
 #[derive(Clone, Default)]
-pub struct OfflineExportCancellation(Arc<AtomicBool>);
+pub struct ExportCancel(Arc<AtomicBool>);
 
-impl std::fmt::Debug for OfflineExportCancellation {
+impl std::fmt::Debug for ExportCancel {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("OfflineExportCancellation")
+            .debug_struct("ExportCancel")
             .field("cancelled", &self.is_cancelled())
             .finish()
     }
 }
 
-impl OfflineExportCancellation {
+impl PartialEq for ExportCancel {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ExportCancel {}
+
+impl ExportCancel {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
@@ -79,7 +87,13 @@ impl OfflineExportCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    pub(crate) fn as_atomic(&self) -> &AtomicBool {
+        &self.0
+    }
 }
+
+pub type OfflineExportCancellation = ExportCancel;
 
 /// An immutable, device-independent description of exactly one pattern export.
 #[derive(Debug, Clone, PartialEq)]
@@ -310,15 +324,83 @@ pub fn stage_export_samples(
     snapshot: &OfflineExportSnapshot,
     cancelled: &AtomicBool,
 ) -> Result<Vec<StagedExportPad>, OfflineExportError> {
-    stage_export_samples_with_hook(snapshot, cancelled, || {})
+    stage_export_samples_with_decoder(
+        snapshot,
+        cancelled,
+        |directory, pad, cancelled| {
+            crate::loader::decode_committed_project_pad(
+                directory,
+                pad,
+                EXPORT_SAMPLE_RATE,
+                cancelled,
+            )
+        },
+        || {},
+    )
 }
 
+#[cfg(test)]
 fn stage_export_samples_with_hook<F>(
     snapshot: &OfflineExportSnapshot,
     cancelled: &AtomicBool,
+    after_stage: F,
+) -> Result<Vec<StagedExportPad>, OfflineExportError>
+where
+    F: FnMut(),
+{
+    stage_export_samples_with_decoder(
+        snapshot,
+        cancelled,
+        |directory, pad, cancelled| {
+            crate::loader::decode_committed_project_pad(
+                directory,
+                pad,
+                EXPORT_SAMPLE_RATE,
+                cancelled,
+            )
+        },
+        after_stage,
+    )
+}
+
+pub(crate) fn stage_export_samples_with_observers<F, G>(
+    snapshot: &OfflineExportSnapshot,
+    cancelled: &AtomicBool,
+    mut after_open: F,
+    after_stage: G,
+) -> Result<Vec<StagedExportPad>, OfflineExportError>
+where
+    F: FnMut(),
+    G: FnMut(),
+{
+    stage_export_samples_with_decoder(
+        snapshot,
+        cancelled,
+        |directory, pad, cancelled| {
+            crate::loader::decode_committed_project_pad_after_open(
+                directory,
+                pad,
+                EXPORT_SAMPLE_RATE,
+                cancelled,
+                &mut after_open,
+            )
+        },
+        after_stage,
+    )
+}
+
+fn stage_export_samples_with_decoder<D, F>(
+    snapshot: &OfflineExportSnapshot,
+    cancelled: &AtomicBool,
+    mut decode: D,
     mut after_stage: F,
 ) -> Result<Vec<StagedExportPad>, OfflineExportError>
 where
+    D: FnMut(
+        &Path,
+        &ProjectPad,
+        &AtomicBool,
+    ) -> Result<crate::loader::LoadedSample, ProjectStoreError>,
     F: FnMut(),
 {
     let directory = snapshot
@@ -330,13 +412,7 @@ where
         if cancelled.load(Ordering::Acquire) {
             return Err(OfflineExportError::Cancelled);
         }
-        let sample = crate::loader::decode_committed_project_pad(
-            directory,
-            pad,
-            EXPORT_SAMPLE_RATE,
-            cancelled,
-        )
-        .map_err(|error| match error {
+        let sample = decode(directory, pad, cancelled).map_err(|error| match error {
             ProjectStoreError::Cancelled => OfflineExportError::Cancelled,
             error => OfflineExportError::ProjectStore(error),
         })?;
@@ -354,11 +430,11 @@ where
     Ok(staged)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OfflineExportRequest {
     token: ExportToken,
     destination: PathBuf,
-    snapshot: OfflineExportSnapshot,
+    snapshot: Box<OfflineExportSnapshot>,
     cancellation: OfflineExportCancellation,
 }
 
@@ -374,7 +450,7 @@ impl OfflineExportRequest {
         Ok(Self {
             token,
             destination,
-            snapshot,
+            snapshot: Box::new(snapshot),
             cancellation,
         })
     }
@@ -406,7 +482,7 @@ impl OfflineExportRequest {
         (
             self.token,
             self.destination,
-            self.snapshot,
+            *self.snapshot,
             self.cancellation,
         )
     }

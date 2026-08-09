@@ -70,6 +70,7 @@ pub enum CaptureError {
     InputRuntime(String),
     DirtySampleDraft(PadId),
     SampleOperationPending(PadId),
+    TargetChanged(PadId),
     ProjectOperationPending,
     AudioUnavailable,
     EmptyCapture,
@@ -138,6 +139,9 @@ impl fmt::Display for CaptureError {
             }
             Self::SampleOperationPending(pad) => {
                 write!(formatter, "pad {pad:?} has pending sample work")
+            }
+            Self::TargetChanged(pad) => {
+                write!(formatter, "capture target {pad:?} changed after admission")
             }
             Self::ProjectOperationPending => formatter.write_str("a project operation is pending"),
             Self::AudioUnavailable => formatter.write_str("audio device is unavailable"),

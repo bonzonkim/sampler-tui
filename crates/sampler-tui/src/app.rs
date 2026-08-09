@@ -80,12 +80,12 @@ mod capture_task7_tests {
     };
     use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
     use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
-    use crate::capture_store::{ManagedCapture, ManagedCaptureId};
+    use crate::capture_store::{CaptureStore, CaptureStoreError, ManagedCapture, ManagedCaptureId};
     use crate::input::InputAction;
     use crate::loader::{
         CaptureFinalizeError, FinalizeCaptureRequest, LoadPurpose, LoadedSample,
-        ProjectSaveWorkerRequest, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult,
-        WorkerSendError,
+        ProjectSaveWorkerRequest, RenderedSample, WORKER_CHANNEL_CAPACITY, WorkerRequest,
+        WorkerResult, WorkerSendError,
     };
     use crate::project_session::ProjectSnapshotError;
     use crate::project_store::{ProjectAssetMapping, SaveKind, SaveReceipt, SourceFingerprint};
@@ -1496,6 +1496,384 @@ mod capture_task7_tests {
     }
 
     #[test]
+    fn capture_recovery_at_new_rate_preserves_managed_source_until_explicit_mapping_release() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        start_capture(&mut app, CaptureSource::Resample, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let finalize = take_finalize(&mut app);
+        let mut store = CaptureStore::new().unwrap();
+        let capture = store
+            .finalize(Arc::from([0.7_f32, -0.7, 0.4, -0.4]), 48_000)
+            .unwrap();
+        let managed_id = capture.id;
+        let managed_path = capture.path.clone();
+        assert!(app.apply_worker_result(finalized(&finalize, Ok(capture))));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+        assert!(managed_path.is_file());
+
+        probe.fail_output_session("output lost");
+        assert!(app.maintain_audio());
+        let (recovered_audio, _) = CaptureAudio::new(44_100, 44_100);
+        assert!(app.retry_with(Box::new(recovered_audio)));
+        let recovery_requests = app.take_worker_requests();
+        let [
+            WorkerRequest::LoadSample {
+                pad,
+                generation,
+                purpose: LoadPurpose::Recovery,
+                path,
+                engine_rate: 44_100,
+                recipe,
+            },
+        ] = recovery_requests.as_slice()
+        else {
+            panic!("expected one different-rate recovery request")
+        };
+        assert_eq!(*pad, target);
+        assert_eq!(*recipe, SampleEditRecipe::identity());
+        let recovery_path = path.clone();
+        let recovery_generation = *generation;
+        assert!(app.apply_worker_result(loaded_result_with_purpose(
+            target,
+            recovery_generation,
+            LoadPurpose::Recovery,
+            recovery_path.to_str().unwrap(),
+            44_100,
+        )));
+
+        assert_eq!(
+            app.pad(target).source.as_deref(),
+            Some(managed_path.as_path())
+        );
+        assert_eq!(
+            app.pad(target).sample.as_ref().unwrap().sample_rate(),
+            44_100
+        );
+        assert_eq!(
+            app.sample_editor.commits[super::pad_offset(target)].managed_capture,
+            Some(managed_id)
+        );
+        assert!(app.pending_managed_releases.is_empty());
+        assert!(managed_path.is_file());
+
+        let snapshot = app.project_snapshot().unwrap();
+        app.request_save_as("saved-recovered-project").unwrap();
+        assert!(app.maintain_project(Instant::now()));
+        let save_requests = app.take_worker_requests();
+        let [WorkerRequest::SaveProject(save)] = save_requests.as_slice() else {
+            panic!("expected explicit save after recovery")
+        };
+        assert_eq!(save.request.snapshot.revision, snapshot.revision);
+        assert_eq!(save.request.snapshot.pads, snapshot.pads);
+        let saved_pad = save.request.snapshot.pads[0].clone();
+        assert!(app.apply_worker_result(save_result(
+            save,
+            vec![ProjectAssetMapping {
+                pad: target,
+                source_generation: saved_pad.source_generation,
+                fingerprint: saved_pad.fingerprint,
+                project_path: "saved-recovered-project/audio/captured.wav".into(),
+            }],
+        )));
+
+        assert_eq!(
+            app.pad(target).source.as_deref(),
+            Some(Path::new("saved-recovered-project/audio/captured.wav"))
+        );
+        assert_eq!(
+            app.sample_editor.commits[super::pad_offset(target)].managed_capture,
+            None
+        );
+        assert!(managed_path.is_file());
+        assert_eq!(
+            app.pending_managed_releases
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [managed_id]
+        );
+
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+        );
+        store.release(managed_id).unwrap();
+        assert!(!managed_path.exists());
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: managed_id,
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert!(!app.maintain_capture());
+        assert!(app.take_worker_requests().is_empty());
+        assert!(matches!(
+            store.release(managed_id),
+            Err(CaptureStoreError::NotLive { id }) if id == managed_id
+        ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CaptureTargetMutation {
+        LoadAdmission,
+        Settings,
+        EditAdmission,
+        EditWorkerCompletion,
+    }
+
+    fn finish_stale_capture_candidate(
+        app: &mut App,
+        probe: &CaptureProbe,
+        target: PadId,
+        expected_sample: &Arc<SampleBuffer>,
+        managed_id: ManagedCaptureId,
+    ) {
+        let installs_before = probe
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, CaptureCall::Install(..)))
+            .count();
+        probe.complete(completion(
+            app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let finalize = take_finalize(app);
+        assert!(app.apply_worker_result(finalized(
+            &finalize,
+            Ok(managed_capture(
+                managed_id.get(),
+                finalize.engine_rate,
+                b"stale target candidate",
+            )),
+        )));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(CapturePhase::Failed),
+            "a stale capture must remain explicitly discardable"
+        );
+        assert_eq!(
+            app.capture_session().failure_cause(),
+            Some(CaptureFailureCause::InvalidCapture)
+        );
+        assert!(Arc::ptr_eq(
+            app.pad(target).sample.as_ref().unwrap(),
+            expected_sample
+        ));
+        assert_eq!(
+            probe
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, CaptureCall::Install(..)))
+                .count(),
+            installs_before,
+            "stale capture reached audio admission"
+        );
+        assert_eq!(app.capture_session().managed_capture_id(), None);
+
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: managed_id,
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert!(!app.maintain_capture());
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn capture_target_fence_rejects_load_settings_edit_and_worker_completion_races() {
+        for (index, mutation) in [
+            CaptureTargetMutation::LoadAdmission,
+            CaptureTargetMutation::Settings,
+            CaptureTargetMutation::EditAdmission,
+            CaptureTargetMutation::EditWorkerCompletion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+            let mut app = App::with_audio(Box::new(audio));
+            let target = pad(0);
+            install_imported(&mut app, target, "original.wav");
+            start_capture(&mut app, CaptureSource::Resample, 4);
+
+            let expected_sample = match mutation {
+                CaptureTargetMutation::LoadAdmission => {
+                    let request = app.begin_load(target, "newer-load.wav").unwrap();
+                    assert!(matches!(request, WorkerRequest::LoadSample { .. }));
+                    Arc::clone(app.pad(target).sample.as_ref().unwrap())
+                }
+                CaptureTargetMutation::Settings => {
+                    let settings = PadSettings {
+                        gain_db: -6.0,
+                        ..app.pad(target).settings
+                    };
+                    app.update_pad_settings(target, settings).unwrap();
+                    assert_eq!(app.pad(target).settings, settings);
+                    Arc::clone(app.pad(target).sample.as_ref().unwrap())
+                }
+                CaptureTargetMutation::EditAdmission
+                | CaptureTargetMutation::EditWorkerCompletion => {
+                    let recipe = SampleEditRecipe {
+                        reversed: true,
+                        ..SampleEditRecipe::identity()
+                    };
+                    app.request_sample_edit(target, recipe).unwrap();
+                    let requests = app.take_worker_requests();
+                    let [WorkerRequest::EditSample { generation, .. }] = requests.as_slice() else {
+                        panic!("expected edit worker request for {mutation:?}")
+                    };
+                    if matches!(mutation, CaptureTargetMutation::EditWorkerCompletion) {
+                        let offset = super::pad_offset(target);
+                        let base_preview = Arc::clone(
+                            &app.sample_editor.pending[offset]
+                                .as_ref()
+                                .unwrap()
+                                .base_preview,
+                        );
+                        assert!(app.apply_worker_result(WorkerResult::Edited {
+                            pad: target,
+                            generation: *generation,
+                            recipe,
+                            result: Ok(RenderedSample {
+                                base_preview,
+                                rendered: Arc::new(
+                                    SampleBuffer::new(48_000, vec![-0.4, 0.4]).unwrap(),
+                                ),
+                                rendered_preview: Arc::new(
+                                    [PreviewColumn { min: -5, max: 5 }; EDIT_PREVIEW_COLUMNS],
+                                ),
+                            }),
+                        }));
+                        assert!(app.maintain_audio());
+                        assert_eq!(app.committed_sample_recipe(target), Some(recipe));
+                    }
+                    Arc::clone(app.pad(target).sample.as_ref().unwrap())
+                }
+            };
+
+            finish_stale_capture_candidate(
+                &mut app,
+                &probe,
+                target,
+                &expected_sample,
+                ManagedCaptureId::new(400 + index as u64),
+            );
+        }
+    }
+
+    #[test]
+    fn capture_target_fence_rejects_removal_before_audio_admission() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        install_imported(&mut app, target, "original.wav");
+        app.request_capture_with_limit_for_test(CaptureSource::Resample, 4)
+            .unwrap();
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Confirm));
+        app.remove_pad_sample(target).unwrap();
+        let calls_before = probe.calls();
+
+        assert!(app.confirm_capture().is_err());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(app.pad(target).sample.is_none());
+        assert_eq!(probe.calls(), calls_before);
+    }
+
+    #[test]
+    fn capture_target_fence_rechecks_ready_to_install_before_audio_admission() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        install_imported(&mut app, target, "original.wav");
+        let original = Arc::clone(app.pad(target).sample.as_ref().unwrap());
+        start_capture(&mut app, CaptureSource::Resample, 4);
+        drive_ready(&mut app, &probe, CaptureSource::Resample, 450, false);
+        let settings = PadSettings {
+            gain_db: -9.0,
+            ..app.pad(target).settings
+        };
+        app.update_pad_settings(target, settings).unwrap();
+
+        finish_ready_stale_capture(
+            &mut app,
+            &probe,
+            target,
+            &original,
+            ManagedCaptureId::new(450),
+        );
+        assert_eq!(app.pad(target).settings, settings);
+    }
+
+    fn finish_ready_stale_capture(
+        app: &mut App,
+        probe: &CaptureProbe,
+        target: PadId,
+        expected_sample: &Arc<SampleBuffer>,
+        managed_id: ManagedCaptureId,
+    ) {
+        let installs_before = probe
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, CaptureCall::Install(..)))
+            .count();
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(Arc::ptr_eq(
+            app.pad(target).sample.as_ref().unwrap(),
+            expected_sample
+        ));
+        assert_eq!(
+            probe
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, CaptureCall::Install(..)))
+                .count(),
+            installs_before
+        );
+        assert_eq!(app.capture_session().managed_capture_id(), None);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: managed_id,
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert!(!app.maintain_capture());
+    }
+
+    #[test]
     fn capture_transaction_public_requests_use_the_hard_limit_constant() {
         let (audio, probe) = CaptureAudio::new(48_000, 44_100);
         let mut app = App::with_audio(Box::new(audio));
@@ -2491,6 +2869,100 @@ mod capture_task7_tests {
     }
 
     #[test]
+    fn capture_lifecycle_retries_post_unlink_sync_failure_once_before_quit_or_open_continues() {
+        for action in [ProjectAction::Quit, ProjectAction::Open] {
+            let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+            let mut app = App::with_audio(Box::new(audio));
+            start_capture(&mut app, CaptureSource::Resample, 8);
+            probe.complete(completion(
+                &app,
+                CaptureSource::Resample,
+                vec![0.25, -0.25],
+                false,
+            ));
+            assert!(app.maintain_capture());
+            assert!(app.maintain_capture());
+            let finalize = take_finalize(&mut app);
+            let mut store = CaptureStore::new().unwrap();
+            let candidate = store.finalize(Arc::from([0.2_f32, -0.2]), 48_000).unwrap();
+            let managed_id = candidate.id;
+            let managed_path = candidate.path.clone();
+            assert!(app.apply_worker_result(finalized(&finalize, Ok(candidate))));
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.capture_session().phase(),
+                Some(CapturePhase::ReadyToInstall)
+            );
+
+            match action {
+                ProjectAction::Quit => app.apply(InputAction::Quit),
+                ProjectAction::Open => {
+                    app.request_open_project_interactive("next-project-after-discard")
+                }
+            }
+            app.apply_key(press(KeyCode::Backspace));
+            assert_eq!(app.capture_session().phase(), None);
+            assert!(!app.should_quit());
+            assert!(app.project_open_stage().is_none());
+
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+            );
+            let sync_error = store
+                .release_with_sync_for_test(managed_id, |_, _| {
+                    Err(CaptureStoreError::Filesystem {
+                        operation: "injected post-unlink directory sync failure",
+                        path: PathBuf::from("injected"),
+                        kind: std::io::ErrorKind::Other,
+                    })
+                })
+                .unwrap_err();
+            assert!(!managed_path.exists());
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: managed_id,
+                    result: Err(sync_error),
+                })
+            );
+            assert!(app.maintain_capture());
+            assert!(!app.should_quit());
+            assert!(app.project_open_stage().is_none());
+
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+            );
+            store.release(managed_id).unwrap();
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: managed_id,
+                    result: Ok(()),
+                })
+            );
+            assert!(app.maintain_capture());
+            assert_eq!(app.managed_release_in_flight(), None);
+            assert!(app.capture_discard_release_pending.is_none());
+
+            match action {
+                ProjectAction::Quit => assert!(app.should_quit()),
+                ProjectAction::Open => assert!(app.project_open_stage().is_some()),
+            }
+            assert!(
+                app.take_worker_requests()
+                    .iter()
+                    .all(|request| !matches!(request, WorkerRequest::ReleaseManagedCapture { .. }))
+            );
+            assert!(matches!(
+                store.release(managed_id),
+                Err(CaptureStoreError::NotLive { id }) if id == managed_id
+            ));
+        }
+    }
+
+    #[test]
     fn capture_lifecycle_failed_finalize_is_cancelable_and_only_typed_worker_failure_retries() {
         let mut retryable = app_at_capture_phase(CapturePhase::Failed);
         let before_generation = retryable.capture_session().generation();
@@ -2970,12 +3442,30 @@ struct ApplySampleContext {
     base_rate: u32,
 }
 
+struct CaptureTargetFence {
+    target: PadId,
+    pad_generation: u64,
+    edit_generation: u64,
+    source: Option<PathBuf>,
+    settings: PadSettings,
+    sample: Option<Arc<SampleBuffer>>,
+    preview: [PreviewColumn; PREVIEW_COLUMNS],
+    base: Option<Arc<SampleBuffer>>,
+    source_generation: u64,
+    fingerprint: Option<SourceFingerprint>,
+    recipe: SampleEditRecipe,
+    base_preview: Option<EditPreview>,
+    rendered_preview: Option<EditPreview>,
+    managed_capture: Option<ManagedCaptureId>,
+}
+
 pub struct App {
     active_bank: BankId,
     selected_pad: usize,
     pads: [PadView; PAD_VIEW_COUNT],
     patterns: PatternWorkspace,
     capture_session: crate::CaptureSession,
+    capture_target_fence: Option<CaptureTargetFence>,
     capture_source_pcm: Option<Arc<[f32]>>,
     capture_hard_limit: bool,
     capture_worker_request: Option<FinalizeCaptureRequest>,
@@ -3033,6 +3523,57 @@ pub struct App {
     project_lifecycle_wait: Option<ProjectLifecycleWait>,
 }
 
+impl CaptureTargetFence {
+    fn capture(app: &App, target: PadId) -> Self {
+        let offset = pad_offset(target);
+        let view = &app.pads[offset];
+        let commit = &app.sample_editor.commits[offset];
+        Self {
+            target,
+            pad_generation: view.generation,
+            edit_generation: app.sample_editor.generations[offset],
+            source: view.source.clone(),
+            settings: view.settings,
+            sample: view.sample.clone(),
+            preview: view.preview,
+            base: commit.base.clone(),
+            source_generation: commit.source_generation,
+            fingerprint: commit.fingerprint,
+            recipe: commit.recipe,
+            base_preview: commit.base_preview.clone(),
+            rendered_preview: commit.rendered_preview.clone(),
+            managed_capture: commit.managed_capture,
+        }
+    }
+
+    fn matches(&self, app: &App) -> bool {
+        let offset = pad_offset(self.target);
+        let view = &app.pads[offset];
+        let commit = &app.sample_editor.commits[offset];
+        self.pad_generation == view.generation
+            && self.edit_generation == app.sample_editor.generations[offset]
+            && self.source == view.source
+            && self.settings == view.settings
+            && Self::same_arc(&self.sample, &view.sample)
+            && self.preview == view.preview
+            && Self::same_arc(&self.base, &commit.base)
+            && self.source_generation == commit.source_generation
+            && self.fingerprint == commit.fingerprint
+            && self.recipe == commit.recipe
+            && Self::same_arc(&self.base_preview, &commit.base_preview)
+            && Self::same_arc(&self.rendered_preview, &commit.rendered_preview)
+            && self.managed_capture == commit.managed_capture
+    }
+
+    fn same_arc<T: ?Sized>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
 impl App {
     pub fn with_audio(audio: Box<dyn AudioPort>) -> Self {
         Self::new(Some(audio), None)
@@ -3057,6 +3598,7 @@ impl App {
             pads: array::from_fn(|_| PadView::default()),
             patterns: PatternWorkspace::new(pattern_sample_rate),
             capture_session: crate::CaptureSession::default(),
+            capture_target_fence: None,
             capture_source_pcm: None,
             capture_hard_limit: false,
             capture_worker_request: None,
@@ -3158,6 +3700,34 @@ impl App {
         self.capture_status
     }
 
+    fn capture_target_fence_for(&self, target: PadId) -> CaptureTargetFence {
+        CaptureTargetFence::capture(self, target)
+    }
+
+    fn capture_target_fence_matches(&self) -> bool {
+        let Some(fence) = self.capture_target_fence.as_ref() else {
+            return false;
+        };
+        self.capture_session.target() == Some(fence.target) && fence.matches(self)
+    }
+
+    fn mark_capture_target_changed(&mut self) -> CaptureError {
+        let target = self
+            .capture_session
+            .target()
+            .expect("target fence requires an active capture");
+        let error = CaptureError::TargetChanged(target);
+        let message = error.to_string();
+        let _ = self
+            .capture_session
+            .mark_failed_with_cause(CaptureFailureCause::InvalidCapture, message.clone());
+        self.status = message;
+        self.overlay = Some(Overlay::CaptureFailed {
+            action: self.pending_capture_project_action(),
+        });
+        error
+    }
+
     pub fn request_resample(&mut self) -> Result<(), CaptureError> {
         self.request_capture_with_frame_limit(CaptureSource::Resample, MAX_CAPTURE_FRAMES)
     }
@@ -3240,8 +3810,10 @@ impl App {
             return Err(CaptureError::Unsupported);
         }
         let source_rate = audio.capture_source_rate(source)?;
+        let target_fence = self.capture_target_fence_for(target);
         self.capture_session
             .begin(source, target, source_rate, max_frames)?;
+        self.capture_target_fence = Some(target_fence);
         if self.pads[pad_offset(target)].sample.is_none() {
             self.confirm_capture()?;
         } else {
@@ -3259,6 +3831,9 @@ impl App {
         let token = self.capture_session.token().expect("active token");
         let source = self.capture_session.source().expect("active source");
         if phase == CapturePhase::Confirm {
+            if !self.capture_target_fence_matches() {
+                return Err(self.mark_capture_target_changed());
+            }
             let buffer = CaptureBuffer::try_new(
                 token,
                 self.capture_session.target().expect("active target"),
@@ -3785,6 +4360,12 @@ impl App {
         let Some(candidate) = self.capture_ready.take() else {
             return false;
         };
+        if !self.capture_target_fence_matches() {
+            self.queue_managed_release(candidate.id);
+            let _ = self.capture_session.set_managed_capture_id(None);
+            self.mark_capture_target_changed();
+            return true;
+        }
         let source = self.capture_session.source().expect("ready source");
         let current_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
         if current_rate != Some(candidate.sample.rendered.sample_rate()) {
@@ -3873,6 +4454,7 @@ impl App {
 
     fn clear_capture_transaction_fields(&mut self) {
         debug_assert!(self.capture_worker_request.is_none());
+        self.capture_target_fence = None;
         self.capture_source_pcm = None;
         self.capture_hard_limit = false;
         self.capture_ready = None;
@@ -8564,7 +9146,9 @@ impl App {
             return;
         }
 
-        self.retire_managed_capture_at(offset);
+        if kind == PendingLoadKind::User {
+            self.retire_managed_capture_at(offset);
+        }
 
         let label = pending
             .path

@@ -130,6 +130,13 @@ struct LiveCapture {
     leaf: std::ffi::OsString,
     path: PathBuf,
     identity: File,
+    release_state: ManagedCaptureReleaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedCaptureReleaseState {
+    Linked,
+    UnlinkedPendingSync,
 }
 
 pub(crate) struct CaptureStore {
@@ -414,22 +421,54 @@ impl CaptureStore {
     }
 
     pub(crate) fn release(&mut self, id: ManagedCaptureId) -> Result<(), CaptureStoreError> {
-        let entry = self
-            .live
-            .get(&id)
-            .ok_or(CaptureStoreError::NotLive { id })?;
-        if !path_matches_identity(&self.root, Path::new(&entry.leaf), &entry.identity) {
-            return Err(CaptureStoreError::IdentityMismatch {
-                id,
-                path: entry.path.clone(),
-            });
+        self.release_with_sync(id, |root, root_path| {
+            root.sync_all()
+                .map_err(|error| io_error("sync managed capture release", root_path, error))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_with_sync_for_test<F>(
+        &mut self,
+        id: ManagedCaptureId,
+        sync: F,
+    ) -> Result<(), CaptureStoreError>
+    where
+        F: FnMut(&File, &Path) -> Result<(), CaptureStoreError>,
+    {
+        self.release_with_sync(id, sync)
+    }
+
+    fn release_with_sync<F>(
+        &mut self,
+        id: ManagedCaptureId,
+        mut sync: F,
+    ) -> Result<(), CaptureStoreError>
+    where
+        F: FnMut(&File, &Path) -> Result<(), CaptureStoreError>,
+    {
+        {
+            let entry = self
+                .live
+                .get_mut(&id)
+                .ok_or(CaptureStoreError::NotLive { id })?;
+            if entry.release_state == ManagedCaptureReleaseState::Linked {
+                if !path_matches_identity(&self.root, Path::new(&entry.leaf), &entry.identity) {
+                    return Err(CaptureStoreError::IdentityMismatch {
+                        id,
+                        path: entry.path.clone(),
+                    });
+                }
+                rustix::fs::unlinkat(&self.root, &entry.leaf, rustix::fs::AtFlags::empty())
+                    .map_err(|error| {
+                        filesystem_error("release managed capture", &entry.path, error)
+                    })?;
+                entry.release_state = ManagedCaptureReleaseState::UnlinkedPendingSync;
+            }
         }
-        rustix::fs::unlinkat(&self.root, &entry.leaf, rustix::fs::AtFlags::empty())
-            .map_err(|error| filesystem_error("release managed capture", &entry.path, error))?;
+        sync(&self.root, &self.root_path)?;
         self.live.remove(&id);
-        self.root
-            .sync_all()
-            .map_err(|error| io_error("sync managed capture release", &self.root_path, error))
+        Ok(())
     }
 
     fn create_temp_with_controls<F, H>(
@@ -530,6 +569,7 @@ impl PublishedCapture {
             leaf,
             path,
             identity,
+            release_state: ManagedCaptureReleaseState::Linked,
         })
     }
 }
@@ -1174,6 +1214,34 @@ mod tests {
         assert!(matches!(
             store.release(capture.id),
             Err(CaptureStoreError::NotLive { .. })
+        ));
+    }
+
+    #[test]
+    fn post_unlink_sync_failure_keeps_the_exact_id_retryable_without_a_second_unlink() {
+        let mut store = CaptureStore::new().unwrap();
+        let capture = store.finalize(Arc::from([0.5_f32, -0.5]), 48_000).unwrap();
+        let path = capture.path.clone();
+        let sync_attempts = Cell::new(0_usize);
+
+        let error = store
+            .release_with_sync_for_test(capture.id, |_, _| {
+                sync_attempts.set(sync_attempts.get() + 1);
+                Err(CaptureStoreError::Filesystem {
+                    operation: "injected post-unlink directory sync failure",
+                    path: PathBuf::from("injected"),
+                    kind: std::io::ErrorKind::Other,
+                })
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert_eq!(sync_attempts.get(), 1);
+        assert!(!path.exists(), "the exact owned leaf was already unlinked");
+        store.release(capture.id).unwrap();
+        assert!(matches!(
+            store.release(capture.id),
+            Err(CaptureStoreError::NotLive { id }) if id == capture.id
         ));
     }
 

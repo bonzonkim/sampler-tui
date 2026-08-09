@@ -17,3 +17,6 @@ sampler-core = { path = "../sampler-core" }
 rustix.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

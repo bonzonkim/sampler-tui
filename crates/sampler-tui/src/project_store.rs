@@ -1182,11 +1182,10 @@ impl AnchoredTemp {
     }
 
     pub(crate) fn verify_path_identity(&self) -> Result<(), ProjectStoreError> {
-        let current = rustix::fs::openat(
+        let actual = rustix::fs::statat(
             &self.directory,
             &self.leaf,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| ProjectStoreError::Filesystem {
             operation: "verify temporary file identity",
@@ -1196,13 +1195,6 @@ impl AnchoredTemp {
         let expected = rustix::fs::fstat(&self.identity).map_err(|error| {
             filesystem_error(
                 "inspect opened temporary file",
-                &self.path,
-                io::Error::from(error),
-            )
-        })?;
-        let actual = rustix::fs::fstat(&current).map_err(|error| {
-            filesystem_error(
-                "inspect current temporary file",
                 &self.path,
                 io::Error::from(error),
             )
@@ -1233,17 +1225,11 @@ impl AnchoredTemp {
         destination: &Path,
         point: AtomicWritePoint,
     ) -> Result<(), ProjectStoreError> {
-        let current = rustix::fs::openat(
-            directory,
-            leaf,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|error| atomic_error(destination, point, io::Error::from(error).kind(), true))?;
+        let actual = rustix::fs::statat(directory, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| {
+                atomic_error(destination, point, io::Error::from(error).kind(), true)
+            })?;
         let expected = rustix::fs::fstat(&self.identity).map_err(|error| {
-            atomic_error(destination, point, io::Error::from(error).kind(), true)
-        })?;
-        let actual = rustix::fs::fstat(&current).map_err(|error| {
             atomic_error(destination, point, io::Error::from(error).kind(), true)
         })?;
         if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
@@ -2444,6 +2430,112 @@ mod tests {
                 b"foreign"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_clone_emfile_cleanup_does_not_require_another_descriptor() {
+        const CHILD: &str = "SAMPLER_TUI_EMFILE_TEMP_CLEANUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "project_store::tests::writer_clone_emfile_cleanup_does_not_require_another_descriptor",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child stdout:\n{}\nchild stderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct LimitGuard(libc::rlimit);
+
+        impl Drop for LimitGuard {
+            fn drop(&mut self) {
+                // SAFETY: The saved limit came from a successful getrlimit call in this process.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+
+        let fixture = ProjectFixture::new();
+        fs::write(fixture.directory.join("foreign-entry"), b"foreign").unwrap();
+        let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+        let destination = fixture.directory.join("project.toml");
+        let before = fs::read_dir(&fixture.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut saved = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `saved` points to writable storage for one rlimit value.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, saved.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: getrlimit succeeded and initialized `saved`.
+        let saved = unsafe { saved.assume_init() };
+        let _guard = LimitGuard(saved);
+        let lowered = libc::rlimit {
+            rlim_cur: saved.rlim_cur.min(128),
+            rlim_max: saved.rlim_max,
+        };
+        // SAFETY: The hard limit is unchanged and the soft limit does not exceed it.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+
+        let observed_limit_error = std::cell::Cell::new(None);
+        let exhausted = std::cell::RefCell::new(Vec::new());
+        let result = create_anchored_temp_with_entropy_and_clone(
+            &project.file,
+            &project.path,
+            &destination,
+            |entropy| {
+                entropy.fill(0x6b);
+                Ok(())
+            },
+            |point, file| {
+                if point == TempClonePoint::DirectoryHandle {
+                    return file.try_clone();
+                }
+                loop {
+                    match File::open("/dev/null") {
+                        Ok(opened) => exhausted.borrow_mut().push(opened),
+                        Err(error) => {
+                            observed_limit_error.set(error.raw_os_error());
+                            break;
+                        }
+                    }
+                }
+                let error = file.try_clone().unwrap_err();
+                assert!(matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::EMFILE || code == libc::ENFILE
+                ));
+                Err(error)
+            },
+        );
+        assert!(matches!(
+            observed_limit_error.get(),
+            Some(code) if code == libc::EMFILE || code == libc::ENFILE
+        ));
+        assert!(matches!(result, Err(ProjectStoreError::Filesystem { .. })));
+        exhausted.borrow_mut().clear();
+
+        let after = fs::read_dir(&fixture.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after, before);
+        assert_eq!(
+            fs::read(fixture.directory.join("foreign-entry")).unwrap(),
+            b"foreign"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ enum PublisherFault {
     HeaderWrite,
     PartialSampleWrite,
     FinalizeWrite,
+    FinalizeSeek,
     FileSync,
     Link,
     DirectorySync { failures: usize },
@@ -96,6 +97,17 @@ impl Write for PublisherFile {
 
 impl Seek for PublisherFile {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            let mut state = faults.lock().expect("publisher fault mutex poisoned");
+            if state.fault == PublisherFault::FinalizeSeek
+                && state.writer_phase == WriterPhase::Finalize
+                && !state.writer_fault_consumed
+            {
+                state.writer_fault_consumed = true;
+                return Err(io::Error::other("injected publisher seek failure"));
+            }
+        }
         self.file.seek(position)
     }
 }
@@ -660,6 +672,28 @@ mod tests {
                 b"foreign"
             );
         }
+    }
+
+    #[test]
+    fn finalize_seek_fault_executes_seek_and_cleans_only_the_owned_temp() {
+        let fixture = Fixture::new("finalize-seek-fault");
+        fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
+        let destination = fixture.destination();
+        let before = fixture.entry_names();
+        let mut publisher =
+            AtomicWavPublisher::prepare_with_fault(&destination, PublisherFault::FinalizeSeek)
+                .unwrap();
+        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+
+        assert_eq!(
+            publish(publisher, &AtomicBool::new(false)),
+            Err(OfflineExportError::Encode(destination))
+        );
+        assert_eq!(fixture.entry_names(), before);
+        assert_eq!(
+            fs::read(fixture.root.join("foreign-entry")).unwrap(),
+            b"foreign"
+        );
     }
 
     #[test]

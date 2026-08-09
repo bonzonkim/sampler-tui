@@ -618,7 +618,7 @@ fn sha256_asset(bytes: &[u8]) -> AssetDigest {
 }
 
 #[test]
-fn mixed_resample_save_move_and_fresh_open_preserve_exact_portable_audible_tuple() {
+fn mixed_resample_save_move_and_fresh_open_preserve_exact_tuple_and_nonzero_rendered_output() {
     let fixture = FixtureTree::new();
     let pattern_wav = fixture.write_constant_wav("pattern.wav", 0.25);
     let live_wav = fixture.write_constant_wav("live.wav", -0.125);
@@ -826,7 +826,10 @@ fn mixed_resample_save_move_and_fresh_open_preserve_exact_portable_audible_tuple
         peak = peak.max(frame[0].abs()).max(frame[1].abs());
     });
     assert!(reopened.engine.executed_triggers() > triggers);
-    assert!(peak > 1.0e-4, "reopened capture must be audible: {peak}");
+    assert!(
+        peak > 1.0e-4,
+        "reopened capture must render a nonzero signal: {peak}"
+    );
 }
 
 #[test]

@@ -75,7 +75,8 @@ mod capture_task7_tests {
     use sampler_core::{BankId, PadId, PadSettings, PatternSnapshot, ProjectId, SampleEditRecipe};
 
     use super::{
-        App, EDIT_PREVIEW_COLUMNS, PadLoadState, PendingProjectAction, PreviewColumn, ProjectAction,
+        App, EDIT_PREVIEW_COLUMNS, Overlay, PadLoadState, PendingProjectAction, PreviewColumn,
+        ProjectAction,
     };
     use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
     use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
@@ -383,6 +384,134 @@ mod capture_task7_tests {
             panic!("expected load request")
         };
         assert!(app.apply_worker_result(loaded_result(target, generation, source)));
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct CaptureCompletionSnapshot {
+        token: u64,
+        target: PadId,
+        source: CaptureSource,
+        sample_rate: u32,
+        stereo: Vec<f32>,
+        hard_limit: bool,
+        peak_bits: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct CaptureSessionSnapshot {
+        sequence: (u64, u64),
+        token: Option<u64>,
+        generation: Option<u64>,
+        target: Option<PadId>,
+        source: Option<CaptureSource>,
+        source_rate: Option<u32>,
+        max_frames: Option<usize>,
+        phase: Option<CapturePhase>,
+        completion: Option<CaptureCompletionSnapshot>,
+        failure: Option<String>,
+        failure_cause: Option<CaptureFailureCause>,
+        failure_is_retryable: bool,
+        managed_capture_id: Option<ManagedCaptureId>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct PadSnapshot {
+        source: Option<PathBuf>,
+        label: String,
+        settings: PadSettings,
+        generation: u64,
+        state: PadLoadState,
+        sample: Option<Arc<SampleBuffer>>,
+        preview: [PreviewColumn; super::PREVIEW_COLUMNS],
+        active: bool,
+        base: Option<Arc<SampleBuffer>>,
+        source_generation: u64,
+        fingerprint: Option<SourceFingerprint>,
+        recipe: SampleEditRecipe,
+        base_preview: Option<Arc<[PreviewColumn; EDIT_PREVIEW_COLUMNS]>>,
+        rendered_preview: Option<Arc<[PreviewColumn; EDIT_PREVIEW_COLUMNS]>>,
+        managed_capture: Option<ManagedCaptureId>,
+        current_session_bound: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct CaptureAdmissionSnapshot {
+        session: CaptureSessionSnapshot,
+        overlay: Option<Overlay>,
+        status: String,
+        capture_status: Option<CaptureStatus>,
+        pad: PadSnapshot,
+        revision: u64,
+        audio_calls: Vec<CaptureCall>,
+    }
+
+    fn capture_admission_snapshot(
+        app: &App,
+        probe: &CaptureProbe,
+        target: PadId,
+    ) -> CaptureAdmissionSnapshot {
+        let session = app.capture_session();
+        CaptureAdmissionSnapshot {
+            session: CaptureSessionSnapshot {
+                sequence: session.sequence_for_test(),
+                token: session.token(),
+                generation: session.generation(),
+                target: session.target(),
+                source: session.source(),
+                source_rate: session.source_rate(),
+                max_frames: session.max_frames(),
+                phase: session.phase(),
+                completion: session
+                    .completion()
+                    .map(|completion| CaptureCompletionSnapshot {
+                        token: completion.token,
+                        target: completion.target,
+                        source: completion.source,
+                        sample_rate: completion.sample_rate,
+                        stereo: completion.stereo.clone(),
+                        hard_limit: completion.hard_limit,
+                        peak_bits: completion.peak.to_bits(),
+                    }),
+                failure: session.failure().map(str::to_owned),
+                failure_cause: session.failure_cause(),
+                failure_is_retryable: session.failure_is_retryable(),
+                managed_capture_id: session.managed_capture_id(),
+            },
+            overlay: app.overlay().cloned(),
+            status: app.status().to_owned(),
+            capture_status: app.capture_status_view(),
+            pad: {
+                let offset = super::pad_offset(target);
+                let pad = app.pad(target);
+                let commit = &app.sample_editor.commits[offset];
+                PadSnapshot {
+                    source: pad.source.clone(),
+                    label: pad.label.clone(),
+                    settings: pad.settings,
+                    generation: pad.generation,
+                    state: pad.state.clone(),
+                    sample: pad.sample.clone(),
+                    preview: pad.preview,
+                    active: pad.active,
+                    base: commit.base.clone(),
+                    source_generation: commit.source_generation,
+                    fingerprint: commit.fingerprint,
+                    recipe: commit.recipe,
+                    base_preview: commit.base_preview.clone(),
+                    rendered_preview: commit.rendered_preview.clone(),
+                    managed_capture: commit.managed_capture,
+                    current_session_bound: app.current_session_bound[offset],
+                }
+            },
+            revision: app.project_revision(),
+            audio_calls: probe.calls(),
+        }
+    }
+
+    fn oversized_frame_limit_error() -> CaptureError {
+        CaptureError::Command(sampler_audio::CaptureError::FrameLimitTooLarge {
+            max_frames: MAX_CAPTURE_FRAMES + 1,
+        })
     }
 
     fn completion(
@@ -1378,6 +1507,38 @@ mod capture_task7_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn capture_request_rejects_oversized_frame_limit_without_mutating_empty_target() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        let before = capture_admission_snapshot(&app, &probe, target);
+
+        assert_eq!(
+            app.request_capture_with_limit_for_test(
+                CaptureSource::Resample,
+                MAX_CAPTURE_FRAMES + 1,
+            ),
+            Err(oversized_frame_limit_error())
+        );
+        assert_eq!(capture_admission_snapshot(&app, &probe, target), before);
+    }
+
+    #[test]
+    fn capture_request_rejects_oversized_frame_limit_without_mutating_occupied_target() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        install_imported(&mut app, target, "occupied-limit.wav");
+        let before = capture_admission_snapshot(&app, &probe, target);
+
+        assert_eq!(
+            app.request_capture_with_limit_for_test(CaptureSource::Input, MAX_CAPTURE_FRAMES + 1,),
+            Err(oversized_frame_limit_error())
+        );
+        assert_eq!(capture_admission_snapshot(&app, &probe, target), before);
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -3008,8 +3169,8 @@ impl App {
     /// Requests a capture with an explicit bounded frame limit.
     ///
     /// This follows the same admission, confirmation, finalization, and transactional install
-    /// workflow as the interactive capture commands. The limit is validated by the capture
-    /// buffer before any callback state changes, which lets constrained hosts choose a smaller
+    /// workflow as the interactive capture commands. The limit is validated before any capture
+    /// session or presentation state changes, which lets constrained hosts choose a smaller
     /// deterministic bound while the built-in commands continue to use [`MAX_CAPTURE_FRAMES`].
     pub fn request_capture_with_frame_limit(
         &mut self,
@@ -3033,6 +3194,11 @@ impl App {
         source: CaptureSource,
         max_frames: usize,
     ) -> Result<(), CaptureError> {
+        if max_frames > MAX_CAPTURE_FRAMES {
+            return Err(CaptureError::Command(
+                sampler_audio::CaptureError::FrameLimitTooLarge { max_frames },
+            ));
+        }
         if self.capture_session.phase().is_some() || self.capture_discard_release_pending.is_some()
         {
             return Err(CaptureError::AlreadyActive);

@@ -443,6 +443,11 @@ impl CaptureSession {
             .and_then(|active| active.managed_capture_id)
     }
 
+    #[cfg(test)]
+    pub(crate) const fn sequence_for_test(&self) -> (u64, u64) {
+        (self.last_token, self.last_generation)
+    }
+
     fn transition(
         &mut self,
         expected: CapturePhase,

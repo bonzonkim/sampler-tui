@@ -1974,6 +1974,129 @@ mod capture_task7_tests {
         );
     }
 
+    fn app_with_ready_managed_capture(id: u64) -> App {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        drive_ready(&mut app, &probe, CaptureSource::Resample, id, false);
+        app
+    }
+
+    fn assert_new_capture_admission_fenced(app: &mut App) {
+        assert!(matches!(
+            app.request_capture_with_limit_for_test(CaptureSource::Input, 8),
+            Err(CaptureError::AlreadyActive)
+        ));
+    }
+
+    #[test]
+    fn ready_capture_discard_waits_through_every_exact_release_boundary() {
+        let discard_id = ManagedCaptureId::new(605);
+        let mut app = app_with_ready_managed_capture(discard_id.get());
+        app.request_open_project_interactive("after-ready-discard-release");
+        for index in 0..WORKER_CHANNEL_CAPACITY {
+            app.pending_worker_requests
+                .push(WorkerRequest::ReleaseManagedCapture {
+                    id: ManagedCaptureId::new(800 + index as u64),
+                });
+        }
+
+        app.apply_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.capture_session().phase(), None);
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_new_capture_admission_fenced(&mut app);
+        assert!(!app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_new_capture_admission_fenced(&mut app);
+
+        app.pending_worker_requests.clear();
+        assert!(app.maintain_capture());
+        let [release] = app.take_worker_requests().try_into().unwrap();
+        assert_eq!(
+            release,
+            WorkerRequest::ReleaseManagedCapture { id: discard_id }
+        );
+        assert_new_capture_admission_fenced(&mut app);
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(999),
+                result: Ok(()),
+            })
+        );
+        assert!(!app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), Some(discard_id));
+        assert_new_capture_admission_fenced(&mut app);
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: discard_id,
+                result: Err(crate::capture_store::CaptureStoreError::NotLive { id: discard_id }),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), None);
+        assert_new_capture_admission_fenced(&mut app);
+
+        assert!(app.maintain_capture());
+        let [release] = app.take_worker_requests().try_into().unwrap();
+        assert_eq!(
+            release,
+            WorkerRequest::ReleaseManagedCapture { id: discard_id }
+        );
+        assert!(app.apply_worker_send_error(release, WorkerSendError::WorkerBusy));
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), None);
+        assert_new_capture_admission_fenced(&mut app);
+
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: discard_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: discard_id,
+                result: Ok(()),
+            })
+        );
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), Some(discard_id));
+        assert_new_capture_admission_fenced(&mut app);
+        assert!(app.maintain_capture());
+        assert_matrix_action_continued(&app, ProjectAction::Open);
+    }
+
+    #[test]
+    fn standalone_ready_capture_cancel_fences_a_new_take_until_exact_release_success() {
+        let discard_id = ManagedCaptureId::new(606);
+        let mut app = app_with_ready_managed_capture(discard_id.get());
+
+        app.cancel_capture().unwrap();
+
+        assert_eq!(app.capture_session().phase(), None);
+        assert_new_capture_admission_fenced(&mut app);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: discard_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: discard_id,
+                result: Ok(()),
+            })
+        );
+        assert_new_capture_admission_fenced(&mut app);
+        assert!(app.maintain_capture());
+        app.request_capture_with_limit_for_test(CaptureSource::Input, 8)
+            .unwrap();
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+    }
+
     #[test]
     fn capture_lifecycle_async_choice_matrix_preserves_intent_ownership_and_continuation() {
         let phases = [
@@ -2009,6 +2132,11 @@ mod capture_task7_tests {
 
                     let before_choice_phase = fixture.app.capture_session().phase();
                     let was_retryable = fixture.app.capture_session().failure_is_retryable();
+                    let ready_discard_id = match phase {
+                        CapturePhase::Finalizing => Some(ManagedCaptureId::new(302)),
+                        CapturePhase::ReadyToInstall => Some(ManagedCaptureId::new(301)),
+                        _ => None,
+                    };
                     fixture.app.apply_key(press(choice.key()));
                     match choice {
                         CaptureLifecycleChoice::Cancel => {
@@ -2022,7 +2150,26 @@ mod capture_task7_tests {
                             assert!(fixture.app.project_open_stage().is_none());
                         }
                         CaptureLifecycleChoice::Discard => {
-                            assert_matrix_action_continued(&fixture.app, action);
+                            if let Some(discard_id) = ready_discard_id {
+                                assert_eq!(fixture.app.capture_session().phase(), None);
+                                assert_matrix_action_waiting(&fixture.app, action);
+                                assert!(fixture.app.maintain_capture());
+                                assert_eq!(
+                                    fixture.app.take_worker_requests(),
+                                    [WorkerRequest::ReleaseManagedCapture { id: discard_id }]
+                                );
+                                assert!(fixture.app.apply_worker_result(
+                                    WorkerResult::ManagedCaptureReleased {
+                                        id: discard_id,
+                                        result: Ok(()),
+                                    }
+                                ));
+                                assert_matrix_action_waiting(&fixture.app, action);
+                                assert!(fixture.app.maintain_capture());
+                                assert_matrix_action_continued(&fixture.app, action);
+                            } else {
+                                assert_matrix_action_continued(&fixture.app, action);
+                            }
                         }
                         CaptureLifecycleChoice::Finalize => {
                             if phase == CapturePhase::Failed {
@@ -3563,6 +3710,10 @@ impl App {
 
     fn finish_capture_discard(&mut self) {
         debug_assert!(self.capture_discard_release_pending.is_none());
+        if let Some(candidate) = self.capture_ready.take() {
+            self.wait_for_capture_discard_release(candidate.id);
+            return;
+        }
         self.discard_capture_transaction();
         self.complete_capture_discard();
     }
@@ -3576,7 +3727,7 @@ impl App {
             action: self.pending_capture_project_action(),
             discarding: true,
         });
-        self.status = "Discarding capture and releasing exact worker artifact…".to_owned();
+        self.status = "Discarding capture and releasing exact managed artifact…".to_owned();
     }
 
     fn complete_capture_discard(&mut self) {
@@ -4060,7 +4211,7 @@ impl App {
                 action: Some(label),
                 discarding: true,
             });
-            self.status = "Discarding capture and releasing exact worker artifact…".to_owned();
+            self.status = "Discarding capture and releasing exact managed artifact…".to_owned();
             return;
         }
         if self.capture_session.phase().is_some() {

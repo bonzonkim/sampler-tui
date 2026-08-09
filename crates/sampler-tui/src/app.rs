@@ -4540,13 +4540,14 @@ pub enum ProjectAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingProjectAction {
     Open(PathBuf),
+    OpenDirect(PathBuf),
     Quit,
 }
 
 impl PendingProjectAction {
     const fn label(&self) -> ProjectAction {
         match self {
-            Self::Open(_) => ProjectAction::Open,
+            Self::Open(_) | Self::OpenDirect(_) => ProjectAction::Open,
             Self::Quit => ProjectAction::Quit,
         }
     }
@@ -4938,10 +4939,6 @@ impl App {
                 parent.to_path_buf(),
             ));
         }
-        let next = self
-            .next_export_token
-            .checked_add(1)
-            .ok_or(crate::OfflineExportError::TokenExhausted)?;
         let project = self
             .project_snapshot()
             .map_err(|error| crate::OfflineExportError::UnresolvedAppState(error.to_string()))?;
@@ -4949,6 +4946,10 @@ impl App {
         let slot = crate::ExportPatternSlot::try_from(selected.get().saturating_add(1))?;
         let snapshot =
             OfflineExportSnapshot::from_save_snapshot(&self.current_dir, &project, slot)?;
+        let next = self
+            .next_export_token
+            .checked_add(1)
+            .ok_or(crate::OfflineExportError::TokenExhausted)?;
         let token = crate::ExportToken::new(self.next_export_token);
         let cancel = crate::ExportCancel::default();
         let request =
@@ -5010,6 +5011,76 @@ impl App {
         true
     }
 
+    fn export_status_has_priority(&self) -> bool {
+        self.overlay.is_none()
+            && self.audio_unavailable_message.is_none()
+            && self.pending_project_action.is_none()
+            && self.project_lifecycle_wait.is_none()
+            && self.project_open.is_none()
+            && self.in_flight_project.is_none()
+            && self.pending_explicit_save.is_none()
+            && self.pending_autosave_save.is_none()
+            && self.capture_session.phase().is_none()
+            && self.capture_discard_release_pending.is_none()
+    }
+
+    fn restore_active_export_presentation(&mut self) {
+        if !self.export_status_has_priority() {
+            return;
+        }
+        if let Some(operation) = self.export_operation.as_ref() {
+            self.export_status_focused = true;
+            self.status = match operation.phase {
+                crate::ExportPhase::Queued => format!(
+                    "Export queued · pattern {} · revision {}",
+                    operation.slot.get() + 1,
+                    operation.revision
+                ),
+                crate::ExportPhase::Running {
+                    completed_units,
+                    total_units,
+                } => {
+                    let percent = completed_units
+                        .min(total_units)
+                        .saturating_mul(100)
+                        .checked_div(total_units)
+                        .unwrap_or(0);
+                    format!(
+                        "Export pattern {} · {percent}% · revision {}",
+                        operation.slot.get() + 1,
+                        operation.revision
+                    )
+                }
+                crate::ExportPhase::Cancelling => format!(
+                    "Cancelling export · pattern {} · revision {}",
+                    operation.slot.get() + 1,
+                    operation.revision
+                ),
+            };
+            return;
+        }
+        self.export_status_focused = false;
+        if let Some(outcome) = self.export_outcome.as_ref() {
+            self.status = match outcome {
+                crate::ExportStatusView::Completed { receipt } => format!(
+                    "Exported pattern {} · revision {} · {} frames",
+                    receipt.slot.get() + 1,
+                    receipt.revision,
+                    receipt.rendered_frames
+                ),
+                crate::ExportStatusView::Cancelled { fence } => format!(
+                    "Export cancelled · pattern {} · revision {}",
+                    fence.slot.get() + 1,
+                    fence.revision
+                ),
+                crate::ExportStatusView::Failed { fence, error } => {
+                    format!("Export failed · revision {} · {error}", fence.revision)
+                }
+                crate::ExportStatusView::Active { .. } => return,
+            };
+        }
+    }
+
     pub fn maintain_export(&mut self, progress: Option<WorkerResult>) -> bool {
         let Some(WorkerResult::ExportProgress {
             token,
@@ -5020,6 +5091,7 @@ impl App {
         else {
             return false;
         };
+        let update_status = self.export_status_has_priority();
         let Some(operation) = self.export_operation.as_mut() else {
             return false;
         };
@@ -5043,11 +5115,13 @@ impl App {
             .saturating_mul(100)
             .checked_div(total_units)
             .unwrap_or(0);
-        self.status = format!(
-            "Export pattern {} · {percent}% · revision {}",
-            operation.slot.get() + 1,
-            operation.revision
-        );
+        if update_status {
+            self.status = format!(
+                "Export pattern {} · {percent}% · revision {}",
+                operation.slot.get() + 1,
+                operation.revision
+            );
+        }
         true
     }
 
@@ -6767,8 +6841,9 @@ impl App {
         &mut self,
         directory: impl Into<PathBuf>,
     ) -> Result<ProjectToken, ProjectOpenError> {
+        let directory = directory.into();
         if self.export_operation.is_some() {
-            self.cancel_export();
+            self.begin_project_action(PendingProjectAction::OpenDirect(directory));
             return Err(ProjectOpenError::OperationPending);
         }
         if self.project_open.is_some()
@@ -6780,11 +6855,17 @@ impl App {
         }
         self.project_snapshot()
             .map_err(|error| ProjectOpenError::UnresolvedState(error.to_string()))?;
+        self.start_project_open_probe(directory)
+    }
+
+    fn start_project_open_probe(
+        &mut self,
+        directory: PathBuf,
+    ) -> Result<ProjectToken, ProjectOpenError> {
         let token = self
             .allocate_project_token()
             .map_err(|_| ProjectOpenError::TokenExhausted)?;
         self.cancel_midi_learn();
-        let directory = directory.into();
         self.project_open_error = None;
         let progress = ProjectOpenStage {
             token,
@@ -6834,6 +6915,10 @@ impl App {
             self.status = "Waiting for offline export cleanup…".to_owned();
             return;
         }
+        if matches!(action, PendingProjectAction::OpenDirect(_)) {
+            self.complete_project_action();
+            return;
+        }
         if self.capture_discard_release_pending.is_some() {
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
             self.overlay = Some(Overlay::CaptureProgress {
@@ -6878,6 +6963,16 @@ impl App {
             }
             PendingProjectAction::Open(directory) => {
                 if let Err(error) = self.request_open_project(directory) {
+                    let message = error.to_string();
+                    self.status = message.clone();
+                    self.overlay = Some(Overlay::ProjectError {
+                        title: "OPEN PROJECT ERROR".to_owned(),
+                        message,
+                    });
+                }
+            }
+            PendingProjectAction::OpenDirect(directory) => {
+                if let Err(error) = self.start_project_open_probe(directory) {
                     let message = error.to_string();
                     self.status = message.clone();
                     self.overlay = Some(Overlay::ProjectError {
@@ -8596,6 +8691,14 @@ impl App {
         {
             self.advance_project_action();
         }
+        self.restore_active_export_presentation();
+    }
+
+    fn dismiss_palette(&mut self) {
+        if self.overlay == Some(Overlay::Palette) {
+            self.overlay = None;
+            self.restore_active_export_presentation();
+        }
     }
 
     fn cancel_overlay(&mut self) {
@@ -9431,36 +9534,41 @@ impl App {
         {
             return false;
         }
+        let update_status = self.export_status_has_priority();
         let fence = operation.result_fence();
         self.export_operation = None;
         self.export_status_focused = false;
-        self.status = match result {
-            Ok(receipt) => {
-                self.export_outcome = Some(crate::ExportStatusView::Completed {
+        let (outcome, message) = match result {
+            Ok(receipt) => (
+                crate::ExportStatusView::Completed {
                     receipt: receipt.clone(),
-                });
+                },
                 format!(
                     "Exported pattern {} · revision {} · {} frames",
                     receipt.slot.get() + 1,
                     receipt.revision,
                     receipt.rendered_frames
-                )
-            }
-            Err(crate::OfflineExportError::Cancelled) => {
-                self.export_outcome = Some(crate::ExportStatusView::Cancelled { fence });
+                ),
+            ),
+            Err(crate::OfflineExportError::Cancelled) => (
+                crate::ExportStatusView::Cancelled { fence },
                 format!(
                     "Export cancelled · pattern {} · revision {revision}",
-                    slot.get() + 1
-                )
-            }
-            Err(error) => {
-                self.export_outcome = Some(crate::ExportStatusView::Failed {
+                    slot.get() + 1,
+                ),
+            ),
+            Err(error) => (
+                crate::ExportStatusView::Failed {
                     fence,
                     error: error.clone(),
-                });
-                format!("Export failed · revision {revision} · {error}")
-            }
+                },
+                format!("Export failed · revision {revision} · {error}"),
+            ),
         };
+        self.export_outcome = Some(outcome);
+        if update_status {
+            self.status = message;
+        }
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::ExportCleanup)
             && self.pending_project_action.is_some()
         {
@@ -9592,6 +9700,9 @@ impl App {
                     message: self.status.clone(),
                 })
             };
+        }
+        if save_succeeded {
+            self.restore_active_export_presentation();
         }
         true
     }
@@ -9863,7 +9974,7 @@ impl App {
             PaletteCommand::OpenPicker => self.open_picker(),
             PaletteCommand::LoadPath(path) => {
                 self.begin_selected_load(path);
-                self.overlay = None;
+                self.dismiss_palette();
             }
             PaletteCommand::Save => match self.request_save() {
                 Ok(()) => {
@@ -9893,7 +10004,7 @@ impl App {
                 self.request_open_project_interactive(directory);
             }
             PaletteCommand::Export(destination) => {
-                self.overlay = None;
+                self.dismiss_palette();
                 if let Err(error) = self.start_export(destination) {
                     self.status = error.to_string();
                 }
@@ -9905,16 +10016,16 @@ impl App {
                 }
                 self.active_bank = bank;
                 self.sync_editor_to_selected_pad();
-                self.overlay = None;
+                self.dismiss_palette();
             }
             PaletteCommand::Select(index) => {
                 if self.select_pad(index) {
-                    self.overlay = None;
+                    self.dismiss_palette();
                 }
             }
             PaletteCommand::StopAll => {
                 self.stop_all();
-                self.overlay = None;
+                self.dismiss_palette();
             }
             PaletteCommand::MidiChannel(channel) => {
                 let result = self.update_midi_channel(channel);
@@ -9922,7 +10033,7 @@ impl App {
             }
             PaletteCommand::MidiLearn => {
                 self.arm_midi_learn();
-                self.overlay = None;
+                self.dismiss_palette();
             }
             PaletteCommand::MidiUnmap => {
                 let result = self.unmap_selected_midi();
@@ -10082,7 +10193,7 @@ impl App {
 
     fn finish_midi_palette_command(&mut self, result: Result<(), String>) {
         match result {
-            Ok(()) => self.overlay = None,
+            Ok(()) => self.dismiss_palette(),
             Err(error) => self.palette_error = Some(error),
         }
     }
@@ -10106,7 +10217,7 @@ impl App {
 
     fn finish_mixer_palette_command(&mut self, result: Result<(), String>) {
         match result {
-            Ok(()) => self.overlay = None,
+            Ok(()) => self.dismiss_palette(),
             Err(error) => self.palette_error = Some(error),
         }
     }
@@ -10115,7 +10226,7 @@ impl App {
         match result {
             Ok(()) => {
                 if self.overlay == Some(Overlay::Palette) {
-                    self.overlay = None;
+                    self.dismiss_palette();
                 }
             }
             Err(error) => self.palette_error = Some(error.to_string()),
@@ -10792,7 +10903,7 @@ impl App {
             return;
         }
         self.patterns.select_slot(slot);
-        self.overlay = None;
+        self.dismiss_palette();
     }
 
     fn start_pattern_playback(&mut self) {
@@ -10814,7 +10925,7 @@ impl App {
             return;
         }
         self.note_pattern_transport_intent(true);
-        self.overlay = None;
+        self.dismiss_palette();
     }
 
     fn stop_pattern_playback(&mut self) {
@@ -10832,7 +10943,7 @@ impl App {
             return;
         }
         self.note_pattern_transport_intent(false);
-        self.overlay = None;
+        self.dismiss_palette();
     }
 
     fn toggle_pattern_recording(&mut self) {
@@ -10955,7 +11066,7 @@ impl App {
             if self.patterns.selected_pattern().generation() != generation {
                 self.commit_project_mutation();
             }
-            self.overlay = None;
+            self.dismiss_palette();
         }
     }
 
@@ -10994,6 +11105,7 @@ impl App {
         } else if entry.is_selectable_file() {
             self.begin_selected_load(entry.path);
             self.overlay = None;
+            self.restore_active_export_presentation();
         } else {
             self.status = "entry is not a supported audio file".to_owned();
         }
@@ -11204,6 +11316,7 @@ impl App {
         self.suspend_pending_sample_edits();
         self.fail_project_sample_apply(self.editor.pad());
         self.audio_unavailable_message = Some(error.clone());
+        self.export_status_focused = false;
         self.held_pad_by_key.fill(None);
         self.cancel_midi_learn();
         self.midi_owned_pads.fill(None);
@@ -11839,6 +11952,7 @@ fn restore_committed_audio_pads(
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -12681,6 +12795,40 @@ mod tests {
             ))
         );
         assert_eq!(app.status(), "device disconnected");
+    }
+
+    #[test]
+    fn device_failure_guidance_remains_above_an_active_export_after_dismissal() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(audio));
+        app.export_operation = Some(crate::export::ExportOperation {
+            token: crate::ExportToken::new(7),
+            project_id: app.project_session.project_id(),
+            revision: app.project_revision(),
+            slot: PatternSlotId::new(0).unwrap(),
+            destination: "mix.wav".into(),
+            cancel: crate::export::ExportCancel::default(),
+            phase: crate::ExportPhase::Running {
+                completed_units: 1,
+                total_units: 2,
+            },
+        });
+        app.export_status_focused = true;
+
+        assert!(app.maintain_audio());
+        assert!(matches!(
+            app.export_status_view(),
+            Some(crate::ExportStatusView::Active { focused: false, .. })
+        ));
+
+        app.close_overlay();
+
+        assert_eq!(app.overlay(), None);
+        assert_eq!(app.status(), "device disconnected · Ctrl+R retries audio");
+        assert!(matches!(
+            app.export_status_view(),
+            Some(crate::ExportStatusView::Active { focused: false, .. })
+        ));
     }
 
     #[test]
@@ -16128,6 +16276,84 @@ mod tests {
         app.patterns.set_view(WorkspaceView::Sample);
         app.sync_editor_to_selected_pad();
         app
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ExportAdmissionTruth {
+        revision: u64,
+        saved_revision: u64,
+        autosaved_revision: u64,
+        project_id: sampler_core::ProjectId,
+        project_directory: Option<PathBuf>,
+        header: String,
+        status: String,
+        overlay: Option<super::Overlay>,
+        palette_text: String,
+        palette_error: Option<String>,
+        active_bank: BankId,
+        selected_pad: usize,
+        selected_slot: PatternSlotId,
+        transport: sampler_core::Transport,
+        transport_playing: bool,
+        telemetry: Telemetry,
+        audio_format: Option<(u32, u16)>,
+        recovery_cursor: Option<usize>,
+        pending_recovery_cleanup: usize,
+        recovery_warning: Option<String>,
+        next_project_token: u64,
+        next_export_token: u64,
+        pending_explicit_save: bool,
+        pending_autosave_save: bool,
+        in_flight_project: bool,
+        project_open: bool,
+        pending_project_action: Option<super::ProjectAction>,
+        project_lifecycle_wait: Option<String>,
+        export_status: Option<crate::ExportStatusView>,
+        worker_requests: Vec<WorkerRequest>,
+    }
+
+    fn export_admission_truth(app: &App) -> ExportAdmissionTruth {
+        ExportAdmissionTruth {
+            revision: app.project_revision(),
+            saved_revision: app.project_session.saved_revision(),
+            autosaved_revision: app.project_session.autosaved_revision(),
+            project_id: app.project_session.project_id(),
+            project_directory: app.project_session.directory().map(ToOwned::to_owned),
+            header: app.project_header(),
+            status: app.status().to_owned(),
+            overlay: app.overlay.clone(),
+            palette_text: app.palette.text().to_owned(),
+            palette_error: app.palette_error.clone(),
+            active_bank: app.active_bank(),
+            selected_pad: app.selected_pad(),
+            selected_slot: app.patterns().selected_slot(),
+            transport: app.patterns().selected_pattern().transport(),
+            transport_playing: app.patterns().is_playing(),
+            telemetry: app.telemetry(),
+            audio_format: app.audio_format(),
+            recovery_cursor: app.recovery_cursor,
+            pending_recovery_cleanup: app.pending_recovery_cleanup.len(),
+            recovery_warning: app
+                .recovery_cleanup_warning
+                .as_ref()
+                .map(ToString::to_string),
+            next_project_token: app.next_project_token,
+            next_export_token: app.next_export_token,
+            pending_explicit_save: app.pending_explicit_save.is_some(),
+            pending_autosave_save: app.pending_autosave_save.is_some(),
+            in_flight_project: app.in_flight_project.is_some(),
+            project_open: app.project_open.is_some(),
+            pending_project_action: app
+                .pending_project_action
+                .as_ref()
+                .map(super::PendingProjectAction::label),
+            project_lifecycle_wait: app
+                .project_lifecycle_wait
+                .as_ref()
+                .map(|wait| format!("{wait:?}")),
+            export_status: app.export_status_view(),
+            worker_requests: app.pending_worker_requests.clone(),
+        }
     }
 
     #[test]
@@ -20521,20 +20747,145 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_export_token_rejects_before_installing_any_operation_or_request() {
-        let mut app = App::without_audio("no output device");
-        app.next_export_token = u64::MAX;
-        let destination = std::env::temp_dir().join(format!(
-            "sampler-tui-export-token-exhausted-{}.wav",
+    fn export_admission_precedence_validates_destination_and_model_before_token_exhaustion() {
+        let root = std::env::temp_dir().join(format!(
+            "sampler-tui-export-token-precedence-{}",
             std::process::id()
         ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
 
+        let mut empty = App::without_audio("no output device");
+        empty.next_export_token = u64::MAX;
+        let empty_truth = export_admission_truth(&empty);
+        let empty_destination = root.join("empty.wav");
         assert_eq!(
-            app.start_export(destination),
+            empty.start_export(empty_destination.clone()),
+            Err(crate::OfflineExportError::EmptyPattern)
+        );
+        assert_eq!(export_admission_truth(&empty), empty_truth);
+        assert_eq!(empty.next_export_token, u64::MAX);
+        assert!(empty.export_operation.is_none());
+        assert!(empty.pending_worker_requests.is_empty());
+        assert!(!empty_destination.exists());
+
+        let invalid_destination = root.join("invalid.flac");
+        assert_eq!(
+            empty.start_export(invalid_destination.clone()),
+            Err(crate::OfflineExportError::DestinationExtension(
+                invalid_destination.clone()
+            ))
+        );
+        assert_eq!(export_admission_truth(&empty), empty_truth);
+        assert!(!invalid_destination.exists());
+
+        let existing_destination = root.join("existing.wav");
+        fs::write(&existing_destination, b"owned").unwrap();
+        assert_eq!(
+            empty.start_export(existing_destination.clone()),
+            Err(crate::OfflineExportError::DestinationExists(
+                existing_destination.clone()
+            ))
+        );
+        assert_eq!(export_admission_truth(&empty), empty_truth);
+        assert_eq!(fs::read(&existing_destination).unwrap(), b"owned");
+
+        let mut missing = project_app();
+        missing.apply_pattern_edit(|patterns| patterns.toggle_step());
+        missing.next_export_token = u64::MAX;
+        let missing_truth = export_admission_truth(&missing);
+        let missing_destination = root.join("missing.wav");
+        assert_eq!(
+            missing.start_export(missing_destination.clone()),
+            Err(crate::OfflineExportError::MissingPadSource { pad: pad(0, 0) })
+        );
+        assert_eq!(export_admission_truth(&missing), missing_truth);
+        assert_eq!(missing.next_export_token, u64::MAX);
+        assert!(missing.export_operation.is_none());
+        assert!(missing.pending_worker_requests.is_empty());
+        assert!(!missing_destination.exists());
+
+        let source = root.join("source.wav");
+        fs::write(&source, []).unwrap();
+        let mut valid = project_app();
+        valid.apply_pattern_edit(|patterns| patterns.toggle_step());
+        valid.pads[0].source = Some(source);
+        valid.next_export_token = u64::MAX;
+        let valid_truth = export_admission_truth(&valid);
+        let exhausted_destination = root.join("exhausted.wav");
+        assert_eq!(
+            valid.start_export(exhausted_destination.clone()),
             Err(crate::OfflineExportError::TokenExhausted)
         );
-        assert_eq!(app.next_export_token, u64::MAX);
-        assert!(app.export_operation.is_none());
-        assert!(app.pending_worker_requests.is_empty());
+        assert_eq!(export_admission_truth(&valid), valid_truth);
+        assert_eq!(valid.next_export_token, u64::MAX);
+        assert!(valid.export_operation.is_none());
+        assert!(valid.pending_worker_requests.is_empty());
+        assert!(!exhausted_destination.exists());
+
+        valid.next_export_token = 1;
+        let active_destination = root.join("active.wav");
+        valid.start_export(active_destination.clone()).unwrap();
+        let active_operation = valid.export_operation.clone();
+        valid.next_export_token = u64::MAX;
+        let active_truth = export_admission_truth(&valid);
+        let masked_invalid = root.join("masked-invalid.flac");
+        assert_eq!(
+            valid.start_export(masked_invalid.clone()),
+            Err(crate::OfflineExportError::OperationPending)
+        );
+        assert_eq!(export_admission_truth(&valid), active_truth);
+        assert_eq!(valid.export_operation, active_operation);
+        assert_eq!(valid.pending_worker_requests.len(), 1);
+        assert!(!active_destination.exists());
+        assert!(!masked_invalid.exists());
+
+        let mut project_busy = App::without_audio("no output device");
+        project_busy
+            .request_save_as(root.join("pending-project"))
+            .unwrap();
+        project_busy.next_export_token = u64::MAX;
+        let project_busy_truth = export_admission_truth(&project_busy);
+        let project_busy_invalid = root.join("project-busy-invalid.flac");
+        assert!(matches!(
+            project_busy.start_export(project_busy_invalid.clone()),
+            Err(crate::OfflineExportError::UnresolvedAppState(_))
+        ));
+        assert_eq!(export_admission_truth(&project_busy), project_busy_truth);
+        assert!(!project_busy_invalid.exists());
+
+        let mut worker_busy = App::without_audio("no output device");
+        worker_busy.next_export_token = u64::MAX;
+        for request_id in 0..WORKER_CHANNEL_CAPACITY as u64 {
+            worker_busy
+                .pending_worker_requests
+                .push(WorkerRequest::ScanDirectory {
+                    request_id,
+                    path: root.clone(),
+                    show_hidden: false,
+                });
+        }
+        let busy_truth = export_admission_truth(&worker_busy);
+        let busy_invalid = root.join("busy-invalid.flac");
+        assert_eq!(
+            worker_busy.start_export(busy_invalid.clone()),
+            Err(crate::OfflineExportError::WorkerBusy)
+        );
+        assert_eq!(export_admission_truth(&worker_busy), busy_truth);
+        assert_eq!(worker_busy.next_export_token, u64::MAX);
+        assert_eq!(
+            worker_busy.pending_worker_requests.len(),
+            WORKER_CHANNEL_CAPACITY
+        );
+        assert!(!busy_invalid.exists());
+
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("sampler-tui-tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 }

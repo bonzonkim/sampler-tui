@@ -4,11 +4,75 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use sampler_audio::{
-    AudioSession, ControlError, DeviceError, Frame, LiveAck, LiveCommandId,
+    AudioSession, CaptureBuffer, CaptureCommand, CaptureOutcome, CaptureSendFailure, CaptureSource,
+    CaptureStatus, ControlError, DeviceError, Frame, InputCaptureSession, LiveAck, LiveCommandId,
     PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT,
     SampleBuffer, SampleSlot, Telemetry,
 };
 use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
+
+use crate::CaptureError;
+
+#[derive(Debug)]
+pub struct CaptureCommandFailure {
+    error: CaptureError,
+    command: CaptureCommand,
+}
+
+impl CaptureCommandFailure {
+    fn from_send(failure: CaptureSendFailure) -> Self {
+        let error = CaptureError::Command(failure.error());
+        let command = failure.into_command();
+        Self { error, command }
+    }
+
+    fn rejected(error: CaptureError, command: CaptureCommand) -> Self {
+        Self { error, command }
+    }
+
+    pub const fn error(&self) -> &CaptureError {
+        &self.error
+    }
+
+    pub fn into_command(self) -> CaptureCommand {
+        self.command
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureSourceMaintenance {
+    completion: Option<CaptureOutcome>,
+    runtime_error: Option<CaptureError>,
+}
+
+#[derive(Debug, Default)]
+pub struct CaptureMaintenance {
+    output: CaptureSourceMaintenance,
+    input: CaptureSourceMaintenance,
+}
+
+impl CaptureMaintenance {
+    pub fn completion(&self, source: CaptureSource) -> Option<&CaptureOutcome> {
+        match source {
+            CaptureSource::Resample => self.output.completion.as_ref(),
+            CaptureSource::Input => self.input.completion.as_ref(),
+        }
+    }
+
+    pub fn take_completion(&mut self, source: CaptureSource) -> Option<CaptureOutcome> {
+        match source {
+            CaptureSource::Resample => self.output.completion.take(),
+            CaptureSource::Input => self.input.completion.take(),
+        }
+    }
+
+    pub fn runtime_error(&self, source: CaptureSource) -> Option<&CaptureError> {
+        match source {
+            CaptureSource::Resample => self.output.runtime_error.as_ref(),
+            CaptureSource::Input => self.input.runtime_error.as_ref(),
+        }
+    }
+}
 
 pub trait AudioPort {
     fn sample_rate(&self) -> u32;
@@ -85,6 +149,80 @@ pub trait AudioPort {
     fn reclaim_retired(&mut self) -> usize;
     fn latest_telemetry(&mut self) -> Option<Telemetry>;
     fn poll_runtime_error(&mut self) -> Option<String>;
+
+    fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
+        match source {
+            CaptureSource::Resample => Ok(self.sample_rate()),
+            CaptureSource::Input => Err(CaptureError::InputOpen(
+                "input capture is unsupported".into(),
+            )),
+        }
+    }
+
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureCommandFailure> {
+        Err(CaptureCommandFailure::rejected(
+            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureCommand::Arm(buffer),
+        ))
+    }
+
+    fn start_capture(
+        &mut self,
+        _source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        Err(CaptureCommandFailure::rejected(
+            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureCommand::Start { token },
+        ))
+    }
+
+    fn stop_capture(
+        &mut self,
+        _source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        Err(CaptureCommandFailure::rejected(
+            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureCommand::Stop { token },
+        ))
+    }
+
+    fn cancel_capture(
+        &mut self,
+        _source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        Err(CaptureCommandFailure::rejected(
+            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureCommand::Cancel { token },
+        ))
+    }
+
+    fn capture_status(&mut self, _source: CaptureSource) -> Option<CaptureStatus> {
+        None
+    }
+
+    fn capture_completion(&mut self, _source: CaptureSource) -> Option<CaptureOutcome> {
+        None
+    }
+
+    fn capture_runtime_error(&mut self, _source: CaptureSource) -> Option<CaptureError> {
+        None
+    }
+
+    fn poll_capture_maintenance(&mut self) -> CaptureMaintenance {
+        CaptureMaintenance {
+            output: CaptureSourceMaintenance {
+                completion: self.capture_completion(CaptureSource::Resample),
+                runtime_error: self.capture_runtime_error(CaptureSource::Resample),
+            },
+            input: CaptureSourceMaintenance {
+                completion: self.capture_completion(CaptureSource::Input),
+                runtime_error: self.capture_runtime_error(CaptureSource::Input),
+            },
+        }
+    }
 }
 
 trait SessionLike {
@@ -157,6 +295,62 @@ trait SessionLike {
     fn reclaim_retired(&mut self) -> usize;
     fn latest_telemetry(&mut self) -> Option<Telemetry>;
     fn poll_error(&mut self) -> Option<Self::RuntimeError>;
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure>;
+    fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn capture_status(&mut self) -> Option<CaptureStatus>;
+    fn capture_completion(&mut self) -> Option<CaptureOutcome>;
+}
+
+trait InputSessionLike {
+    fn sample_rate(&self) -> u32;
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure>;
+    fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
+    fn capture_status(&mut self) -> Option<CaptureStatus>;
+    fn capture_completion(&mut self) -> Option<CaptureOutcome>;
+    fn capture_state(&mut self) -> sampler_audio::CaptureState;
+    fn poll_error(&mut self) -> Option<String>;
+}
+
+impl InputSessionLike for InputCaptureSession {
+    fn sample_rate(&self) -> u32 {
+        InputCaptureSession::sample_rate(self)
+    }
+
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().arm(buffer)
+    }
+
+    fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().start(token)
+    }
+
+    fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().stop(token)
+    }
+
+    fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().cancel(token)
+    }
+
+    fn capture_status(&mut self) -> Option<CaptureStatus> {
+        None
+    }
+
+    fn capture_completion(&mut self) -> Option<CaptureOutcome> {
+        self.controller_mut().try_next_outcome()
+    }
+
+    fn capture_state(&mut self) -> sampler_audio::CaptureState {
+        self.controller_mut().state()
+    }
+
+    fn poll_error(&mut self) -> Option<String> {
+        InputCaptureSession::poll_error(self).map(|error| error.to_string())
+    }
 }
 
 impl SessionLike for AudioSession {
@@ -299,19 +493,68 @@ impl SessionLike for AudioSession {
     fn poll_error(&mut self) -> Option<Self::RuntimeError> {
         AudioSession::poll_error(self)
     }
+
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().arm_capture(buffer)
+    }
+
+    fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().start_capture(token)
+    }
+
+    fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().stop_capture(token)
+    }
+
+    fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+        self.controller_mut().cancel_capture(token)
+    }
+
+    fn capture_status(&mut self) -> Option<CaptureStatus> {
+        self.controller_mut().capture_status()
+    }
+
+    fn capture_completion(&mut self) -> Option<CaptureOutcome> {
+        self.controller_mut().try_capture_completion()
+    }
 }
 
 pub struct SessionAudioPort<S = AudioSession> {
     session: Option<RefCell<S>>,
+    input: Option<Box<dyn InputSessionLike>>,
+    input_opener: Box<dyn FnMut() -> Result<Box<dyn InputSessionLike>, String>>,
+    active_capture: Option<AdapterCaptureIdentity>,
     retained_samples: [Option<Arc<SampleBuffer>>; SAMPLE_SLOT_COUNT],
     retained_patterns: [Option<Arc<PatternSnapshot>>; PATTERN_SNAPSHOT_SLOT_COUNT],
     retained_pattern_slots: [Option<PatternSnapshotSlot>; PATTERN_SNAPSHOT_SLOT_COUNT],
 }
 
+#[derive(Clone, Copy)]
+struct AdapterCaptureIdentity {
+    token: u64,
+    target: PadId,
+    source: CaptureSource,
+    max_frames: usize,
+}
+
 impl<S> SessionAudioPort<S> {
     fn new(session: S) -> Self {
+        Self::new_with_input_opener(session, || {
+            InputCaptureSession::open_default()
+                .map(|session| Box::new(session) as Box<dyn InputSessionLike>)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn new_with_input_opener(
+        session: S,
+        input_opener: impl FnMut() -> Result<Box<dyn InputSessionLike>, String> + 'static,
+    ) -> Self {
         Self {
             session: Some(RefCell::new(session)),
+            input: None,
+            input_opener: Box::new(input_opener),
+            active_capture: None,
             retained_samples: array::from_fn(|_| None),
             retained_patterns: array::from_fn(|_| None),
             retained_pattern_slots: array::from_fn(|_| None),
@@ -330,10 +573,18 @@ impl<S> SessionAudioPort<S> {
             .expect("audio session exists until adapter drop")
             .get_mut()
     }
+
+    fn input_mut(&mut self) -> Result<&mut Box<dyn InputSessionLike>, CaptureError> {
+        if self.input.is_none() {
+            self.input = Some((self.input_opener)().map_err(CaptureError::InputOpen)?);
+        }
+        Ok(self.input.as_mut().expect("input capture was just opened"))
+    }
 }
 
 impl<S> Drop for SessionAudioPort<S> {
     fn drop(&mut self) {
+        drop(self.input.take());
         drop(self.session.take());
         self.retained_samples.fill(None);
         self.retained_patterns.fill(None);
@@ -524,6 +775,187 @@ where
             .poll_error()
             .map(|error| error.to_string())
     }
+
+    fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
+        match source {
+            CaptureSource::Resample => Ok(self.session_mut().sample_rate()),
+            CaptureSource::Input => Ok(self.input_mut()?.sample_rate()),
+        }
+    }
+
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureCommandFailure> {
+        let source = buffer.source();
+        let identity = AdapterCaptureIdentity {
+            token: buffer.token(),
+            target: buffer.target(),
+            source,
+            max_frames: buffer.max_frames(),
+        };
+        if self.active_capture.is_some() {
+            return Err(CaptureCommandFailure::rejected(
+                CaptureError::AlreadyActive,
+                CaptureCommand::Arm(buffer),
+            ));
+        }
+        let expected_rate = match self.capture_source_rate(source) {
+            Ok(sample_rate) => sample_rate,
+            Err(error) => {
+                return Err(CaptureCommandFailure::rejected(
+                    error,
+                    CaptureCommand::Arm(buffer),
+                ));
+            }
+        };
+        if buffer.sample_rate() != expected_rate {
+            return Err(CaptureCommandFailure::rejected(
+                CaptureError::CompletionRateMismatch,
+                CaptureCommand::Arm(buffer),
+            ));
+        }
+        let result = match source {
+            CaptureSource::Resample => self.session_mut().begin_capture(buffer),
+            CaptureSource::Input => match self.input_mut() {
+                Ok(input) => input.begin_capture(buffer),
+                Err(error) => {
+                    return Err(CaptureCommandFailure::rejected(
+                        error,
+                        CaptureCommand::Arm(buffer),
+                    ));
+                }
+            },
+        };
+        result.map_err(CaptureCommandFailure::from_send)?;
+        self.active_capture = Some(identity);
+        Ok(())
+    }
+
+    fn start_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        self.require_active_source(source, CaptureCommand::Start { token })?;
+        match source {
+            CaptureSource::Resample => self.session_mut().start_capture(token),
+            CaptureSource::Input => self
+                .input_mut()
+                .map_err(|error| {
+                    CaptureCommandFailure::rejected(error, CaptureCommand::Start { token })
+                })?
+                .start_capture(token),
+        }
+        .map_err(CaptureCommandFailure::from_send)
+    }
+
+    fn stop_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        self.require_active_source(source, CaptureCommand::Stop { token })?;
+        match source {
+            CaptureSource::Resample => self.session_mut().stop_capture(token),
+            CaptureSource::Input => self
+                .input_mut()
+                .map_err(|error| {
+                    CaptureCommandFailure::rejected(error, CaptureCommand::Stop { token })
+                })?
+                .stop_capture(token),
+        }
+        .map_err(CaptureCommandFailure::from_send)
+    }
+
+    fn cancel_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        self.require_active_source(source, CaptureCommand::Cancel { token })?;
+        match source {
+            CaptureSource::Resample => self.session_mut().cancel_capture(token),
+            CaptureSource::Input => self
+                .input_mut()
+                .map_err(|error| {
+                    CaptureCommandFailure::rejected(error, CaptureCommand::Cancel { token })
+                })?
+                .cancel_capture(token),
+        }
+        .map_err(CaptureCommandFailure::from_send)
+    }
+
+    fn capture_status(&mut self, source: CaptureSource) -> Option<CaptureStatus> {
+        match source {
+            CaptureSource::Resample => self.session_mut().capture_status(),
+            CaptureSource::Input => {
+                if let Some(status) = self.input.as_mut()?.capture_status() {
+                    return Some(status);
+                }
+                let identity = self
+                    .active_capture
+                    .filter(|identity| identity.source == CaptureSource::Input)?;
+                let state = self.input.as_mut()?.capture_state();
+                Some(CaptureStatus {
+                    token: identity.token,
+                    source: identity.source,
+                    target: identity.target,
+                    state,
+                    frames: 0,
+                    max_frames: identity.max_frames,
+                    peak: 0.0,
+                    hard_limit: false,
+                })
+            }
+        }
+    }
+
+    fn capture_completion(&mut self, source: CaptureSource) -> Option<CaptureOutcome> {
+        let outcome = match source {
+            CaptureSource::Resample => self.session_mut().capture_completion(),
+            CaptureSource::Input => self.input.as_mut()?.capture_completion(),
+        };
+        if outcome.is_some()
+            && self
+                .active_capture
+                .is_some_and(|identity| identity.source == source)
+        {
+            self.active_capture = None;
+        }
+        outcome
+    }
+
+    fn capture_runtime_error(&mut self, source: CaptureSource) -> Option<CaptureError> {
+        match source {
+            CaptureSource::Resample => self
+                .session_mut()
+                .poll_error()
+                .map(|error| CaptureError::OutputRuntime(error.to_string())),
+            CaptureSource::Input => self
+                .input
+                .as_mut()?
+                .poll_error()
+                .map(CaptureError::InputRuntime),
+        }
+    }
+}
+
+impl<S> SessionAudioPort<S> {
+    fn require_active_source(
+        &self,
+        source: CaptureSource,
+        command: CaptureCommand,
+    ) -> Result<(), CaptureCommandFailure> {
+        match self.active_capture {
+            Some(active) if active.source == source => Ok(()),
+            Some(_) => Err(CaptureCommandFailure::rejected(
+                CaptureError::CompletionSourceMismatch,
+                command,
+            )),
+            None => Err(CaptureCommandFailure::rejected(
+                CaptureError::NoActiveCapture,
+                command,
+            )),
+        }
+    }
 }
 
 pub fn open_default_audio() -> Result<Box<dyn AudioPort>, String> {
@@ -535,22 +967,31 @@ pub fn open_default_audio() -> Result<Box<dyn AudioPort>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::{Arc, Weak};
     use std::thread::ThreadId;
 
     use sampler_audio::{
-        ControlError, LiveAck, LiveCommandId, PatternRetirement, PatternSnapshotSlot,
-        PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+        CaptureBuffer, CaptureCommand, CaptureController, CaptureCore,
+        CaptureError as CoreCaptureError, CaptureOutcome, CaptureSendFailure, CaptureSource,
+        CaptureState, CaptureStatus, ControlError, LiveAck, LiveCommandId, PatternRetirement,
+        PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+        capture_channels,
     };
     use sampler_core::{
         EditablePattern, Meter, PadId, PadSettings, PatternSlotId, PatternSnapshot, Resolution,
         Tempo, Transport,
     };
 
-    use super::{AudioPort, SessionAudioPort, SessionLike};
+    use super::{
+        AudioPort, CaptureCommandFailure, CaptureMaintenance, InputSessionLike, SessionAudioPort,
+        SessionLike,
+    };
+    use crate::CaptureError;
+
+    type CaptureDropOrder = Rc<RefCell<Vec<(&'static str, ThreadId)>>>;
 
     struct FakeSession {
         sample_rate: u32,
@@ -566,6 +1007,10 @@ mod tests {
         next_pattern_slot: Option<PatternSnapshotSlot>,
         retired_pattern_slots: VecDeque<PatternSnapshotSlot>,
         removed_pads: Vec<PadId>,
+        capture: Option<CaptureController>,
+        capture_polls: Rc<Cell<usize>>,
+        runtime_errors: VecDeque<ControlError>,
+        capture_drop_order: Option<CaptureDropOrder>,
     }
 
     #[derive(Clone)]
@@ -603,6 +1048,10 @@ mod tests {
                 next_pattern_slot: None,
                 retired_pattern_slots: VecDeque::new(),
                 removed_pads: Vec::new(),
+                capture: None,
+                capture_polls: Rc::new(Cell::new(0)),
+                runtime_errors: VecDeque::new(),
+                capture_drop_order: None,
             }
         }
 
@@ -655,10 +1104,33 @@ mod tests {
         fn pattern_calls(&self) -> &[PatternCall] {
             &self.pattern_calls
         }
+
+        fn capture_ready(sample_rate: u32) -> (Self, CaptureCore, Rc<Cell<usize>>) {
+            let (controller, core) = capture_channels(4, 1);
+            let mut session = Self::ready(sample_rate, 2);
+            session.capture = Some(controller);
+            let polls = Rc::clone(&session.capture_polls);
+            (session, core, polls)
+        }
+
+        fn with_runtime_error(mut self, error: ControlError) -> Self {
+            self.runtime_errors.push_back(error);
+            self
+        }
+
+        fn with_capture_drop_order(mut self, order: CaptureDropOrder) -> Self {
+            self.capture_drop_order = Some(order);
+            self
+        }
     }
 
     impl Drop for FakeSession {
         fn drop(&mut self) {
+            if let Some(order) = &self.capture_drop_order {
+                order
+                    .borrow_mut()
+                    .push(("output", std::thread::current().id()));
+            }
             if let Some(ownership) = &self.ownership {
                 let owners_alive = ownership
                     .installed
@@ -840,7 +1312,97 @@ mod tests {
         }
 
         fn poll_error(&mut self) -> Option<Self::RuntimeError> {
+            self.runtime_errors.pop_front()
+        }
+
+        fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
+            self.capture.as_mut().unwrap().arm(buffer)
+        }
+
+        fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.capture.as_mut().unwrap().start(token)
+        }
+
+        fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.capture.as_mut().unwrap().stop(token)
+        }
+
+        fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.capture.as_mut().unwrap().cancel(token)
+        }
+
+        fn capture_status(&mut self) -> Option<CaptureStatus> {
             None
+        }
+
+        fn capture_completion(&mut self) -> Option<CaptureOutcome> {
+            self.capture_polls.set(self.capture_polls.get() + 1);
+            self.capture.as_mut().unwrap().try_next_outcome()
+        }
+    }
+
+    struct FakeInputSession {
+        controller: CaptureController,
+        core: CaptureCore,
+        sample_rate: u32,
+        polls: Rc<Cell<usize>>,
+        errors: VecDeque<ControlError>,
+        drop_order: CaptureDropOrder,
+    }
+
+    impl Drop for FakeInputSession {
+        fn drop(&mut self) {
+            self.drop_order
+                .borrow_mut()
+                .push(("input", std::thread::current().id()));
+        }
+    }
+
+    impl InputSessionLike for FakeInputSession {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
+            self.controller.arm(buffer)?;
+            self.core.poll_commands();
+            Ok(())
+        }
+
+        fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.controller.start(token)?;
+            self.core.poll_commands();
+            self.core.push_frame([0.5, -0.5]);
+            Ok(())
+        }
+
+        fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.controller.stop(token)?;
+            self.core.poll_commands();
+            Ok(())
+        }
+
+        fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
+            self.controller.cancel(token)?;
+            self.core.poll_commands();
+            Ok(())
+        }
+
+        fn capture_status(&mut self) -> Option<CaptureStatus> {
+            None
+        }
+
+        fn capture_completion(&mut self) -> Option<CaptureOutcome> {
+            self.polls.set(self.polls.get() + 1);
+            self.controller.try_next_outcome()
+        }
+
+        fn capture_state(&mut self) -> CaptureState {
+            self.controller.state()
+        }
+
+        fn poll_error(&mut self) -> Option<String> {
+            self.errors.pop_front().map(|error| error.to_string())
         }
     }
 
@@ -1067,5 +1629,157 @@ mod tests {
         assert_eq!(port.reclaim_retired(), 1);
 
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn input_capture_is_lazy_reused_and_exactly_routed() {
+        let (output, output_core, _) = FakeSession::capture_ready(48_000);
+        let (input_controller, input_core) = capture_channels(4, 1);
+        let input_polls = Rc::new(Cell::new(0));
+        let opens = Rc::new(Cell::new(0));
+        let drop_order = Rc::new(RefCell::new(Vec::new()));
+        let mut input = Some(FakeInputSession {
+            controller: input_controller,
+            core: input_core,
+            sample_rate: 44_100,
+            polls: Rc::clone(&input_polls),
+            errors: VecDeque::new(),
+            drop_order: Rc::clone(&drop_order),
+        });
+        let open_count = Rc::clone(&opens);
+        let mut port = SessionAudioPort::new_with_input_opener(output, move || {
+            open_count.set(open_count.get() + 1);
+            Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
+        });
+
+        assert_eq!(opens.get(), 0);
+        assert_eq!(
+            port.capture_source_rate(CaptureSource::Input).unwrap(),
+            44_100
+        );
+        assert_eq!(
+            port.capture_source_rate(CaptureSource::Input).unwrap(),
+            44_100
+        );
+        assert_eq!(opens.get(), 1);
+
+        port.begin_capture(
+            CaptureBuffer::try_new(1, PadId::first(), CaptureSource::Input, 44_100, 2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output_core.state(), CaptureState::Idle);
+        let status = port.capture_status(CaptureSource::Input).unwrap();
+        assert_eq!(status.state, CaptureState::Armed);
+        assert_eq!(status.token, 1);
+        assert_eq!(status.max_frames, 2);
+        port.start_capture(CaptureSource::Input, 1).unwrap();
+        port.stop_capture(CaptureSource::Input, 1).unwrap();
+
+        let maintenance = port.poll_capture_maintenance();
+        let CaptureOutcome::Completed(completion) =
+            maintenance.completion(CaptureSource::Input).unwrap()
+        else {
+            panic!("input capture must complete")
+        };
+        assert_eq!(completion.source, CaptureSource::Input);
+        assert_eq!(completion.sample_rate, 44_100);
+        assert!(maintenance.completion(CaptureSource::Resample).is_none());
+        assert_eq!(input_polls.get(), 1);
+    }
+
+    #[test]
+    fn maintenance_polls_each_source_completion_at_most_once_and_types_runtime_errors() {
+        let (output, _output_core, output_polls) = FakeSession::capture_ready(48_000);
+        let output = output.with_runtime_error(ControlError::ClosedSession);
+        let (input_controller, input_core) = capture_channels(4, 1);
+        let input_polls = Rc::new(Cell::new(0));
+        let drop_order = Rc::new(RefCell::new(Vec::new()));
+        let input = FakeInputSession {
+            controller: input_controller,
+            core: input_core,
+            sample_rate: 44_100,
+            polls: Rc::clone(&input_polls),
+            errors: VecDeque::from([ControlError::CommandQueueFull]),
+            drop_order,
+        };
+        let mut input = Some(input);
+        let mut port = SessionAudioPort::new_with_input_opener(output, move || {
+            Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
+        });
+        port.capture_source_rate(CaptureSource::Input).unwrap();
+
+        let maintenance: CaptureMaintenance = port.poll_capture_maintenance();
+
+        assert_eq!(output_polls.get(), 1);
+        assert_eq!(input_polls.get(), 1);
+        assert_eq!(
+            maintenance.runtime_error(CaptureSource::Resample),
+            Some(&CaptureError::OutputRuntime(
+                "audio session is closed after a runtime failure".into()
+            ))
+        );
+        assert_eq!(
+            maintenance.runtime_error(CaptureSource::Input),
+            Some(&CaptureError::InputRuntime(
+                "audio command queue is full".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn controller_full_begin_error_returns_the_exact_capture_buffer() {
+        let (mut output, _core, _) = FakeSession::capture_ready(48_000);
+        for token in 1..=4 {
+            output.capture.as_mut().unwrap().start(token).unwrap();
+        }
+        let mut port = SessionAudioPort::new(output);
+        let buffer =
+            CaptureBuffer::try_new(7, PadId::first(), CaptureSource::Resample, 48_000, 8).unwrap();
+        let pointer = buffer.stereo().as_ptr();
+
+        let failure: CaptureCommandFailure = port.begin_capture(buffer).unwrap_err();
+
+        assert_eq!(
+            failure.error(),
+            &CaptureError::Command(CoreCaptureError::CommandFull)
+        );
+        let CaptureCommand::Arm(returned) = failure.into_command() else {
+            panic!("begin failure must own the rejected arm command")
+        };
+        assert_eq!(returned.token(), 7);
+        assert_eq!(returned.stereo().as_ptr(), pointer);
+    }
+
+    #[test]
+    fn adapter_teardown_drops_input_before_output_on_the_app_thread() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let (output, _output_core, _) = FakeSession::capture_ready(48_000);
+        let output = output.with_capture_drop_order(Rc::clone(&order));
+        let (input_controller, input_core) = capture_channels(4, 1);
+        let input = FakeInputSession {
+            controller: input_controller,
+            core: input_core,
+            sample_rate: 44_100,
+            polls: Rc::new(Cell::new(0)),
+            errors: VecDeque::new(),
+            drop_order: Rc::clone(&order),
+        };
+        let mut input = Some(input);
+        let mut port = SessionAudioPort::new_with_input_opener(output, move || {
+            Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
+        });
+        port.capture_source_rate(CaptureSource::Input).unwrap();
+        port.begin_capture(
+            CaptureBuffer::try_new(1, PadId::first(), CaptureSource::Input, 44_100, 8).unwrap(),
+        )
+        .unwrap();
+        let app_thread = std::thread::current().id();
+
+        drop(port);
+
+        assert_eq!(
+            *order.borrow(),
+            [("input", app_thread), ("output", app_thread)]
+        );
     }
 }

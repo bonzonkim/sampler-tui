@@ -402,6 +402,7 @@ pub struct App {
     selected_pad: usize,
     pads: [PadView; PAD_VIEW_COUNT],
     patterns: PatternWorkspace,
+    capture_session: crate::CaptureSession,
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
@@ -472,6 +473,7 @@ impl App {
             selected_pad: 0,
             pads: array::from_fn(|_| PadView::default()),
             patterns: PatternWorkspace::new(pattern_sample_rate),
+            capture_session: crate::CaptureSession::default(),
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
@@ -549,6 +551,14 @@ impl App {
             pending_project_action: None,
             project_lifecycle_wait: None,
         }
+    }
+
+    pub const fn capture_session(&self) -> &crate::CaptureSession {
+        &self.capture_session
+    }
+
+    pub const fn capture_session_mut(&mut self) -> &mut crate::CaptureSession {
+        &mut self.capture_session
     }
 
     pub fn apply(&mut self, action: InputAction) {

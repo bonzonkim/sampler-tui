@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audio;
+pub mod capture;
 mod capture_store;
 pub mod cli;
 pub mod diagnostic;
@@ -22,6 +23,7 @@ pub use app::{
     SampleEditStatus,
 };
 pub use audio::AudioPort;
+pub use capture::{CaptureError, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};

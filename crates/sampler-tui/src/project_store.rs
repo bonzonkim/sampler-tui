@@ -408,7 +408,7 @@ impl ProjectStore {
     }
 }
 
-fn open_anchored_parent(
+pub(crate) fn open_anchored_parent(
     path: &Path,
     source_error: bool,
 ) -> Result<(File, std::ffi::OsString), ProjectStoreError> {
@@ -464,6 +464,35 @@ fn open_anchored_parent(
         }
     }
     Ok((directory, leaf))
+}
+
+pub(crate) fn revalidate_anchored_parent(
+    path: &Path,
+    opened: &File,
+) -> Result<(), ProjectStoreError> {
+    let (current, _) = open_anchored_parent(path, false)?;
+    let expected = rustix::fs::fstat(opened).map_err(|error| {
+        filesystem_error(
+            "inspect opened parent directory",
+            path,
+            io::Error::from(error),
+        )
+    })?;
+    let actual = rustix::fs::fstat(&current).map_err(|error| {
+        filesystem_error(
+            "inspect current parent directory",
+            path,
+            io::Error::from(error),
+        )
+    })?;
+    if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
+        return Err(ProjectStoreError::Filesystem {
+            operation: "verify destination parent identity",
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+        });
+    }
+    Ok(())
 }
 
 struct ProjectLock {
@@ -1139,7 +1168,7 @@ fn migrate_legacy(
 
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
 
-struct AnchoredTemp {
+pub(crate) struct AnchoredTemp {
     directory: File,
     identity: File,
     leaf: std::ffi::OsString,
@@ -1152,7 +1181,7 @@ impl AnchoredTemp {
         self.armed = false;
     }
 
-    fn verify_path_identity(&self) -> Result<(), ProjectStoreError> {
+    pub(crate) fn verify_path_identity(&self) -> Result<(), ProjectStoreError> {
         let current = rustix::fs::openat(
             &self.directory,
             &self.leaf,
@@ -1188,7 +1217,7 @@ impl AnchoredTemp {
         Ok(())
     }
 
-    fn unlink_owned(&mut self) -> Result<(), ProjectStoreError> {
+    pub(crate) fn unlink_owned(&mut self) -> Result<(), ProjectStoreError> {
         self.verify_path_identity()?;
         rustix::fs::unlinkat(&self.directory, &self.leaf, rustix::fs::AtFlags::empty()).map_err(
             |error| filesystem_error("remove temporary file", &self.path, io::Error::from(error)),
@@ -1197,7 +1226,7 @@ impl AnchoredTemp {
         Ok(())
     }
 
-    fn verify_destination_identity(
+    pub(crate) fn verify_destination_identity(
         &self,
         directory: &File,
         leaf: &Path,
@@ -1222,6 +1251,34 @@ impl AnchoredTemp {
         }
         Ok(())
     }
+
+    pub(crate) fn identity(&self) -> &File {
+        &self.identity
+    }
+
+    pub(crate) fn link_noreplace(
+        &self,
+        destination_directory: &File,
+        destination_leaf: &Path,
+    ) -> Result<NoReplacePublication, rustix::io::Errno> {
+        match rustix::fs::linkat(
+            &self.directory,
+            &self.leaf,
+            destination_directory,
+            destination_leaf,
+            rustix::fs::AtFlags::empty(),
+        ) {
+            Ok(()) => Ok(NoReplacePublication::Published),
+            Err(rustix::io::Errno::EXIST) => Ok(NoReplacePublication::DestinationExists),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoReplacePublication {
+    Published,
+    DestinationExists,
 }
 
 impl Drop for AnchoredTemp {
@@ -1416,15 +1473,9 @@ where
     checkpoint(hook, AtomicWritePoint::OwnerBeforePublish, &path, false)?;
     project.revalidate_path_identity()?;
     temporary.verify_path_identity()?;
-    match rustix::fs::linkat(
-        &project.file,
-        &temporary.leaf,
-        &project.file,
-        SAVE_AS_OWNER,
-        rustix::fs::AtFlags::empty(),
-    ) {
-        Ok(()) => {}
-        Err(rustix::io::Errno::EXIST) => {
+    match temporary.link_noreplace(&project.file, Path::new(SAVE_AS_OWNER)) {
+        Ok(NoReplacePublication::Published) => {}
+        Ok(NoReplacePublication::DestinationExists) => {
             return Err(ProjectStoreError::SaveAsTargetNotEmpty {
                 path: project.path.clone(),
             });
@@ -1462,7 +1513,7 @@ fn remove_save_as_owner(project: &ProjectDirectory) -> Result<(), ProjectStoreEr
         .map_err(|error| filesystem_error("sync save-as owner removal", &project.path, error))
 }
 
-fn create_anchored_temp(
+pub(crate) fn create_anchored_temp(
     directory: &File,
     directory_path: &Path,
     destination: &Path,
@@ -1640,32 +1691,24 @@ where
             )?;
             temporary.disarm();
         }
-        MetadataPublication::NoReplace => {
-            match rustix::fs::linkat(
-                &project.file,
-                &temporary.leaf,
-                &project.file,
-                leaf,
-                rustix::fs::AtFlags::empty(),
-            ) {
-                Ok(()) => {
-                    let _ = temporary.unlink_owned();
-                }
-                Err(rustix::io::Errno::EXIST) => {
-                    return Err(ProjectStoreError::SaveAsTargetNotEmpty {
-                        path: project.path.clone(),
-                    });
-                }
-                Err(error) => {
-                    return Err(atomic_error(
-                        destination,
-                        AtomicWritePoint::BeforeRename,
-                        io::Error::from(error).kind(),
-                        false,
-                    ));
-                }
+        MetadataPublication::NoReplace => match temporary.link_noreplace(&project.file, leaf) {
+            Ok(NoReplacePublication::Published) => {
+                let _ = temporary.unlink_owned();
             }
-        }
+            Ok(NoReplacePublication::DestinationExists) => {
+                return Err(ProjectStoreError::SaveAsTargetNotEmpty {
+                    path: project.path.clone(),
+                });
+            }
+            Err(error) => {
+                return Err(atomic_error(
+                    destination,
+                    AtomicWritePoint::BeforeRename,
+                    io::Error::from(error).kind(),
+                    false,
+                ));
+            }
+        },
     }
     checkpoint(
         hook,
@@ -1811,17 +1854,11 @@ where
     drop(output);
     checkpoint(hook, AtomicWritePoint::BeforeRename, destination, false)?;
     temporary.verify_path_identity()?;
-    match rustix::fs::linkat(
-        &audio.file,
-        &temporary.leaf,
-        &audio.file,
-        leaf,
-        rustix::fs::AtFlags::empty(),
-    ) {
-        Ok(()) => {
+    match temporary.link_noreplace(&audio.file, leaf) {
+        Ok(NoReplacePublication::Published) => {
             let _ = temporary.unlink_owned();
         }
-        Err(rustix::io::Errno::EXIST) => {
+        Ok(NoReplacePublication::DestinationExists) => {
             verify_existing_asset(audio, leaf, destination, expected)?;
             return Ok(());
         }

@@ -13,7 +13,7 @@ use sampler_core::{
 use sampler_tui::export::StagedExportPad;
 use sampler_tui::export_file::AtomicWavPublisher;
 use sampler_tui::{
-    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportToken, OfflineExportError,
+    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportToken, OfflineExportError, OfflineExportReceipt,
     OfflineExportSnapshot, OfflineFrameSink, OfflineRenderSummary, ProjectSavePad,
     SourceFingerprint, SupportedAudioExtension, render_offline,
 };
@@ -88,7 +88,10 @@ fn snapshot() -> OfflineExportSnapshot {
     .unwrap()
 }
 
-fn export_frames(destination: &Path, frames: &[[f32; 2]]) -> Result<(), OfflineExportError> {
+fn export_frames(
+    destination: &Path,
+    frames: &[[f32; 2]],
+) -> Result<OfflineExportReceipt, OfflineExportError> {
     let snapshot = snapshot();
     let cancelled = AtomicBool::new(false);
     let mut publisher = AtomicWavPublisher::prepare(destination)?;
@@ -101,8 +104,7 @@ fn export_frames(destination: &Path, frames: &[[f32; 2]]) -> Result<(), OfflineE
             peak: [0.5, 0.75],
         },
         &cancelled,
-    )?;
-    Ok(())
+    )
 }
 
 #[test]
@@ -111,7 +113,21 @@ fn publisher_writes_float_stereo_48k_and_never_overwrites() {
     let destination = fixture.path("mix.wav");
     let frames = [[0.25, -0.5], [0.5, -0.75]];
 
-    export_frames(&destination, &frames).unwrap();
+    let receipt = export_frames(&destination, &frames).unwrap();
+
+    assert_eq!(
+        receipt,
+        OfflineExportReceipt {
+            token: ExportToken::new(7),
+            destination: destination.clone(),
+            project_id: ProjectId::from_bytes([0x44; 16]),
+            revision: 9,
+            slot: PatternSlotId::new(0).unwrap(),
+            sample_rate: 48_000,
+            rendered_frames: 2,
+            file_bytes: fs::metadata(&destination).unwrap().len(),
+        }
+    );
 
     let mut reader = WavReader::open(&destination).unwrap();
     assert_eq!(reader.spec().channels, 2);

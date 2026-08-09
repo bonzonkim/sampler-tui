@@ -1529,11 +1529,41 @@ fn create_anchored_temp_with_entropy<F>(
     directory: &File,
     directory_path: &Path,
     destination: &Path,
-    mut fill_entropy: F,
+    fill_entropy: F,
 ) -> Result<(File, AnchoredTemp), ProjectStoreError>
 where
     F: FnMut(&mut [u8; 32]) -> Result<(), ProjectStoreError>,
 {
+    create_anchored_temp_with_entropy_and_clone(
+        directory,
+        directory_path,
+        destination,
+        fill_entropy,
+        |_, file| file.try_clone(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempClonePoint {
+    DirectoryHandle,
+    WriterHandle,
+}
+
+fn create_anchored_temp_with_entropy_and_clone<F, C>(
+    directory: &File,
+    directory_path: &Path,
+    destination: &Path,
+    mut fill_entropy: F,
+    mut clone_file: C,
+) -> Result<(File, AnchoredTemp), ProjectStoreError>
+where
+    F: FnMut(&mut [u8; 32]) -> Result<(), ProjectStoreError>,
+    C: FnMut(TempClonePoint, &File) -> io::Result<File>,
+{
+    // Clone directory authority before creating an entry. Once CREATE|EXCL succeeds, ownership is
+    // immediately armed around the returned file; the only later clone is therefore drop-safe.
+    let owned_directory = clone_file(TempClonePoint::DirectoryHandle, directory)
+        .map_err(|error| filesystem_error("clone directory handle", directory_path, error))?;
     let base = destination
         .file_name()
         .and_then(|name| name.to_str())
@@ -1548,29 +1578,24 @@ where
         }
         let leaf = std::ffi::OsString::from(format!(".{base}.sampler-tui-tmp-{nonce}"));
         match rustix::fs::openat(
-            directory,
+            &owned_directory,
             &leaf,
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         ) {
             Ok(owned) => {
-                let file = File::from(owned);
-                let identity = file.try_clone().map_err(|error| {
-                    filesystem_error("retain temporary file identity", destination, error)
-                })?;
-                let directory = directory.try_clone().map_err(|error| {
-                    filesystem_error("clone directory handle", directory_path, error)
-                })?;
-                return Ok((
-                    file,
-                    AnchoredTemp {
-                        directory,
-                        identity,
-                        path: directory_path.join(&leaf),
-                        leaf,
-                        armed: true,
-                    },
-                ));
+                let temporary = AnchoredTemp {
+                    directory: owned_directory,
+                    identity: File::from(owned),
+                    path: directory_path.join(&leaf),
+                    leaf,
+                    armed: true,
+                };
+                let writer = clone_file(TempClonePoint::WriterHandle, &temporary.identity)
+                    .map_err(|error| {
+                        filesystem_error("clone temporary writer handle", destination, error)
+                    })?;
+                return Ok((writer, temporary));
             }
             Err(rustix::io::Errno::EXIST) => continue,
             Err(error) => {
@@ -1897,7 +1922,7 @@ where
 mod tests {
     use std::{
         fs,
-        io::Cursor,
+        io::{self, Cursor},
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -2357,6 +2382,68 @@ mod tests {
             }
         ));
         assert_eq!(fs::read(collision).unwrap(), b"foreign collision");
+    }
+
+    #[test]
+    fn every_temp_handle_clone_failure_preserves_the_exact_directory_entry_set() {
+        for failing in [
+            TempClonePoint::DirectoryHandle,
+            TempClonePoint::WriterHandle,
+        ] {
+            let fixture = ProjectFixture::new();
+            fs::write(fixture.directory.join("foreign-entry"), b"foreign").unwrap();
+            let project = ProjectDirectory::open_existing(&fixture.directory).unwrap();
+            let destination = fixture.directory.join("project.toml");
+            let before = fs::read_dir(&fixture.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            let result = create_anchored_temp_with_entropy_and_clone(
+                &project.file,
+                &project.path,
+                &destination,
+                |entropy| {
+                    entropy.fill(0x5a);
+                    Ok(())
+                },
+                |point, file| {
+                    if point == failing {
+                        Err(io::Error::other("injected clone failure"))
+                    } else {
+                        file.try_clone()
+                    }
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("{failing:?} must fail"),
+            };
+            assert_eq!(
+                error,
+                ProjectStoreError::Filesystem {
+                    operation: match failing {
+                        TempClonePoint::DirectoryHandle => "clone directory handle",
+                        TempClonePoint::WriterHandle => "clone temporary writer handle",
+                    },
+                    path: match failing {
+                        TempClonePoint::DirectoryHandle => project.path.clone(),
+                        TempClonePoint::WriterHandle => destination.clone(),
+                    },
+                    kind: io::ErrorKind::Other,
+                }
+            );
+
+            let after = fs::read_dir(&fixture.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(after, before, "{failing:?}");
+            assert_eq!(
+                fs::read(fixture.directory.join("foreign-entry")).unwrap(),
+                b"foreign"
+            );
+        }
     }
 
     #[test]

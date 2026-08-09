@@ -1,7 +1,10 @@
 use std::fs::File;
-use std::io;
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rustix::fs::FileType as RustixFileType;
@@ -18,49 +21,223 @@ use crate::project_store::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublisherCheckpoint {
-    AfterPrepare,
-    BeforeWrite,
-    BeforeFinalize,
-    BeforeFileSync,
     BeforePublish,
     BeforeDirectorySync,
 }
 
 #[cfg(test)]
-type FailureHook = Box<dyn FnMut(PublisherCheckpoint) -> Option<io::ErrorKind>>;
+type MutationHook = Box<dyn FnMut(PublisherCheckpoint)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterPhase {
+    #[cfg(test)]
+    Header,
+    Samples,
+    Finalize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublisherFault {
+    HeaderWrite,
+    PartialSampleWrite,
+    FinalizeWrite,
+    FileSync,
+    Link,
+    DirectorySync { failures: usize },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PublisherFaultState {
+    fault: PublisherFault,
+    writer_phase: WriterPhase,
+    writer_fault_consumed: bool,
+    partial_write_started: bool,
+    directory_sync_failures_remaining: usize,
+}
+
+struct PublisherFile {
+    file: File,
+    #[cfg(test)]
+    faults: Option<Arc<Mutex<PublisherFaultState>>>,
+}
+
+impl Write for PublisherFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            let mut state = faults.lock().expect("publisher fault mutex poisoned");
+            let fail_phase = match state.fault {
+                PublisherFault::HeaderWrite => Some(WriterPhase::Header),
+                PublisherFault::PartialSampleWrite => Some(WriterPhase::Samples),
+                PublisherFault::FinalizeWrite => Some(WriterPhase::Finalize),
+                _ => None,
+            };
+            if fail_phase == Some(state.writer_phase) && !state.writer_fault_consumed {
+                if state.fault == PublisherFault::PartialSampleWrite && !state.partial_write_started
+                {
+                    let partial = bytes.len().min(2);
+                    let written = self.file.write(&bytes[..partial])?;
+                    state.partial_write_started = true;
+                    return Ok(written);
+                }
+                state.writer_fault_consumed = true;
+                return Err(io::Error::other("injected publisher writer failure"));
+            }
+        }
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for PublisherFile {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+#[derive(Default)]
+struct PublisherIo {
+    #[cfg(test)]
+    faults: Option<Arc<Mutex<PublisherFaultState>>>,
+}
+
+impl PublisherIo {
+    #[cfg(test)]
+    fn with_fault(fault: PublisherFault) -> Self {
+        let directory_sync_failures_remaining = match fault {
+            PublisherFault::DirectorySync { failures } => failures,
+            _ => 0,
+        };
+        Self {
+            faults: Some(Arc::new(Mutex::new(PublisherFaultState {
+                fault,
+                writer_phase: WriterPhase::Header,
+                writer_fault_consumed: false,
+                partial_write_started: false,
+                directory_sync_failures_remaining,
+            }))),
+        }
+    }
+
+    fn wrap_file(&self, file: File) -> PublisherFile {
+        PublisherFile {
+            file,
+            #[cfg(test)]
+            faults: self.faults.clone(),
+        }
+    }
+
+    fn set_writer_phase(&self, phase: WriterPhase) {
+        #[cfg(not(test))]
+        let _ = phase;
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            faults
+                .lock()
+                .expect("publisher fault mutex poisoned")
+                .writer_phase = phase;
+        }
+    }
+
+    fn sync_file(&self, file: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            let mut state = faults.lock().expect("publisher fault mutex poisoned");
+            if state.fault == PublisherFault::FileSync && !state.writer_fault_consumed {
+                state.writer_fault_consumed = true;
+                return Err(io::Error::other("injected file sync failure"));
+            }
+        }
+        file.sync_all()
+    }
+
+    fn link_noreplace(
+        &self,
+        temporary: &AnchoredTemp,
+        parent: &File,
+        leaf: &Path,
+    ) -> io::Result<NoReplacePublication> {
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            let mut state = faults.lock().expect("publisher fault mutex poisoned");
+            if state.fault == PublisherFault::Link && !state.writer_fault_consumed {
+                state.writer_fault_consumed = true;
+                return Err(io::Error::other("injected linkat failure"));
+            }
+        }
+        temporary
+            .link_noreplace(parent, leaf)
+            .map_err(io::Error::from)
+    }
+
+    fn sync_directory(&self, directory: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(faults) = &self.faults {
+            let mut state = faults.lock().expect("publisher fault mutex poisoned");
+            if state.directory_sync_failures_remaining != 0 {
+                state.directory_sync_failures_remaining -= 1;
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+        }
+        directory.sync_all()
+    }
+}
 
 /// Streams bounded stereo frames into an identity-owned temporary WAV and atomically publishes it.
 pub struct AtomicWavPublisher {
-    writer: Option<WavWriter<File>>,
+    writer: Option<WavWriter<PublisherFile>>,
     temporary: AnchoredTemp,
     parent: File,
     destination_leaf: std::ffi::OsString,
     destination: PathBuf,
     written_frames: u64,
+    io: PublisherIo,
     #[cfg(test)]
-    hook: FailureHook,
+    mutation_hook: MutationHook,
 }
 
 impl AtomicWavPublisher {
     pub fn prepare(destination: &Path) -> Result<Self, OfflineExportError> {
         Self::prepare_internal(
             destination,
+            PublisherIo::default(),
             #[cfg(test)]
-            Box::new(|_| None),
+            Box::new(|_| {}),
         )
     }
 
     #[cfg(test)]
-    fn prepare_with_hook<F>(destination: &Path, hook: F) -> Result<Self, OfflineExportError>
+    fn prepare_with_mutation_hook<F>(
+        destination: &Path,
+        hook: F,
+    ) -> Result<Self, OfflineExportError>
     where
-        F: FnMut(PublisherCheckpoint) -> Option<io::ErrorKind> + 'static,
+        F: FnMut(PublisherCheckpoint) + 'static,
     {
-        Self::prepare_internal(destination, Box::new(hook))
+        Self::prepare_internal(destination, PublisherIo::default(), Box::new(hook))
+    }
+
+    #[cfg(test)]
+    fn prepare_with_fault(
+        destination: &Path,
+        fault: PublisherFault,
+    ) -> Result<Self, OfflineExportError> {
+        Self::prepare_internal(
+            destination,
+            PublisherIo::with_fault(fault),
+            Box::new(|_| {}),
+        )
     }
 
     fn prepare_internal(
         destination: &Path,
-        #[cfg(test)] hook: FailureHook,
+        io: PublisherIo,
+        #[cfg(test)] mutation_hook: MutationHook,
     ) -> Result<Self, OfflineExportError> {
         validate_wav_destination(destination)?;
         let (parent, destination_leaf) = open_anchored_parent(destination, false)
@@ -95,7 +272,7 @@ impl AtomicWavPublisher {
         )
         .map_err(|error| temporary_error(destination, error))?;
         let writer = WavWriter::new(
-            file,
+            io.wrap_file(file),
             WavSpec {
                 channels: 2,
                 sample_rate: EXPORT_SAMPLE_RATE,
@@ -104,17 +281,18 @@ impl AtomicWavPublisher {
             },
         )
         .map_err(|_| OfflineExportError::Encode(destination.to_path_buf()))?;
-        let mut publisher = Self {
+        io.set_writer_phase(WriterPhase::Samples);
+        let publisher = Self {
             writer: Some(writer),
             temporary,
             parent,
             destination_leaf,
             destination: destination.to_path_buf(),
             written_frames: 0,
+            io,
             #[cfg(test)]
-            hook,
+            mutation_hook,
         };
-        publisher.checkpoint(PublisherCheckpoint::AfterPrepare)?;
         Ok(publisher)
     }
 
@@ -140,20 +318,17 @@ impl AtomicWavPublisher {
             return Err(OfflineExportError::Arithmetic);
         }
 
-        self.checkpoint(PublisherCheckpoint::BeforeFinalize)?;
-        let mut writer = self
+        self.io.set_writer_phase(WriterPhase::Finalize);
+        let writer = self
             .writer
             .take()
             .ok_or_else(|| OfflineExportError::Encode(self.destination.clone()))?;
         writer
-            .flush()
-            .and_then(|()| writer.finalize())
+            .finalize()
             .map_err(|_| OfflineExportError::Encode(self.destination.clone()))?;
 
-        self.checkpoint(PublisherCheckpoint::BeforeFileSync)?;
-        self.temporary
-            .identity()
-            .sync_all()
+        self.io
+            .sync_file(self.temporary.identity())
             .map_err(|error| OfflineExportError::Sync {
                 path: self.destination.clone(),
                 kind: error.kind(),
@@ -168,7 +343,7 @@ impl AtomicWavPublisher {
             })?
             .len();
 
-        self.checkpoint(PublisherCheckpoint::BeforePublish)?;
+        self.mutate(PublisherCheckpoint::BeforePublish);
         if cancelled.load(Ordering::Acquire) {
             return Err(OfflineExportError::Cancelled);
         }
@@ -177,10 +352,11 @@ impl AtomicWavPublisher {
         self.temporary
             .verify_path_identity()
             .map_err(|error| publish_error(&self.destination, error))?;
-        match self
-            .temporary
-            .link_noreplace(&self.parent, Path::new(&self.destination_leaf))
-        {
+        match self.io.link_noreplace(
+            &self.temporary,
+            &self.parent,
+            Path::new(&self.destination_leaf),
+        ) {
             Ok(NoReplacePublication::Published) => {}
             Ok(NoReplacePublication::DestinationExists) => {
                 return Err(OfflineExportError::DestinationExists(
@@ -190,7 +366,7 @@ impl AtomicWavPublisher {
             Err(error) => {
                 return Err(OfflineExportError::Publish {
                     path: self.destination.clone(),
-                    kind: io::Error::from(error).kind(),
+                    kind: error.kind(),
                 });
             }
         }
@@ -215,6 +391,7 @@ impl AtomicWavPublisher {
     }
 
     fn finish_publication(&mut self) -> Result<(), OfflineExportError> {
+        self.mutate(PublisherCheckpoint::BeforeDirectorySync);
         self.temporary
             .verify_destination_identity(
                 &self.parent,
@@ -226,11 +403,10 @@ impl AtomicWavPublisher {
         self.temporary
             .unlink_owned()
             .map_err(|error| cleanup_error(&self.destination, error))?;
-        self.checkpoint(PublisherCheckpoint::BeforeDirectorySync)?;
         revalidate_anchored_parent(&self.destination, &self.parent)
             .map_err(|error| publish_error(&self.destination, error))?;
-        self.parent
-            .sync_all()
+        self.io
+            .sync_directory(&self.parent)
             .map_err(|error| OfflineExportError::Sync {
                 path: self.destination.clone(),
                 kind: error.kind(),
@@ -255,8 +431,8 @@ impl AtomicWavPublisher {
             path: self.destination.clone(),
             kind: io::Error::from(error).kind(),
         })?;
-        self.parent
-            .sync_all()
+        self.io
+            .sync_directory(&self.parent)
             .map_err(|error| OfflineExportError::Cleanup {
                 path: self.destination.clone(),
                 kind: error.kind(),
@@ -264,34 +440,11 @@ impl AtomicWavPublisher {
     }
 
     #[cfg(not(test))]
-    fn checkpoint(&mut self, _point: PublisherCheckpoint) -> Result<(), OfflineExportError> {
-        Ok(())
-    }
+    fn mutate(&mut self, _point: PublisherCheckpoint) {}
 
     #[cfg(test)]
-    fn checkpoint(&mut self, point: PublisherCheckpoint) -> Result<(), OfflineExportError> {
-        let Some(kind) = (self.hook)(point) else {
-            return Ok(());
-        };
-        Err(match point {
-            PublisherCheckpoint::AfterPrepare => OfflineExportError::TemporaryFile {
-                path: self.destination.clone(),
-                kind,
-            },
-            PublisherCheckpoint::BeforeWrite | PublisherCheckpoint::BeforeFinalize => {
-                OfflineExportError::Encode(self.destination.clone())
-            }
-            PublisherCheckpoint::BeforeFileSync | PublisherCheckpoint::BeforeDirectorySync => {
-                OfflineExportError::Sync {
-                    path: self.destination.clone(),
-                    kind,
-                }
-            }
-            PublisherCheckpoint::BeforePublish => OfflineExportError::Publish {
-                path: self.destination.clone(),
-                kind,
-            },
-        })
+    fn mutate(&mut self, point: PublisherCheckpoint) {
+        (self.mutation_hook)(point);
     }
 }
 
@@ -300,7 +453,6 @@ impl OfflineFrameSink for AtomicWavPublisher {
         if frames.is_empty() || frames.len() > EXPORT_CHUNK_FRAMES {
             return Err(OfflineExportError::Encode(self.destination.clone()));
         }
-        self.checkpoint(PublisherCheckpoint::BeforeWrite)?;
         let writer = self
             .writer
             .as_mut()
@@ -353,7 +505,7 @@ fn cleanup_error(destination: &Path, error: ProjectStoreError) -> OfflineExportE
 mod tests {
     use std::fs;
     use std::io;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -369,7 +521,7 @@ mod tests {
         SupportedAudioExtension,
     };
 
-    use super::{AtomicWavPublisher, PublisherCheckpoint};
+    use super::{AtomicWavPublisher, PublisherCheckpoint, PublisherFault};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -403,6 +555,13 @@ mod tests {
                         .to_string_lossy()
                         .starts_with(".mix.wav.sampler-tui-tmp-")
                 })
+                .collect()
+        }
+
+        fn entry_names(&self) -> std::collections::BTreeSet<std::ffi::OsString> {
+            fs::read_dir(&self.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
                 .collect()
         }
     }
@@ -474,32 +633,88 @@ mod tests {
             .map(|_| ())
     }
 
-    fn failure_result(
-        destination: &Path,
-        point: PublisherCheckpoint,
-    ) -> Result<(), OfflineExportError> {
-        let hook = move |candidate| (candidate == point).then_some(io::ErrorKind::Other);
-        let mut publisher = AtomicWavPublisher::prepare_with_hook(destination, hook)?;
-        publisher.write_frames(&[[0.25, -0.5]])?;
-        publish(publisher, &AtomicBool::new(false))
+    #[test]
+    fn writer_faults_are_observed_from_header_partial_sample_and_finalize_io() {
+        for fault in [
+            PublisherFault::HeaderWrite,
+            PublisherFault::PartialSampleWrite,
+            PublisherFault::FinalizeWrite,
+        ] {
+            let fixture = Fixture::new("writer-io-fault");
+            fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
+            let destination = fixture.destination();
+            let before = fixture.entry_names();
+
+            let result = match AtomicWavPublisher::prepare_with_fault(&destination, fault) {
+                Err(error) => Err(error),
+                Ok(mut publisher) => match publisher.write_frames(&[[0.25, -0.5]]) {
+                    Err(error) => Err(error),
+                    Ok(()) => publish(publisher, &AtomicBool::new(false)),
+                },
+            };
+
+            assert_eq!(result, Err(OfflineExportError::Encode(destination)));
+            assert_eq!(fixture.entry_names(), before, "{fault:?}");
+            assert_eq!(
+                fs::read(fixture.root.join("foreign-entry")).unwrap(),
+                b"foreign"
+            );
+        }
     }
 
     #[test]
-    fn every_injected_failure_fence_preserves_an_absent_destination_and_cleans_owned_temp() {
-        for point in [
-            PublisherCheckpoint::AfterPrepare,
-            PublisherCheckpoint::BeforeWrite,
-            PublisherCheckpoint::BeforeFinalize,
-            PublisherCheckpoint::BeforeFileSync,
-            PublisherCheckpoint::BeforePublish,
-            PublisherCheckpoint::BeforeDirectorySync,
+    fn sync_link_and_repeated_rollback_sync_faults_return_exact_errors_and_no_destination() {
+        for (fault, expected) in [
+            (
+                PublisherFault::FileSync,
+                OfflineExportError::Sync {
+                    path: PathBuf::new(),
+                    kind: io::ErrorKind::Other,
+                },
+            ),
+            (
+                PublisherFault::Link,
+                OfflineExportError::Publish {
+                    path: PathBuf::new(),
+                    kind: io::ErrorKind::Other,
+                },
+            ),
+            (
+                PublisherFault::DirectorySync { failures: 1 },
+                OfflineExportError::Sync {
+                    path: PathBuf::new(),
+                    kind: io::ErrorKind::Other,
+                },
+            ),
+            (
+                PublisherFault::DirectorySync { failures: 2 },
+                OfflineExportError::Cleanup {
+                    path: PathBuf::new(),
+                    kind: io::ErrorKind::Other,
+                },
+            ),
         ] {
-            let fixture = Fixture::new("failure-matrix");
+            let fixture = Fixture::new("publication-io-fault");
+            fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
             let destination = fixture.destination();
+            let before = fixture.entry_names();
+            let mut publisher =
+                AtomicWavPublisher::prepare_with_fault(&destination, fault).unwrap();
+            publisher.write_frames(&[[0.25, -0.5]]).unwrap();
 
-            assert!(failure_result(&destination, point).is_err(), "{point:?}");
-            assert!(!destination.exists(), "{point:?}");
-            assert!(fixture.temp_entries().is_empty(), "{point:?}");
+            let mut expected = expected;
+            match &mut expected {
+                OfflineExportError::Sync { path, .. }
+                | OfflineExportError::Publish { path, .. }
+                | OfflineExportError::Cleanup { path, .. } => *path = destination.clone(),
+                _ => unreachable!(),
+            }
+            assert_eq!(publish(publisher, &AtomicBool::new(false)), Err(expected));
+            assert_eq!(fixture.entry_names(), before, "{fault:?}");
+            assert_eq!(
+                fs::read(fixture.root.join("foreign-entry")).unwrap(),
+                b"foreign"
+            );
         }
     }
 
@@ -516,9 +731,9 @@ mod tests {
             {
                 fs::write(&hook_destination, b"foreign destination").unwrap();
             }
-            None
         };
-        let mut publisher = AtomicWavPublisher::prepare_with_hook(&destination, hook).unwrap();
+        let mut publisher =
+            AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
         publisher.write_frames(&[[0.25, -0.5]]).unwrap();
 
         assert_eq!(
@@ -526,6 +741,47 @@ mod tests {
             Err(OfflineExportError::DestinationExists(destination.clone()))
         );
         assert_eq!(fs::read(&destination).unwrap(), b"foreign destination");
+        assert!(fixture.temp_entries().is_empty());
+    }
+
+    #[test]
+    fn post_link_destination_substitution_never_returns_a_receipt_or_deletes_foreign_bytes() {
+        let fixture = Fixture::new("post-link-destination-substitution");
+        let destination = fixture.destination();
+        let hook_destination = destination.clone();
+        let substituted = Arc::new(AtomicBool::new(false));
+        let hook_substituted = Arc::clone(&substituted);
+        let hook = move |point| {
+            if point == PublisherCheckpoint::BeforeDirectorySync
+                && !hook_substituted.swap(true, Ordering::AcqRel)
+            {
+                fs::remove_file(&hook_destination).unwrap();
+                fs::write(&hook_destination, b"foreign post-link destination").unwrap();
+            }
+        };
+        let mut publisher =
+            AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
+        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+
+        assert_eq!(
+            publisher.publish(
+                ExportToken::new(21),
+                &snapshot(),
+                OfflineRenderSummary {
+                    frame_count: 1,
+                    peak: [0.25, 0.5],
+                },
+                &AtomicBool::new(false),
+            ),
+            Err(OfflineExportError::Cleanup {
+                path: destination.clone(),
+                kind: io::ErrorKind::Other,
+            })
+        );
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"foreign post-link destination"
+        );
         assert!(fixture.temp_entries().is_empty());
     }
 
@@ -540,9 +796,9 @@ mod tests {
                 if cancel_at_fence && point == PublisherCheckpoint::BeforePublish {
                     hook_cancelled.store(true, Ordering::Release);
                 }
-                None
             };
-            let mut publisher = AtomicWavPublisher::prepare_with_hook(&destination, hook).unwrap();
+            let mut publisher =
+                AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
             publisher.write_frames(&[[0.25, -0.5]]).unwrap();
 
             assert_eq!(
@@ -570,23 +826,21 @@ mod tests {
                 fs::rename(&hook_root, &hook_held).unwrap();
                 fs::create_dir(&hook_root).unwrap();
             }
-            None
         };
-        let mut publisher = AtomicWavPublisher::prepare_with_hook(&destination, hook).unwrap();
+        let mut publisher =
+            AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
         publisher.write_frames(&[[0.25, -0.5]]).unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             publish(publisher, &AtomicBool::new(false)),
-            Err(OfflineExportError::Publish { .. })
-        ));
+            Err(OfflineExportError::Publish {
+                path: destination.clone(),
+                kind: io::ErrorKind::Other,
+            })
+        );
         assert!(!destination.exists());
-        assert!(fs::read_dir(&held).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with('.')
-        }));
+        assert!(!held.join("mix.wav").exists());
+        assert_eq!(fs::read_dir(&held).unwrap().count(), 0);
         fs::remove_dir_all(held).unwrap();
     }
 }

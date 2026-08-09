@@ -2998,11 +2998,25 @@ impl App {
     }
 
     pub fn request_resample(&mut self) -> Result<(), CaptureError> {
-        self.request_capture(CaptureSource::Resample, MAX_CAPTURE_FRAMES)
+        self.request_capture_with_frame_limit(CaptureSource::Resample, MAX_CAPTURE_FRAMES)
     }
 
     pub fn request_input_recording(&mut self) -> Result<(), CaptureError> {
-        self.request_capture(CaptureSource::Input, MAX_CAPTURE_FRAMES)
+        self.request_capture_with_frame_limit(CaptureSource::Input, MAX_CAPTURE_FRAMES)
+    }
+
+    /// Requests a capture with an explicit bounded frame limit.
+    ///
+    /// This follows the same admission, confirmation, finalization, and transactional install
+    /// workflow as the interactive capture commands. The limit is validated by the capture
+    /// buffer before any callback state changes, which lets constrained hosts choose a smaller
+    /// deterministic bound while the built-in commands continue to use [`MAX_CAPTURE_FRAMES`].
+    pub fn request_capture_with_frame_limit(
+        &mut self,
+        source: CaptureSource,
+        max_frames: usize,
+    ) -> Result<(), CaptureError> {
+        self.request_capture(source, max_frames)
     }
 
     #[cfg(test)]
@@ -3011,7 +3025,7 @@ impl App {
         source: CaptureSource,
         max_frames: usize,
     ) -> Result<(), CaptureError> {
-        self.request_capture(source, max_frames)
+        self.request_capture_with_frame_limit(source, max_frames)
     }
 
     fn request_capture(

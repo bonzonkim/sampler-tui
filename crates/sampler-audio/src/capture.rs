@@ -481,7 +481,7 @@ impl CaptureCore {
             .is_some_and(|buffer| buffer.stereo.is_empty())
         {
             self.record_error(CaptureError::EmptyCapture);
-            self.finish_cancelled();
+            self.finish_completed(false);
             return;
         }
         self.finish_completed(false);

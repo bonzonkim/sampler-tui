@@ -419,10 +419,12 @@ mod tests {
         controller.stop(9).unwrap();
         core.poll_commands();
         assert_eq!(core.take_error(), Some(CaptureError::EmptyCapture));
-        let CaptureOutcome::Cancelled(buffer) = controller.try_next_outcome().unwrap() else {
-            panic!("idle callback must leave the armed buffer empty");
+        let CaptureOutcome::Completed(completion) = controller.try_next_outcome().unwrap() else {
+            panic!("empty stop must return typed completion ownership to App");
         };
-        assert!(buffer.stereo().is_empty());
+        assert!(completion.stereo.is_empty());
+        assert_eq!(completion.peak, 0.0);
+        assert!(!completion.hard_limit);
     }
 
     #[test]

@@ -17,6 +17,18 @@ pub enum ModelError {
     PanOutOfRange,
     #[error("pitch must be finite and in -24..=24 semitones")]
     PitchOutOfRange,
+    #[error("send must be finite and in 0..=1")]
+    SendOutOfRange,
+    #[error("delay time must be in 10..=2000 ms")]
+    DelayTimeOutOfRange,
+    #[error("delay feedback must be finite and in 0..=0.95")]
+    FeedbackOutOfRange,
+    #[error("effect parameter must be finite and in 0..=1")]
+    EffectParameterOutOfRange,
+    #[error("effect return gain must be finite and in -60..=6 dB")]
+    ReturnGainOutOfRange,
+    #[error("master gain must be finite and in -60..=6 dB")]
+    MasterGainOutOfRange,
     #[error("tempo must be finite and in 20..=300 BPM")]
     TempoOutOfRange,
     #[error("unsupported meter {numerator}/{denominator}")]

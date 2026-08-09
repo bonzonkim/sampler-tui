@@ -1,4 +1,5 @@
 pub mod error;
+pub mod mixer;
 pub mod pad;
 pub mod pattern;
 pub mod project;
@@ -7,6 +8,7 @@ pub mod transport;
 pub mod voice;
 
 pub use error::{PatternCompileError, PatternEditError, SampleEditError};
+pub use mixer::{DelaySettings, MasterMixSettings, PadMixSettings, ReverbSettings};
 pub use pad::{BankId, ChokeGroup, ModelError, PadId, PadSettings, PlaybackMode};
 pub use pattern::{
     EditablePattern, EventId, FIRST_LOOP_VALID_MASK_WORDS, MAX_PATTERN_ACTIONS, MAX_PATTERN_EVENTS,

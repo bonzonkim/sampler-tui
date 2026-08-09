@@ -5,6 +5,12 @@ pub const PADS_PER_BANK: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
+    #[error("MIDI note {0} is outside 0..=127")]
+    MidiNoteOutOfRange(u8),
+    #[error("MIDI channel {0} is outside 1..=16")]
+    MidiChannelOutOfRange(u8),
+    #[error("MIDI note {0} is assigned more than once in one bank")]
+    DuplicateMidiNote(u8),
     #[error("bank {0} is outside 0..10")]
     BankOutOfRange(u8),
     #[error("pad {0} is outside 0..16")]

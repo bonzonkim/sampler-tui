@@ -6,6 +6,7 @@ mod decode;
 mod device;
 mod engine;
 mod error;
+mod input;
 mod resample;
 mod sample;
 
@@ -29,8 +30,9 @@ pub use device::{AudioSession, write_frames};
 pub use engine::AudioEngine;
 pub use error::{
     CaptureError, ControlError, DecodeError, DeviceBufferError, DeviceError, EngineError,
-    PrepareError, SampleError,
+    InputBufferError, InputDeviceError, PrepareError, SampleError,
 };
+pub use input::{InputCaptureSession, write_input_device};
 pub use resample::{prepare_sample, prepare_sample_with_frame_limit};
 pub use sample::{SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot};
 pub use sampler_core::{Frame, PadId, PadSettings};

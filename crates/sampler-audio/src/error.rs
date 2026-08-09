@@ -124,6 +124,14 @@ pub enum DeviceBufferError {
     FrameCountMismatch { frames: usize, output_frames: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InputBufferError {
+    #[error("input device channel count must be non-zero")]
+    ZeroChannels,
+    #[error("input buffer length {samples} is not divisible by {channels} channels")]
+    MisalignedInput { samples: usize, channels: usize },
+}
+
 #[derive(Debug, Error)]
 pub enum DeviceError {
     #[error("no default output device is available")]
@@ -139,5 +147,23 @@ pub enum DeviceError {
     #[error("could not start the output stream: {0}")]
     PlayStream(#[source] cpal::Error),
     #[error("output stream failed: {0}")]
+    Runtime(#[source] cpal::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum InputDeviceError {
+    #[error("no default input device is available")]
+    NoDefaultInputDevice,
+    #[error("could not query the default input configuration: {0}")]
+    DefaultInputConfig(#[source] cpal::Error),
+    #[error("unsupported input configuration: {channels} channels at {sample_rate} Hz")]
+    UnsupportedConfiguration { sample_rate: u32, channels: u16 },
+    #[error("unsupported input sample format: {0}")]
+    UnsupportedSampleFormat(cpal::SampleFormat),
+    #[error("could not build the input stream: {0}")]
+    BuildStream(#[source] cpal::Error),
+    #[error("could not start the input stream: {0}")]
+    PlayStream(#[source] cpal::Error),
+    #[error("input stream failed: {0}")]
     Runtime(#[source] cpal::Error),
 }

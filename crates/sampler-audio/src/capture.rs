@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sampler_core::PadId;
@@ -161,6 +161,7 @@ impl CaptureState {
 
 struct CaptureShared {
     state: AtomicU8,
+    failed: AtomicBool,
 }
 
 impl CaptureShared {
@@ -184,6 +185,14 @@ impl CaptureShared {
             .map_err(CaptureState::from_raw)
     }
 
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     fn release_arm_reservation(&self) {
         let _ = self.state.compare_exchange(
             CaptureState::ARMED,
@@ -200,9 +209,26 @@ pub struct CaptureController {
     shared: Arc<CaptureShared>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CaptureFailureHandle {
+    shared: Arc<CaptureShared>,
+}
+
+impl CaptureFailureHandle {
+    pub(crate) fn mark_failed(&self) {
+        self.shared.mark_failed();
+    }
+}
+
 impl CaptureController {
     pub fn arm(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
         let command = CaptureCommand::Arm(buffer);
+        if self.shared.is_failed() {
+            return Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                command,
+            ));
+        }
         match self.shared.reserve_arm() {
             Ok(()) => match self.send(command) {
                 Ok(()) => Ok(()),
@@ -211,6 +237,10 @@ impl CaptureController {
                     Err(failure)
                 }
             },
+            Err(_) if self.shared.is_failed() => Err(CaptureSendFailure::new(
+                CaptureError::CommandClosed,
+                command,
+            )),
             Err(CaptureState::CompletionPending) => Err(CaptureSendFailure::new(
                 CaptureError::CompletionPending,
                 command,
@@ -241,8 +271,14 @@ impl CaptureController {
         self.shared.state()
     }
 
+    pub(crate) fn failure_handle(&self) -> CaptureFailureHandle {
+        CaptureFailureHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     fn send(&mut self, command: CaptureCommand) -> Result<(), CaptureSendFailure> {
-        if self.commands.is_abandoned() {
+        if self.shared.is_failed() || self.commands.is_abandoned() {
             return Err(CaptureSendFailure::new(
                 CaptureError::CommandClosed,
                 command,
@@ -267,6 +303,9 @@ pub struct CaptureCore {
 
 impl CaptureCore {
     pub fn poll_commands(&mut self) {
+        if self.shared.is_failed() {
+            return;
+        }
         if self.pending.is_some() {
             self.flush_pending();
             return;
@@ -279,7 +318,7 @@ impl CaptureCore {
     }
 
     pub fn push_frame(&mut self, frame: [f32; 2]) {
-        if self.state != CaptureState::Recording {
+        if self.shared.is_failed() || self.state != CaptureState::Recording {
             return;
         }
         let Some(buffer) = self.active.as_mut() else {
@@ -302,6 +341,10 @@ impl CaptureCore {
 
     pub const fn state(&self) -> CaptureState {
         self.state
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.shared.is_failed()
     }
 
     pub fn take_error(&mut self) -> Option<CaptureError> {
@@ -449,6 +492,7 @@ pub fn capture_channels(
     let (outcome_producer, outcome_consumer) = RingBuffer::new(completion_capacity);
     let shared = Arc::new(CaptureShared {
         state: AtomicU8::new(CaptureState::IDLE),
+        failed: AtomicBool::new(false),
     });
     (
         CaptureController {

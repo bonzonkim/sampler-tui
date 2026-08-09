@@ -123,7 +123,7 @@ impl Drop for AudioSession {
     }
 }
 
-fn drop_stream_before_controller<T>(stream: &mut Option<T>) {
+pub(crate) fn drop_stream_before_controller<T>(stream: &mut Option<T>) {
     drop(stream.take());
 }
 

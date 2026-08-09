@@ -5058,7 +5058,7 @@ mod tests {
         BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SampleEditRecipe,
     };
 
-    use crate::audio::AudioPort;
+    use crate::audio::{AudioPort, CaptureSupport};
     use crate::input::InputAction;
 
     use crate::DirectoryScan;
@@ -5257,6 +5257,10 @@ mod tests {
     }
 
     impl AudioPort for FakeAudio {
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+
         fn sample_rate(&self) -> u32 {
             self.sample_rate
         }

@@ -20,8 +20,8 @@ use sampler_core::{
     SampleEditRecipe,
 };
 use sampler_tui::{
-    App, AudioPort, InputAction, KeyboardCapabilities, ProjectOpenPhase, ProjectStore,
-    RecoveryChoice, WorkerHandle, WorkerRequest,
+    App, AudioPort, CaptureSupport, InputAction, KeyboardCapabilities, ProjectOpenPhase,
+    ProjectStore, RecoveryChoice, WorkerHandle, WorkerRequest,
 };
 
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +122,10 @@ impl ControllerPort {
 }
 
 impl AudioPort for ControllerPort {
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Unsupported
+    }
+
     fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

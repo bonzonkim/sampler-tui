@@ -11,7 +11,7 @@ mod tests {
         PATTERN_SLOT_COUNT, PadId, PadSettings, PatternSlotId, PatternSnapshot, Tempo,
     };
 
-    use crate::AudioPort;
+    use crate::{AudioPort, CaptureSupport};
 
     use super::{
         MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace,
@@ -28,6 +28,10 @@ mod tests {
     }
 
     impl AudioPort for FakeAudio {
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+
         fn sample_rate(&self) -> u32 {
             48_000
         }
@@ -131,6 +135,10 @@ mod tests {
     }
 
     impl AudioPort for OneSlotAudio {
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+
         fn sample_rate(&self) -> u32 {
             100
         }

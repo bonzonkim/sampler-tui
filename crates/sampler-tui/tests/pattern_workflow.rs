@@ -17,8 +17,8 @@ use sampler_core::{
     PatternSnapshot, PlaybackMode, Resolution, Tempo, Transport,
 };
 use sampler_tui::{
-    App, AudioPort, EDIT_PREVIEW_COLUMNS, KeyboardCapabilities, LoadSampleError, LoadedSample,
-    PreviewColumn, WorkerRequest, WorkerResult,
+    App, AudioPort, CaptureSupport, EDIT_PREVIEW_COLUMNS, KeyboardCapabilities, LoadSampleError,
+    LoadedSample, PreviewColumn, WorkerRequest, WorkerResult,
 };
 
 struct ControllerPort {
@@ -38,6 +38,10 @@ impl ControllerPort {
 }
 
 impl AudioPort for ControllerPort {
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Unsupported
+    }
+
     fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

@@ -15,8 +15,26 @@ pub enum CapturePhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
+    Unsupported,
     AlreadyActive,
+    ActiveCapture {
+        source: CaptureSource,
+        token: u64,
+    },
     NoActiveCapture,
+    ZeroCommandToken,
+    CommandSourceMismatch {
+        expected: CaptureSource,
+        received: CaptureSource,
+    },
+    CommandTokenMismatch {
+        expected: u64,
+        received: u64,
+    },
+    CommandRateMismatch {
+        expected: u32,
+        received: u32,
+    },
     TokenExhausted,
     GenerationExhausted,
     ZeroSourceRate,
@@ -29,6 +47,7 @@ pub enum CaptureError {
     CompletionTargetMismatch,
     CompletionSourceMismatch,
     CompletionRateMismatch,
+    RetryCompletionMissing,
     Command(sampler_audio::CaptureError),
     InputOpen(String),
     OutputRuntime(String),
@@ -38,8 +57,28 @@ pub enum CaptureError {
 impl fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unsupported => formatter.write_str("audio capture is unsupported"),
             Self::AlreadyActive => formatter.write_str("a capture is already active"),
+            Self::ActiveCapture { source, token } => {
+                write!(
+                    formatter,
+                    "{source:?} capture token {token} is already active"
+                )
+            }
             Self::NoActiveCapture => formatter.write_str("no capture is active"),
+            Self::ZeroCommandToken => formatter.write_str("capture command token must be non-zero"),
+            Self::CommandSourceMismatch { expected, received } => write!(
+                formatter,
+                "capture command source {received:?} does not match active source {expected:?}"
+            ),
+            Self::CommandTokenMismatch { expected, received } => write!(
+                formatter,
+                "capture command token {received} does not match active token {expected}"
+            ),
+            Self::CommandRateMismatch { expected, received } => write!(
+                formatter,
+                "capture command rate {received} does not match source rate {expected}"
+            ),
             Self::TokenExhausted => formatter.write_str("capture tokens are exhausted"),
             Self::GenerationExhausted => formatter.write_str("capture generations are exhausted"),
             Self::ZeroSourceRate => formatter.write_str("capture source rate must be non-zero"),
@@ -61,6 +100,9 @@ impl fmt::Display for CaptureError {
             }
             Self::CompletionRateMismatch => {
                 formatter.write_str("capture completion source rate does not match")
+            }
+            Self::RetryCompletionMissing => {
+                formatter.write_str("failed capture has no completion to retry")
             }
             Self::Command(error) => error.fmt(formatter),
             Self::InputOpen(error) => write!(formatter, "could not open input capture: {error}"),
@@ -206,27 +248,29 @@ impl CaptureSession {
         Ok(())
     }
 
-    pub fn retry_finalizing(&mut self) -> Result<(), CaptureError> {
-        let active = self.active.as_mut().ok_or(CaptureError::NoActiveCapture)?;
-        if active.phase != CapturePhase::Failed || active.completion.is_none() {
+    pub fn retry_finalization_with_next_generation(&mut self) -> Result<u64, CaptureError> {
+        let active = self.active.as_ref().ok_or(CaptureError::NoActiveCapture)?;
+        if active.phase != CapturePhase::Failed {
             return Err(CaptureError::IllegalTransition {
                 from: active.phase,
                 to: CapturePhase::Finalizing,
             });
         }
-        active.phase = CapturePhase::Finalizing;
-        active.failure = None;
-        Ok(())
-    }
-
-    pub fn advance_generation(&mut self) -> Result<u64, CaptureError> {
+        if active.completion.is_none() {
+            return Err(CaptureError::RetryCompletionMissing);
+        }
         let generation = self
             .last_generation
             .checked_add(1)
             .ok_or(CaptureError::GenerationExhausted)?;
-        let active = self.active.as_mut().ok_or(CaptureError::NoActiveCapture)?;
+        let active = self
+            .active
+            .as_mut()
+            .expect("active capture was validated before mutation");
         self.last_generation = generation;
         active.generation = generation;
+        active.phase = CapturePhase::Finalizing;
+        active.failure = None;
         Ok(generation)
     }
 
@@ -407,6 +451,156 @@ mod tests {
                 from: CapturePhase::ReadyToInstall,
                 to: CapturePhase::Recording,
             })
+        );
+    }
+
+    #[test]
+    fn every_completion_identity_mismatch_returns_the_exact_vec_and_preserves_state() {
+        #[derive(Clone, Copy)]
+        enum Mismatch {
+            Token,
+            Target,
+            Source,
+            Rate,
+        }
+
+        for mismatch in [
+            Mismatch::Token,
+            Mismatch::Target,
+            Mismatch::Source,
+            Mismatch::Rate,
+        ] {
+            let mut session = CaptureSession::default();
+            session
+                .begin(CaptureSource::Resample, PadId::first(), 48_000, 16)
+                .unwrap();
+            session.mark_arming().unwrap();
+            session.mark_recording().unwrap();
+            let mut candidate = completion(&session, CaptureSource::Resample);
+            let expected_error = match mismatch {
+                Mismatch::Token => {
+                    candidate.token += 1;
+                    CaptureError::CompletionTokenMismatch
+                }
+                Mismatch::Target => {
+                    candidate.target = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+                    CaptureError::CompletionTargetMismatch
+                }
+                Mismatch::Source => {
+                    candidate.source = CaptureSource::Input;
+                    CaptureError::CompletionSourceMismatch
+                }
+                Mismatch::Rate => {
+                    candidate.sample_rate = 44_100;
+                    CaptureError::CompletionRateMismatch
+                }
+            };
+            let pointer = candidate.stereo.as_ptr();
+            let before = (
+                session.token(),
+                session.generation(),
+                session.target(),
+                session.source(),
+                session.source_rate(),
+                session.max_frames(),
+                session.phase(),
+            );
+
+            let failure = session.accept_completion(candidate).unwrap_err();
+
+            assert_eq!(failure.error(), expected_error);
+            let returned = failure.into_completion();
+            assert_eq!(returned.stereo.as_ptr(), pointer);
+            assert_eq!(
+                (
+                    session.token(),
+                    session.generation(),
+                    session.target(),
+                    session.source(),
+                    session.source_rate(),
+                    session.max_frames(),
+                    session.phase(),
+                ),
+                before
+            );
+            assert!(session.completion().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_retry_checks_generation_before_atomic_phase_and_generation_change() {
+        let mut session = CaptureSession::with_last_ids(0, 6);
+        session
+            .begin(CaptureSource::Input, PadId::first(), 44_100, 16)
+            .unwrap();
+        session.mark_arming().unwrap();
+        assert_eq!(
+            session.retry_finalization_with_next_generation(),
+            Err(CaptureError::IllegalTransition {
+                from: CapturePhase::Arming,
+                to: CapturePhase::Finalizing,
+            })
+        );
+        assert_eq!(
+            (session.generation(), session.phase()),
+            (Some(7), Some(CapturePhase::Arming))
+        );
+
+        session.mark_recording().unwrap();
+        session
+            .accept_completion(completion(&session, CaptureSource::Input))
+            .unwrap();
+        session.mark_failed("encode failed").unwrap();
+        assert_eq!(session.retry_finalization_with_next_generation(), Ok(8));
+        assert_eq!(
+            (session.generation(), session.phase(), session.failure()),
+            (Some(8), Some(CapturePhase::Finalizing), None)
+        );
+
+        let mut without_completion = CaptureSession::default();
+        without_completion
+            .begin(CaptureSource::Input, PadId::first(), 44_100, 16)
+            .unwrap();
+        without_completion.mark_failed("device lost").unwrap();
+        assert_eq!(
+            without_completion.retry_finalization_with_next_generation(),
+            Err(CaptureError::RetryCompletionMissing)
+        );
+        assert_eq!(
+            (
+                without_completion.generation(),
+                without_completion.phase(),
+                without_completion.failure(),
+            ),
+            (Some(1), Some(CapturePhase::Failed), Some("device lost"))
+        );
+    }
+
+    #[test]
+    fn failed_retry_overflow_preserves_generation_phase_completion_and_failure() {
+        let mut session = CaptureSession::with_last_ids(0, u64::MAX - 1);
+        session
+            .begin(CaptureSource::Input, PadId::first(), 44_100, 16)
+            .unwrap();
+        session.mark_arming().unwrap();
+        session.mark_recording().unwrap();
+        session
+            .accept_completion(completion(&session, CaptureSource::Input))
+            .unwrap();
+        session.mark_failed("retryable").unwrap();
+        let completion_pointer = session.completion().unwrap().stereo.as_ptr();
+
+        assert_eq!(
+            session.retry_finalization_with_next_generation(),
+            Err(CaptureError::GenerationExhausted)
+        );
+        assert_eq!(session.last_ids(), (1, u64::MAX));
+        assert_eq!(session.generation(), Some(u64::MAX));
+        assert_eq!(session.phase(), Some(CapturePhase::Failed));
+        assert_eq!(session.failure(), Some("retryable"));
+        assert_eq!(
+            session.completion().unwrap().stereo.as_ptr(),
+            completion_pointer
         );
     }
 

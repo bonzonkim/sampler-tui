@@ -22,7 +22,7 @@ pub use app::{
     PreviewColumn, ProjectAction, ProjectSaveError, ProjectSaveFailure, SampleEditRequestError,
     SampleEditStatus,
 };
-pub use audio::AudioPort;
+pub use audio::{AudioPort, CaptureSupport};
 pub use capture::{CaptureError, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};

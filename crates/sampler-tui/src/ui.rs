@@ -859,7 +859,7 @@ mod tests {
     use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
     use sampler_core::{PadId, PadSettings, ProjectDocument, ProjectId};
 
-    use crate::audio::AudioPort;
+    use crate::audio::{AudioPort, CaptureSupport};
     use crate::input::InputAction;
     use crate::loader::{LoadPurpose, LoadSampleError, LoadedSample, WorkerResult};
     use crate::{
@@ -907,6 +907,10 @@ mod tests {
     }
 
     impl AudioPort for FakeAudio {
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+
         fn sample_rate(&self) -> u32 {
             self.record_format_read();
             48_000

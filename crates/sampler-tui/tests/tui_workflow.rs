@@ -21,9 +21,9 @@ use sampler_tui::terminal::{
     run_event_loop_with_observer, run_with_runtime_lifecycle,
 };
 use sampler_tui::{
-    App, AudioPort, DirectoryEntry, DirectoryEntryKind, DirectoryScan, KeyboardCapabilities,
-    LoadedSample, PAD_KEYS, PreviewColumn, WorkerRequest, WorkerResult, WorkerSendError,
-    WorkerSendFailure,
+    App, AudioPort, CaptureSupport, DirectoryEntry, DirectoryEntryKind, DirectoryScan,
+    KeyboardCapabilities, LoadedSample, PAD_KEYS, PreviewColumn, WorkerRequest, WorkerResult,
+    WorkerSendError, WorkerSendFailure,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +133,10 @@ impl Drop for FakeAudio {
 }
 
 impl AudioPort for FakeAudio {
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Unsupported
+    }
+
     fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

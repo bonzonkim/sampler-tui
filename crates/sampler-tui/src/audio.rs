@@ -13,6 +13,12 @@ use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
 use crate::CaptureError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSupport {
+    Unsupported,
+    Available,
+}
+
 #[derive(Debug)]
 pub struct CaptureCommandFailure {
     error: CaptureError,
@@ -150,18 +156,15 @@ pub trait AudioPort {
     fn latest_telemetry(&mut self) -> Option<Telemetry>;
     fn poll_runtime_error(&mut self) -> Option<String>;
 
-    fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
-        match source {
-            CaptureSource::Resample => Ok(self.sample_rate()),
-            CaptureSource::Input => Err(CaptureError::InputOpen(
-                "input capture is unsupported".into(),
-            )),
-        }
+    fn capture_support(&self) -> CaptureSupport;
+
+    fn capture_source_rate(&mut self, _source: CaptureSource) -> Result<u32, CaptureError> {
+        Err(CaptureError::Unsupported)
     }
 
     fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureCommandFailure> {
         Err(CaptureCommandFailure::rejected(
-            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureError::Unsupported,
             CaptureCommand::Arm(buffer),
         ))
     }
@@ -172,7 +175,7 @@ pub trait AudioPort {
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
         Err(CaptureCommandFailure::rejected(
-            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureError::Unsupported,
             CaptureCommand::Start { token },
         ))
     }
@@ -183,7 +186,7 @@ pub trait AudioPort {
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
         Err(CaptureCommandFailure::rejected(
-            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureError::Unsupported,
             CaptureCommand::Stop { token },
         ))
     }
@@ -194,7 +197,7 @@ pub trait AudioPort {
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
         Err(CaptureCommandFailure::rejected(
-            CaptureError::Command(sampler_audio::CaptureError::CommandClosed),
+            CaptureError::Unsupported,
             CaptureCommand::Cancel { token },
         ))
     }
@@ -776,6 +779,10 @@ where
             .map(|error| error.to_string())
     }
 
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Available
+    }
+
     fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
         match source {
             CaptureSource::Resample => Ok(self.session_mut().sample_rate()),
@@ -791,9 +798,18 @@ where
             source,
             max_frames: buffer.max_frames(),
         };
-        if self.active_capture.is_some() {
+        if buffer.token() == 0 {
             return Err(CaptureCommandFailure::rejected(
-                CaptureError::AlreadyActive,
+                CaptureError::ZeroCommandToken,
+                CaptureCommand::Arm(buffer),
+            ));
+        }
+        if let Some(active) = self.active_capture {
+            return Err(CaptureCommandFailure::rejected(
+                CaptureError::ActiveCapture {
+                    source: active.source,
+                    token: active.token,
+                },
                 CaptureCommand::Arm(buffer),
             ));
         }
@@ -808,7 +824,10 @@ where
         };
         if buffer.sample_rate() != expected_rate {
             return Err(CaptureCommandFailure::rejected(
-                CaptureError::CompletionRateMismatch,
+                CaptureError::CommandRateMismatch {
+                    expected: expected_rate,
+                    received: buffer.sample_rate(),
+                },
                 CaptureCommand::Arm(buffer),
             ));
         }
@@ -834,7 +853,7 @@ where
         source: CaptureSource,
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
-        self.require_active_source(source, CaptureCommand::Start { token })?;
+        self.require_active_identity(source, token, CaptureCommand::Start { token })?;
         match source {
             CaptureSource::Resample => self.session_mut().start_capture(token),
             CaptureSource::Input => self
@@ -852,7 +871,7 @@ where
         source: CaptureSource,
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
-        self.require_active_source(source, CaptureCommand::Stop { token })?;
+        self.require_active_identity(source, token, CaptureCommand::Stop { token })?;
         match source {
             CaptureSource::Resample => self.session_mut().stop_capture(token),
             CaptureSource::Input => self
@@ -870,7 +889,7 @@ where
         source: CaptureSource,
         token: u64,
     ) -> Result<(), CaptureCommandFailure> {
-        self.require_active_source(source, CaptureCommand::Cancel { token })?;
+        self.require_active_identity(source, token, CaptureCommand::Cancel { token })?;
         match source {
             CaptureSource::Resample => self.session_mut().cancel_capture(token),
             CaptureSource::Input => self
@@ -939,21 +958,32 @@ where
 }
 
 impl<S> SessionAudioPort<S> {
-    fn require_active_source(
+    fn require_active_identity(
         &self,
         source: CaptureSource,
+        token: u64,
         command: CaptureCommand,
     ) -> Result<(), CaptureCommandFailure> {
         match self.active_capture {
-            Some(active) if active.source == source => Ok(()),
-            Some(_) => Err(CaptureCommandFailure::rejected(
-                CaptureError::CompletionSourceMismatch,
-                command,
-            )),
             None => Err(CaptureCommandFailure::rejected(
                 CaptureError::NoActiveCapture,
                 command,
             )),
+            Some(active) if active.source != source => Err(CaptureCommandFailure::rejected(
+                CaptureError::CommandSourceMismatch {
+                    expected: active.source,
+                    received: source,
+                },
+                command,
+            )),
+            Some(active) if active.token != token => Err(CaptureCommandFailure::rejected(
+                CaptureError::CommandTokenMismatch {
+                    expected: active.token,
+                    received: token,
+                },
+                command,
+            )),
+            Some(_) => Ok(()),
         }
     }
 }
@@ -967,9 +997,11 @@ pub fn open_default_audio() -> Result<Box<dyn AudioPort>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
     use std::thread::ThreadId;
 
@@ -986,12 +1018,112 @@ mod tests {
     };
 
     use super::{
-        AudioPort, CaptureCommandFailure, CaptureMaintenance, InputSessionLike, SessionAudioPort,
-        SessionLike,
+        AudioPort, CaptureCommandFailure, CaptureMaintenance, CaptureSupport, InputSessionLike,
+        SessionAudioPort, SessionLike,
     };
     use crate::CaptureError;
 
-    type CaptureDropOrder = Rc<RefCell<Vec<(&'static str, ThreadId)>>>;
+    struct CaptureTrackingAllocator;
+
+    #[global_allocator]
+    static CAPTURE_TRACKING_ALLOCATOR: CaptureTrackingAllocator = CaptureTrackingAllocator;
+    static TRACKED_ALLOCATION: AtomicUsize = AtomicUsize::new(0);
+    static OWNERSHIP_EVENTS: AtomicPtr<CaptureOwnershipEvents> =
+        AtomicPtr::new(std::ptr::null_mut());
+
+    thread_local! {
+        static IS_APP_OWNER_THREAD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // SAFETY: Every operation delegates to `System` with the unchanged pointer/layout contract.
+    unsafe impl GlobalAlloc for CaptureTrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The caller provides the allocation layout required by `GlobalAlloc`.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if TRACKED_ALLOCATION
+                .compare_exchange(pointer as usize, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let events = OWNERSHIP_EVENTS.load(Ordering::Acquire);
+                if !events.is_null() {
+                    // SAFETY: The test retains the `Arc<CaptureOwnershipEvents>` until after the
+                    // tracked allocation is deallocated and clears this pointer before Arc drop.
+                    unsafe { &*events }.record(&unsafe { &*events }.allocation);
+                }
+            }
+            // SAFETY: The pointer/layout pair came from the delegated `System` allocator.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    struct CaptureOwnershipEvents {
+        next: AtomicUsize,
+        stream_core: AtomicUsize,
+        allocation: AtomicUsize,
+        controller: AtomicUsize,
+        output: AtomicUsize,
+        off_app_thread: AtomicBool,
+    }
+
+    impl CaptureOwnershipEvents {
+        fn new() -> Self {
+            Self {
+                next: AtomicUsize::new(1),
+                stream_core: AtomicUsize::new(0),
+                allocation: AtomicUsize::new(0),
+                controller: AtomicUsize::new(0),
+                output: AtomicUsize::new(0),
+                off_app_thread: AtomicBool::new(false),
+            }
+        }
+
+        fn record(&self, slot: &AtomicUsize) {
+            if !IS_APP_OWNER_THREAD.with(Cell::get) {
+                self.off_app_thread.store(true, Ordering::Release);
+            }
+            slot.store(self.next.fetch_add(1, Ordering::AcqRel), Ordering::Release);
+        }
+    }
+
+    struct TrackedCaptureCore {
+        inner: CaptureCore,
+        _completion: Option<OwnershipCompletionProbe>,
+    }
+
+    struct TrackedCaptureController {
+        inner: CaptureController,
+        _completion: Option<OwnershipCompletionProbe>,
+    }
+
+    enum OwnershipCompletionKind {
+        StreamCore,
+        Controller,
+        Output,
+    }
+
+    struct OwnershipCompletionProbe {
+        events: Arc<CaptureOwnershipEvents>,
+        kind: OwnershipCompletionKind,
+    }
+
+    impl Drop for OwnershipCompletionProbe {
+        fn drop(&mut self) {
+            match self.kind {
+                OwnershipCompletionKind::StreamCore => {
+                    self.events.record(&self.events.stream_core);
+                }
+                OwnershipCompletionKind::Controller => {
+                    self.events.record(&self.events.controller);
+                }
+                OwnershipCompletionKind::Output => {
+                    self.events.record(&self.events.output);
+                }
+            }
+        }
+    }
 
     struct FakeSession {
         sample_rate: u32,
@@ -1010,7 +1142,7 @@ mod tests {
         capture: Option<CaptureController>,
         capture_polls: Rc<Cell<usize>>,
         runtime_errors: VecDeque<ControlError>,
-        capture_drop_order: Option<CaptureDropOrder>,
+        capture_output_completion: Option<OwnershipCompletionProbe>,
     }
 
     #[derive(Clone)]
@@ -1051,7 +1183,7 @@ mod tests {
                 capture: None,
                 capture_polls: Rc::new(Cell::new(0)),
                 runtime_errors: VecDeque::new(),
-                capture_drop_order: None,
+                capture_output_completion: None,
             }
         }
 
@@ -1118,19 +1250,17 @@ mod tests {
             self
         }
 
-        fn with_capture_drop_order(mut self, order: CaptureDropOrder) -> Self {
-            self.capture_drop_order = Some(order);
+        fn with_capture_ownership_events(mut self, events: Arc<CaptureOwnershipEvents>) -> Self {
+            self.capture_output_completion = Some(OwnershipCompletionProbe {
+                events,
+                kind: OwnershipCompletionKind::Output,
+            });
             self
         }
     }
 
     impl Drop for FakeSession {
         fn drop(&mut self) {
-            if let Some(order) = &self.capture_drop_order {
-                order
-                    .borrow_mut()
-                    .push(("output", std::thread::current().id()));
-            }
             if let Some(ownership) = &self.ownership {
                 let owners_alive = ownership
                     .installed
@@ -1342,20 +1472,13 @@ mod tests {
     }
 
     struct FakeInputSession {
-        controller: CaptureController,
-        core: CaptureCore,
+        // Field order is the production input-session contract: stream/core is destroyed before
+        // the controller that can still refer to its callback-owned ring state.
+        core: TrackedCaptureCore,
+        controller: TrackedCaptureController,
         sample_rate: u32,
         polls: Rc<Cell<usize>>,
         errors: VecDeque<ControlError>,
-        drop_order: CaptureDropOrder,
-    }
-
-    impl Drop for FakeInputSession {
-        fn drop(&mut self) {
-            self.drop_order
-                .borrow_mut()
-                .push(("input", std::thread::current().id()));
-        }
     }
 
     impl InputSessionLike for FakeInputSession {
@@ -1364,27 +1487,27 @@ mod tests {
         }
 
         fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
-            self.controller.arm(buffer)?;
-            self.core.poll_commands();
+            self.controller.inner.arm(buffer)?;
+            self.core.inner.poll_commands();
             Ok(())
         }
 
         fn start_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
-            self.controller.start(token)?;
-            self.core.poll_commands();
-            self.core.push_frame([0.5, -0.5]);
+            self.controller.inner.start(token)?;
+            self.core.inner.poll_commands();
+            self.core.inner.push_frame([0.5, -0.5]);
             Ok(())
         }
 
         fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
-            self.controller.stop(token)?;
-            self.core.poll_commands();
+            self.controller.inner.stop(token)?;
+            self.core.inner.poll_commands();
             Ok(())
         }
 
         fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure> {
-            self.controller.cancel(token)?;
-            self.core.poll_commands();
+            self.controller.inner.cancel(token)?;
+            self.core.inner.poll_commands();
             Ok(())
         }
 
@@ -1394,15 +1517,41 @@ mod tests {
 
         fn capture_completion(&mut self) -> Option<CaptureOutcome> {
             self.polls.set(self.polls.get() + 1);
-            self.controller.try_next_outcome()
+            self.controller.inner.try_next_outcome()
         }
 
         fn capture_state(&mut self) -> CaptureState {
-            self.controller.state()
+            self.controller.inner.state()
         }
 
         fn poll_error(&mut self) -> Option<String> {
             self.errors.pop_front().map(|error| error.to_string())
+        }
+    }
+
+    fn fake_input_session(
+        controller: CaptureController,
+        core: CaptureCore,
+        events: Option<Arc<CaptureOwnershipEvents>>,
+    ) -> FakeInputSession {
+        FakeInputSession {
+            core: TrackedCaptureCore {
+                inner: core,
+                _completion: events.as_ref().map(|events| OwnershipCompletionProbe {
+                    events: Arc::clone(events),
+                    kind: OwnershipCompletionKind::StreamCore,
+                }),
+            },
+            controller: TrackedCaptureController {
+                inner: controller,
+                _completion: events.map(|events| OwnershipCompletionProbe {
+                    events,
+                    kind: OwnershipCompletionKind::Controller,
+                }),
+            },
+            sample_rate: 44_100,
+            polls: Rc::new(Cell::new(0)),
+            errors: VecDeque::new(),
         }
     }
 
@@ -1637,15 +1786,9 @@ mod tests {
         let (input_controller, input_core) = capture_channels(4, 1);
         let input_polls = Rc::new(Cell::new(0));
         let opens = Rc::new(Cell::new(0));
-        let drop_order = Rc::new(RefCell::new(Vec::new()));
-        let mut input = Some(FakeInputSession {
-            controller: input_controller,
-            core: input_core,
-            sample_rate: 44_100,
-            polls: Rc::clone(&input_polls),
-            errors: VecDeque::new(),
-            drop_order: Rc::clone(&drop_order),
-        });
+        let mut opened_input = fake_input_session(input_controller, input_core, None);
+        opened_input.polls = Rc::clone(&input_polls);
+        let mut input = Some(opened_input);
         let open_count = Rc::clone(&opens);
         let mut port = SessionAudioPort::new_with_input_opener(output, move || {
             open_count.set(open_count.get() + 1);
@@ -1693,15 +1836,9 @@ mod tests {
         let output = output.with_runtime_error(ControlError::ClosedSession);
         let (input_controller, input_core) = capture_channels(4, 1);
         let input_polls = Rc::new(Cell::new(0));
-        let drop_order = Rc::new(RefCell::new(Vec::new()));
-        let input = FakeInputSession {
-            controller: input_controller,
-            core: input_core,
-            sample_rate: 44_100,
-            polls: Rc::clone(&input_polls),
-            errors: VecDeque::from([ControlError::CommandQueueFull]),
-            drop_order,
-        };
+        let mut input = fake_input_session(input_controller, input_core, None);
+        input.polls = Rc::clone(&input_polls);
+        input.errors = VecDeque::from([ControlError::CommandQueueFull]);
         let mut input = Some(input);
         let mut port = SessionAudioPort::new_with_input_opener(output, move || {
             Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
@@ -1751,35 +1888,333 @@ mod tests {
     }
 
     #[test]
-    fn adapter_teardown_drops_input_before_output_on_the_app_thread() {
-        let order = Rc::new(RefCell::new(Vec::new()));
+    fn adapter_teardown_drops_stream_core_allocation_controller_then_output_on_app_thread() {
+        let events = Arc::new(CaptureOwnershipEvents::new());
         let (output, _output_core, _) = FakeSession::capture_ready(48_000);
-        let output = output.with_capture_drop_order(Rc::clone(&order));
+        let output = output.with_capture_ownership_events(Arc::clone(&events));
         let (input_controller, input_core) = capture_channels(4, 1);
-        let input = FakeInputSession {
-            controller: input_controller,
-            core: input_core,
-            sample_rate: 44_100,
-            polls: Rc::new(Cell::new(0)),
-            errors: VecDeque::new(),
-            drop_order: Rc::clone(&order),
-        };
+        let input = fake_input_session(input_controller, input_core, Some(Arc::clone(&events)));
         let mut input = Some(input);
         let mut port = SessionAudioPort::new_with_input_opener(output, move || {
             Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
         });
         port.capture_source_rate(CaptureSource::Input).unwrap();
-        port.begin_capture(
-            CaptureBuffer::try_new(1, PadId::first(), CaptureSource::Input, 44_100, 8).unwrap(),
-        )
-        .unwrap();
-        let app_thread = std::thread::current().id();
+        let buffer =
+            CaptureBuffer::try_new(1, PadId::first(), CaptureSource::Input, 44_100, 8).unwrap();
+        let allocation = buffer.stereo().as_ptr() as usize;
+        port.begin_capture(buffer).unwrap();
+        assert_eq!(
+            port.capture_status(CaptureSource::Input).unwrap().state,
+            CaptureState::Armed
+        );
+
+        TRACKED_ALLOCATION.store(allocation, Ordering::Release);
+        OWNERSHIP_EVENTS.store(Arc::as_ptr(&events).cast_mut(), Ordering::Release);
+        IS_APP_OWNER_THREAD.with(|marker| marker.set(true));
 
         drop(port);
 
+        IS_APP_OWNER_THREAD.with(|marker| marker.set(false));
+        OWNERSHIP_EVENTS.store(std::ptr::null_mut(), Ordering::Release);
+        TRACKED_ALLOCATION.store(0, Ordering::Release);
         assert_eq!(
-            *order.borrow(),
-            [("input", app_thread), ("output", app_thread)]
+            (
+                events.stream_core.load(Ordering::Acquire),
+                events.allocation.load(Ordering::Acquire),
+                events.controller.load(Ordering::Acquire),
+                events.output.load(Ordering::Acquire),
+            ),
+            (2, 1, 3, 4)
         );
+        assert!(!events.off_app_thread.load(Ordering::Acquire));
+    }
+
+    fn port_for_capture_source(
+        source: CaptureSource,
+    ) -> (SessionAudioPort<FakeSession>, CaptureCore) {
+        let (output, output_core, _) = FakeSession::capture_ready(48_000);
+        match source {
+            CaptureSource::Resample => (SessionAudioPort::new(output), output_core),
+            CaptureSource::Input => {
+                let (controller, core) = capture_channels(4, 1);
+                let input = fake_input_session(controller, core, None);
+                let mut input = Some(input);
+                (
+                    SessionAudioPort::new_with_input_opener(output, move || {
+                        Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
+                    }),
+                    output_core,
+                )
+            }
+        }
+    }
+
+    fn arm_source(port: &mut SessionAudioPort<FakeSession>, source: CaptureSource, token: u64) {
+        let sample_rate = match source {
+            CaptureSource::Resample => 48_000,
+            CaptureSource::Input => 44_100,
+        };
+        port.begin_capture(
+            CaptureBuffer::try_new(token, PadId::first(), source, sample_rate, 8).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_capture_command_synchronously_rejects_stale_tokens_for_both_sources() {
+        for source in [CaptureSource::Resample, CaptureSource::Input] {
+            for command_kind in ["start", "stop", "cancel"] {
+                let (mut port, mut output_core) = port_for_capture_source(source);
+                arm_source(&mut port, source, 41);
+                if source == CaptureSource::Resample {
+                    output_core.poll_commands();
+                    assert_eq!(output_core.state(), CaptureState::Armed);
+                }
+
+                let failure = match command_kind {
+                    "start" => port.start_capture(source, 42).unwrap_err(),
+                    "stop" => port.stop_capture(source, 42).unwrap_err(),
+                    "cancel" => port.cancel_capture(source, 42).unwrap_err(),
+                    _ => unreachable!(),
+                };
+
+                assert_eq!(
+                    failure.error(),
+                    &CaptureError::CommandTokenMismatch {
+                        expected: 41,
+                        received: 42,
+                    }
+                );
+                match (command_kind, failure.into_command()) {
+                    ("start", CaptureCommand::Start { token: 42 })
+                    | ("stop", CaptureCommand::Stop { token: 42 })
+                    | ("cancel", CaptureCommand::Cancel { token: 42 }) => {}
+                    (_, command) => panic!("wrong rejected command: {command:?}"),
+                }
+                if source == CaptureSource::Resample {
+                    assert_eq!(output_core.state(), CaptureState::Armed);
+                } else {
+                    assert_eq!(
+                        port.capture_status(CaptureSource::Input).unwrap().state,
+                        CaptureState::Armed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_capture_command_returns_exact_command_on_active_source_mismatch() {
+        for command_kind in ["start", "stop", "cancel"] {
+            let (mut port, _) = port_for_capture_source(CaptureSource::Input);
+            arm_source(&mut port, CaptureSource::Input, 41);
+
+            let failure = match command_kind {
+                "start" => port.start_capture(CaptureSource::Resample, 41).unwrap_err(),
+                "stop" => port.stop_capture(CaptureSource::Resample, 41).unwrap_err(),
+                "cancel" => port
+                    .cancel_capture(CaptureSource::Resample, 41)
+                    .unwrap_err(),
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                failure.error(),
+                &CaptureError::CommandSourceMismatch {
+                    expected: CaptureSource::Input,
+                    received: CaptureSource::Resample,
+                }
+            );
+            match (command_kind, failure.into_command()) {
+                ("start", CaptureCommand::Start { token: 41 })
+                | ("stop", CaptureCommand::Stop { token: 41 })
+                | ("cancel", CaptureCommand::Cancel { token: 41 }) => {}
+                (_, command) => panic!("wrong rejected command: {command:?}"),
+            }
+            assert_eq!(
+                port.capture_status(CaptureSource::Input).unwrap().state,
+                CaptureState::Armed
+            );
+        }
+    }
+
+    #[test]
+    fn arm_rejects_zero_and_active_identity_with_exact_buffer_ownership() {
+        for source in [CaptureSource::Resample, CaptureSource::Input] {
+            let sample_rate = match source {
+                CaptureSource::Resample => 48_000,
+                CaptureSource::Input => 44_100,
+            };
+            let (mut port, _output_core) = port_for_capture_source(source);
+            let zero = CaptureBuffer::try_new(0, PadId::first(), source, sample_rate, 8).unwrap();
+            let zero_pointer = zero.stereo().as_ptr();
+            let zero_failure = port.begin_capture(zero).unwrap_err();
+            assert_eq!(zero_failure.error(), &CaptureError::ZeroCommandToken);
+            let CaptureCommand::Arm(zero_returned) = zero_failure.into_command() else {
+                panic!("zero-token arm must return the buffer")
+            };
+            assert_eq!(zero_returned.stereo().as_ptr(), zero_pointer);
+
+            arm_source(&mut port, source, 9);
+            let overlapping_source = match source {
+                CaptureSource::Resample => CaptureSource::Input,
+                CaptureSource::Input => CaptureSource::Resample,
+            };
+            let overlapping_rate = match overlapping_source {
+                CaptureSource::Resample => 48_000,
+                CaptureSource::Input => 44_100,
+            };
+            let overlapping =
+                CaptureBuffer::try_new(10, PadId::first(), overlapping_source, overlapping_rate, 8)
+                    .unwrap();
+            let overlapping_pointer = overlapping.stereo().as_ptr();
+            let overlapping_failure = port.begin_capture(overlapping).unwrap_err();
+            assert_eq!(
+                overlapping_failure.error(),
+                &CaptureError::ActiveCapture { source, token: 9 }
+            );
+            let CaptureCommand::Arm(overlapping_returned) = overlapping_failure.into_command()
+            else {
+                panic!("active arm must return the buffer")
+            };
+            assert_eq!(overlapping_returned.stereo().as_ptr(), overlapping_pointer);
+        }
+    }
+
+    #[test]
+    fn arm_rate_mismatch_is_command_typed_and_returns_exact_buffer() {
+        for source in [CaptureSource::Resample, CaptureSource::Input] {
+            let expected_rate = match source {
+                CaptureSource::Resample => 48_000,
+                CaptureSource::Input => 44_100,
+            };
+            let received_rate = expected_rate - 1;
+            let (mut port, _output_core) = port_for_capture_source(source);
+            let buffer =
+                CaptureBuffer::try_new(3, PadId::first(), source, received_rate, 8).unwrap();
+            let pointer = buffer.stereo().as_ptr();
+
+            let failure = port.begin_capture(buffer).unwrap_err();
+
+            assert_eq!(
+                failure.error(),
+                &CaptureError::CommandRateMismatch {
+                    expected: expected_rate,
+                    received: received_rate,
+                }
+            );
+            let CaptureCommand::Arm(returned) = failure.into_command() else {
+                panic!("rate-mismatched arm must return the exact buffer")
+            };
+            assert_eq!(returned.stereo().as_ptr(), pointer);
+            assert!(port.capture_status(source).is_none());
+        }
+    }
+
+    struct UnsupportedAudioPort;
+
+    impl AudioPort for UnsupportedAudioPort {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+
+        fn render_horizon(&self) -> u64 {
+            0
+        }
+
+        fn install(
+            &mut self,
+            _pad: PadId,
+            _sample: Arc<SampleBuffer>,
+            _settings: PadSettings,
+        ) -> Result<SampleSlot, String> {
+            Err("unsupported".into())
+        }
+
+        fn trigger(&mut self, _pad: PadId, _at: u64, _velocity: f32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn release(&mut self, _pad: PadId, _at: u64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_pad(&mut self, _pad: PadId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_all(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reclaim_retired(&mut self) -> usize {
+            0
+        }
+
+        fn latest_telemetry(&mut self) -> Option<Telemetry> {
+            None
+        }
+
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            None
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+    }
+
+    #[test]
+    fn unsupported_audio_port_does_not_claim_partial_capture_support() {
+        let mut port = UnsupportedAudioPort;
+        assert_eq!(port.capture_support(), CaptureSupport::Unsupported);
+        for source in [CaptureSource::Resample, CaptureSource::Input] {
+            assert_eq!(
+                port.capture_source_rate(source),
+                Err(CaptureError::Unsupported)
+            );
+            assert!(port.capture_status(source).is_none());
+            assert!(port.capture_completion(source).is_none());
+            assert!(port.capture_runtime_error(source).is_none());
+        }
+        let buffer =
+            CaptureBuffer::try_new(1, PadId::first(), CaptureSource::Resample, 48_000, 8).unwrap();
+        let pointer = buffer.stereo().as_ptr();
+        let failure = port.begin_capture(buffer).unwrap_err();
+        assert_eq!(failure.error(), &CaptureError::Unsupported);
+        let CaptureCommand::Arm(returned) = failure.into_command() else {
+            panic!("unsupported arm must return the exact buffer")
+        };
+        assert_eq!(returned.stereo().as_ptr(), pointer);
+
+        for command in ["start", "stop", "cancel"] {
+            let failure = match command {
+                "start" => port.start_capture(CaptureSource::Resample, 7).unwrap_err(),
+                "stop" => port.stop_capture(CaptureSource::Resample, 7).unwrap_err(),
+                "cancel" => port.cancel_capture(CaptureSource::Resample, 7).unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert_eq!(failure.error(), &CaptureError::Unsupported);
+            match (command, failure.into_command()) {
+                ("start", CaptureCommand::Start { token: 7 })
+                | ("stop", CaptureCommand::Stop { token: 7 })
+                | ("cancel", CaptureCommand::Cancel { token: 7 }) => {}
+                (_, rejected) => panic!("wrong unsupported command: {rejected:?}"),
+            }
+        }
+
+        let maintenance = port.poll_capture_maintenance();
+        for source in [CaptureSource::Resample, CaptureSource::Input] {
+            assert!(maintenance.completion(source).is_none());
+            assert!(maintenance.runtime_error(source).is_none());
+        }
     }
 }

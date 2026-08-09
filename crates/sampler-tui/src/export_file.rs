@@ -20,7 +20,7 @@ use crate::project_store::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublisherCheckpoint {
+pub(crate) enum PublisherCheckpoint {
     BeforePublish,
     BeforeDirectorySync,
 }
@@ -224,7 +224,7 @@ impl AtomicWavPublisher {
     }
 
     #[cfg(test)]
-    fn prepare_with_mutation_hook<F>(
+    pub(crate) fn prepare_with_mutation_hook<F>(
         destination: &Path,
         hook: F,
     ) -> Result<Self, OfflineExportError>

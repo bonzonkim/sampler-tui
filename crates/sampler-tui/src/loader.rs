@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -25,6 +25,8 @@ use crate::export::{
     OfflineExportRequest, stage_export_samples_with_observers,
 };
 use crate::export_file::AtomicWavPublisher;
+#[cfg(test)]
+use crate::export_file::PublisherCheckpoint;
 use crate::export_render::{OfflineFrameSink, render_offline};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 use crate::project_store::{
@@ -353,13 +355,16 @@ impl fmt::Display for WorkerPanicked {
 
 impl Error for WorkerPanicked {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportProgressSnapshot {
+    token: ExportToken,
+    completed_units: u64,
+    total_units: u64,
+}
+
 #[derive(Default)]
 struct CoalescedExportProgress {
-    sequence: AtomicU64,
-    token: AtomicU64,
-    completed_units: AtomicU64,
-    total_units: AtomicU64,
-    consumed_sequence: AtomicU64,
+    latest: AtomicPtr<ExportProgressSnapshot>,
     #[cfg(test)]
     consumer_gate: Mutex<()>,
 }
@@ -375,13 +380,18 @@ impl CoalescedExportProgress {
             debug_assert!(false, "progress slot accepts only export progress");
             return;
         };
-        let writing = self.sequence.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        self.token.store(token.get(), Ordering::Relaxed);
-        self.completed_units
-            .store(completed_units, Ordering::Relaxed);
-        self.total_units.store(total_units, Ordering::Relaxed);
-        self.sequence
-            .store(writing.wrapping_add(1), Ordering::Release);
+        let next = Box::into_raw(Box::new(ExportProgressSnapshot {
+            token,
+            completed_units,
+            total_units,
+        }));
+        let previous = self.latest.swap(next, Ordering::AcqRel);
+        if !previous.is_null() {
+            // SAFETY: every non-null pointer in `latest` originates from `Box::into_raw`. Atomic
+            // swap transfers the single slot ownership to exactly one producer or consumer; no
+            // thread dereferences a pointer without first removing it from the slot.
+            unsafe { drop(Box::from_raw(previous)) };
+        }
     }
 
     fn take(&self) -> Option<WorkerResult> {
@@ -390,36 +400,29 @@ impl CoalescedExportProgress {
             .consumer_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for _ in 0..4 {
-            let sequence = self.sequence.load(Ordering::Acquire);
-            if sequence == 0 || !sequence.is_multiple_of(2) {
-                std::hint::spin_loop();
-                continue;
-            }
-            let consumed = self.consumed_sequence.load(Ordering::Acquire);
-            if sequence == consumed {
-                return None;
-            }
-            let token = ExportToken::new(self.token.load(Ordering::Relaxed));
-            let completed_units = self.completed_units.load(Ordering::Relaxed);
-            let total_units = self.total_units.load(Ordering::Relaxed);
-            if self.sequence.load(Ordering::Acquire) != sequence {
-                std::hint::spin_loop();
-                continue;
-            }
-            if self
-                .consumed_sequence
-                .compare_exchange(consumed, sequence, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(WorkerResult::ExportProgress {
-                    token,
-                    completed_units,
-                    total_units,
-                });
-            }
+        let snapshot = self.latest.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if snapshot.is_null() {
+            return None;
         }
-        None
+        // SAFETY: the swap removed the pointer from the only shared slot and transferred its
+        // unique Box ownership to this consumer. The producer can no longer observe or free it.
+        let snapshot = unsafe { Box::from_raw(snapshot) };
+        Some(WorkerResult::ExportProgress {
+            token: snapshot.token,
+            completed_units: snapshot.completed_units,
+            total_units: snapshot.total_units,
+        })
+    }
+}
+
+impl Drop for CoalescedExportProgress {
+    fn drop(&mut self) {
+        let snapshot = *self.latest.get_mut();
+        if !snapshot.is_null() {
+            // SAFETY: `&mut self` proves no concurrent access. The remaining pointer still has
+            // the unique Box ownership installed by `publish` and was never removed by `take`.
+            unsafe { drop(Box::from_raw(snapshot)) };
+        }
     }
 }
 
@@ -458,12 +461,114 @@ impl InFlightExportCancels {
     }
 }
 
+struct WorkerAdmission {
+    sender: Mutex<Option<SyncSender<WorkerRequest>>>,
+    export_cancels: Arc<InFlightExportCancels>,
+    #[cfg(test)]
+    shutdown_admitted_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl WorkerAdmission {
+    fn new(sender: SyncSender<WorkerRequest>, export_cancels: Arc<InFlightExportCancels>) -> Self {
+        Self {
+            sender: Mutex::new(Some(sender)),
+            export_cancels,
+            #[cfg(test)]
+            shutdown_admitted_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_shutdown_admitted_hook(
+        sender: SyncSender<WorkerRequest>,
+        export_cancels: Arc<InFlightExportCancels>,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            sender: Mutex::new(Some(sender)),
+            export_cancels,
+            shutdown_admitted_hook: Some(hook),
+        }
+    }
+
+    fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
+        let mut sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(active_sender) = sender.as_ref() else {
+            return Err(WorkerSendFailure::new(
+                WorkerSendError::WorkerClosed,
+                request,
+            ));
+        };
+
+        if matches!(request, WorkerRequest::Shutdown) {
+            match active_sender.try_send(request) {
+                Ok(()) => {
+                    self.export_cancels.cancel_all();
+                    #[cfg(test)]
+                    if let Some(hook) = self.shutdown_admitted_hook.as_ref() {
+                        hook();
+                    }
+                    sender.take();
+                    Ok(())
+                }
+                Err(TrySendError::Full(request)) => {
+                    Err(WorkerSendFailure::new(WorkerSendError::WorkerBusy, request))
+                }
+                Err(TrySendError::Disconnected(request)) => {
+                    sender.take();
+                    Err(WorkerSendFailure::new(
+                        WorkerSendError::WorkerClosed,
+                        request,
+                    ))
+                }
+            }
+        } else {
+            let cancel = match &request {
+                WorkerRequest::Export(request) => Some(request.cancellation()),
+                _ => None,
+            };
+            if let Some(cancel) = cancel.as_ref() {
+                self.export_cancels.register(cancel.clone());
+            }
+            let result = active_sender
+                .try_send(request)
+                .map_err(|error| match error {
+                    TrySendError::Full(request) => {
+                        WorkerSendFailure::new(WorkerSendError::WorkerBusy, request)
+                    }
+                    TrySendError::Disconnected(request) => {
+                        WorkerSendFailure::new(WorkerSendError::WorkerClosed, request)
+                    }
+                });
+            if result.is_err()
+                && let Some(cancel) = cancel.as_ref()
+            {
+                self.export_cancels.remove(cancel);
+            }
+            result
+        }
+    }
+
+    fn request_shutdown(&self) {
+        let mut sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.export_cancels.cancel_all();
+        if let Some(sender) = sender.take() {
+            let _ = sender.try_send(WorkerRequest::Shutdown);
+        }
+    }
+}
+
 pub struct WorkerHandle {
-    requests: Option<SyncSender<WorkerRequest>>,
+    admission: WorkerAdmission,
     results: Receiver<WorkerResult>,
     worker: Option<JoinHandle<()>>,
     export_progress: Arc<CoalescedExportProgress>,
-    export_cancels: Arc<InFlightExportCancels>,
 }
 
 impl WorkerHandle {
@@ -499,29 +604,15 @@ impl WorkerHandle {
             })
             .expect("loader worker thread can be spawned");
         Self {
-            requests: Some(requests),
+            admission: WorkerAdmission::new(requests, export_cancels),
             results,
             worker: Some(worker),
             export_progress,
-            export_cancels,
         }
     }
 
     pub fn try_send(&self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
-        let cancel = match &request {
-            WorkerRequest::Export(request) => Some(request.cancellation()),
-            _ => None,
-        };
-        if let Some(cancel) = cancel.as_ref() {
-            self.export_cancels.register(cancel.clone());
-        }
-        let result = try_send_request(self.requests.as_ref(), request);
-        if result.is_err()
-            && let Some(cancel) = cancel.as_ref()
-        {
-            self.export_cancels.remove(cancel);
-        }
-        result
+        self.admission.try_send(request)
     }
 
     pub fn try_recv(&self) -> Result<WorkerResult, mpsc::TryRecvError> {
@@ -537,11 +628,7 @@ impl WorkerHandle {
     }
 
     pub fn request_shutdown(&mut self) {
-        self.export_cancels.cancel_all();
-        if let Some(sender) = self.requests.take() {
-            let _ = sender.try_send(WorkerRequest::Shutdown);
-            drop(sender);
-        }
+        self.admission.request_shutdown();
     }
 
     pub fn join(&mut self) -> Result<(), WorkerPanicked> {
@@ -566,6 +653,7 @@ impl WorkerHandle {
     }
 }
 
+#[cfg(test)]
 fn try_send_request(
     sender: Option<&SyncSender<WorkerRequest>>,
     request: WorkerRequest,
@@ -602,6 +690,15 @@ fn worker_loop(requests: Receiver<WorkerRequest>, results: SyncSender<WorkerResu
 }
 
 type ProjectAssetOpenHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type ExportPublisherHook = Arc<dyn Fn(PublisherCheckpoint) + Send + Sync>;
+
+#[derive(Default)]
+struct WorkerHooks {
+    asset_open: Option<ProjectAssetOpenHook>,
+    #[cfg(test)]
+    publisher: Option<ExportPublisherHook>,
+}
 
 fn worker_loop_with_asset_hook(
     requests: Receiver<WorkerRequest>,
@@ -614,8 +711,32 @@ fn worker_loop_with_asset_hook(
         requests,
         results,
         Box::new(ProjectStore),
-        hook,
+        WorkerHooks {
+            asset_open: hook,
+            #[cfg(test)]
+            publisher: None,
+        },
         export_progress,
+        export_cancels,
+    );
+}
+
+#[cfg(test)]
+fn worker_loop_with_export_hook(
+    requests: Receiver<WorkerRequest>,
+    results: SyncSender<WorkerResult>,
+    hook: ExportPublisherHook,
+    export_cancels: Arc<InFlightExportCancels>,
+) {
+    worker_loop_with_store_and_asset_hook(
+        requests,
+        results,
+        Box::new(ProjectStore),
+        WorkerHooks {
+            asset_open: None,
+            publisher: Some(hook),
+        },
+        Arc::new(CoalescedExportProgress::default()),
         export_cancels,
     );
 }
@@ -660,7 +781,7 @@ fn worker_loop_with_store(
         requests,
         results,
         store,
-        None,
+        WorkerHooks::default(),
         Arc::new(CoalescedExportProgress::default()),
         Arc::new(InFlightExportCancels::default()),
     );
@@ -670,7 +791,7 @@ fn worker_loop_with_store_and_asset_hook(
     requests: Receiver<WorkerRequest>,
     results: SyncSender<WorkerResult>,
     store: Box<dyn ProjectStoreBackend>,
-    asset_hook: Option<ProjectAssetOpenHook>,
+    hooks: WorkerHooks,
     export_progress: Arc<CoalescedExportProgress>,
     export_cancels: Arc<InFlightExportCancels>,
 ) {
@@ -805,7 +926,7 @@ fn worker_loop_with_store_and_asset_hook(
                         expected_digest,
                         engine_rate,
                         recipe,
-                        asset_hook.as_ref(),
+                        hooks.asset_open.as_ref(),
                     ),
                     path,
                     recipe,
@@ -817,7 +938,7 @@ fn worker_loop_with_store_and_asset_hook(
                 let revision = request.snapshot().revision();
                 let destination = request.destination().to_path_buf();
                 let cancel = request.cancellation();
-                let result = run_export(request, &export_progress, asset_hook.as_ref());
+                let result = run_export(request, &export_progress, &hooks);
                 export_cancels.remove(&cancel);
                 WorkerResult::ExportFinished {
                     token,
@@ -862,7 +983,7 @@ impl OfflineFrameSink for ExportProgressSink<'_> {
 fn run_export(
     request: OfflineExportRequest,
     progress: &CoalescedExportProgress,
-    asset_hook: Option<&ProjectAssetOpenHook>,
+    hooks: &WorkerHooks,
 ) -> Result<OfflineExportReceipt, OfflineExportError> {
     let (token, destination, snapshot, cancel) = request.into_parts();
     let loop_frames = snapshot.loop_frames()?;
@@ -884,7 +1005,7 @@ fn run_export(
         &snapshot,
         cancel.as_atomic(),
         || {
-            if let Some(hook) = asset_hook {
+            if let Some(hook) = hooks.asset_open.as_ref() {
                 hook();
             }
         },
@@ -901,6 +1022,14 @@ fn run_export(
         return Err(OfflineExportError::Cancelled);
     }
 
+    #[cfg(test)]
+    let mut publisher = if let Some(hook) = hooks.publisher.as_ref() {
+        let hook = Arc::clone(hook);
+        AtomicWavPublisher::prepare_with_mutation_hook(&destination, move |point| hook(point))?
+    } else {
+        AtomicWavPublisher::prepare(&destination)?
+    };
+    #[cfg(not(test))]
     let mut publisher = AtomicWavPublisher::prepare(&destination)?;
     let summary = {
         let mut sink = ExportProgressSink {
@@ -1307,16 +1436,21 @@ mod tests {
     use std::time::Duration;
 
     use sampler_audio::{CaptureSource, SampleBuffer};
-    use sampler_core::{BankId, PadId, PadSettings, ProjectId, SampleEditRecipe};
+    use sampler_core::{
+        AssetDigest, BankId, EventId, MasterMixSettings, Meter, PadId, PadMixSettings, PadSettings,
+        PatternEvent, PatternSlotId, ProjectDocument, ProjectId, ProjectPad, ProjectPattern,
+        ProjectPatternEvent, Resolution, SampleEditRecipe, Tempo, Transport,
+    };
     use sha2::{Digest, Sha256};
 
     use super::{
         CoalescedExportProgress, EDIT_PREVIEW_COLUMNS, FinalizeCaptureRequest,
         InFlightExportCancels, LoadPurpose, MAX_DIRECTORY_ENTRIES, MAX_ENCODED_FILE_BYTES,
-        ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken, StageProjectSampleRequest,
-        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerPanicked, WorkerRequest, WorkerResult,
-        WorkerSendError, build_preview, downsample_preview, frame_duration, load_sample,
-        preview_column, scan_directory, try_send_request, worker_loop, worker_loop_with_store,
+        ProjectSaveWorkerRequest, ProjectStoreBackend, ProjectToken, PublisherCheckpoint,
+        StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY, WorkerAdmission, WorkerHandle,
+        WorkerPanicked, WorkerRequest, WorkerResult, WorkerSendError, build_preview,
+        downsample_preview, frame_duration, load_sample, preview_column, scan_directory,
+        try_send_request, worker_loop, worker_loop_with_export_hook, worker_loop_with_store,
     };
     use crate::{
         DirectoryEntry, ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectSaveSnapshot,
@@ -1415,11 +1549,10 @@ mod tests {
         let (result_sender, results) = mpsc::sync_channel(result_capacity);
         let worker = thread::spawn(move || worker_loop(request_receiver, result_sender));
         WorkerHandle {
-            requests: Some(requests),
+            admission: WorkerAdmission::new(requests, Arc::new(InFlightExportCancels::default())),
             results,
             worker: Some(worker),
             export_progress: Arc::new(CoalescedExportProgress::default()),
-            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1431,11 +1564,10 @@ mod tests {
             .spawn(move || worker_loop_with_store(request_receiver, result_sender, store))
             .unwrap();
         WorkerHandle {
-            requests: Some(requests),
+            admission: WorkerAdmission::new(requests, Arc::new(InFlightExportCancels::default())),
             results,
             worker: Some(worker),
             export_progress: Arc::new(CoalescedExportProgress::default()),
-            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1446,11 +1578,10 @@ mod tests {
         drop(result_sender);
         let worker = thread::spawn(|| panic!("injected loader panic"));
         WorkerHandle {
-            requests: Some(requests),
+            admission: WorkerAdmission::new(requests, Arc::new(InFlightExportCancels::default())),
             results,
             worker: Some(worker),
             export_progress: Arc::new(CoalescedExportProgress::default()),
-            export_cancels: Arc::new(InFlightExportCancels::default()),
         }
     }
 
@@ -1469,6 +1600,146 @@ mod tests {
                 patterns: Vec::new(),
             },
         }
+    }
+
+    fn offline_export_request(token: u64) -> crate::OfflineExportRequest {
+        let pad = pad(0, 0);
+        let slot = PatternSlotId::new(0).unwrap();
+        let snapshot = crate::OfflineExportSnapshot::new(
+            ProjectId::from_bytes([token as u8; 16]),
+            token,
+            slot,
+            ProjectPattern {
+                slot,
+                name: "admission".to_owned(),
+                sample_rate: crate::EXPORT_SAMPLE_RATE,
+                tempo: Tempo::new(120.0).unwrap(),
+                meter: Meter::new(4, 4).unwrap(),
+                bars: 1,
+                resolution: Resolution::Sixteenth,
+                swing: 0.5,
+                quantize_strength: 0.0,
+                events: vec![ProjectPatternEvent {
+                    event: PatternEvent::new(EventId(1), pad, 0, 1.0, None).unwrap(),
+                    raw_frame: 0,
+                }],
+            },
+            vec![ProjectSavePad {
+                pad,
+                source_path: PathBuf::from("source.wav"),
+                source_generation: 1,
+                fingerprint: SourceFingerprint {
+                    digest: AssetDigest::from_bytes([token as u8; 32]),
+                    encoded_bytes: 1,
+                    extension: SupportedAudioExtension::Wav,
+                },
+                settings: PadSettings::default(),
+                mix: PadMixSettings::default(),
+                recipe: SampleEditRecipe::identity(),
+            }],
+            MasterMixSettings::default(),
+            crate::EXPORT_SAMPLE_RATE,
+        )
+        .unwrap();
+        crate::OfflineExportRequest::new(
+            crate::ExportToken::new(token),
+            PathBuf::from(format!("export-{token}.wav")),
+            snapshot,
+            crate::ExportCancel::default(),
+        )
+        .unwrap()
+    }
+
+    fn project_backed_export_request(
+        label: &str,
+        token: u64,
+    ) -> (
+        DirectoryFixture,
+        crate::OfflineExportRequest,
+        crate::ExportCancel,
+    ) {
+        let source = wav_fixture(48_000, &[0, i16::MAX, 0, i16::MIN]);
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let project = DirectoryFixture::new(label);
+        fs::create_dir(project.path().join("audio")).unwrap();
+        let asset_path = format!("audio/{}.wav", fingerprint.digest);
+        fs::copy(source.path(), project.path().join(&asset_path)).unwrap();
+        let pad = pad(0, 0);
+        let slot = PatternSlotId::new(0).unwrap();
+        let tempo = Tempo::new(240.0).unwrap();
+        let meter = Meter::new(4, 4).unwrap();
+        let transport = Transport::new(
+            crate::EXPORT_SAMPLE_RATE,
+            tempo,
+            meter,
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap()
+        .with_swing(0.5)
+        .unwrap();
+        let document = ProjectDocument::new_v4(
+            ProjectId::from_bytes([token as u8; 16]),
+            "worker fence",
+            token,
+            vec![
+                ProjectPad::new(
+                    pad,
+                    asset_path,
+                    fingerprint.digest,
+                    PadSettings::default(),
+                    PadMixSettings::default(),
+                    SampleEditRecipe::identity(),
+                )
+                .unwrap(),
+            ],
+            vec![ProjectPattern {
+                slot,
+                name: "worker fence".to_owned(),
+                sample_rate: crate::EXPORT_SAMPLE_RATE,
+                tempo,
+                meter,
+                bars: 1,
+                resolution: Resolution::Sixteenth,
+                swing: 0.5,
+                quantize_strength: 0.0,
+                events: vec![ProjectPatternEvent {
+                    event: PatternEvent::new(EventId(1), pad, 0, 1.0, None)
+                        .unwrap()
+                        .quantized(&transport, 0.0),
+                    raw_frame: 0,
+                }],
+            }],
+            MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
+        )
+        .unwrap();
+        let snapshot = crate::OfflineExportSnapshot::from_document(
+            project.path(),
+            &document,
+            crate::ExportPatternSlot::try_from(1).unwrap(),
+        )
+        .unwrap();
+        let cancel = crate::ExportCancel::default();
+        let request = crate::OfflineExportRequest::new(
+            crate::ExportToken::new(token),
+            project.path().join("mix.wav"),
+            snapshot,
+            cancel.clone(),
+        )
+        .unwrap();
+        (project, request, cancel)
+    }
+
+    fn export_temp_entries(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("sampler-tui-tmp"))
+            })
+            .collect()
     }
 
     struct ScriptedProjectStore;
@@ -1571,6 +1842,236 @@ mod tests {
                 total_units: 8,
             })
         );
+    }
+
+    #[test]
+    fn concurrent_export_waits_for_shutdown_admission_then_returns_closed_and_unregistered() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let export_cancels = Arc::new(InFlightExportCancels::default());
+        let gate = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let hook_gate = Arc::clone(&gate);
+        let hook = Arc::new(move || {
+            let (lock, changed) = &*hook_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+        });
+        let admission = Arc::new(WorkerAdmission::with_shutdown_admitted_hook(
+            sender,
+            Arc::clone(&export_cancels),
+            hook,
+        ));
+        let shutdown_admission = Arc::clone(&admission);
+        let shutdown = thread::spawn(move || shutdown_admission.try_send(WorkerRequest::Shutdown));
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = changed.wait(state).unwrap();
+            }
+        }
+
+        let request = offline_export_request(107);
+        let expected = request.clone();
+        let export_admission = Arc::clone(&admission);
+        let (done_sender, done_receiver) = mpsc::channel();
+        let export = thread::spawn(move || {
+            done_sender
+                .send(export_admission.try_send(WorkerRequest::Export(request)))
+                .unwrap();
+        });
+        assert_eq!(
+            done_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            changed.notify_all();
+        }
+        assert_eq!(shutdown.join().unwrap(), Ok(()));
+        let failure = done_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        export.join().unwrap();
+
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Export(expected));
+        assert_eq!(receiver.try_recv(), Ok(WorkerRequest::Shutdown));
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        assert!(
+            export_cancels
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancellation_immediately_before_publish_returns_one_cancelled_terminal_and_no_file() {
+        let (project, request, cancel) = project_backed_export_request("cancel-before-link", 111);
+        let destination = request.destination().to_path_buf();
+        let gate = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let hook_gate = Arc::clone(&gate);
+        let hook = Arc::new(move |checkpoint| {
+            if checkpoint != PublisherCheckpoint::BeforePublish {
+                return;
+            }
+            let (lock, changed) = &*hook_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+        });
+        let (request_sender, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let (result_sender, result_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let export_cancels = Arc::new(InFlightExportCancels::default());
+        let admission = WorkerAdmission::new(request_sender, Arc::clone(&export_cancels));
+        let worker_export_cancels = Arc::clone(&export_cancels);
+        let worker = thread::spawn(move || {
+            worker_loop_with_export_hook(
+                request_receiver,
+                result_sender,
+                hook,
+                worker_export_cancels,
+            )
+        });
+        admission.try_send(WorkerRequest::Export(request)).unwrap();
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = changed.wait(state).unwrap();
+            }
+        }
+
+        cancel.cancel();
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            changed.notify_all();
+        }
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WorkerResult::ExportFinished {
+                token,
+                result: Err(crate::OfflineExportError::Cancelled),
+                ..
+            } if token == crate::ExportToken::new(111)
+        ));
+        admission.try_send(WorkerRequest::Shutdown).unwrap();
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        worker.join().unwrap();
+        assert!(
+            export_cancels
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+
+        assert!(!destination.exists());
+        assert!(export_temp_entries(project.path()).is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_link_linearization_returns_one_receipt_and_complete_file() {
+        let (project, request, cancel) = project_backed_export_request("cancel-after-link", 112);
+        let destination = request.destination().to_path_buf();
+        let gate = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let hook_gate = Arc::clone(&gate);
+        let hook = Arc::new(move |checkpoint| {
+            if checkpoint != PublisherCheckpoint::BeforeDirectorySync {
+                return;
+            }
+            let (lock, changed) = &*hook_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+        });
+        let (request_sender, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let (result_sender, result_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let export_cancels = Arc::new(InFlightExportCancels::default());
+        let admission = WorkerAdmission::new(request_sender, Arc::clone(&export_cancels));
+        let worker_export_cancels = Arc::clone(&export_cancels);
+        let worker = thread::spawn(move || {
+            worker_loop_with_export_hook(
+                request_receiver,
+                result_sender,
+                hook,
+                worker_export_cancels,
+            )
+        });
+        admission.try_send(WorkerRequest::Export(request)).unwrap();
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.0 {
+                state = changed.wait(state).unwrap();
+            }
+        }
+
+        assert!(destination.is_file());
+        cancel.cancel();
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            changed.notify_all();
+        }
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WorkerResult::ExportFinished {
+                token,
+                result: Ok(ref receipt),
+                ..
+            } if token == crate::ExportToken::new(112)
+                && receipt.token == token
+                && receipt.destination == destination
+        ));
+        admission.try_send(WorkerRequest::Shutdown).unwrap();
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        worker.join().unwrap();
+        assert!(
+            export_cancels
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+
+        let reader = hound::WavReader::open(&destination).unwrap();
+        assert_eq!(reader.spec().sample_rate, crate::EXPORT_SAMPLE_RATE);
+        assert_eq!(reader.duration(), 48_000);
+        assert!(export_temp_entries(project.path()).is_empty());
     }
 
     #[test]
@@ -2334,6 +2835,42 @@ mod tests {
         let failure = try_send_request(None, WorkerRequest::Shutdown).unwrap_err();
         assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
         assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
+    }
+
+    #[test]
+    fn worker_admission_retains_a_full_sender_and_closes_a_disconnected_sender() {
+        let (full_sender, full_receiver) = mpsc::sync_channel(1);
+        full_sender.try_send(WorkerRequest::Shutdown).unwrap();
+        let full_admission =
+            WorkerAdmission::new(full_sender, Arc::new(InFlightExportCancels::default()));
+
+        let failure = full_admission
+            .try_send(WorkerRequest::Shutdown)
+            .unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerBusy);
+        assert_eq!(failure.into_request(), WorkerRequest::Shutdown);
+        assert_eq!(full_receiver.try_recv(), Ok(WorkerRequest::Shutdown));
+        assert_eq!(full_admission.try_send(WorkerRequest::Shutdown), Ok(()));
+        let failure = full_admission
+            .try_send(WorkerRequest::Shutdown)
+            .unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+
+        let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
+        drop(closed_receiver);
+        let closed_admission =
+            WorkerAdmission::new(closed_sender, Arc::new(InFlightExportCancels::default()));
+        let failure = closed_admission
+            .try_send(WorkerRequest::Shutdown)
+            .unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        let request = offline_export_request(108);
+        let expected = request.clone();
+        let failure = closed_admission
+            .try_send(WorkerRequest::Export(request))
+            .unwrap_err();
+        assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+        assert_eq!(failure.into_request(), WorkerRequest::Export(expected));
     }
 
     #[test]

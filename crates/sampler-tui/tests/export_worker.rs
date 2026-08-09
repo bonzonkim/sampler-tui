@@ -12,9 +12,9 @@ use sampler_core::{
 };
 use sampler_tui::loader::PROGRESS_CHANNEL_CAPACITY;
 use sampler_tui::{
-    EXPORT_CHUNK_FRAMES, ExportCancel, ExportPatternSlot, ExportToken, OfflineExportError,
-    OfflineExportRequest, OfflineExportSnapshot, SourceFingerprint, WorkerHandle, WorkerRequest,
-    WorkerResult, WorkerSendError,
+    ExportCancel, ExportPatternSlot, ExportToken, OfflineExportError, OfflineExportRequest,
+    OfflineExportSnapshot, SourceFingerprint, WorkerHandle, WorkerRequest, WorkerResult,
+    WorkerSendError,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -279,6 +279,66 @@ fn closed_worker_returns_the_exact_export_request_without_creating_a_temp() {
 }
 
 #[test]
+fn admitted_shutdown_closes_export_admission_and_cancels_every_earlier_export() {
+    let first = Fixture::new("shutdown-marker-first");
+    let later = Fixture::new("shutdown-marker-later");
+    let (first_request, _) = first.request(28, "first.wav");
+    let (later_request, _) = later.request(29, "later.wav");
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let hook_gate = Arc::clone(&gate);
+    let mut worker = WorkerHandle::spawn_with_project_asset_open_hook(move || {
+        let (lock, changed) = &*hook_gate;
+        let mut state = lock.lock().unwrap();
+        state.0 = true;
+        changed.notify_all();
+        while !state.1 {
+            state = changed.wait(state).unwrap();
+        }
+    });
+    worker
+        .try_send(WorkerRequest::Export(first_request))
+        .unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    worker.try_send(WorkerRequest::Shutdown).unwrap();
+    let later_send = worker.try_send(WorkerRequest::Export(later_request.clone()));
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        changed.notify_all();
+    }
+    let terminal = worker.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        worker.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    worker.join().unwrap();
+
+    let failure = later_send.unwrap_err();
+    assert_eq!(failure.kind(), WorkerSendError::WorkerClosed);
+    assert_eq!(failure.into_request(), WorkerRequest::Export(later_request));
+    assert!(matches!(
+        terminal,
+        WorkerResult::ExportFinished {
+            token,
+            result: Err(OfflineExportError::Cancelled),
+            ..
+        } if token == ExportToken::new(28)
+    ));
+    assert!(!first.root.join("first.wav").exists());
+    assert!(!later.root.join("later.wav").exists());
+    assert!(first.temp_entries().is_empty());
+    assert!(later.temp_entries().is_empty());
+}
+
+#[test]
 fn an_old_cancel_and_terminal_token_cannot_cancel_or_identify_a_newer_export() {
     let fixture = Fixture::new("stale-token");
     let (old_request, old_cancel) = fixture.request(31, "old.wav");
@@ -309,70 +369,6 @@ fn an_old_cancel_and_terminal_token_cannot_cancel_or_identify_a_newer_export() {
     assert!(!fixture.root.join("old.wav").exists());
     assert!(fixture.root.join("new.wav").is_file());
     assert!(fixture.temp_entries().is_empty());
-    worker.shutdown().unwrap();
-}
-
-#[test]
-fn cancellation_racing_with_publish_has_one_terminal_linearized_outcome() {
-    let fixture = Fixture::new("publish-race");
-    let mut worker = WorkerHandle::spawn();
-    let mut cancelled_outcomes = 0;
-    for token_value in 40..48 {
-        let destination = format!("race-{token_value}.wav");
-        let destination_path = fixture.root.join(&destination);
-        let (request, cancel) = fixture.request(token_value, &destination);
-        let token = request.token();
-        let expected_total_units = request
-            .snapshot()
-            .loop_frames()
-            .unwrap()
-            .div_ceil(EXPORT_CHUNK_FRAMES as u64)
-            + 2;
-        worker.try_send(WorkerRequest::Export(request)).unwrap();
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(WorkerResult::ExportProgress {
-                token: progress_token,
-                completed_units,
-                total_units,
-            }) = worker.try_recv_export_progress()
-                && progress_token == token
-                && total_units == expected_total_units
-                && completed_units.checked_add(1) == Some(total_units)
-            {
-                cancel.cancel();
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "progress timed out");
-            std::hint::spin_loop();
-        }
-
-        match worker.recv_timeout(Duration::from_secs(5)).unwrap() {
-            WorkerResult::ExportFinished {
-                token: result_token,
-                result: Ok(receipt),
-                ..
-            } => {
-                assert_eq!(result_token, token);
-                assert_eq!(receipt.token, token);
-                assert!(destination_path.is_file());
-            }
-            WorkerResult::ExportFinished {
-                token: result_token,
-                result: Err(OfflineExportError::Cancelled),
-                ..
-            } => {
-                assert_eq!(result_token, token);
-                cancelled_outcomes += 1;
-                assert!(!destination_path.exists());
-            }
-            other => panic!("unexpected publish-race terminal result: {other:?}"),
-        }
-        assert!(worker.try_recv().is_err());
-        assert!(fixture.temp_entries().is_empty());
-    }
-    assert!(cancelled_outcomes > 0);
     worker.shutdown().unwrap();
 }
 

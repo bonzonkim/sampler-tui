@@ -147,6 +147,8 @@ pub enum WorkerRequest {
     Shutdown,
 }
 
+// Project probing carries the public, unboxed project document; keep the worker API stable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerResult {
     CaptureFinalized {

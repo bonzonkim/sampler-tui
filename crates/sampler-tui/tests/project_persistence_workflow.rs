@@ -221,7 +221,7 @@ fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     let saved_snapshot = source.app.project_snapshot().unwrap();
     let explicit_bytes = fs::read(project.join("project.toml")).unwrap();
     let explicit_text = std::str::from_utf8(&explicit_bytes).unwrap();
-    assert!(explicit_text.contains("schema_version = 3"));
+    assert!(explicit_text.contains("schema_version = 4"));
     let probe = ProjectStore.probe(&project).unwrap();
     let document = probe.explicit.unwrap().unwrap();
     assert_eq!(document.pads.len(), 2);

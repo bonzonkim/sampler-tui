@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BankId, ChokeGroup, DelaySettings, EditablePattern, EventId, MAX_PATTERN_EVENTS,
-    MasterMixSettings, Meter, ModelError, PATTERN_SLOT_COUNT, PadId, PadMixSettings, PadSettings,
-    PatternEditError, PatternEvent, PatternSlotId, PlaybackMode, Resolution, ReverbSettings,
-    SampleEditError, SampleEditRecipe, Tempo, Transport,
+    MasterMixSettings, Meter, MidiBankMap, MidiChannelFilter, MidiNote, MidiSettings, ModelError,
+    PATTERN_SLOT_COUNT, PadId, PadMixSettings, PadSettings, PatternEditError, PatternEvent,
+    PatternSlotId, PlaybackMode, Resolution, ReverbSettings, SampleEditError, SampleEditRecipe,
+    Tempo, Transport,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProjectId([u8; 16]);
@@ -287,6 +288,34 @@ struct WireV3ProjectDocument {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct WireV4ProjectDocument {
+    schema_version: u32,
+    project_id: String,
+    name: String,
+    revision: u64,
+    #[serde(default)]
+    pads: Vec<WireV3ProjectPad>,
+    #[serde(default)]
+    patterns: Vec<WireV2ProjectPattern>,
+    master_mix: WireMasterMixSettings,
+    midi: WireMidiSettings,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireMidiSettings {
+    channel: MidiChannelFilter,
+    banks: [WireMidiBankMap; 10],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireMidiBankMap {
+    notes: [i16; 16],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireV3ProjectPad {
     pad: WirePadId,
     audio_path: String,
@@ -451,6 +480,64 @@ impl From<MasterMixSettings> for WireMasterMixSettings {
     }
 }
 
+impl TryFrom<WireMidiBankMap> for MidiBankMap {
+    type Error = ProjectError;
+
+    fn try_from(value: WireMidiBankMap) -> Result<Self, Self::Error> {
+        let mut notes = [None; 16];
+        for (index, note) in value.notes.into_iter().enumerate() {
+            notes[index] = match note {
+                -1 => None,
+                0..=127 => Some(MidiNote::new(note as u8).map_err(ProjectError::InvalidModel)?),
+                invalid => {
+                    return Err(ProjectError::InvalidModel(ModelError::MidiNoteOutOfRange(
+                        u8::try_from(invalid).unwrap_or(u8::MAX),
+                    )));
+                }
+            };
+        }
+        MidiBankMap::new(notes).map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<MidiBankMap> for WireMidiBankMap {
+    fn from(value: MidiBankMap) -> Self {
+        Self {
+            notes: value
+                .notes()
+                .map(|note| note.map_or(-1, |note| i16::from(note.get()))),
+        }
+    }
+}
+
+impl TryFrom<WireMidiSettings> for MidiSettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WireMidiSettings) -> Result<Self, Self::Error> {
+        let banks = value
+            .banks
+            .into_iter()
+            .map(MidiBankMap::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("the fixed wire MIDI bank count is ten");
+        MidiSettings::new(value.channel, banks).map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<MidiSettings> for WireMidiSettings {
+    fn from(value: MidiSettings) -> Self {
+        Self {
+            channel: value.channel(),
+            banks: std::array::from_fn(|index| {
+                value
+                    .bank(BankId::new(index as u8).expect("wire MIDI bank index is bounded"))
+                    .into()
+            }),
+        }
+    }
+}
+
 impl TryFrom<WirePatternEvent> for PatternEvent {
     type Error = ProjectError;
 
@@ -477,16 +564,18 @@ pub struct ProjectDocument {
     pub pads: Vec<ProjectPad>,
     pub patterns: Vec<ProjectPattern>,
     pub master_mix: MasterMixSettings,
+    pub midi: MidiSettings,
 }
 
 impl ProjectDocument {
-    pub fn new_v3(
+    pub fn new_v4(
         project_id: ProjectId,
         name: impl Into<String>,
         revision: u64,
         pads: Vec<ProjectPad>,
         patterns: Vec<ProjectPattern>,
         master_mix: MasterMixSettings,
+        midi: MidiSettings,
     ) -> Result<Self, ProjectError> {
         let patterns = complete_sparse_patterns(patterns)?;
         let project = Self {
@@ -497,6 +586,7 @@ impl ProjectDocument {
             pads,
             patterns,
             master_mix,
+            midi,
         };
         project.validate()?;
         Ok(project)
@@ -504,7 +594,7 @@ impl ProjectDocument {
 
     pub fn to_toml(&self) -> Result<String, ProjectError> {
         self.validate()?;
-        let wire = WireV3ProjectDocument::try_from(self)?;
+        let wire = WireV4ProjectDocument::try_from(self)?;
         toml::to_string_pretty(&wire).map_err(|error| ProjectError::TomlEncode(error.to_string()))
     }
 
@@ -519,9 +609,12 @@ impl ProjectDocument {
         match header.schema_version {
             1 => parse_v1_legacy(source),
             2 => parse_v2(source)
-                .and_then(migrate_v2_to_v3)
+                .and_then(migrate_v2_to_v4)
                 .map(ParsedProjectDocument::Current),
-            3 => parse_v3_current(source).map(ParsedProjectDocument::Current),
+            3 => parse_v3(source)
+                .and_then(migrate_v3_to_v4)
+                .map(ParsedProjectDocument::Current),
+            4 => parse_v4_current(source).map(ParsedProjectDocument::Current),
             found if found > CURRENT_SCHEMA_VERSION => Err(ProjectError::NewerSchema {
                 found,
                 supported: CURRENT_SCHEMA_VERSION,
@@ -562,6 +655,7 @@ impl ProjectDocument {
         self.master_mix
             .validate()
             .map_err(ProjectError::InvalidModel)?;
+        self.midi.validate().map_err(ProjectError::InvalidModel)?;
         Ok(())
     }
 }
@@ -576,8 +670,12 @@ fn parse_v2(source: &str) -> Result<WireV2ProjectDocument, ProjectError> {
     toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))
 }
 
-fn parse_v3_current(source: &str) -> Result<ProjectDocument, ProjectError> {
-    let wire: WireV3ProjectDocument =
+fn parse_v3(source: &str) -> Result<WireV3ProjectDocument, ProjectError> {
+    toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))
+}
+
+fn parse_v4_current(source: &str) -> Result<ProjectDocument, ProjectError> {
+    let wire: WireV4ProjectDocument =
         toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
     ProjectDocument::try_from(wire)
 }
@@ -754,6 +852,8 @@ impl ProjectPattern {
     }
 }
 
+// Keep the established public enum shape; boxing `Current` would be an unrelated API break.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedProjectDocument {
     Current(ProjectDocument),
@@ -1075,14 +1175,14 @@ impl TryFrom<WireV2ProjectPattern> for ProjectPattern {
     }
 }
 
-fn migrate_v2_to_v3(value: WireV2ProjectDocument) -> Result<ProjectDocument, ProjectError> {
+fn migrate_v2_to_v4(value: WireV2ProjectDocument) -> Result<ProjectDocument, ProjectError> {
     if value.schema_version != 2 {
         return Err(ProjectError::UnsupportedSchema(value.schema_version));
     }
     let project_id = decode_hex(&value.project_id)
         .map(ProjectId::from_bytes)
         .ok_or(ProjectError::InvalidProjectId)?;
-    ProjectDocument::new_v3(
+    ProjectDocument::new_v4(
         project_id,
         value.name,
         value.revision,
@@ -1097,20 +1197,47 @@ fn migrate_v2_to_v3(value: WireV2ProjectDocument) -> Result<ProjectDocument, Pro
             .map(ProjectPattern::try_from)
             .collect::<Result<Vec<_>, _>>()?,
         MasterMixSettings::default(),
+        MidiSettings::default(),
     )
 }
 
-impl TryFrom<WireV3ProjectDocument> for ProjectDocument {
+fn migrate_v3_to_v4(value: WireV3ProjectDocument) -> Result<ProjectDocument, ProjectError> {
+    if value.schema_version != 3 {
+        return Err(ProjectError::UnsupportedSchema(value.schema_version));
+    }
+    let project_id = decode_hex(&value.project_id)
+        .map(ProjectId::from_bytes)
+        .ok_or(ProjectError::InvalidProjectId)?;
+    ProjectDocument::new_v4(
+        project_id,
+        value.name,
+        value.revision,
+        value
+            .pads
+            .into_iter()
+            .map(ProjectPad::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        value
+            .patterns
+            .into_iter()
+            .map(ProjectPattern::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        value.master_mix.try_into()?,
+        MidiSettings::default(),
+    )
+}
+
+impl TryFrom<WireV4ProjectDocument> for ProjectDocument {
     type Error = ProjectError;
 
-    fn try_from(value: WireV3ProjectDocument) -> Result<Self, Self::Error> {
+    fn try_from(value: WireV4ProjectDocument) -> Result<Self, Self::Error> {
         if value.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(ProjectError::UnsupportedSchema(value.schema_version));
         }
         let project_id = decode_hex(&value.project_id)
             .map(ProjectId::from_bytes)
             .ok_or(ProjectError::InvalidProjectId)?;
-        Self::new_v3(
+        Self::new_v4(
             project_id,
             value.name,
             value.revision,
@@ -1125,11 +1252,12 @@ impl TryFrom<WireV3ProjectDocument> for ProjectDocument {
                 .map(ProjectPattern::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
             value.master_mix.try_into()?,
+            value.midi.try_into()?,
         )
     }
 }
 
-impl TryFrom<&ProjectDocument> for WireV3ProjectDocument {
+impl TryFrom<&ProjectDocument> for WireV4ProjectDocument {
     type Error = ProjectError;
 
     fn try_from(value: &ProjectDocument) -> Result<Self, Self::Error> {
@@ -1171,6 +1299,7 @@ impl TryFrom<&ProjectDocument> for WireV3ProjectDocument {
                 })
                 .collect(),
             master_mix: value.master_mix.into(),
+            midi: value.midi.into(),
         })
     }
 }
@@ -1299,8 +1428,9 @@ fn validate_current_audio_path(
 mod tests {
     use super::*;
     use crate::{
-        BankId, DelaySettings, EditablePattern, MasterMixSettings, PadId, PadMixSettings,
-        PadSettings, PatternSlotId, ReverbSettings, SAMPLE_PHASE_SCALE, SampleEditRecipe,
+        BankId, DelaySettings, EditablePattern, MasterMixSettings, MidiChannel, MidiChannelFilter,
+        MidiNote, MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, ReverbSettings,
+        SAMPLE_PHASE_SCALE, SampleEditRecipe,
     };
 
     fn digest(byte: u8) -> AssetDigest {
@@ -1312,13 +1442,14 @@ mod tests {
     }
 
     fn empty_project(name: &str) -> ProjectDocument {
-        ProjectDocument::new_v3(
+        ProjectDocument::new_v4(
             ProjectId::from_bytes([0x10; 16]),
             name,
             0,
             Vec::new(),
             Vec::new(),
             MasterMixSettings::default(),
+            MidiSettings::default(),
         )
         .unwrap()
     }
@@ -1369,7 +1500,7 @@ index = {index}
             .unwrap(),
         );
         let encoded = project.to_toml().unwrap();
-        assert!(encoded.contains("schema_version = 3"));
+        assert!(encoded.contains("schema_version = 4"));
         assert_eq!(
             ProjectDocument::from_toml(&encoded).unwrap(),
             ParsedProjectDocument::Current(project)
@@ -1636,7 +1767,6 @@ schema_version = 3
 project_id = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
 name = "literal-v3"
 revision = 42
-patterns = []
 
 [master_mix]
 gain_db = -6.0
@@ -1662,10 +1792,11 @@ bank = 0
 index = 0
 
 [pads.settings]
-mode = "OneShot"
-gain_db = 0.0
-pan = 0.0
-pitch_semitones = 0.0
+mode = "Gate"
+gain_db = -3.0
+pan = -0.0
+pitch_semitones = 2.0
+choke_group = 4
 
 [pads.mix]
 muted = true
@@ -1673,10 +1804,93 @@ delay_send = 0.25
 reverb_send = 0.75
 
 [pads.recipe]
-start_phase = 0
+start_phase = 1
 end_phase = 4294967296
-reversed = false
-normalize = false
+reversed = true
+normalize = true
+
+[[patterns]]
+slot = 7
+name = "literal v3 pattern"
+sample_rate = 48000
+tempo = 123.0
+bars = 2
+resolution = "eighth"
+swing = 0.6
+quantize_strength = 0.75
+
+[patterns.meter]
+numerator = 3
+denominator = 4
+
+[[patterns.events]]
+id = 9
+frame = 0
+raw_frame = 0
+velocity = 0.75
+duration = 2400
+original_offset = 0
+
+[patterns.events.pad]
+bank = 0
+index = 0
+"#;
+
+    const SCHEMA_V4_LITERAL: &str = r#"
+schema_version = 4
+project_id = "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+name = "literal-v4"
+revision = 84
+pads = []
+patterns = []
+
+[master_mix]
+gain_db = 0.0
+
+[master_mix.delay]
+enabled = false
+time_ms = 250
+feedback = 0.35
+return_db = -12.0
+
+[master_mix.reverb]
+enabled = false
+room_size = 0.5
+damping = 0.5
+return_db = -12.0
+
+[midi]
+channel = "omni"
+
+[[midi.banks]]
+notes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+[[midi.banks]]
+notes = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+
+[[midi.banks]]
+notes = [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+
+[[midi.banks]]
+notes = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+
+[[midi.banks]]
+notes = [64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79]
+
+[[midi.banks]]
+notes = [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95]
+
+[[midi.banks]]
+notes = [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+
+[[midi.banks]]
+notes = [112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+
+[[midi.banks]]
+notes = [-1, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+
+[[midi.banks]]
+notes = [36, -1, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 "#;
 
     fn quantized_pattern(slot: PatternSlotId) -> EditablePattern {
@@ -1711,7 +1925,7 @@ normalize = false
     fn current_document() -> ProjectDocument {
         let id = ProjectId::from_bytes([0x2a; 16]);
         let digest = AssetDigest::from_bytes([0x5c; 32]);
-        ProjectDocument::new_v3(
+        ProjectDocument::new_v4(
             id,
             "beat",
             41,
@@ -1721,6 +1935,7 @@ normalize = false
                     .unwrap(),
             ],
             MasterMixSettings::default(),
+            MidiSettings::default(),
         )
         .unwrap()
     }
@@ -1733,7 +1948,7 @@ normalize = false
             ReverbSettings::new(true, 0.8, 0.2, -7.0).unwrap(),
         )
         .unwrap();
-        ProjectDocument::new_v3(
+        ProjectDocument::new_v4(
             ProjectId::from_bytes([0x2a; 16]),
             "mixer round trip",
             42,
@@ -1750,8 +1965,268 @@ normalize = false
             ],
             Vec::new(),
             master_mix,
+            MidiSettings::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn literal_schema_v3_migrates_every_existing_field_and_exact_default_midi() {
+        let original_wire: WireV3ProjectDocument = toml::from_str(SCHEMA_V3_LITERAL).unwrap();
+        let ParsedProjectDocument::Current(project) =
+            ProjectDocument::from_toml(SCHEMA_V3_LITERAL).unwrap()
+        else {
+            panic!("v3 must migrate to current")
+        };
+        assert_eq!(project.schema_version, 4);
+        assert_eq!(project.project_id, ProjectId::from_bytes([0x2a; 16]));
+        assert_eq!(project.name, "literal-v3");
+        assert_eq!(project.revision, 42);
+        assert_eq!(project.midi, MidiSettings::default());
+        assert_eq!(project.pads.len(), 1);
+        let pad = &project.pads[0];
+        assert_eq!(pad.pad, PadId::first());
+        assert_eq!(pad.audio_path, current_audio_path(0x5c, "wav"));
+        assert_eq!(pad.asset_digest, digest(0x5c));
+        assert_eq!(pad.settings.mode, PlaybackMode::Gate);
+        assert_eq!(pad.settings.gain_db.to_bits(), (-3.0_f32).to_bits());
+        assert_eq!(pad.settings.pan.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(pad.settings.pitch_semitones.to_bits(), 2.0_f32.to_bits());
+        assert_eq!(pad.settings.choke_group, Some(ChokeGroup::new(4).unwrap()));
+        assert_eq!(pad.mix, PadMixSettings::new(true, 0.25, 0.75).unwrap());
+        assert_eq!(pad.mix.delay_send.to_bits(), 0.25_f32.to_bits());
+        assert_eq!(pad.mix.reverb_send.to_bits(), 0.75_f32.to_bits());
+        assert_eq!(
+            pad.recipe,
+            SampleEditRecipe::new(1, SAMPLE_PHASE_SCALE, true, true).unwrap()
+        );
+        assert_eq!(
+            project.master_mix,
+            MasterMixSettings::new(
+                -6.0,
+                DelaySettings::new(true, 640, 0.625, -9.0).unwrap(),
+                ReverbSettings::new(true, 0.8, 0.2, -7.0).unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(project.master_mix.gain_db.to_bits(), (-6.0_f32).to_bits());
+        assert_eq!(
+            project.master_mix.delay.feedback.to_bits(),
+            0.625_f32.to_bits()
+        );
+        assert_eq!(
+            project.master_mix.reverb.room_size.to_bits(),
+            0.8_f32.to_bits()
+        );
+        assert_eq!(project.patterns.len(), PATTERN_SLOT_COUNT);
+        let pattern = &project.patterns[0];
+        assert_eq!(pattern.slot, PatternSlotId::new(7).unwrap());
+        assert_eq!(pattern.name, "literal v3 pattern");
+        assert_eq!(pattern.sample_rate, 48_000);
+        assert_eq!(pattern.tempo, Tempo::new(123.0).unwrap());
+        assert_eq!(pattern.meter, Meter::new(3, 4).unwrap());
+        assert_eq!(pattern.bars, 2);
+        assert_eq!(pattern.resolution, Resolution::Eighth);
+        assert_eq!(pattern.swing.to_bits(), 0.6_f64.to_bits());
+        assert_eq!(pattern.quantize_strength.to_bits(), 0.75_f32.to_bits());
+        assert_eq!(pattern.events.len(), 1);
+        assert_eq!(pattern.events[0].event.id, EventId(9));
+        assert_eq!(pattern.events[0].event.pad, PadId::first());
+        assert_eq!(pattern.events[0].event.frame, 0);
+        assert_eq!(pattern.events[0].raw_frame, 0);
+        assert_eq!(
+            pattern.events[0].event.velocity.to_bits(),
+            0.75_f32.to_bits()
+        );
+        assert_eq!(pattern.events[0].event.duration, Some(2_400));
+        assert_eq!(pattern.events[0].event.original_offset, Some(0));
+
+        let migrated_wire: WireV4ProjectDocument =
+            toml::from_str(&project.to_toml().unwrap()).unwrap();
+        let original_pad = &original_wire.pads[0];
+        let migrated_pad = &migrated_wire.pads[0];
+        assert_eq!(
+            original_pad.settings.gain_db.to_bits(),
+            migrated_pad.settings.gain_db.to_bits()
+        );
+        assert_eq!(
+            original_pad.settings.pan.to_bits(),
+            migrated_pad.settings.pan.to_bits()
+        );
+        assert_eq!(
+            original_pad.settings.pitch_semitones.to_bits(),
+            migrated_pad.settings.pitch_semitones.to_bits()
+        );
+        assert_eq!(
+            original_pad.mix.delay_send.to_bits(),
+            migrated_pad.mix.delay_send.to_bits()
+        );
+        assert_eq!(
+            original_pad.mix.reverb_send.to_bits(),
+            migrated_pad.mix.reverb_send.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.gain_db.to_bits(),
+            migrated_wire.master_mix.gain_db.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.delay.feedback.to_bits(),
+            migrated_wire.master_mix.delay.feedback.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.delay.return_db.to_bits(),
+            migrated_wire.master_mix.delay.return_db.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.reverb.room_size.to_bits(),
+            migrated_wire.master_mix.reverb.room_size.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.reverb.damping.to_bits(),
+            migrated_wire.master_mix.reverb.damping.to_bits()
+        );
+        assert_eq!(
+            original_wire.master_mix.reverb.return_db.to_bits(),
+            migrated_wire.master_mix.reverb.return_db.to_bits()
+        );
+        let original_pattern = &original_wire.patterns[0];
+        let migrated_pattern = &migrated_wire.patterns[0];
+        assert_eq!(
+            original_pattern.tempo.to_bits(),
+            migrated_pattern.tempo.to_bits()
+        );
+        assert_eq!(
+            original_pattern.swing.to_bits(),
+            migrated_pattern.swing.to_bits()
+        );
+        assert_eq!(
+            original_pattern.quantize_strength.to_bits(),
+            migrated_pattern.quantize_strength.to_bits()
+        );
+        assert_eq!(
+            original_pattern.events[0].velocity.to_bits(),
+            migrated_pattern.events[0].velocity.to_bits()
+        );
+    }
+
+    #[test]
+    fn literal_schema_v4_round_trips_omni_channel_sixteen_all_banks_and_unmaps() {
+        let ParsedProjectDocument::Current(omni) =
+            ProjectDocument::from_toml(SCHEMA_V4_LITERAL).unwrap()
+        else {
+            panic!("v4 must parse as current")
+        };
+        assert_eq!(omni.schema_version, 4);
+        assert_eq!(omni.midi.channel(), MidiChannelFilter::Omni);
+        for bank_index in 0..10_u8 {
+            let bank = BankId::new(bank_index).unwrap();
+            for pad in 0..16_u8 {
+                let expected = match (bank_index, pad) {
+                    (8, 0) | (9, 1) => None,
+                    (0..=7, _) => Some(MidiNote::new(bank_index * 16 + pad).unwrap()),
+                    (_, _) => Some(MidiNote::new(36 + pad).unwrap()),
+                };
+                assert_eq!(omni.midi.bank(bank).note(pad).unwrap(), expected);
+            }
+        }
+        assert_eq!(
+            omni.midi.bank(BankId::new(0).unwrap()).note(0).unwrap(),
+            Some(MidiNote::new(0).unwrap())
+        );
+        assert_eq!(
+            omni.midi.bank(BankId::new(7).unwrap()).note(15).unwrap(),
+            Some(MidiNote::new(127).unwrap())
+        );
+        assert_eq!(
+            omni.midi.bank(BankId::new(8).unwrap()).note(0).unwrap(),
+            None
+        );
+        assert_eq!(
+            omni.midi.bank(BankId::new(9).unwrap()).note(1).unwrap(),
+            None
+        );
+        let encoded = omni.to_toml().unwrap();
+        assert!(encoded.contains("schema_version = 4"));
+        assert_eq!(
+            ProjectDocument::from_toml(&encoded).unwrap(),
+            ParsedProjectDocument::Current(omni.clone())
+        );
+
+        let channel_sixteen = SCHEMA_V4_LITERAL.replace("channel = \"omni\"", "channel = 16");
+        let ParsedProjectDocument::Current(channel_sixteen) =
+            ProjectDocument::from_toml(&channel_sixteen).unwrap()
+        else {
+            panic!("numbered v4 must parse")
+        };
+        assert_eq!(
+            channel_sixteen.midi.channel(),
+            MidiChannelFilter::Channel(MidiChannel::new(16).unwrap())
+        );
+
+        let custom = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(MidiChannel::new(16).unwrap()))
+            .map(BankId::new(9).unwrap(), 0, MidiNote::new(127).unwrap())
+            .unwrap()
+            .unmap(BankId::new(9).unwrap(), 1)
+            .unwrap();
+        let constructed = ProjectDocument::new_v4(
+            ProjectId::from_bytes([0x4a; 16]),
+            "constructed-v4",
+            85,
+            Vec::new(),
+            Vec::new(),
+            MasterMixSettings::default(),
+            custom,
+        )
+        .unwrap();
+        assert_eq!(constructed.midi, custom);
+        assert_eq!(
+            ProjectDocument::from_toml(&constructed.to_toml().unwrap()).unwrap(),
+            ParsedProjectDocument::Current(constructed)
+        );
+    }
+
+    #[test]
+    fn literal_schema_v4_rejects_duplicates_invalid_values_unknown_fields_and_schema_five() {
+        let invalid_semantic_values = [
+            SCHEMA_V4_LITERAL.replacen("notes = [0, 1", "notes = [0, 0", 1),
+            SCHEMA_V4_LITERAL.replacen("notes = [0, 1", "notes = [128, 1", 1),
+            SCHEMA_V4_LITERAL.replacen("notes = [0, 1", "notes = [-2, 1", 1),
+            SCHEMA_V4_LITERAL.replace("channel = \"omni\"", "channel = 0"),
+            SCHEMA_V4_LITERAL.replace("channel = \"omni\"", "channel = 17"),
+        ];
+        for source in invalid_semantic_values {
+            assert!(
+                ProjectDocument::from_toml(&source).is_err(),
+                "accepted invalid v4 fixture: {source}"
+            );
+        }
+        let unknown_fields = [
+            SCHEMA_V4_LITERAL.replace("revision = 84", "revision = 84\nunknown_root = 1"),
+            SCHEMA_V4_LITERAL.replace("channel = \"omni\"", "channel = \"omni\"\nunknown_midi = 1"),
+            SCHEMA_V4_LITERAL.replacen(
+                "notes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]",
+                "notes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]\nunknown_bank = 1",
+                1,
+            ),
+        ];
+        for source in unknown_fields {
+            assert!(
+                matches!(
+                    ProjectDocument::from_toml(&source),
+                    Err(ProjectError::TomlSyntax(_))
+                ),
+                "accepted invalid v4 fixture: {source}"
+            );
+        }
+        let schema_five = SCHEMA_V4_LITERAL.replacen("schema_version = 4", "schema_version = 5", 1);
+        assert_eq!(
+            ProjectDocument::from_toml(&schema_five),
+            Err(ProjectError::NewerSchema {
+                found: 5,
+                supported: 4
+            })
+        );
     }
 
     #[test]
@@ -1762,7 +2237,8 @@ normalize = false
             panic!("v2 must migrate directly to current")
         };
 
-        assert_eq!(project.schema_version, 3);
+        assert_eq!(project.schema_version, 4);
+        assert_eq!(project.midi, MidiSettings::default());
         assert_eq!(project.project_id, ProjectId::from_bytes([0x2a; 16]));
         assert_eq!(project.name, "literal-v2");
         assert_eq!(project.revision, 41);
@@ -1808,7 +2284,7 @@ normalize = false
     fn schema_v3_round_trip_preserves_every_mixer_field() {
         let document = mixer_document_fixture();
         let encoded = document.to_toml().unwrap();
-        assert!(encoded.contains("schema_version = 3"));
+        assert!(encoded.contains("schema_version = 4"));
         assert_eq!(
             ProjectDocument::from_toml(&encoded).unwrap(),
             ParsedProjectDocument::Current(document)
@@ -1918,13 +2394,13 @@ normalize = false
     }
 
     #[test]
-    fn schema_four_is_rejected_as_newer_than_schema_three() {
-        let schema_four = SCHEMA_V3_LITERAL.replacen("schema_version = 3", "schema_version = 4", 1);
+    fn schema_five_is_rejected_as_newer_than_schema_four() {
+        let schema_five = SCHEMA_V3_LITERAL.replacen("schema_version = 3", "schema_version = 5", 1);
         assert_eq!(
-            ProjectDocument::from_toml(&schema_four),
+            ProjectDocument::from_toml(&schema_five),
             Err(ProjectError::NewerSchema {
-                found: 4,
-                supported: 3,
+                found: 5,
+                supported: 4,
             })
         );
     }
@@ -1959,13 +2435,14 @@ normalize = false
         let existing =
             ProjectPattern::from_editable(&quantized_pattern(PatternSlotId::new(7).unwrap()))
                 .unwrap();
-        let project = ProjectDocument::new_v3(
+        let project = ProjectDocument::new_v4(
             ProjectId::from_bytes([0x4d; 16]),
             "sparse",
             1,
             Vec::new(),
             vec![existing.clone()],
             MasterMixSettings::default(),
+            MidiSettings::default(),
         )
         .unwrap();
 
@@ -2073,26 +2550,28 @@ normalize = false
             ProjectPattern::from_editable(&second).unwrap(),
         ];
         assert!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 ProjectId::from_bytes([1; 16]),
                 "same names are fine",
                 0,
                 Vec::new(),
                 patterns,
                 MasterMixSettings::default(),
+                MidiSettings::default(),
             )
             .is_ok()
         );
 
         let duplicate = ProjectPattern::from_editable(&first).unwrap();
         assert_eq!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 ProjectId::from_bytes([1; 16]),
                 "duplicate slot",
                 0,
                 Vec::new(),
                 vec![duplicate.clone(), duplicate],
                 MasterMixSettings::default(),
+                MidiSettings::default(),
             ),
             Err(ProjectError::DuplicatePatternSlot(
                 PatternSlotId::new(1).unwrap()
@@ -2103,13 +2582,14 @@ normalize = false
     #[test]
     fn schema_v3_rejects_revision_recipe_offsets_max_event_unknown_fields_and_future_schema() {
         assert_eq!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 ProjectId::from_bytes([1; 16]),
                 "revision",
                 i64::MAX as u64 + 1,
                 Vec::new(),
                 Vec::new(),
                 MasterMixSettings::default(),
+                MidiSettings::default(),
             ),
             Err(ProjectError::InvalidRevision(i64::MAX as u64 + 1))
         );
@@ -2134,11 +2614,11 @@ normalize = false
             );
         }
 
-        let future = encoded.replacen("schema_version = 3", "schema_version = 4", 1);
+        let future = encoded.replacen("schema_version = 4", "schema_version = 5", 1);
         assert_eq!(
             ProjectDocument::from_toml(&future),
             Err(ProjectError::NewerSchema {
-                found: 4,
+                found: 5,
                 supported: CURRENT_SCHEMA_VERSION,
             })
         );
@@ -2151,13 +2631,14 @@ normalize = false
         let mut duplicate_pad = base.clone();
         duplicate_pad.pads.push(duplicate_pad.pads[0].clone());
         assert!(matches!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 duplicate_pad.project_id,
                 duplicate_pad.name,
                 duplicate_pad.revision,
                 duplicate_pad.pads,
                 duplicate_pad.patterns,
                 duplicate_pad.master_mix,
+                duplicate_pad.midi,
             ),
             Err(ProjectError::DuplicatePad(_))
         ));
@@ -2165,13 +2646,14 @@ normalize = false
         let mut invalid_settings = base.clone();
         invalid_settings.pads[0].settings.pan = 2.0;
         assert_eq!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 invalid_settings.project_id,
                 invalid_settings.name,
                 invalid_settings.revision,
                 invalid_settings.pads,
                 invalid_settings.patterns,
                 invalid_settings.master_mix,
+                invalid_settings.midi,
             ),
             Err(ProjectError::InvalidModel(ModelError::PanOutOfRange))
         );
@@ -2180,13 +2662,14 @@ normalize = false
         let event = duplicate_event.patterns[0].events[0];
         duplicate_event.patterns[0].events.push(event);
         assert_eq!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 duplicate_event.project_id,
                 duplicate_event.name,
                 duplicate_event.revision,
                 duplicate_event.pads,
                 duplicate_event.patterns,
                 duplicate_event.master_mix,
+                duplicate_event.midi,
             ),
             Err(ProjectError::InvalidModel(ModelError::DuplicateEvent))
         );
@@ -2198,13 +2681,14 @@ normalize = false
             .transport()
             .loop_frames();
         assert_eq!(
-            ProjectDocument::new_v3(
+            ProjectDocument::new_v4(
                 invalid_raw.project_id,
                 invalid_raw.name,
                 invalid_raw.revision,
                 invalid_raw.pads,
                 invalid_raw.patterns,
                 invalid_raw.master_mix,
+                invalid_raw.midi,
             ),
             Err(ProjectError::InvalidModel(ModelError::InvalidEvent))
         );

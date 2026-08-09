@@ -662,13 +662,14 @@ mod mixer_task6_tests {
         let nondefault = nondefault_master_mix();
         app.update_master_mix(nondefault).unwrap();
         let old_project_id = app.project_session.project_id();
-        let document = ProjectDocument::new_v3(
+        let document = ProjectDocument::new_v4(
             ProjectId::from_bytes([0x61; 16]),
             "Mixer open",
             7,
             Vec::new(),
             app.patterns.export_project_patterns().unwrap(),
             MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
         )
         .unwrap();
         app.project_open = Some(
@@ -719,13 +720,14 @@ mod mixer_task6_tests {
             app.project_revision(),
         );
         let candidate_master = MasterMixSettings::default();
-        let document = ProjectDocument::new_v3(
+        let document = ProjectDocument::new_v4(
             ProjectId::from_bytes([0xa1; 16]),
             "Remove old pad",
             21,
             Vec::new(),
             app.patterns.export_project_patterns().unwrap(),
             candidate_master,
+            sampler_core::MidiSettings::default(),
         )
         .unwrap();
         stage_mixer_project_open(&mut app, document);
@@ -788,7 +790,7 @@ mod mixer_task6_tests {
         let second_pad = pad(1);
         let second_settings = PadSettings::new(PlaybackMode::Gate, -2.0, 0.3, 0.75, None).unwrap();
         let second_mix = PadMixSettings::new(false, 0.4, 0.6).unwrap();
-        let document = ProjectDocument::new_v3(
+        let document = ProjectDocument::new_v4(
             ProjectId::from_bytes([0xa2; 16]),
             "Replace pads",
             22,
@@ -798,6 +800,7 @@ mod mixer_task6_tests {
             ],
             app.patterns.export_project_patterns().unwrap(),
             candidate_master,
+            sampler_core::MidiSettings::default(),
         )
         .unwrap();
         stage_mixer_project_open(&mut app, document);
@@ -850,13 +853,14 @@ mod mixer_task6_tests {
             app.master_mix(),
             app.project_revision(),
         );
-        let document = ProjectDocument::new_v3(
+        let document = ProjectDocument::new_v4(
             ProjectId::from_bytes([0xa3; 16]),
             "Rollback retry",
             23,
             Vec::new(),
             app.patterns.export_project_patterns().unwrap(),
             MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
         )
         .unwrap();
         stage_mixer_project_open(&mut app, document);
@@ -15819,7 +15823,7 @@ mod tests {
         revision: u64,
         pads: Vec<sampler_core::ProjectPad>,
     ) -> sampler_core::ProjectDocument {
-        sampler_core::ProjectDocument::new_v3(
+        sampler_core::ProjectDocument::new_v4(
             project_id,
             name,
             revision,
@@ -15828,6 +15832,7 @@ mod tests {
                 .export_project_patterns()
                 .unwrap(),
             sampler_core::MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
         )
         .unwrap()
     }

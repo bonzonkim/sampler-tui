@@ -909,13 +909,14 @@ impl ProjectStore {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let document = ProjectDocument::new_v3(
+        let document = ProjectDocument::new_v4(
             request.snapshot.project_id,
             request.snapshot.name.clone(),
             request.snapshot.revision,
             document_pads,
             request.snapshot.patterns.clone(),
             request.snapshot.master_mix,
+            sampler_core::MidiSettings::default(),
         )?;
         let directory = prepare_project_directory(
             &request.directory,
@@ -1119,13 +1120,14 @@ fn migrate_legacy(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    ProjectDocument::new_v3(
+    ProjectDocument::new_v4(
         ProjectId::from_bytes(project_id),
         legacy.name(),
         legacy.revision(),
         pads,
         patterns,
         sampler_core::MasterMixSettings::default(),
+        sampler_core::MidiSettings::default(),
     )
     .map_err(ProjectStoreError::from)
 }
@@ -2160,13 +2162,14 @@ mod tests {
             .save(fixture.request(1, SaveKind::Explicit))
             .unwrap();
         let before = read(&fixture.directory.join("project.toml"));
-        let foreign = ProjectDocument::new_v3(
+        let foreign = ProjectDocument::new_v4(
             ProjectId::from_bytes([0x7f; 16]),
             "foreign temp",
             90,
             Vec::new(),
             Vec::new(),
             sampler_core::MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
         )
         .unwrap()
         .to_toml()
@@ -2547,6 +2550,7 @@ pitch_semitones = 0.0
         let migrated = probe.explicit.unwrap().unwrap();
         assert_ne!(migrated.project_id, ProjectId::from_bytes([0; 16]));
         assert_eq!(migrated.revision, 0);
+        assert_eq!(migrated.midi, sampler_core::MidiSettings::default());
         assert_eq!(migrated.pads.len(), 1);
         let canonical = fixture.directory.join(&migrated.pads[0].audio_path);
         assert_eq!(fs::read(&canonical).unwrap(), fixture.source_bytes);
@@ -3034,13 +3038,14 @@ pitch_semitones = 0.0
         request.directory = target.clone();
         request.save_as = true;
         request.snapshot.project_id = ProjectId::from_bytes([0x71; 16]);
-        let foreign = ProjectDocument::new_v3(
+        let foreign = ProjectDocument::new_v4(
             ProjectId::from_bytes([0x72; 16]),
             "foreign",
             99,
             Vec::new(),
             Vec::new(),
             sampler_core::MasterMixSettings::default(),
+            sampler_core::MidiSettings::default(),
         )
         .unwrap()
         .to_toml()

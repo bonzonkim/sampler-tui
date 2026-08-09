@@ -79,6 +79,10 @@ impl MidiIngressConsumer {
     pub fn lost_count(&self) -> usize {
         self.lost.load(Ordering::Relaxed)
     }
+
+    pub fn take_lost_count(&self) -> usize {
+        self.lost.swap(0, Ordering::AcqRel)
+    }
 }
 
 pub fn midi_ingress() -> (MidiIngressProducer, MidiIngressConsumer) {
@@ -102,6 +106,8 @@ fn increment_lost(lost: &AtomicUsize) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use sampler_core::{MidiChannel, MidiNote};
 
@@ -251,5 +257,61 @@ mod tests {
         let lost = AtomicUsize::new(usize::MAX);
         increment_lost(&lost);
         assert_eq!(lost.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn taking_lost_count_consumes_each_interval_exactly_once() {
+        let (mut producer, consumer) = midi_ingress();
+        for _ in 0..MIDI_INGRESS_CAPACITY {
+            producer.try_push_message(&[0x90, 60, 100]);
+        }
+        producer.try_push_message(&[0x90, 60, 100]);
+        producer.try_push_message(&[0x90, 60, 100]);
+
+        assert_eq!(consumer.take_lost_count(), 2);
+        assert_eq!(consumer.take_lost_count(), 0);
+        producer.try_push_message(&[0x90, 60, 100]);
+        assert_eq!(consumer.take_lost_count(), 1);
+        assert_eq!(consumer.take_lost_count(), 0);
+    }
+
+    #[test]
+    fn saturation_is_consumed_once_and_a_later_overflow_starts_a_fresh_interval() {
+        let (mut producer, consumer) = midi_ingress();
+        for _ in 0..MIDI_INGRESS_CAPACITY {
+            producer.try_push_message(&[0x90, 60, 100]);
+        }
+        consumer.lost.store(usize::MAX, Ordering::Relaxed);
+
+        assert_eq!(consumer.take_lost_count(), usize::MAX);
+        assert_eq!(consumer.take_lost_count(), 0);
+        producer.try_push_message(&[0x90, 60, 100]);
+        assert_eq!(consumer.take_lost_count(), 1);
+    }
+
+    #[test]
+    fn overflow_racing_a_take_is_accounted_on_exactly_one_side_of_the_interval_boundary() {
+        const ATTEMPTED_OVERFLOWS: usize = 50_000;
+
+        let (mut producer, consumer) = midi_ingress();
+        for _ in 0..MIDI_INGRESS_CAPACITY {
+            producer.try_push_message(&[0x90, 60, 100]);
+        }
+        let start = Arc::new(Barrier::new(2));
+        let producer_start = Arc::clone(&start);
+        let worker = thread::spawn(move || {
+            producer_start.wait();
+            for _ in 0..ATTEMPTED_OVERFLOWS {
+                producer.try_push_message(&[0x90, 60, 100]);
+            }
+        });
+
+        start.wait();
+        let before_boundary = consumer.take_lost_count();
+        worker.join().unwrap();
+        let after_boundary = consumer.take_lost_count();
+
+        assert_eq!(before_boundary + after_boundary, ATTEMPTED_OVERFLOWS);
+        assert_eq!(consumer.take_lost_count(), 0);
     }
 }

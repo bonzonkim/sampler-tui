@@ -60,6 +60,7 @@ pub enum ProjectSaveError {
 #[cfg(test)]
 mod mixer_task6_tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -73,7 +74,10 @@ mod mixer_task6_tests {
         PlaybackMode, ProjectDocument, ProjectId, ReverbSettings, SampleEditRecipe,
     };
 
-    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, pad_offset};
+    use super::{
+        App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, ProjectAdmission,
+        ProjectOpenOperation, StagedProjectPad, pad_offset,
+    };
     use crate::audio::{AudioPort, CaptureSupport};
     use crate::capture::CapturePhase;
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
@@ -86,6 +90,7 @@ mod mixer_task6_tests {
         UpdatePad,
         UpdatePadMix,
         UpdateMasterMix,
+        RemoveSample,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,15 +99,16 @@ mod mixer_task6_tests {
         UpdatePad(PadId, PadSettings),
         UpdatePadMix(PadId, PadMixSettings),
         UpdateMasterMix(MasterMixSettings),
+        RemoveSample(PadId),
     }
 
     struct MixerAudioState {
         calls: Vec<MixerAudioCall>,
-        fail_next: Option<MixerAudioCallKind>,
+        fail_next: VecDeque<MixerAudioCallKind>,
         fail_install_number: Option<usize>,
         install_attempts: usize,
         runtime_error: Option<String>,
-        installed: Vec<(PadId, PadMixSettings)>,
+        installed: Vec<(PadId, PadSettings, PadMixSettings)>,
         master: Option<MasterMixSettings>,
     }
 
@@ -115,7 +121,7 @@ mod mixer_task6_tests {
         }
 
         fn fail_next(&self, kind: MixerAudioCallKind) {
-            self.0.borrow_mut().fail_next = Some(kind);
+            self.0.borrow_mut().fail_next.push_back(kind);
         }
 
         fn fail_device(&self, message: &str) {
@@ -134,7 +140,18 @@ mod mixer_task6_tests {
                 .installed
                 .iter()
                 .rev()
-                .find_map(|(candidate, mix)| (*candidate == pad).then_some(*mix))
+                .find_map(|(candidate, _, mix)| (*candidate == pad).then_some(*mix))
+        }
+
+        fn installed_tuple(&self, pad: PadId) -> Option<(PadSettings, PadMixSettings)> {
+            self.0
+                .borrow()
+                .installed
+                .iter()
+                .rev()
+                .find_map(|(candidate, settings, mix)| {
+                    (*candidate == pad).then_some((*settings, *mix))
+                })
         }
 
         fn master(&self) -> Option<MasterMixSettings> {
@@ -148,7 +165,7 @@ mod mixer_task6_tests {
         fn new() -> (Self, MixerProbe) {
             let probe = MixerProbe(Rc::new(RefCell::new(MixerAudioState {
                 calls: Vec::new(),
-                fail_next: None,
+                fail_next: VecDeque::new(),
                 fail_install_number: None,
                 install_attempts: 0,
                 runtime_error: None,
@@ -168,8 +185,8 @@ mod mixer_task6_tests {
                     return Err(format!("install {} failed", state.install_attempts));
                 }
             }
-            if state.fail_next == Some(kind) {
-                state.fail_next = None;
+            if state.fail_next.front() == Some(&kind) {
+                state.fail_next.pop_front();
                 Err(format!("{kind:?} failed"))
             } else {
                 Ok(())
@@ -201,7 +218,11 @@ mod mixer_task6_tests {
                 MixerAudioCallKind::Install,
                 MixerAudioCall::Install(pad, settings, mix),
             )?;
-            self.0.0.borrow_mut().installed.push((pad, mix));
+            let mut state = self.0.0.borrow_mut();
+            state
+                .installed
+                .retain(|(candidate, _, _)| *candidate != pad);
+            state.installed.push((pad, settings, mix));
             SampleSlot::new(0).map_err(|error| error.to_string())
         }
 
@@ -221,18 +242,53 @@ mod mixer_task6_tests {
             Ok(())
         }
 
+        fn remove_sample(&mut self, pad: PadId) -> Result<(), String> {
+            self.admit(
+                MixerAudioCallKind::RemoveSample,
+                MixerAudioCall::RemoveSample(pad),
+            )?;
+            self.0
+                .0
+                .borrow_mut()
+                .installed
+                .retain(|(candidate, _, _)| *candidate != pad);
+            Ok(())
+        }
+
         fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
             self.admit(
                 MixerAudioCallKind::UpdatePad,
                 MixerAudioCall::UpdatePad(pad, settings),
-            )
+            )?;
+            if let Some((_, installed, _)) = self
+                .0
+                .0
+                .borrow_mut()
+                .installed
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == pad)
+            {
+                *installed = settings;
+            }
+            Ok(())
         }
 
         fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String> {
             self.admit(
                 MixerAudioCallKind::UpdatePadMix,
                 MixerAudioCall::UpdatePadMix(pad, settings),
-            )
+            )?;
+            if let Some((_, _, installed)) = self
+                .0
+                .0
+                .borrow_mut()
+                .installed
+                .iter_mut()
+                .find(|(candidate, _, _)| *candidate == pad)
+            {
+                *installed = settings;
+            }
+            Ok(())
         }
 
         fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), String> {
@@ -322,6 +378,83 @@ mod mixer_task6_tests {
                 source_frames: 1,
                 duration: Duration::from_secs_f64(1.0 / 48_000.0),
             },
+        }
+    }
+
+    fn mixer_loaded_sample() -> LoadedSample {
+        let rendered = sample();
+        let fingerprint =
+            SourceFingerprint::from_encoded_bytes(Path::new("fixture.wav"), b"").unwrap();
+        LoadedSample {
+            fingerprint,
+            base: Arc::clone(&rendered),
+            base_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
+            rendered,
+            rendered_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
+            recipe: SampleEditRecipe::identity(),
+            source_rate: 48_000,
+            source_frames: 1,
+            duration: Duration::from_secs_f64(1.0 / 48_000.0),
+        }
+    }
+
+    fn mixer_project_pad(
+        target: PadId,
+        settings: PadSettings,
+        mix: PadMixSettings,
+    ) -> sampler_core::ProjectPad {
+        let fingerprint =
+            SourceFingerprint::from_encoded_bytes(Path::new("fixture.wav"), b"").unwrap();
+        sampler_core::ProjectPad::new(
+            target,
+            format!("audio/{}.wav", fingerprint.digest),
+            fingerprint.digest,
+            settings,
+            mix,
+            SampleEditRecipe::identity(),
+        )
+        .unwrap()
+    }
+
+    fn stage_mixer_project_open(app: &mut App, document: ProjectDocument) {
+        let pad_specs = document
+            .pads
+            .iter()
+            .map(|pad| (pad.pad, pad.settings, pad.mix))
+            .collect::<Vec<_>>();
+        let operation = app
+            .build_project_open_candidate(
+                ProjectToken::new(801),
+                PathBuf::from("mixer-project"),
+                document,
+                0,
+                false,
+            )
+            .unwrap();
+        let ProjectOpenOperation::Staging(mut candidate) = operation else {
+            panic!("expected staged project candidate")
+        };
+        for (target, settings, mix) in pad_specs {
+            candidate.staged_pads[pad_offset(target)] = Some(Box::new(StagedProjectPad {
+                path: PathBuf::from("mixer-project/fixture.wav"),
+                settings,
+                mix,
+                loaded: mixer_loaded_sample(),
+            }));
+        }
+        candidate.next_decode = candidate.document.pads.len();
+        candidate.progress.staged_pads = candidate.document.pads.len();
+        app.project_open = Some(ProjectOpenOperation::Staging(candidate));
+    }
+
+    fn finish_mixer_project_open(app: &mut App) {
+        while app.project_open_stage().is_some() {
+            if let Some(ProjectOpenOperation::Staging(candidate)) = app.project_open.as_mut()
+                && matches!(candidate.admission, ProjectAdmission::Patterns(_))
+            {
+                candidate.admission = ProjectAdmission::Complete;
+            }
+            assert!(app.maintain_project(Instant::now()));
         }
     }
 
@@ -481,7 +614,9 @@ mod mixer_task6_tests {
                 }
                 MixerAudioCallKind::Install => candidate_probe.fail_install_number(1),
                 MixerAudioCallKind::UpdatePad => candidate_probe.fail_install_number(2),
-                MixerAudioCallKind::UpdatePadMix => unreachable!(),
+                MixerAudioCallKind::UpdatePadMix | MixerAudioCallKind::RemoveSample => {
+                    unreachable!()
+                }
             }
             assert!(app.retry_with(Box::new(candidate)));
             assert_eq!(
@@ -551,6 +686,192 @@ mod mixer_task6_tests {
                 MasterMixSettings::default()
             ))
         );
+    }
+
+    #[test]
+    fn mixer_project_open_remove_failure_restores_the_exact_old_audio_tuple_before_retry() {
+        let (mut app, probe, old_pad) = loaded_mixer_app();
+        let old_mix = PadMixSettings::new(true, 0.2, 0.8).unwrap();
+        app.update_pad_mix(old_pad, old_mix).unwrap();
+        let old_master = nondefault_master_mix();
+        app.update_master_mix(old_master).unwrap();
+        let old_tuple = (
+            app.pad(old_pad).settings,
+            app.pad_mix(old_pad),
+            app.master_mix(),
+            app.project_revision(),
+        );
+        let candidate_master = MasterMixSettings::default();
+        let document = ProjectDocument::new_v3(
+            ProjectId::from_bytes([0xa1; 16]),
+            "Remove old pad",
+            21,
+            Vec::new(),
+            app.patterns.export_project_patterns().unwrap(),
+            candidate_master,
+        )
+        .unwrap();
+        stage_mixer_project_open(&mut app, document);
+
+        assert!(app.maintain_project(Instant::now()));
+        assert!(app.maintain_project(Instant::now()));
+        probe.fail_next(MixerAudioCallKind::RemoveSample);
+        assert!(!app.maintain_project(Instant::now()));
+
+        assert_eq!(
+            (
+                app.pad(old_pad).settings,
+                app.pad_mix(old_pad),
+                app.master_mix(),
+                app.project_revision(),
+            ),
+            old_tuple
+        );
+        assert_eq!(probe.master(), Some(old_master));
+        assert_eq!(
+            probe.installed_tuple(old_pad),
+            Some((PadSettings::default(), old_mix))
+        );
+
+        finish_mixer_project_open(&mut app);
+        assert_eq!(app.project_revision(), 21);
+        assert_eq!(app.master_mix(), candidate_master);
+        assert_eq!(probe.master(), Some(candidate_master));
+        assert_eq!(probe.installed_tuple(old_pad), None);
+    }
+
+    #[test]
+    fn mixer_project_open_later_install_failure_rolls_back_earlier_candidate_pad_before_retry() {
+        let (mut app, probe, first_pad) = loaded_mixer_app();
+        let old_settings = PadSettings::new(
+            PlaybackMode::Gate,
+            -5.0,
+            0.1,
+            1.5,
+            Some(ChokeGroup::new(2).unwrap()),
+        )
+        .unwrap();
+        app.update_pad_settings(first_pad, old_settings).unwrap();
+        let old_mix = PadMixSettings::new(true, 0.1, 0.9).unwrap();
+        app.update_pad_mix(first_pad, old_mix).unwrap();
+        let old_master = nondefault_master_mix();
+        app.update_master_mix(old_master).unwrap();
+        let old_tuple = (
+            app.pad(first_pad).settings,
+            app.pad_mix(first_pad),
+            app.master_mix(),
+            app.project_revision(),
+        );
+
+        let candidate_master =
+            MasterMixSettings::new(2.0, DelaySettings::default(), ReverbSettings::default())
+                .unwrap();
+        let first_settings = PadSettings::new(PlaybackMode::OneShot, -1.0, 0.2, 0.5, None).unwrap();
+        let first_mix = PadMixSettings::new(false, 0.7, 0.3).unwrap();
+        let second_pad = pad(1);
+        let second_settings = PadSettings::new(PlaybackMode::Gate, -2.0, 0.3, 0.75, None).unwrap();
+        let second_mix = PadMixSettings::new(false, 0.4, 0.6).unwrap();
+        let document = ProjectDocument::new_v3(
+            ProjectId::from_bytes([0xa2; 16]),
+            "Replace pads",
+            22,
+            vec![
+                mixer_project_pad(first_pad, first_settings, first_mix),
+                mixer_project_pad(second_pad, second_settings, second_mix),
+            ],
+            app.patterns.export_project_patterns().unwrap(),
+            candidate_master,
+        )
+        .unwrap();
+        stage_mixer_project_open(&mut app, document);
+
+        assert!(app.maintain_project(Instant::now()));
+        assert!(app.maintain_project(Instant::now()));
+        probe.fail_install_number(2);
+        assert!(app.maintain_project(Instant::now()));
+        assert!(!app.maintain_project(Instant::now()));
+
+        assert_eq!(
+            (
+                app.pad(first_pad).settings,
+                app.pad_mix(first_pad),
+                app.master_mix(),
+                app.project_revision(),
+            ),
+            old_tuple
+        );
+        assert_eq!(probe.master(), Some(old_master));
+        assert_eq!(
+            probe.installed_tuple(first_pad),
+            Some((old_settings, old_mix))
+        );
+        assert_eq!(probe.installed_tuple(second_pad), None);
+
+        finish_mixer_project_open(&mut app);
+        assert_eq!(app.project_revision(), 22);
+        assert_eq!(app.master_mix(), candidate_master);
+        assert_eq!(
+            probe.installed_tuple(first_pad),
+            Some((first_settings, first_mix))
+        );
+        assert_eq!(
+            probe.installed_tuple(second_pad),
+            Some((second_settings, second_mix))
+        );
+    }
+
+    #[test]
+    fn mixer_project_open_rollback_failure_stays_inconsistent_until_exact_restore_retries() {
+        let (mut app, probe, old_pad) = loaded_mixer_app();
+        let old_mix = PadMixSettings::new(true, 0.35, 0.65).unwrap();
+        app.update_pad_mix(old_pad, old_mix).unwrap();
+        let old_master = nondefault_master_mix();
+        app.update_master_mix(old_master).unwrap();
+        let old_tuple = (
+            app.pad(old_pad).settings,
+            app.pad_mix(old_pad),
+            app.master_mix(),
+            app.project_revision(),
+        );
+        let document = ProjectDocument::new_v3(
+            ProjectId::from_bytes([0xa3; 16]),
+            "Rollback retry",
+            23,
+            Vec::new(),
+            app.patterns.export_project_patterns().unwrap(),
+            MasterMixSettings::default(),
+        )
+        .unwrap();
+        stage_mixer_project_open(&mut app, document);
+
+        assert!(app.maintain_project(Instant::now()));
+        assert!(app.maintain_project(Instant::now()));
+        probe.fail_next(MixerAudioCallKind::RemoveSample);
+        probe.fail_next(MixerAudioCallKind::UpdateMasterMix);
+        assert!(!app.maintain_project(Instant::now()));
+        assert!(app.status().contains("rollback"));
+        assert_eq!(
+            (
+                app.pad(old_pad).settings,
+                app.pad_mix(old_pad),
+                app.master_mix(),
+                app.project_revision(),
+            ),
+            old_tuple
+        );
+        assert_ne!(probe.master(), Some(old_master));
+
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(probe.master(), Some(old_master));
+        assert_eq!(
+            probe.installed_tuple(old_pad),
+            Some((PadSettings::default(), old_mix))
+        );
+
+        finish_mixer_project_open(&mut app);
+        assert_eq!(app.project_revision(), 23);
+        assert_eq!(probe.master(), Some(MasterMixSettings::default()));
+        assert_eq!(probe.installed_tuple(old_pad), None);
     }
 
     #[test]
@@ -3809,6 +4130,8 @@ enum ProjectAdmission {
     StopAll,
     Master,
     Pads(usize),
+    RestoreCommittedMaster { end_pad: usize },
+    RestoreCommittedPads { next_pad: usize, end_pad: usize },
     Patterns(usize),
     Complete,
 }
@@ -6216,7 +6539,85 @@ impl App {
                                     };
                                     changed = true;
                                 }
-                                Err(error) => self.status = error,
+                                Err(error) => {
+                                    if let Err(rollback_error) =
+                                        audio.update_master_mix(self.master_mix)
+                                    {
+                                        candidate.admission =
+                                            ProjectAdmission::RestoreCommittedMaster {
+                                                end_pad: offset,
+                                            };
+                                        self.status = format!(
+                                            "Project admission failed ({error}); audio rollback failed: restore master mixer: {rollback_error}"
+                                        );
+                                    } else if let Err((next_pad, rollback_error)) =
+                                        restore_committed_audio_pads(
+                                            audio.as_mut(),
+                                            &self.pads,
+                                            &self.pad_mixes,
+                                            &self.current_session_bound,
+                                            0,
+                                            offset,
+                                        )
+                                    {
+                                        candidate.admission =
+                                            ProjectAdmission::RestoreCommittedPads {
+                                                next_pad,
+                                                end_pad: offset,
+                                            };
+                                        self.status = format!(
+                                            "Project admission failed ({error}); audio rollback failed: {rollback_error}"
+                                        );
+                                    } else {
+                                        candidate.admission = ProjectAdmission::StopAll;
+                                        candidate.progress.admitted_actions = 0;
+                                        self.status = format!(
+                                            "Project admission failed ({error}); committed audio restored"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ProjectAdmission::RestoreCommittedMaster { end_pad } => {
+                            match audio.update_master_mix(self.master_mix) {
+                                Ok(()) => {
+                                    candidate.admission = ProjectAdmission::RestoreCommittedPads {
+                                        next_pad: 0,
+                                        end_pad,
+                                    };
+                                    changed = true;
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Audio rollback failed: restore master mixer: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        ProjectAdmission::RestoreCommittedPads { next_pad, end_pad } => {
+                            match restore_committed_audio_pads(
+                                audio.as_mut(),
+                                &self.pads,
+                                &self.pad_mixes,
+                                &self.current_session_bound,
+                                next_pad,
+                                end_pad,
+                            ) {
+                                Ok(()) => {
+                                    candidate.admission = ProjectAdmission::StopAll;
+                                    candidate.progress.admitted_actions = 0;
+                                    self.status =
+                                        "Committed audio restored; restarting project admission"
+                                            .to_owned();
+                                    changed = true;
+                                }
+                                Err((next_pad, error)) => {
+                                    candidate.admission = ProjectAdmission::RestoreCommittedPads {
+                                        next_pad,
+                                        end_pad,
+                                    };
+                                    self.status = format!("Audio rollback failed: {error}");
+                                }
                             }
                         }
                         ProjectAdmission::Patterns(submitted) => {
@@ -10182,6 +10583,44 @@ fn pad_from_offset(offset: usize) -> PadId {
         u8::try_from(offset % usize::from(PADS_PER_BANK)).expect("bounded pad index fits in u8");
     PadId::new(BankId::new(bank).expect("bounded bank is valid"), index)
         .expect("bounded pad is valid")
+}
+
+fn restore_committed_audio_pads(
+    audio: &mut dyn AudioPort,
+    pads: &[PadView; PAD_VIEW_COUNT],
+    pad_mixes: &[PadMixSettings; PAD_VIEW_COUNT],
+    current_session_bound: &[bool; PAD_VIEW_COUNT],
+    start_pad: usize,
+    end_pad: usize,
+) -> Result<(), (usize, String)> {
+    for offset in start_pad..end_pad {
+        let pad = pad_from_offset(offset);
+        let result = if current_session_bound[offset] {
+            let sample = pads[offset].sample.as_ref().ok_or_else(|| {
+                (
+                    offset,
+                    format!("restore {pad:?}: committed sample is missing"),
+                )
+            })?;
+            audio
+                .install_recovery(
+                    pad,
+                    Arc::clone(sample),
+                    pads[offset].settings,
+                    pad_mixes[offset],
+                )
+                .map(|_| ())
+                .map_err(|error| format!("restore {pad:?}: {error}"))
+        } else {
+            audio
+                .remove_sample(pad)
+                .map_err(|error| format!("remove candidate-only {pad:?}: {error}"))
+        };
+        if let Err(error) = result {
+            return Err((offset, error));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -16064,8 +16503,8 @@ mod tests {
     }
 
     #[test]
-    fn project_open_admission_backpressure_retries_the_exact_same_pad_action() {
-        let audio = FakeAudio::ready(48_000, 2).failing_install("command queue full");
+    fn project_open_install_failure_restores_then_restarts_admission_from_stop_all() {
+        let audio = FakeAudio::ready(48_000, 2).failing_install("install rejected");
         let calls = audio.call_log();
         let mut app = App::with_audio(Box::new(audio));
         let document = project_open_document(
@@ -16083,16 +16522,12 @@ mod tests {
         assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
 
         assert!(!app.maintain_project(Instant::now()));
-        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
-        assert!(app.status().contains("command queue full"));
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 0);
+        assert!(app.status().contains("committed audio restored"));
 
         assert!(app.maintain_project(Instant::now()));
-        assert_eq!(
-            calls.snapshot(),
-            [AudioCall::StopAll, AudioCall::Install(pad(0, 0))]
-        );
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 3);
+        assert_eq!(calls.snapshot().last(), Some(&AudioCall::StopAll));
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
     }
 
     #[test]

@@ -1037,10 +1037,10 @@ normalize = false
 }
 
 #[test]
-fn mixer_project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
+fn mixer_project_open_pad_install_backpressure_rolls_back_before_clean_retry() {
     let fixture = FixtureTree::new();
     let wav = fixture.write_wav("source.wav");
-    let project = fixture.path("backpressure-project");
+    let project = fixture.path("pad-backpressure-project");
     let now = Instant::now();
     let mut source = Harness::new();
     source.load(pad(0), &wav);
@@ -1064,11 +1064,14 @@ fn mixer_project_open_install_backpressure_keeps_the_old_tuple_until_retry_commi
         target.app.maintain_project(now);
         target.dispatch_queued();
     }
-    let blocked_progress = target.app.project_open_stage().unwrap().clone();
+    assert!(target.app.maintain_project(now));
     assert_eq!(
-        blocked_progress.admitted_actions, 1,
-        "StopAll admitted first"
+        target.app.project_open_stage().unwrap().admitted_actions,
+        2,
+        "StopAll and master must admit before targeting the first pad install"
     );
+    target.engine.render_frames(0, |_| {});
+    let blocked_progress = target.app.project_open_stage().unwrap().clone();
     let mut saturated_commands = 0;
     loop {
         match target.controller.borrow_mut().stop_pad(pad(15)) {
@@ -1079,6 +1082,7 @@ fn mixer_project_open_install_backpressure_keeps_the_old_tuple_until_retry_commi
     }
     assert_eq!(saturated_commands, 8);
     target.app.maintain_project(now);
+    assert!(target.app.status().contains("audio rollback failed"));
     assert!(target.app.status().contains("queue is full"));
     assert_eq!(target.app.project_open_stage().unwrap(), &blocked_progress);
     assert_eq!(target.app.project_snapshot().unwrap(), old);
@@ -1089,10 +1093,19 @@ fn mixer_project_open_install_backpressure_keeps_the_old_tuple_until_retry_commi
     target.engine.render_frames(0, |_| {});
     target.app.maintain_audio();
     assert!(target.app.maintain_project(now));
+    assert!(target.app.maintain_project(now));
     assert_eq!(
         target.app.project_open_stage().unwrap().admitted_actions,
-        blocked_progress.admitted_actions + 1,
-        "the exact blocked pad install advances once after queue drain"
+        0,
+        "rollback completes before candidate admission restarts"
+    );
+    assert!(target.app.maintain_project(now));
+    assert!(target.app.maintain_project(now));
+    assert!(target.app.maintain_project(now));
+    assert_eq!(
+        target.app.project_open_stage().unwrap().admitted_actions,
+        3,
+        "clean retry replays StopAll and master before the first pad install"
     );
     target.finish_open(now);
     assert!(target.app.pad(pad(0)).sample.is_some());

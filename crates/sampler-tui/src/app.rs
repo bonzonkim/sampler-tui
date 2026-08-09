@@ -1688,7 +1688,7 @@ mod capture_task7_tests {
             installs_before,
             "stale capture reached audio admission"
         );
-        assert_eq!(app.capture_session().managed_capture_id(), None);
+        assert_eq!(app.capture_session().managed_capture_id(), Some(managed_id));
 
         assert!(app.maintain_capture());
         assert_eq!(
@@ -1702,6 +1702,7 @@ mod capture_task7_tests {
             })
         );
         assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().managed_capture_id(), None);
         assert!(!app.maintain_capture());
         assert!(app.take_worker_requests().is_empty());
     }
@@ -1831,6 +1832,112 @@ mod capture_task7_tests {
         assert_eq!(app.pad(target).settings, settings);
     }
 
+    #[test]
+    fn stale_ready_target_discard_waits_for_exact_release_retry_before_quit_or_open_advances() {
+        for action in [ProjectAction::Quit, ProjectAction::Open] {
+            let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+            let mut app = App::with_audio(Box::new(audio));
+            let target = pad(0);
+            install_imported(&mut app, target, "original.wav");
+            start_capture(&mut app, CaptureSource::Resample, 4);
+            probe.complete(completion(
+                &app,
+                CaptureSource::Resample,
+                vec![0.25, -0.25],
+                false,
+            ));
+            assert!(app.maintain_capture());
+            assert!(app.maintain_capture());
+            let finalize = take_finalize(&mut app);
+            let mut store = CaptureStore::new().unwrap();
+            let candidate = store.finalize(Arc::from([0.2_f32, -0.2]), 48_000).unwrap();
+            let managed_id = candidate.id;
+            let managed_path = candidate.path.clone();
+            assert!(app.apply_worker_result(finalized(&finalize, Ok(candidate))));
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.capture_session().phase(),
+                Some(CapturePhase::ReadyToInstall)
+            );
+
+            app.update_pad_settings(
+                target,
+                PadSettings {
+                    gain_db: -9.0,
+                    ..app.pad(target).settings
+                },
+            )
+            .unwrap();
+            assert!(app.maintain_capture());
+            assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+            assert_eq!(
+                app.capture_session().managed_capture_id(),
+                Some(managed_id),
+                "the rejected artifact remains the capture lifecycle's exact release fence"
+            );
+
+            match action {
+                ProjectAction::Quit => app.apply(InputAction::Quit),
+                ProjectAction::Open => {
+                    app.request_open_project_interactive("after-stale-ready-discard")
+                }
+            }
+            app.apply_key(press(KeyCode::Backspace));
+            assert_eq!(app.capture_session().phase(), None);
+            assert_eq!(app.capture_discard_release_pending, Some(managed_id));
+            assert_matrix_action_waiting(&app, action);
+
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+            );
+            let sync_error = store
+                .release_with_sync_for_test(managed_id, |_, _| {
+                    Err(CaptureStoreError::Filesystem {
+                        operation: "injected stale-target post-unlink directory sync failure",
+                        path: PathBuf::from("injected"),
+                        kind: std::io::ErrorKind::Other,
+                    })
+                })
+                .unwrap_err();
+            assert!(!managed_path.exists());
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: managed_id,
+                    result: Err(sync_error),
+                })
+            );
+            assert!(app.maintain_capture());
+            assert_eq!(app.capture_discard_release_pending, Some(managed_id));
+            assert_matrix_action_waiting(&app, action);
+
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+            );
+            store.release(managed_id).unwrap();
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: managed_id,
+                    result: Ok(()),
+                })
+            );
+            assert!(app.maintain_capture());
+            assert_eq!(app.capture_discard_release_pending, None);
+            assert!(matches!(
+                app.overlay(),
+                Some(Overlay::UnsavedProject { action: shown }) if *shown == action
+            ));
+            assert_matrix_action_waiting(&app, action);
+            assert!(matches!(
+                store.release(managed_id),
+                Err(CaptureStoreError::NotLive { id }) if id == managed_id
+            ));
+        }
+    }
+
     fn finish_ready_stale_capture(
         app: &mut App,
         probe: &CaptureProbe,
@@ -1857,7 +1964,7 @@ mod capture_task7_tests {
                 .count(),
             installs_before
         );
-        assert_eq!(app.capture_session().managed_capture_id(), None);
+        assert_eq!(app.capture_session().managed_capture_id(), Some(managed_id));
         assert!(app.maintain_capture());
         assert_eq!(
             app.take_worker_requests(),
@@ -1870,6 +1977,7 @@ mod capture_task7_tests {
             })
         );
         assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().managed_capture_id(), None);
         assert!(!app.maintain_capture());
     }
 
@@ -4198,6 +4306,8 @@ impl App {
                         if self.capture_discard_release_pending == Some(id) {
                             self.capture_discard_release_pending = None;
                             self.complete_capture_discard();
+                        } else if self.capture_session.managed_capture_id() == Some(id) {
+                            let _ = self.capture_session.set_managed_capture_id(None);
                         }
                         true
                     }
@@ -4362,7 +4472,6 @@ impl App {
         };
         if !self.capture_target_fence_matches() {
             self.queue_managed_release(candidate.id);
-            let _ = self.capture_session.set_managed_capture_id(None);
             self.mark_capture_target_changed();
             return true;
         }
@@ -4474,6 +4583,10 @@ impl App {
         debug_assert!(self.capture_discard_release_pending.is_none());
         if let Some(candidate) = self.capture_ready.take() {
             self.wait_for_capture_discard_release(candidate.id);
+            return;
+        }
+        if let Some(id) = self.capture_session.managed_capture_id() {
+            self.wait_for_capture_discard_release(id);
             return;
         }
         self.discard_capture_transaction();

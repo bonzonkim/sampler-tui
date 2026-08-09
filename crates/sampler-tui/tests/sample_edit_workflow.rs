@@ -160,17 +160,13 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         if self.probe.reject_install.get() {
             return Err("test audio queue full".to_owned());
         }
         self.controller()
-            .install(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install(pad, sample, settings, mix)
             .map_err(|error| error.to_string())
     }
 
@@ -179,14 +175,10 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.controller()
-            .install_recovery(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install_recovery(pad, sample, settings, mix)
             .map_err(|error| error.to_string())
     }
 
@@ -448,6 +440,7 @@ fn recovery_port_uses_the_controller_recovery_admission_limit() {
             pad(0),
             Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
             PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
         )
         .expect("recovery credit available");
     }
@@ -456,6 +449,7 @@ fn recovery_port_uses_the_controller_recovery_admission_limit() {
             pad(0),
             Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
             PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
         )
         .is_err(),
         "the 33rd recovery must exhaust the controller's reserved recovery credits"
@@ -464,6 +458,7 @@ fn recovery_port_uses_the_controller_recovery_admission_limit() {
         pad(1),
         Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
         PadSettings::default(),
+        sampler_core::PadMixSettings::default(),
     )
     .expect("recovery credits do not consume ordinary install capacity");
 }

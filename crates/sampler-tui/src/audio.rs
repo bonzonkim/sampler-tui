@@ -9,7 +9,9 @@ use sampler_audio::{
     InputCaptureSession, LiveAck, LiveCommandId, PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot,
     PatternSwitch, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot, Telemetry,
 };
-use sampler_core::{PadId, PadMixSettings, PadSettings, PatternSlotId, PatternSnapshot};
+use sampler_core::{
+    MasterMixSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PatternSnapshot,
+};
 
 use crate::CaptureError;
 
@@ -89,14 +91,16 @@ pub trait AudioPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, String>;
     fn install_recovery(
         &mut self,
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, String> {
-        self.install(pad, sample, settings)
+        self.install(pad, sample, settings, mix)
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String>;
     fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), String> {
@@ -152,6 +156,12 @@ pub trait AudioPort {
     fn stop_pad(&mut self, pad: PadId) -> Result<(), String>;
     fn stop_all(&mut self) -> Result<(), String>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String>;
+    fn update_pad_mix(&mut self, _pad: PadId, _settings: PadMixSettings) -> Result<(), String> {
+        Ok(())
+    }
+    fn update_master_mix(&mut self, _settings: MasterMixSettings) -> Result<(), String> {
+        Ok(())
+    }
     fn reclaim_retired(&mut self) -> usize;
     fn latest_telemetry(&mut self) -> Option<Telemetry>;
     fn poll_runtime_error(&mut self) -> Option<String>;
@@ -240,14 +250,16 @@ trait SessionLike {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, Self::CommandError>;
     fn install_recovery(
         &mut self,
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, Self::CommandError> {
-        self.install(pad, sample, settings)
+        self.install(pad, sample, settings, mix)
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), Self::CommandError>;
     fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), Self::CommandError> {
@@ -292,6 +304,19 @@ trait SessionLike {
     fn stop_pad(&mut self, pad: PadId) -> Result<(), Self::CommandError>;
     fn stop_all(&mut self) -> Result<(), Self::CommandError>;
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), Self::CommandError>;
+    fn update_pad_mix(
+        &mut self,
+        _pad: PadId,
+        _settings: PadMixSettings,
+    ) -> Result<(), Self::CommandError> {
+        Ok(())
+    }
+    fn update_master_mix(
+        &mut self,
+        _settings: MasterMixSettings,
+    ) -> Result<(), Self::CommandError> {
+        Ok(())
+    }
     fn reclaim_retired_slot(&mut self) -> Option<SampleSlot> {
         None
     }
@@ -382,9 +407,9 @@ impl SessionLike for AudioSession {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, Self::CommandError> {
-        self.controller_mut()
-            .install(pad, sample, settings, PadMixSettings::default())
+        self.controller_mut().install(pad, sample, settings, mix)
     }
 
     fn install_recovery(
@@ -392,9 +417,10 @@ impl SessionLike for AudioSession {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, Self::CommandError> {
         self.controller_mut()
-            .install_recovery(pad, sample, settings, PadMixSettings::default())
+            .install_recovery(pad, sample, settings, mix)
     }
 
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), Self::CommandError> {
@@ -485,6 +511,18 @@ impl SessionLike for AudioSession {
 
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), Self::CommandError> {
         self.controller_mut().update_pad(pad, settings)
+    }
+
+    fn update_pad_mix(
+        &mut self,
+        pad: PadId,
+        settings: PadMixSettings,
+    ) -> Result<(), Self::CommandError> {
+        self.controller_mut().update_pad_mix(pad, settings)
+    }
+
+    fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), Self::CommandError> {
+        self.controller_mut().update_master_mix(settings)
     }
 
     fn reclaim_retired(&mut self) -> usize {
@@ -622,11 +660,12 @@ where
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, String> {
         let retained = Arc::clone(&sample);
         let slot = self
             .session_mut()
-            .install(pad, sample, settings)
+            .install(pad, sample, settings, mix)
             .map_err(|error| error.to_string())?;
         self.retained_samples[slot.index()] = Some(retained);
         Ok(slot)
@@ -637,11 +676,12 @@ where
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, String> {
         let retained = Arc::clone(&sample);
         let slot = self
             .session_mut()
-            .install_recovery(pad, sample, settings)
+            .install_recovery(pad, sample, settings, mix)
             .map_err(|error| error.to_string())?;
         self.retained_samples[slot.index()] = Some(retained);
         Ok(slot)
@@ -759,6 +799,18 @@ where
     fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
         self.session_mut()
             .update_pad(pad, settings)
+            .map_err(|error| error.to_string())
+    }
+
+    fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String> {
+        self.session_mut()
+            .update_pad_mix(pad, settings)
+            .map_err(|error| error.to_string())
+    }
+
+    fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), String> {
+        self.session_mut()
+            .update_master_mix(settings)
             .map_err(|error| error.to_string())
     }
 
@@ -1318,6 +1370,7 @@ mod tests {
             _pad: PadId,
             sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, Self::CommandError> {
             if let Some(ownership) = &self.ownership {
                 ownership
@@ -1742,8 +1795,13 @@ mod tests {
         let mut port = SessionAudioPort::new(session);
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25, 0.25]).unwrap());
         let weak = Arc::downgrade(&sample);
-        port.install(PadId::first(), Arc::clone(&sample), PadSettings::default())
-            .unwrap();
+        port.install(
+            PadId::first(),
+            Arc::clone(&sample),
+            PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
+        )
+        .unwrap();
         drop(sample);
 
         assert!(weak.upgrade().is_some());
@@ -1760,15 +1818,25 @@ mod tests {
         let mut port = SessionAudioPort::new(session);
         let first = Arc::new(SampleBuffer::new(48_000, vec![0.1, 0.1]).unwrap());
         let first_weak = Arc::downgrade(&first);
-        port.install(PadId::first(), Arc::clone(&first), PadSettings::default())
-            .unwrap();
+        port.install(
+            PadId::first(),
+            Arc::clone(&first),
+            PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
+        )
+        .unwrap();
         drop(first);
         assert!(first_weak.upgrade().is_some());
 
         let second = Arc::new(SampleBuffer::new(48_000, vec![0.2, 0.2]).unwrap());
         let second_weak = Arc::downgrade(&second);
-        port.install(PadId::first(), Arc::clone(&second), PadSettings::default())
-            .unwrap();
+        port.install(
+            PadId::first(),
+            Arc::clone(&second),
+            PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
+        )
+        .unwrap();
         drop(second);
 
         assert!(first_weak.upgrade().is_none());
@@ -1790,8 +1858,13 @@ mod tests {
         let mut port = SessionAudioPort::new(session);
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25, 0.25]).unwrap());
         let weak = Arc::downgrade(&sample);
-        port.install(PadId::first(), Arc::clone(&sample), PadSettings::default())
-            .unwrap();
+        port.install(
+            PadId::first(),
+            Arc::clone(&sample),
+            PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
+        )
+        .unwrap();
         drop(sample);
         assert!(weak.upgrade().is_some());
 
@@ -2205,6 +2278,7 @@ mod tests {
             _pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             Err("unsupported".into())
         }

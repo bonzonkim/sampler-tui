@@ -143,14 +143,10 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.controller()
-            .install(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install(pad, sample, settings, mix)
             .map_err(|error| error.to_string())
     }
 
@@ -159,14 +155,10 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.controller()
-            .install_recovery(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install_recovery(pad, sample, settings, mix)
             .map_err(|error| error.to_string())
     }
 

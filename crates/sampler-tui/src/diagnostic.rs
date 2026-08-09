@@ -53,7 +53,12 @@ pub fn play(path: PathBuf) -> Result<(), DynError> {
     );
 
     audio
-        .install(PadId::first(), Arc::new(sample), PadSettings::default())
+        .install(
+            PadId::first(),
+            Arc::new(sample),
+            PadSettings::default(),
+            sampler_core::PadMixSettings::default(),
+        )
         .map_err(io::Error::other)?;
     let initial_frame = wait_for_initial_telemetry(audio.as_mut())?;
     let trigger_frame = initial_frame

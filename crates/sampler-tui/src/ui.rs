@@ -1210,6 +1210,7 @@ mod tests {
             _pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             SampleSlot::new(0).map_err(|error| error.to_string())
         }

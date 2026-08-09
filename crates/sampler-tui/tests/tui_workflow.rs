@@ -154,6 +154,7 @@ impl AudioPort for FakeAudio {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        _mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.accept_command(AudioCall::Install {
             pad,

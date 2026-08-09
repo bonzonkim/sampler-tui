@@ -13,8 +13,8 @@ use sampler_audio::{
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, ProjectDocument, ProjectId,
-    SampleEditRecipe,
+    BankId, MasterMixSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PlaybackMode,
+    ProjectDocument, ProjectId, SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -55,6 +55,423 @@ pub enum ProjectSaveError {
     Snapshot(ProjectSnapshotError),
     Entropy(String),
     TokenExhausted,
+}
+
+#[cfg(test)]
+mod mixer_task6_tests {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use sampler_audio::{
+        CaptureCompletion, CaptureSource, Frame, SampleBuffer, SampleSlot, Telemetry,
+    };
+    use sampler_core::{
+        BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
+        PlaybackMode, ReverbSettings, SampleEditRecipe,
+    };
+
+    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, pad_offset};
+    use crate::audio::{AudioPort, CaptureSupport};
+    use crate::capture::CapturePhase;
+    use crate::capture_store::{ManagedCapture, ManagedCaptureId};
+    use crate::loader::LoadedSample;
+    use crate::project_store::SourceFingerprint;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MixerAudioCallKind {
+        Install,
+        UpdatePad,
+        UpdatePadMix,
+        UpdateMasterMix,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum MixerAudioCall {
+        Install(PadId, PadSettings, PadMixSettings),
+        UpdatePad(PadId, PadSettings),
+        UpdatePadMix(PadId, PadMixSettings),
+        UpdateMasterMix(MasterMixSettings),
+    }
+
+    struct MixerAudioState {
+        calls: Vec<MixerAudioCall>,
+        fail_next: Option<MixerAudioCallKind>,
+        runtime_error: Option<String>,
+        installed: Vec<(PadId, PadMixSettings)>,
+        master: Option<MasterMixSettings>,
+    }
+
+    #[derive(Clone)]
+    struct MixerProbe(Rc<RefCell<MixerAudioState>>);
+
+    impl MixerProbe {
+        fn calls(&self) -> Vec<MixerAudioCall> {
+            self.0.borrow().calls.clone()
+        }
+
+        fn fail_next(&self, kind: MixerAudioCallKind) {
+            self.0.borrow_mut().fail_next = Some(kind);
+        }
+
+        fn fail_device(&self, message: &str) {
+            self.0.borrow_mut().runtime_error = Some(message.to_owned());
+        }
+
+        fn installed_mix(&self, pad: PadId) -> Option<PadMixSettings> {
+            self.0
+                .borrow()
+                .installed
+                .iter()
+                .rev()
+                .find_map(|(candidate, mix)| (*candidate == pad).then_some(*mix))
+        }
+
+        fn master(&self) -> Option<MasterMixSettings> {
+            self.0.borrow().master
+        }
+    }
+
+    struct MixerAudio(MixerProbe);
+
+    impl MixerAudio {
+        fn new() -> (Self, MixerProbe) {
+            let probe = MixerProbe(Rc::new(RefCell::new(MixerAudioState {
+                calls: Vec::new(),
+                fail_next: None,
+                runtime_error: None,
+                installed: Vec::new(),
+                master: None,
+            })));
+            (Self(probe.clone()), probe)
+        }
+
+        fn admit(&self, kind: MixerAudioCallKind, call: MixerAudioCall) -> Result<(), String> {
+            let mut state = self.0.0.borrow_mut();
+            state.calls.push(call);
+            if state.fail_next == Some(kind) {
+                state.fail_next = None;
+                Err(format!("{kind:?} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl AudioPort for MixerAudio {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+
+        fn render_horizon(&self) -> Frame {
+            0
+        }
+
+        fn install(
+            &mut self,
+            pad: PadId,
+            _sample: Arc<SampleBuffer>,
+            settings: PadSettings,
+            mix: PadMixSettings,
+        ) -> Result<SampleSlot, String> {
+            self.admit(
+                MixerAudioCallKind::Install,
+                MixerAudioCall::Install(pad, settings, mix),
+            )?;
+            self.0.0.borrow_mut().installed.push((pad, mix));
+            SampleSlot::new(0).map_err(|error| error.to_string())
+        }
+
+        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_pad(&mut self, _pad: PadId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_all(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
+            self.admit(
+                MixerAudioCallKind::UpdatePad,
+                MixerAudioCall::UpdatePad(pad, settings),
+            )
+        }
+
+        fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String> {
+            self.admit(
+                MixerAudioCallKind::UpdatePadMix,
+                MixerAudioCall::UpdatePadMix(pad, settings),
+            )
+        }
+
+        fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), String> {
+            self.admit(
+                MixerAudioCallKind::UpdateMasterMix,
+                MixerAudioCall::UpdateMasterMix(settings),
+            )?;
+            self.0.0.borrow_mut().master = Some(settings);
+            Ok(())
+        }
+
+        fn reclaim_retired(&mut self) -> usize {
+            0
+        }
+
+        fn latest_telemetry(&mut self) -> Option<Telemetry> {
+            None
+        }
+
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            self.0.0.borrow_mut().runtime_error.take()
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
+        }
+    }
+
+    fn pad(index: u8) -> PadId {
+        PadId::new(BankId::new(0).unwrap(), index).unwrap()
+    }
+
+    fn sample() -> Arc<SampleBuffer> {
+        Arc::new(SampleBuffer::new(48_000, vec![0.25, -0.25]).unwrap())
+    }
+
+    fn install_loaded_pad(app: &mut App, target: PadId, mix: PadMixSettings) {
+        app.update_pad_mix(target, mix).unwrap();
+        let sample = sample();
+        let settings = PadSettings::default();
+        app.audio
+            .as_mut()
+            .unwrap()
+            .install(target, Arc::clone(&sample), settings, mix)
+            .unwrap();
+        let offset = pad_offset(target);
+        app.pads[offset].sample = Some(sample);
+        app.pads[offset].state = PadLoadState::Ready;
+        app.current_session_bound[offset] = true;
+    }
+
+    fn loaded_mixer_app() -> (App, MixerProbe, PadId) {
+        let (audio, probe) = MixerAudio::new();
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        install_loaded_pad(&mut app, target, PadMixSettings::default());
+        (app, probe, target)
+    }
+
+    fn nondefault_master_mix() -> MasterMixSettings {
+        MasterMixSettings::new(
+            -3.0,
+            DelaySettings::new(true, 20, 0.4, -6.0).unwrap(),
+            ReverbSettings::new(true, 0.7, 0.3, -9.0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn managed_capture(id: u64) -> ManagedCapture {
+        let rendered = sample();
+        let fingerprint =
+            SourceFingerprint::from_encoded_bytes(Path::new("capture.wav"), b"capture").unwrap();
+        ManagedCapture {
+            id: ManagedCaptureId::new(id),
+            path: PathBuf::from(format!("managed-{id}.wav")),
+            fingerprint,
+            sample: LoadedSample {
+                fingerprint,
+                base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS]),
+                rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -2, max: 2 }; EDIT_PREVIEW_COLUMNS],
+                ),
+                recipe: SampleEditRecipe::identity(),
+                source_rate: 48_000,
+                source_frames: 1,
+                duration: Duration::from_secs_f64(1.0 / 48_000.0),
+            },
+        }
+    }
+
+    fn ready_capture_target_fixture() -> (App, MixerProbe, PadId, ManagedCaptureId) {
+        let (mut app, probe, target) = loaded_mixer_app();
+        app.capture_session
+            .begin(CaptureSource::Resample, target, 48_000, 4)
+            .unwrap();
+        app.capture_target_fence = Some(app.capture_target_fence_for(target));
+        app.capture_session.mark_arming().unwrap();
+        app.capture_session.mark_recording().unwrap();
+        app.capture_session
+            .accept_completion(CaptureCompletion {
+                token: app.capture_session.token().unwrap(),
+                target,
+                source: CaptureSource::Resample,
+                sample_rate: 48_000,
+                stereo: vec![0.5, -0.5],
+                hard_limit: false,
+                peak: 0.5,
+            })
+            .unwrap();
+        app.capture_session.mark_ready_to_install().unwrap();
+        let id = ManagedCaptureId::new(91);
+        app.capture_session
+            .set_managed_capture_id(Some(id))
+            .unwrap();
+        app.capture_ready = Some(managed_capture(id.get()));
+        (app, probe, target, id)
+    }
+
+    #[test]
+    fn loaded_pad_mix_and_master_commit_only_after_exact_audio_admission() {
+        let (mut app, probe, target) = loaded_mixer_app();
+        let revision = app.project_revision();
+        let pad_mix = PadMixSettings::new(true, 0.25, 0.75).unwrap();
+        app.update_pad_mix(target, pad_mix).unwrap();
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdatePadMix(target, pad_mix))
+        );
+        assert_eq!(app.pad_mix(target), pad_mix);
+        assert_eq!(app.project_revision(), revision + 1);
+
+        let revision = app.project_revision();
+        let master = nondefault_master_mix();
+        app.update_master_mix(master).unwrap();
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdateMasterMix(master))
+        );
+        assert_eq!(app.master_mix(), master);
+        assert_eq!(app.project_revision(), revision + 1);
+    }
+
+    #[test]
+    fn mixer_noops_unloaded_updates_failures_and_revision_exhaustion_are_exact() {
+        let (mut app, probe, target) = loaded_mixer_app();
+        let before = (
+            app.pad_mix(target),
+            app.master_mix(),
+            app.project_revision(),
+        );
+        probe.fail_next(MixerAudioCallKind::UpdatePadMix);
+        assert!(
+            app.update_pad_mix(target, PadMixSettings::new(true, 1.0, 1.0).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            (
+                app.pad_mix(target),
+                app.master_mix(),
+                app.project_revision()
+            ),
+            before
+        );
+
+        app.project_session
+            .set_current_revision_for_test(i64::MAX as u64);
+        let before = (app.master_mix(), app.project_revision(), probe.calls());
+        assert!(app.update_master_mix(nondefault_master_mix()).is_err());
+        assert_eq!(
+            (app.master_mix(), app.project_revision(), probe.calls()),
+            before
+        );
+
+        let (audio, unloaded_probe) = MixerAudio::new();
+        let mut unloaded = App::with_audio(Box::new(audio));
+        let local = PadMixSettings::new(false, 0.3, 0.6).unwrap();
+        unloaded.update_pad_mix(target, local).unwrap();
+        assert_eq!(unloaded.pad_mix(target), local);
+        assert_eq!(unloaded.project_revision(), 0);
+        let calls = unloaded_probe.calls();
+        unloaded.update_pad_mix(target, local).unwrap();
+        assert_eq!(unloaded_probe.calls(), calls);
+        assert_eq!(unloaded.project_revision(), 0);
+    }
+
+    #[test]
+    fn replacement_audio_is_fully_configured_before_device_recovery_commits() {
+        let (mut app, old_probe, first_pad) = loaded_mixer_app();
+        let first_mix = PadMixSettings::new(true, 0.2, 0.8).unwrap();
+        app.update_pad_mix(first_pad, first_mix).unwrap();
+        let second_pad = pad(1);
+        let second_mix = PadMixSettings::new(false, 0.4, 0.6).unwrap();
+        install_loaded_pad(&mut app, second_pad, second_mix);
+        let master = nondefault_master_mix();
+        app.update_master_mix(master).unwrap();
+
+        old_probe.fail_device("lost");
+        assert!(app.maintain_audio());
+        let (replacement, replacement_probe) = MixerAudio::new();
+        assert!(app.retry_default_device_with(|| Ok(Box::new(replacement))));
+        assert_eq!(replacement_probe.master(), Some(master));
+        assert_eq!(replacement_probe.installed_mix(first_pad), Some(first_mix));
+        assert_eq!(
+            replacement_probe.installed_mix(second_pad),
+            Some(second_mix)
+        );
+        assert_eq!(
+            replacement_probe.calls(),
+            vec![
+                MixerAudioCall::UpdateMasterMix(master),
+                MixerAudioCall::Install(first_pad, PadSettings::default(), first_mix),
+                MixerAudioCall::Install(second_pad, PadSettings::default(), second_mix),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_target_fence_rejects_ready_take_after_mix_or_choke_changes() {
+        for change_mix in [true, false] {
+            let (mut app, probe, target, managed_id) = ready_capture_target_fixture();
+            let installs_before = probe
+                .calls()
+                .into_iter()
+                .filter(|call| matches!(call, MixerAudioCall::Install(..)))
+                .count();
+            if change_mix {
+                app.update_pad_mix(target, PadMixSettings::new(true, 0.5, 0.5).unwrap())
+                    .unwrap();
+            } else {
+                app.update_pad_settings(
+                    target,
+                    PadSettings::new(
+                        PlaybackMode::OneShot,
+                        0.0,
+                        0.0,
+                        0.0,
+                        Some(ChokeGroup::new(1).unwrap()),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            assert!(app.maintain_capture());
+            assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+            let installs_after = probe
+                .calls()
+                .into_iter()
+                .filter(|call| matches!(call, MixerAudioCall::Install(..)))
+                .count();
+            assert_eq!(installs_after, installs_before);
+            assert_eq!(app.capture_session().managed_capture_id(), Some(managed_id));
+            assert_eq!(app.pending_managed_releases.back(), Some(&managed_id));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +612,7 @@ mod capture_task7_tests {
             pad: PadId,
             sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             let mut state = self.0.0.borrow_mut();
             state
@@ -3556,6 +3974,7 @@ struct CaptureTargetFence {
     edit_generation: u64,
     source: Option<PathBuf>,
     settings: PadSettings,
+    mix: PadMixSettings,
     sample: Option<Arc<SampleBuffer>>,
     preview: [PreviewColumn; PREVIEW_COLUMNS],
     base: Option<Arc<SampleBuffer>>,
@@ -3571,6 +3990,8 @@ pub struct App {
     active_bank: BankId,
     selected_pad: usize,
     pads: [PadView; PAD_VIEW_COUNT],
+    pad_mixes: [PadMixSettings; PAD_VIEW_COUNT],
+    master_mix: MasterMixSettings,
     patterns: PatternWorkspace,
     capture_session: crate::CaptureSession,
     capture_target_fence: Option<CaptureTargetFence>,
@@ -3642,6 +4063,7 @@ impl CaptureTargetFence {
             edit_generation: app.sample_editor.generations[offset],
             source: view.source.clone(),
             settings: view.settings,
+            mix: app.pad_mixes[offset],
             sample: view.sample.clone(),
             preview: view.preview,
             base: commit.base.clone(),
@@ -3662,6 +4084,7 @@ impl CaptureTargetFence {
             && self.edit_generation == app.sample_editor.generations[offset]
             && self.source == view.source
             && self.settings == view.settings
+            && self.mix == app.pad_mixes[offset]
             && Self::same_arc(&self.sample, &view.sample)
             && self.preview == view.preview
             && Self::same_arc(&self.base, &commit.base)
@@ -3692,7 +4115,13 @@ impl App {
         Self::new(None, Some(error))
     }
 
-    fn new(audio: Option<Box<dyn AudioPort>>, audio_error: Option<String>) -> Self {
+    fn new(mut audio: Option<Box<dyn AudioPort>>, mut audio_error: Option<String>) -> Self {
+        if let Some(candidate) = audio.as_mut()
+            && let Err(error) = candidate.update_master_mix(MasterMixSettings::default())
+        {
+            audio = None;
+            audio_error = Some(error);
+        }
         let overlay = audio_error.clone().map(Overlay::DeviceError);
         let audio_format = audio
             .as_ref()
@@ -3704,6 +4133,8 @@ impl App {
             active_bank: BankId::new(0).expect("bank zero is valid"),
             selected_pad: 0,
             pads: array::from_fn(|_| PadView::default()),
+            pad_mixes: [PadMixSettings::default(); PAD_VIEW_COUNT],
+            master_mix: MasterMixSettings::default(),
             patterns: PatternWorkspace::new(pattern_sample_rate),
             capture_session: crate::CaptureSession::default(),
             capture_target_fence: None,
@@ -4511,7 +4942,12 @@ impl App {
             .audio
             .as_mut()
             .expect("matching ready rate requires audio")
-            .install(target, Arc::clone(&candidate.sample.rendered), settings);
+            .install(
+                target,
+                Arc::clone(&candidate.sample.rendered),
+                settings,
+                self.pad_mixes[offset],
+            );
         if let Err(error) = install {
             self.capture_ready = Some(candidate);
             self.status = error;
@@ -5602,6 +6038,7 @@ impl App {
                                             pad,
                                             Arc::clone(&staged.loaded.rendered),
                                             staged.settings,
+                                            PadMixSettings::default(),
                                         )
                                         .map(|_| ())
                                 } else {
@@ -5718,6 +6155,8 @@ impl App {
             candidate.saved_revision
         };
         self.pads = pads;
+        self.pad_mixes = [PadMixSettings::default(); PAD_VIEW_COUNT];
+        self.master_mix = MasterMixSettings::default();
         self.patterns = candidate.patterns;
         self.project_session = ProjectSession::opened(
             candidate.document.project_id,
@@ -6482,7 +6921,12 @@ impl App {
         }
         let pad = pad_from_offset(offset);
         let settings = self.pads[offset].settings;
-        if let Err(error) = audio.install(pad, Arc::clone(&rendered.rendered), settings) {
+        if let Err(error) = audio.install(
+            pad,
+            Arc::clone(&rendered.rendered),
+            settings,
+            self.pad_mixes[offset],
+        ) {
             let kind = pending.kind;
             pending.phase = PendingEditPhase::Ready(rendered);
             self.sample_editor.pending[offset] = Some(pending);
@@ -6557,6 +7001,55 @@ impl App {
 
     pub fn pad(&self, pad: PadId) -> &PadView {
         &self.pads[pad_offset(pad)]
+    }
+
+    pub fn pad_mix(&self, pad: PadId) -> PadMixSettings {
+        self.pad_mixes[pad_offset(pad)]
+    }
+
+    pub const fn master_mix(&self) -> MasterMixSettings {
+        self.master_mix
+    }
+
+    pub fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String> {
+        settings.validate().map_err(|error| error.to_string())?;
+        let offset = pad_offset(pad);
+        if self.pad_mixes[offset] == settings {
+            return Ok(());
+        }
+        if self.pads[offset].sample.is_none() {
+            self.pad_mixes[offset] = settings;
+            return Ok(());
+        }
+        if !self.current_session_bound[offset] || self.audio.is_none() {
+            return Err("loaded sample is not admitted to the current audio session".to_owned());
+        }
+        self.ensure_project_mutation_available()?;
+        self.audio
+            .as_mut()
+            .expect("current session binding requires an audio controller")
+            .update_pad_mix(pad, settings)?;
+        self.pad_mixes[offset] = settings;
+        self.commit_project_mutation();
+        Ok(())
+    }
+
+    pub fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), String> {
+        settings.validate().map_err(|error| error.to_string())?;
+        if self.master_mix == settings {
+            return Ok(());
+        }
+        if self.audio.is_none() {
+            return Err("audio is unavailable".to_owned());
+        }
+        self.ensure_project_mutation_available()?;
+        self.audio
+            .as_mut()
+            .expect("audio availability was checked")
+            .update_master_mix(settings)?;
+        self.master_mix = settings;
+        self.commit_project_mutation();
+        Ok(())
     }
 
     /// Atomically updates a pad's validated settings. Unloaded pads remain a local edit; loaded
@@ -7360,7 +7853,12 @@ impl App {
                 if let Some(pending) = self.pending_load_slot_mut(offset, kind).as_mut() {
                     pending.phase = PendingLoadPhase::Failed;
                 }
-                self.pads[offset].state = PadLoadState::Error(error.clone());
+                self.pads[offset].state =
+                    if self.current_session_bound[offset] && self.pads[offset].sample.is_some() {
+                        PadLoadState::Ready
+                    } else {
+                        PadLoadState::Error(error.clone())
+                    };
                 self.status = error;
                 self.refresh_editor_for_offset(offset);
                 return true;
@@ -8941,10 +9439,39 @@ impl App {
         self.sync_editor_to_selected_pad();
     }
 
-    fn recover_audio(&mut self, audio: Box<dyn AudioPort>) {
+    fn recover_audio(&mut self, mut audio: Box<dyn AudioPort>) {
         let sample_rate = audio.sample_rate();
         let channels = audio.channels();
         let mut local_error = None;
+        let mut prebound = [false; PAD_VIEW_COUNT];
+
+        if let Err(error) = audio.update_master_mix(self.master_mix) {
+            self.status = error.clone();
+            self.audio_unavailable_message = Some(error);
+            return;
+        }
+        if self.project_open.is_none() {
+            for (offset, bound) in prebound.iter_mut().enumerate() {
+                let Some(sample) = self.pads[offset].sample.as_ref() else {
+                    continue;
+                };
+                if sample.sample_rate() != sample_rate {
+                    continue;
+                }
+                let pad = pad_from_offset(offset);
+                if let Err(error) = audio.install_recovery(
+                    pad,
+                    Arc::clone(sample),
+                    self.pads[offset].settings,
+                    self.pad_mixes[offset],
+                ) {
+                    self.status = error.clone();
+                    self.audio_unavailable_message = Some(error);
+                    return;
+                }
+                *bound = true;
+            }
+        }
 
         self.audio = Some(audio);
         self.audio_format = Some((sample_rate, channels));
@@ -9012,7 +9539,11 @@ impl App {
                     .as_ref()
                     .is_some_and(|sample| sample.sample_rate() == sample_rate)
                 {
-                    self.reinstall_pending[offset] = true;
+                    self.current_session_bound[offset] = prebound[offset];
+                    self.reinstall_pending[offset] = !prebound[offset];
+                    if prebound[offset] {
+                        view.state = PadLoadState::Ready;
+                    }
                 } else if let Some(path) = view.source.clone() {
                     self.recovery_generations[offset] = self.recovery_generations[offset]
                         .max(view.generation)
@@ -9244,10 +9775,18 @@ impl App {
         let settings = self.pads[offset].settings;
         let audio = self.audio.as_mut().expect("audio availability was checked");
         let install_result = match pending.kind {
-            PendingLoadKind::User => audio.install(pad, Arc::clone(&loaded.rendered), settings),
-            PendingLoadKind::Recovery => {
-                audio.install_recovery(pad, Arc::clone(&loaded.rendered), settings)
-            }
+            PendingLoadKind::User => audio.install(
+                pad,
+                Arc::clone(&loaded.rendered),
+                settings,
+                self.pad_mixes[offset],
+            ),
+            PendingLoadKind::Recovery => audio.install_recovery(
+                pad,
+                Arc::clone(&loaded.rendered),
+                settings,
+                self.pad_mixes[offset],
+            ),
         };
         if let Err(error) = install_result {
             pending.phase = PendingLoadPhase::Ready(loaded);
@@ -9328,7 +9867,12 @@ impl App {
             return;
         }
 
-        match audio.install_recovery(pad, sample, self.pads[offset].settings) {
+        match audio.install_recovery(
+            pad,
+            sample,
+            self.pads[offset].settings,
+            self.pad_mixes[offset],
+        ) {
             Ok(_) => {
                 self.reinstall_pending[offset] = false;
                 self.current_session_bound[offset] = true;
@@ -9702,6 +10246,7 @@ mod tests {
             pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             if let Some(error) = self.install_error.take() {
                 return Err(error);
@@ -11065,7 +11610,10 @@ mod tests {
         let replacement_audio = FakeAudio::ready(48_000, 2);
         let calls = replacement_audio.call_log();
         app.retry_default_device_with(|| Ok(Box::new(replacement_audio)));
-        assert_eq!(calls.snapshot(), [AudioCall::Install(pad(0, 0))]);
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::Install(pad(0, 0)), AudioCall::Install(pad(0, 1)),]
+        );
 
         let replacement = app.begin_load(pad(0, 1), "new.wav").unwrap();
         let WorkerRequest::LoadSample {

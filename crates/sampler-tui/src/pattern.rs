@@ -46,6 +46,7 @@ mod tests {
             _pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             Err("unused".into())
         }
@@ -153,6 +154,7 @@ mod tests {
             _pad: PadId,
             _sample: Arc<SampleBuffer>,
             _settings: PadSettings,
+            _mix: sampler_core::PadMixSettings,
         ) -> Result<SampleSlot, String> {
             Err("unused".into())
         }

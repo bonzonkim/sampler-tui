@@ -56,15 +56,11 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.installed_settings.borrow_mut().push(settings);
         self.controller()
-            .install(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install(pad, sample, settings, mix)
             .map_err(|e| e.to_string())
     }
     fn install_recovery(
@@ -72,15 +68,11 @@ impl AudioPort for ControllerPort {
         pad: PadId,
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: sampler_core::PadMixSettings,
     ) -> Result<SampleSlot, String> {
         self.installed_settings.borrow_mut().push(settings);
         self.controller()
-            .install_recovery(
-                pad,
-                sample,
-                settings,
-                sampler_core::PadMixSettings::default(),
-            )
+            .install_recovery(pad, sample, settings, mix)
             .map_err(|e| e.to_string())
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String> {
@@ -591,7 +583,7 @@ fn pad_settings_update_is_validated_and_audio_atomic() {
 }
 
 #[test]
-fn retrying_pad_settings_wait_for_their_current_session_binding() {
+fn retrying_pad_settings_use_the_reconstructed_current_session_binding() {
     let mut harness = PatternHarness::new(48_000);
     harness.load_pad(1);
     harness.callback(0);
@@ -615,20 +607,17 @@ fn retrying_pad_settings_wait_for_their_current_session_binding() {
     let calls = harness.update_calls.get();
     let b_before = harness.app.pad(pad(1)).settings;
     let b_settings = PadSettings::new(PlaybackMode::Gate, -6.0, 0.0, 0.0, None).unwrap();
-    assert_eq!(
-        harness.app.update_pad_settings(pad(1), b_settings),
-        Err("loaded sample is not admitted to the current audio session".to_owned())
-    );
-    assert_eq!(harness.update_calls.get(), calls);
-    assert_eq!(harness.app.pad(pad(1)).settings, b_before);
+    assert_eq!(harness.app.update_pad_settings(pad(1), b_settings), Ok(()));
+    assert_eq!(harness.update_calls.get(), calls + 1);
+    assert_eq!(harness.app.pad(pad(1)).settings, b_settings);
     let a_settings = PadSettings::new(PlaybackMode::Gate, -3.0, 0.0, 0.0, None).unwrap();
     harness.app.update_pad_settings(pad(0), a_settings).unwrap();
-    assert_eq!(harness.update_calls.get(), calls + 1);
+    assert_eq!(harness.update_calls.get(), calls + 2);
     for _ in 0..2 {
         harness.app.maintain_audio();
         harness.callback(0);
     }
-    assert_eq!(harness.app.pad(pad(1)).settings, b_before);
+    assert_eq!(harness.app.pad(pad(1)).settings, b_settings);
     assert_eq!(harness.installed_settings.borrow().last(), Some(&b_before));
     assert_eq!(harness.engine.invalid_commands(), 0);
 }

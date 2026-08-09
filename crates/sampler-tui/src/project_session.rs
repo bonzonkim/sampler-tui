@@ -7,7 +7,7 @@ use sampler_core::{PadId, ProjectId};
 
 use crate::loader::LoadSampleError;
 use crate::project_store::ProjectStoreError;
-use crate::{ProjectToken, SaveKind};
+use crate::{CapturePhase, ProjectToken, SaveKind};
 
 pub const MAX_PROJECT_REVISION: u64 = i64::MAX as u64;
 
@@ -126,6 +126,7 @@ pub enum ProjectStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSnapshotError {
+    UnresolvedCapture(CapturePhase),
     DirtySampleDraft(PadId),
     PendingSampleLoad(PadId),
     PendingSampleEdit(PadId),
@@ -137,6 +138,9 @@ pub enum ProjectSnapshotError {
 impl std::fmt::Display for ProjectSnapshotError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnresolvedCapture(phase) => {
+                write!(formatter, "capture work is unresolved in phase {phase:?}")
+            }
             Self::DirtySampleDraft(pad) => {
                 write!(formatter, "pad {pad:?} has an uncommitted sample draft")
             }

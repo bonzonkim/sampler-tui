@@ -3,6 +3,8 @@ use std::fmt;
 use sampler_audio::{CaptureCompletion, CaptureSource};
 use sampler_core::PadId;
 
+use crate::capture_store::ManagedCaptureId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturePhase {
     Confirm,
@@ -52,6 +54,12 @@ pub enum CaptureError {
     InputOpen(String),
     OutputRuntime(String),
     InputRuntime(String),
+    DirtySampleDraft(PadId),
+    SampleOperationPending(PadId),
+    ProjectOperationPending,
+    AudioUnavailable,
+    EmptyCapture,
+    ProjectRevisionExhausted,
 }
 
 impl fmt::Display for CaptureError {
@@ -108,6 +116,16 @@ impl fmt::Display for CaptureError {
             Self::InputOpen(error) => write!(formatter, "could not open input capture: {error}"),
             Self::OutputRuntime(error) => write!(formatter, "output capture failed: {error}"),
             Self::InputRuntime(error) => write!(formatter, "input capture failed: {error}"),
+            Self::DirtySampleDraft(pad) => {
+                write!(formatter, "pad {pad:?} has an uncommitted sample draft")
+            }
+            Self::SampleOperationPending(pad) => {
+                write!(formatter, "pad {pad:?} has pending sample work")
+            }
+            Self::ProjectOperationPending => formatter.write_str("a project operation is pending"),
+            Self::AudioUnavailable => formatter.write_str("audio device is unavailable"),
+            Self::EmptyCapture => formatter.write_str("capture contains no frames"),
+            Self::ProjectRevisionExhausted => formatter.write_str("project revision is exhausted"),
         }
     }
 }
@@ -140,6 +158,7 @@ struct ActiveCapture {
     phase: CapturePhase,
     completion: Option<CaptureCompletion>,
     failure: Option<String>,
+    managed_capture_id: Option<ManagedCaptureId>,
 }
 
 #[derive(Default)]
@@ -187,6 +206,7 @@ impl CaptureSession {
             phase: CapturePhase::Confirm,
             completion: None,
             failure: None,
+            managed_capture_id: None,
         });
         Ok(())
     }
@@ -241,6 +261,15 @@ impl CaptureSession {
         self.transition(CapturePhase::Finalizing, CapturePhase::ReadyToInstall)
     }
 
+    pub(crate) fn set_managed_capture_id(
+        &mut self,
+        id: Option<ManagedCaptureId>,
+    ) -> Result<(), CaptureError> {
+        let active = self.active.as_mut().ok_or(CaptureError::NoActiveCapture)?;
+        active.managed_capture_id = id;
+        Ok(())
+    }
+
     pub fn mark_failed(&mut self, message: impl Into<String>) -> Result<(), CaptureError> {
         let active = self.active.as_mut().ok_or(CaptureError::NoActiveCapture)?;
         active.phase = CapturePhase::Failed;
@@ -271,7 +300,43 @@ impl CaptureSession {
         active.generation = generation;
         active.phase = CapturePhase::Finalizing;
         active.failure = None;
+        active.managed_capture_id = None;
         Ok(generation)
+    }
+
+    pub(crate) fn advance_finalization_generation(&mut self) -> Result<u64, CaptureError> {
+        let active = self.active.as_ref().ok_or(CaptureError::NoActiveCapture)?;
+        if !matches!(
+            active.phase,
+            CapturePhase::Finalizing | CapturePhase::ReadyToInstall
+        ) {
+            return Err(CaptureError::IllegalTransition {
+                from: active.phase,
+                to: CapturePhase::Finalizing,
+            });
+        }
+        let generation = self
+            .last_generation
+            .checked_add(1)
+            .ok_or(CaptureError::GenerationExhausted)?;
+        let active = self
+            .active
+            .as_mut()
+            .expect("active capture was validated before mutation");
+        self.last_generation = generation;
+        active.generation = generation;
+        active.phase = CapturePhase::Finalizing;
+        active.failure = None;
+        active.managed_capture_id = None;
+        Ok(generation)
+    }
+
+    pub(crate) fn take_completion_stereo(&mut self) -> Option<Vec<f32>> {
+        self.active
+            .as_mut()?
+            .completion
+            .as_mut()
+            .map(|completion| std::mem::take(&mut completion.stereo))
     }
 
     pub fn discard(&mut self) -> Result<Option<CaptureCompletion>, CaptureError> {
@@ -317,6 +382,12 @@ impl CaptureSession {
         self.active
             .as_ref()
             .and_then(|active| active.failure.as_deref())
+    }
+
+    pub fn managed_capture_id(&self) -> Option<ManagedCaptureId> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.managed_capture_id)
     }
 
     fn transition(

@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use sampler_audio::{SampleBuffer, Telemetry, TransportStamp};
+use sampler_audio::{
+    CaptureBuffer, CaptureOutcome, CaptureSource, MAX_CAPTURE_FRAMES, SampleBuffer, Telemetry,
+    TransportStamp,
+};
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
     BankId, PadId, PadSettings, PatternSlotId, PlaybackMode, ProjectDocument, ProjectId,
@@ -16,12 +19,14 @@ use sampler_core::{
 
 use crate::PatternSwitch;
 use crate::audio::{AudioPort, open_default_audio};
+use crate::capture::{CaptureError, CapturePhase};
+use crate::capture_store::{ManagedCapture, ManagedCaptureId};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
 use crate::loader::{
-    EditPreview, LoadPurpose, MAX_DIRECTORY_ENTRIES, ProjectSaveWorkerRequest, ProjectToken,
-    RenderedSample, StageProjectSampleRequest, WORKER_CHANNEL_CAPACITY, WorkerRequest,
-    WorkerResult, WorkerSendError,
+    EditPreview, FinalizeCaptureRequest, LoadPurpose, MAX_DIRECTORY_ENTRIES,
+    ProjectSaveWorkerRequest, ProjectToken, RenderedSample, StageProjectSampleRequest,
+    WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
@@ -50,6 +55,999 @@ pub enum ProjectSaveError {
     Snapshot(ProjectSnapshotError),
     Entropy(String),
     TokenExhausted,
+}
+
+#[cfg(test)]
+mod capture_task7_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use sampler_audio::{
+        CaptureBuffer, CaptureCompletion, CaptureOutcome, CaptureSource, CaptureStatus, Frame,
+        LiveCommandId, MAX_CAPTURE_FRAMES, PatternSnapshotSlot, SampleBuffer, SampleSlot,
+        Telemetry,
+    };
+    use sampler_core::{BankId, PadId, PadSettings, PatternSnapshot, ProjectId, SampleEditRecipe};
+
+    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn};
+    use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
+    use crate::capture::{CaptureError, CapturePhase};
+    use crate::capture_store::{ManagedCapture, ManagedCaptureId};
+    use crate::loader::{
+        CaptureFinalizeError, FinalizeCaptureRequest, LoadPurpose, LoadedSample,
+        ProjectSaveWorkerRequest, WorkerRequest, WorkerResult, WorkerSendError,
+    };
+    use crate::project_session::ProjectSnapshotError;
+    use crate::project_store::{ProjectAssetMapping, SaveKind, SaveReceipt, SourceFingerprint};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureCall {
+        Begin {
+            token: u64,
+            target: PadId,
+            source: CaptureSource,
+            rate: u32,
+            max_frames: usize,
+        },
+        Start(CaptureSource, u64),
+        Stop(CaptureSource, u64),
+        Cancel(CaptureSource, u64),
+        Install(PadId, usize),
+        Remove(PadId),
+    }
+
+    struct CaptureAudioState {
+        output_rate: Cell<u32>,
+        input_rate: u32,
+        calls: Vec<CaptureCall>,
+        armed: Option<CaptureBuffer>,
+        outcomes: VecDeque<CaptureOutcome>,
+        runtime_errors: VecDeque<(CaptureSource, CaptureError)>,
+        output_session_error: Option<String>,
+        install_failures: usize,
+        installed: Vec<Arc<SampleBuffer>>,
+    }
+
+    #[derive(Clone)]
+    struct CaptureProbe(Rc<RefCell<CaptureAudioState>>);
+
+    impl CaptureProbe {
+        fn calls(&self) -> Vec<CaptureCall> {
+            self.0.borrow().calls.clone()
+        }
+
+        fn complete(&self, completion: CaptureCompletion) {
+            let mut state = self.0.borrow_mut();
+            state.armed = None;
+            state
+                .outcomes
+                .push_back(CaptureOutcome::Completed(completion));
+        }
+
+        fn fail_device(&self, source: CaptureSource, message: &str) {
+            let error = match source {
+                CaptureSource::Resample => CaptureError::OutputRuntime(message.to_owned()),
+                CaptureSource::Input => CaptureError::InputRuntime(message.to_owned()),
+            };
+            self.0
+                .borrow_mut()
+                .runtime_errors
+                .push_back((source, error));
+        }
+
+        fn fail_next_install(&self) {
+            self.0.borrow_mut().install_failures += 1;
+        }
+
+        fn fail_output_session(&self, message: &str) {
+            self.0.borrow_mut().output_session_error = Some(message.to_owned());
+        }
+
+        fn set_output_rate(&self, rate: u32) {
+            self.0.borrow().output_rate.set(rate);
+        }
+    }
+
+    struct CaptureAudio(CaptureProbe);
+
+    impl CaptureAudio {
+        fn new(output_rate: u32, input_rate: u32) -> (Self, CaptureProbe) {
+            let probe = CaptureProbe(Rc::new(RefCell::new(CaptureAudioState {
+                output_rate: Cell::new(output_rate),
+                input_rate,
+                calls: Vec::new(),
+                armed: None,
+                outcomes: VecDeque::new(),
+                runtime_errors: VecDeque::new(),
+                output_session_error: None,
+                install_failures: 0,
+                installed: Vec::new(),
+            })));
+            (Self(probe.clone()), probe)
+        }
+    }
+
+    impl AudioPort for CaptureAudio {
+        fn sample_rate(&self) -> u32 {
+            self.0.0.borrow().output_rate.get()
+        }
+        fn channels(&self) -> u16 {
+            2
+        }
+        fn render_horizon(&self) -> Frame {
+            0
+        }
+        fn install(
+            &mut self,
+            pad: PadId,
+            sample: Arc<SampleBuffer>,
+            _settings: PadSettings,
+        ) -> Result<SampleSlot, String> {
+            let mut state = self.0.0.borrow_mut();
+            state
+                .calls
+                .push(CaptureCall::Install(pad, Arc::as_ptr(&sample) as usize));
+            if state.install_failures > 0 {
+                state.install_failures -= 1;
+                return Err("audio install queue full".to_owned());
+            }
+            state.installed.push(sample);
+            SampleSlot::new(0).map_err(|error| error.to_string())
+        }
+        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            Ok(())
+        }
+        fn trigger_live_tracked(
+            &mut self,
+            _pad: PadId,
+            _velocity: f32,
+        ) -> Result<LiveCommandId, String> {
+            Ok(LiveCommandId::FIRST)
+        }
+        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+            Ok(())
+        }
+        fn release_live_tracked(&mut self, _pad: PadId) -> Result<LiveCommandId, String> {
+            Ok(LiveCommandId::FIRST)
+        }
+        fn install_pattern(
+            &mut self,
+            _snapshot: Arc<PatternSnapshot>,
+        ) -> Result<PatternSnapshotSlot, String> {
+            Err("unused".to_owned())
+        }
+        fn remove_sample(&mut self, pad: PadId) -> Result<(), String> {
+            self.0.0.borrow_mut().calls.push(CaptureCall::Remove(pad));
+            Ok(())
+        }
+        fn stop_pad(&mut self, _pad: PadId) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop_all(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Ok(())
+        }
+        fn reclaim_retired(&mut self) -> usize {
+            0
+        }
+        fn latest_telemetry(&mut self) -> Option<Telemetry> {
+            None
+        }
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            self.0.0.borrow_mut().output_session_error.take()
+        }
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Available
+        }
+        fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
+            let state = self.0.0.borrow();
+            Ok(match source {
+                CaptureSource::Resample => state.output_rate.get(),
+                CaptureSource::Input => state.input_rate,
+            })
+        }
+        fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureCommandFailure> {
+            let mut state = self.0.0.borrow_mut();
+            state.calls.push(CaptureCall::Begin {
+                token: buffer.token(),
+                target: buffer.target(),
+                source: buffer.source(),
+                rate: buffer.sample_rate(),
+                max_frames: buffer.max_frames(),
+            });
+            state.armed = Some(buffer);
+            Ok(())
+        }
+        fn start_capture(
+            &mut self,
+            source: CaptureSource,
+            token: u64,
+        ) -> Result<(), CaptureCommandFailure> {
+            self.0
+                .0
+                .borrow_mut()
+                .calls
+                .push(CaptureCall::Start(source, token));
+            Ok(())
+        }
+        fn stop_capture(
+            &mut self,
+            source: CaptureSource,
+            token: u64,
+        ) -> Result<(), CaptureCommandFailure> {
+            self.0
+                .0
+                .borrow_mut()
+                .calls
+                .push(CaptureCall::Stop(source, token));
+            Ok(())
+        }
+        fn cancel_capture(
+            &mut self,
+            source: CaptureSource,
+            token: u64,
+        ) -> Result<(), CaptureCommandFailure> {
+            let mut state = self.0.0.borrow_mut();
+            state.calls.push(CaptureCall::Cancel(source, token));
+            if let Some(buffer) = state.armed.take() {
+                state.outcomes.push_back(CaptureOutcome::Cancelled(buffer));
+            }
+            Ok(())
+        }
+        fn capture_status(&mut self, _source: CaptureSource) -> Option<CaptureStatus> {
+            None
+        }
+        fn capture_completion(&mut self, source: CaptureSource) -> Option<CaptureOutcome> {
+            let mut state = self.0.0.borrow_mut();
+            let position = state.outcomes.iter().position(|outcome| match outcome {
+                CaptureOutcome::Completed(completion) => completion.source == source,
+                CaptureOutcome::Cancelled(buffer) => buffer.source() == source,
+            })?;
+            state.outcomes.remove(position)
+        }
+        fn capture_runtime_error(&mut self, source: CaptureSource) -> Option<CaptureError> {
+            let mut state = self.0.0.borrow_mut();
+            let position = state
+                .runtime_errors
+                .iter()
+                .position(|(candidate, _)| *candidate == source)?;
+            state
+                .runtime_errors
+                .remove(position)
+                .map(|(_, error)| error)
+        }
+    }
+
+    fn pad(index: u8) -> PadId {
+        PadId::new(BankId::new(0).unwrap(), index).unwrap()
+    }
+
+    fn fingerprint(bytes: &[u8]) -> SourceFingerprint {
+        SourceFingerprint::from_encoded_bytes(Path::new("fixture.wav"), bytes).unwrap()
+    }
+
+    fn loaded_result(target: PadId, generation: u64, source: &str) -> WorkerResult {
+        let rendered = Arc::new(SampleBuffer::new(48_000, vec![0.2, -0.2]).unwrap());
+        WorkerResult::Loaded {
+            pad: target,
+            generation,
+            purpose: LoadPurpose::User,
+            path: source.into(),
+            result: Ok(LoadedSample {
+                fingerprint: fingerprint(source.as_bytes()),
+                base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -3, max: 3 }; EDIT_PREVIEW_COLUMNS]),
+                rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -3, max: 3 }; EDIT_PREVIEW_COLUMNS],
+                ),
+                recipe: SampleEditRecipe::identity(),
+                source_rate: 48_000,
+                source_frames: 1,
+                duration: std::time::Duration::from_secs_f64(1.0 / 48_000.0),
+            }),
+        }
+    }
+
+    fn install_imported(app: &mut App, target: PadId, source: &str) {
+        let WorkerRequest::LoadSample { generation, .. } =
+            app.begin_load(target, source).expect("load request")
+        else {
+            panic!("expected load request")
+        };
+        assert!(app.apply_worker_result(loaded_result(target, generation, source)));
+    }
+
+    fn completion(
+        app: &App,
+        source: CaptureSource,
+        stereo: Vec<f32>,
+        hard_limit: bool,
+    ) -> CaptureCompletion {
+        CaptureCompletion {
+            token: app.capture_session().token().unwrap(),
+            target: app.capture_session().target().unwrap(),
+            source,
+            sample_rate: app.capture_session().source_rate().unwrap(),
+            stereo,
+            hard_limit,
+            peak: 0.75,
+        }
+    }
+
+    fn take_finalize(app: &mut App) -> FinalizeCaptureRequest {
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::FinalizeCapture(request)] = requests.as_slice() else {
+            panic!("expected one finalize request, got {requests:?}")
+        };
+        request.clone()
+    }
+
+    fn managed_capture(id: u64, rate: u32, bytes: &[u8]) -> ManagedCapture {
+        let rendered = Arc::new(SampleBuffer::new(rate, vec![0.7, -0.7, 0.4, -0.4]).unwrap());
+        let source_fingerprint = fingerprint(bytes);
+        ManagedCapture {
+            id: ManagedCaptureId::new(id),
+            path: PathBuf::from(format!("managed-{id}.wav")),
+            fingerprint: source_fingerprint,
+            sample: LoadedSample {
+                fingerprint: source_fingerprint,
+                base: Arc::clone(&rendered),
+                base_preview: Arc::new([PreviewColumn { min: -7, max: 7 }; EDIT_PREVIEW_COLUMNS]),
+                rendered,
+                rendered_preview: Arc::new(
+                    [PreviewColumn { min: -6, max: 6 }; EDIT_PREVIEW_COLUMNS],
+                ),
+                recipe: SampleEditRecipe::identity(),
+                source_rate: rate,
+                source_frames: 2,
+                duration: std::time::Duration::from_secs_f64(2.0 / f64::from(rate)),
+            },
+        }
+    }
+
+    fn finalized(
+        request: &FinalizeCaptureRequest,
+        result: Result<ManagedCapture, CaptureFinalizeError>,
+    ) -> WorkerResult {
+        WorkerResult::CaptureFinalized {
+            token: request.token,
+            generation: request.generation,
+            target: request.target,
+            source: request.source,
+            source_rate: request.source_rate,
+            engine_rate: request.engine_rate,
+            stereo: Arc::clone(&request.stereo),
+            hard_limit: request.hard_limit,
+            result,
+        }
+    }
+
+    fn start_capture(app: &mut App, source: CaptureSource, frames: usize) {
+        app.request_capture_with_limit_for_test(source, frames)
+            .unwrap();
+        if app.capture_session().phase() == Some(CapturePhase::Confirm) {
+            app.confirm_capture().unwrap();
+        }
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+    }
+
+    fn drive_ready(
+        app: &mut App,
+        probe: &CaptureProbe,
+        source: CaptureSource,
+        id: u64,
+        hard_limit: bool,
+    ) -> FinalizeCaptureRequest {
+        probe.complete(completion(app, source, vec![0.25, -0.25], hard_limit));
+        assert!(app.maintain_capture());
+        assert!(app.take_worker_requests().is_empty());
+        assert!(app.maintain_capture());
+        let request = take_finalize(app);
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(id, request.engine_rate, b"captured")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+        request
+    }
+
+    #[test]
+    fn capture_transaction_empty_pad_uses_one_boundary_action_per_maintenance_and_commits_full_tuple_once()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+
+        start_capture(&mut app, CaptureSource::Resample, 4);
+        let token = app.capture_session().token().unwrap();
+        assert_eq!(
+            probe.calls(),
+            [
+                CaptureCall::Begin {
+                    token,
+                    target,
+                    source: CaptureSource::Resample,
+                    rate: 48_000,
+                    max_frames: 4,
+                },
+                CaptureCall::Start(CaptureSource::Resample, token),
+            ]
+        );
+        app.stop_capture().unwrap();
+        assert_eq!(
+            probe.calls().last(),
+            Some(&CaptureCall::Stop(CaptureSource::Resample, token))
+        );
+
+        drive_ready(&mut app, &probe, CaptureSource::Resample, 7, true);
+        assert_eq!(app.project_revision(), 0);
+        assert!(app.pad(target).sample.is_none());
+        assert!(app.maintain_capture());
+
+        let snapshot = app.project_snapshot().unwrap();
+        assert_eq!(app.project_revision(), 1);
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.pads.len(), 1);
+        assert_eq!(snapshot.pads[0].source_path, PathBuf::from("managed-7.wav"));
+        assert_eq!(snapshot.pads[0].fingerprint, fingerprint(b"captured"));
+        assert_eq!(snapshot.pads[0].recipe, SampleEditRecipe::identity());
+        assert_eq!(app.pad(target).state, PadLoadState::Ready);
+        assert_eq!(app.capture_session().phase(), None);
+        assert!(app.status().contains("MAX"));
+    }
+
+    #[test]
+    fn capture_transaction_occupied_pad_waits_for_confirmation_and_preserves_exact_candidate_through_busy_failure_and_install_retry()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        install_imported(&mut app, target, "old.wav");
+        let old_sample = Arc::clone(app.pad(target).sample.as_ref().unwrap());
+        let old_revision = app.project_revision();
+
+        app.request_capture_with_limit_for_test(CaptureSource::Resample, 4)
+            .unwrap();
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Confirm));
+        assert!(
+            !probe
+                .calls()
+                .iter()
+                .any(|call| matches!(call, CaptureCall::Begin { .. }))
+        );
+        app.confirm_capture().unwrap();
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.3, -0.3],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let first = take_finalize(&mut app);
+        let pointer = Arc::as_ptr(&first.stereo);
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::FinalizeCapture(first.clone()),
+            WorkerSendError::WorkerBusy,
+        ));
+        assert!(app.maintain_capture());
+        let retry = take_finalize(&mut app);
+        assert!(Arc::ptr_eq(&first.stereo, &retry.stereo));
+        assert_eq!(Arc::as_ptr(&retry.stereo), pointer);
+        assert!(Arc::ptr_eq(
+            app.pad(target).sample.as_ref().unwrap(),
+            &old_sample
+        ));
+        assert_eq!(app.project_revision(), old_revision);
+
+        assert!(app.apply_worker_result(finalized(
+            &retry,
+            Err(CaptureFinalizeError::Prepare("encode failed".to_owned())),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        app.retry_capture_finalization().unwrap();
+        assert!(app.maintain_capture());
+        let second = take_finalize(&mut app);
+        assert!(Arc::ptr_eq(&retry.stereo, &second.stereo));
+        assert!(
+            app.apply_worker_result(finalized(&second, Ok(managed_capture(8, 48_000, b"retry")),))
+        );
+        assert!(app.maintain_capture());
+        probe.fail_next_install();
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+        assert_eq!(
+            app.capture_session().managed_capture_id(),
+            Some(ManagedCaptureId::new(8))
+        );
+        assert!(Arc::ptr_eq(
+            app.pad(target).sample.as_ref().unwrap(),
+            &old_sample
+        ));
+        assert_eq!(app.project_revision(), old_revision);
+        assert!(app.maintain_capture());
+        assert_eq!(app.project_revision(), old_revision + 1);
+        assert!(!Arc::ptr_eq(
+            app.pad(target).sample.as_ref().unwrap(),
+            &old_sample
+        ));
+    }
+
+    #[test]
+    fn capture_transaction_rejects_dirty_project_state_empty_and_stale_results_without_mutation() {
+        let (audio, _probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        install_imported(&mut app, pad(0), "draft.wav");
+        app.editor_mut_for_test().toggle_reverse();
+        assert_eq!(
+            app.request_capture_with_limit_for_test(CaptureSource::Resample, 4),
+            Err(CaptureError::DirtySampleDraft(app.editor.pad()))
+        );
+        app.discard_sample_draft();
+        app.request_save_as("pending-project").unwrap();
+        assert_eq!(
+            app.request_capture_with_limit_for_test(CaptureSource::Resample, 4),
+            Err(CaptureError::ProjectOperationPending)
+        );
+        app.pending_explicit_save = None;
+
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+
+        start_capture(&mut app, CaptureSource::Input, 4);
+        probe.complete(completion(&app, CaptureSource::Input, Vec::new(), false));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert_eq!(app.project_revision(), 0);
+        assert!(app.pad(pad(0)).sample.is_none());
+        app.cancel_capture().unwrap();
+
+        start_capture(&mut app, CaptureSource::Input, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Input,
+            vec![0.1, -0.1],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        for stale in [
+            WorkerResult::CaptureFinalized {
+                token: request.token + 1,
+                generation: request.generation,
+                target: request.target,
+                source: request.source,
+                source_rate: request.source_rate,
+                engine_rate: request.engine_rate,
+                stereo: Arc::clone(&request.stereo),
+                hard_limit: request.hard_limit,
+                result: Err(CaptureFinalizeError::Prepare("stale token".to_owned())),
+            },
+            WorkerResult::CaptureFinalized {
+                token: request.token,
+                generation: request.generation + 1,
+                target: request.target,
+                source: request.source,
+                source_rate: request.source_rate + 1,
+                engine_rate: request.engine_rate,
+                stereo: Arc::clone(&request.stereo),
+                hard_limit: request.hard_limit,
+                result: Err(CaptureFinalizeError::Prepare("stale fence".to_owned())),
+            },
+            WorkerResult::CaptureFinalized {
+                token: request.token,
+                generation: request.generation,
+                target: pad(1),
+                source: request.source,
+                source_rate: request.source_rate,
+                engine_rate: request.engine_rate,
+                stereo: Arc::clone(&request.stereo),
+                hard_limit: request.hard_limit,
+                result: Err(CaptureFinalizeError::Prepare("stale target".to_owned())),
+            },
+            WorkerResult::CaptureFinalized {
+                token: request.token,
+                generation: request.generation,
+                target: request.target,
+                source: CaptureSource::Resample,
+                source_rate: request.source_rate,
+                engine_rate: request.engine_rate,
+                stereo: Arc::clone(&request.stereo),
+                hard_limit: request.hard_limit,
+                result: Err(CaptureFinalizeError::Prepare("stale source".to_owned())),
+            },
+            WorkerResult::CaptureFinalized {
+                token: request.token,
+                generation: request.generation,
+                target: request.target,
+                source: request.source,
+                source_rate: request.source_rate,
+                engine_rate: request.engine_rate + 1,
+                stereo: Arc::clone(&request.stereo),
+                hard_limit: request.hard_limit,
+                result: Err(CaptureFinalizeError::Prepare(
+                    "stale engine rate".to_owned(),
+                )),
+            },
+        ] {
+            assert!(app.apply_worker_result(stale));
+            assert!(!app.maintain_capture());
+            assert_eq!(
+                app.capture_session().phase(),
+                Some(CapturePhase::Finalizing)
+            );
+            assert_eq!(app.capture_session().generation(), Some(request.generation));
+        }
+        assert_eq!(app.project_revision(), 0);
+    }
+
+    #[test]
+    fn capture_transaction_changed_output_rate_refinalizes_only_input_and_device_loss_never_resumes()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        install_imported(&mut app, pad(0), "old-device.wav");
+        let old_sample = Arc::clone(app.pad(pad(0)).sample.as_ref().unwrap());
+        let old_revision = app.project_revision();
+        start_capture(&mut app, CaptureSource::Input, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Input,
+            vec![0.2, -0.2],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        let generation = request.generation;
+        probe.set_output_rate(44_100);
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(9, 48_000, b"old-rate")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().generation(), Some(generation + 1));
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(CapturePhase::Finalizing)
+        );
+        assert!(app.maintain_capture());
+        let rerender = take_finalize(&mut app);
+        assert_eq!(rerender.engine_rate, 44_100);
+        assert!(Arc::ptr_eq(&request.stereo, &rerender.stereo));
+
+        probe.fail_device(CaptureSource::Input, "input disconnected");
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(app.audio.is_none());
+        assert!(Arc::ptr_eq(
+            app.pad(pad(0)).sample.as_ref().unwrap(),
+            &old_sample
+        ));
+        assert_eq!(app.project_revision(), old_revision);
+        let calls = probe.calls().len();
+        let (replacement, replacement_probe) = CaptureAudio::new(44_100, 44_100);
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(replacement_probe.calls().is_empty());
+        assert_eq!(probe.calls().len(), calls);
+    }
+
+    #[test]
+    fn capture_transaction_general_output_loss_marks_capture_failed_before_app_thread_teardown() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        install_imported(&mut app, pad(0), "old-output.wav");
+        let old_sample = Arc::clone(app.pad(pad(0)).sample.as_ref().unwrap());
+        let old_revision = app.project_revision();
+        start_capture(&mut app, CaptureSource::Resample, 4);
+
+        probe.fail_output_session("output disconnected");
+        assert!(app.maintain_audio());
+
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(app.audio.is_none());
+        assert!(Arc::ptr_eq(
+            app.pad(pad(0)).sample.as_ref().unwrap(),
+            &old_sample
+        ));
+        assert_eq!(app.project_revision(), old_revision);
+    }
+
+    #[test]
+    fn capture_transaction_resample_rate_mismatch_fails_without_silent_resampling() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.2, -0.2],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        probe.set_output_rate(44_100);
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(10, 48_000, b"resample-old-rate")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert_eq!(app.capture_session().generation(), Some(request.generation));
+        assert!(app.pad(pad(0)).sample.is_none());
+        assert_eq!(app.project_revision(), 0);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_snapshot_refuses_every_unresolved_phase() {
+        for phase in [
+            CapturePhase::Confirm,
+            CapturePhase::Arming,
+            CapturePhase::Recording,
+            CapturePhase::Finalizing,
+            CapturePhase::ReadyToInstall,
+            CapturePhase::Failed,
+        ] {
+            let mut app = App::without_audio("offline");
+            app.capture_session_mut()
+                .begin(CaptureSource::Resample, pad(0), 48_000, 4)
+                .unwrap();
+            if phase != CapturePhase::Confirm {
+                app.capture_session_mut().mark_arming().unwrap();
+            }
+            if !matches!(phase, CapturePhase::Confirm | CapturePhase::Arming) {
+                app.capture_session_mut().mark_recording().unwrap();
+            }
+            if matches!(
+                phase,
+                CapturePhase::Finalizing | CapturePhase::ReadyToInstall
+            ) {
+                let candidate = completion(&app, CaptureSource::Resample, vec![0.2, -0.2], false);
+                app.capture_session_mut()
+                    .accept_completion(candidate)
+                    .unwrap();
+            }
+            if phase == CapturePhase::ReadyToInstall {
+                app.capture_session_mut().mark_ready_to_install().unwrap();
+            }
+            if phase == CapturePhase::Failed {
+                app.capture_session_mut().mark_failed("failed").unwrap();
+            }
+            assert_eq!(
+                app.project_snapshot(),
+                Err(ProjectSnapshotError::UnresolvedCapture(phase)),
+                "phase {phase:?}"
+            );
+        }
+    }
+
+    fn commit_capture(app: &mut App, probe: &CaptureProbe, id: u64) {
+        start_capture(app, CaptureSource::Resample, 4);
+        drive_ready(app, probe, CaptureSource::Resample, id, false);
+        assert!(app.maintain_capture());
+    }
+
+    #[test]
+    fn capture_snapshot_commits_managed_wav_immediately_and_replacement_release_survives_backpressure_and_mismatch()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        commit_capture(&mut app, &probe, 21);
+        let snapshot = app.project_snapshot().unwrap();
+        assert_eq!(
+            snapshot.pads[0].source_path,
+            PathBuf::from("managed-21.wav")
+        );
+        assert_eq!(snapshot.pads[0].fingerprint, fingerprint(b"captured"));
+        assert_eq!(snapshot.pads[0].recipe, SampleEditRecipe::identity());
+
+        app.project_session = crate::ProjectSession::new(
+            ProjectId::from_bytes([0x21; 16]),
+            Some(PathBuf::from("named-project")),
+            "Named",
+            app.project_revision(),
+        );
+        app.update_pad_settings(
+            target,
+            PadSettings {
+                gain_db: -1.0,
+                ..PadSettings::default()
+            },
+        )
+        .unwrap();
+        assert!(app.maintain_project(Instant::now() + Duration::from_secs(3)));
+        let autosave_requests = app.take_worker_requests();
+        let [WorkerRequest::SaveProject(autosave)] = autosave_requests.as_slice() else {
+            panic!("expected autosave snapshot")
+        };
+        assert_eq!(autosave.request.kind, SaveKind::Recovery);
+        assert_eq!(
+            autosave.request.snapshot.pads[0].source_path,
+            PathBuf::from("managed-21.wav")
+        );
+        assert_eq!(
+            autosave.request.snapshot.pads[0].fingerprint,
+            fingerprint(b"captured")
+        );
+        assert!(app.apply_worker_result(save_result(autosave, Vec::new())));
+
+        install_imported(&mut app, target, "replacement.wav");
+        assert!(app.maintain_capture());
+        let requests = app.take_worker_requests();
+        assert_eq!(
+            requests,
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(21),
+            }]
+        );
+        assert!(app.apply_worker_send_error(
+            requests.into_iter().next().unwrap(),
+            WorkerSendError::WorkerBusy,
+        ));
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(21),
+            }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(99),
+                result: Ok(()),
+            })
+        );
+        assert!(!app.maintain_capture());
+        assert_eq!(
+            app.managed_release_in_flight(),
+            Some(ManagedCaptureId::new(21))
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(21),
+                result: Err(crate::capture_store::CaptureStoreError::NotLive {
+                    id: ManagedCaptureId::new(21),
+                }),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), None);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(21),
+            }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(21),
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), None);
+    }
+
+    fn save_result(
+        request: &ProjectSaveWorkerRequest,
+        mappings: Vec<ProjectAssetMapping>,
+    ) -> WorkerResult {
+        WorkerResult::ProjectSaved {
+            token: request.token,
+            kind: request.request.kind,
+            project_id: request.request.snapshot.project_id,
+            directory: request.request.directory.clone(),
+            revision: request.request.snapshot.revision,
+            result: Ok(SaveReceipt {
+                directory: request.request.directory.clone(),
+                kind: request.request.kind,
+                project_id: request.request.snapshot.project_id,
+                revision: request.request.snapshot.revision,
+                canonical_toml: "saved".to_owned(),
+                mappings,
+            }),
+        }
+    }
+
+    #[test]
+    fn capture_snapshot_remove_and_explicit_mapping_each_release_the_exact_prior_managed_id() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0);
+        commit_capture(&mut app, &probe, 31);
+        let before_remove = app.project_revision();
+        app.remove_pad_sample(target).unwrap();
+        assert!(app.pad(target).sample.is_none());
+        assert_eq!(app.project_revision(), before_remove + 1);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(31),
+            }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(31),
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+
+        commit_capture(&mut app, &probe, 32);
+        let capture_snapshot = app.project_snapshot().unwrap();
+        app.request_save_as("saved-project").unwrap();
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::SaveProject(request)] = requests.as_slice() else {
+            panic!("expected explicit save")
+        };
+        assert_eq!(request.request.kind, SaveKind::Explicit);
+        assert_eq!(request.request.snapshot.revision, capture_snapshot.revision);
+        assert_eq!(request.request.snapshot.pads, capture_snapshot.pads);
+        let saved_pad = request.request.snapshot.pads[0].clone();
+        assert!(app.apply_worker_result(save_result(
+            request,
+            vec![ProjectAssetMapping {
+                pad: target,
+                source_generation: saved_pad.source_generation,
+                fingerprint: saved_pad.fingerprint,
+                project_path: "saved-project/audio/captured.wav".into(),
+            }],
+        )));
+        assert_eq!(
+            app.pad(target).source.as_deref(),
+            Some(Path::new("saved-project/audio/captured.wav"))
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(32),
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_transaction_public_requests_use_the_hard_limit_constant() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        app.request_resample().unwrap();
+        assert!(probe.calls().iter().any(|call| matches!(
+            call,
+            CaptureCall::Begin {
+                max_frames: MAX_CAPTURE_FRAMES,
+                ..
+            }
+        )));
+    }
 }
 
 impl fmt::Display for ProjectSaveError {
@@ -288,6 +1286,7 @@ struct SampleCommit {
     recipe: SampleEditRecipe,
     base_preview: Option<EditPreview>,
     rendered_preview: Option<EditPreview>,
+    managed_capture: Option<ManagedCaptureId>,
 }
 
 impl Default for SampleCommit {
@@ -299,6 +1298,7 @@ impl Default for SampleCommit {
             recipe: SampleEditRecipe::identity(),
             base_preview: None,
             rendered_preview: None,
+            managed_capture: None,
         }
     }
 }
@@ -403,6 +1403,14 @@ pub struct App {
     pads: [PadView; PAD_VIEW_COUNT],
     patterns: PatternWorkspace,
     capture_session: crate::CaptureSession,
+    capture_source_pcm: Option<Arc<[f32]>>,
+    capture_hard_limit: bool,
+    capture_worker_queued: bool,
+    capture_engine_rate_in_flight: Option<u32>,
+    capture_ready: Option<ManagedCapture>,
+    capture_worker_results: VecDeque<WorkerResult>,
+    pending_managed_releases: VecDeque<ManagedCaptureId>,
+    managed_release_in_flight: Option<ManagedCaptureId>,
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
@@ -474,6 +1482,14 @@ impl App {
             pads: array::from_fn(|_| PadView::default()),
             patterns: PatternWorkspace::new(pattern_sample_rate),
             capture_session: crate::CaptureSession::default(),
+            capture_source_pcm: None,
+            capture_hard_limit: false,
+            capture_worker_queued: false,
+            capture_engine_rate_in_flight: None,
+            capture_ready: None,
+            capture_worker_results: VecDeque::new(),
+            pending_managed_releases: VecDeque::new(),
+            managed_release_in_flight: None,
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
@@ -559,6 +1575,591 @@ impl App {
 
     pub const fn capture_session_mut(&mut self) -> &mut crate::CaptureSession {
         &mut self.capture_session
+    }
+
+    pub fn request_resample(&mut self) -> Result<(), CaptureError> {
+        self.request_capture(CaptureSource::Resample, MAX_CAPTURE_FRAMES)
+    }
+
+    pub fn request_input_recording(&mut self) -> Result<(), CaptureError> {
+        self.request_capture(CaptureSource::Input, MAX_CAPTURE_FRAMES)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_capture_with_limit_for_test(
+        &mut self,
+        source: CaptureSource,
+        max_frames: usize,
+    ) -> Result<(), CaptureError> {
+        self.request_capture(source, max_frames)
+    }
+
+    fn request_capture(
+        &mut self,
+        source: CaptureSource,
+        max_frames: usize,
+    ) -> Result<(), CaptureError> {
+        if self.capture_session.phase().is_some() {
+            return Err(CaptureError::AlreadyActive);
+        }
+        if self.editor.is_dirty() {
+            return Err(CaptureError::DirtySampleDraft(self.editor.pad()));
+        }
+        if self.project_open.is_some()
+            || self.pending_explicit_save.is_some()
+            || self.pending_autosave_save.is_some()
+            || self.in_flight_project.is_some()
+            || self.project_session.in_flight().is_some()
+            || !self.pending_recovery_cleanup.is_empty()
+            || self.pending_project_action.is_some()
+            || self.project_lifecycle_wait.is_some()
+        {
+            return Err(CaptureError::ProjectOperationPending);
+        }
+        if let Some(offset) = (0..PAD_VIEW_COUNT).find(|offset| {
+            self.pending_loads[*offset]
+                .as_ref()
+                .is_some_and(|pending| !matches!(pending.phase, PendingLoadPhase::Failed))
+                || self.committed_recovery_loads[*offset]
+                    .as_ref()
+                    .is_some_and(|pending| !matches!(pending.phase, PendingLoadPhase::Failed))
+                || self.sample_editor.pending[*offset]
+                    .as_ref()
+                    .is_some_and(|pending| !matches!(pending.phase, PendingEditPhase::Failed))
+        }) {
+            return Err(CaptureError::SampleOperationPending(pad_from_offset(
+                offset,
+            )));
+        }
+        let target = self
+            .selected_pad_id()
+            .ok_or(CaptureError::NoActiveCapture)?;
+        let audio = self.audio.as_mut().ok_or(CaptureError::AudioUnavailable)?;
+        if audio.capture_support() != crate::audio::CaptureSupport::Available {
+            return Err(CaptureError::Unsupported);
+        }
+        let source_rate = audio.capture_source_rate(source)?;
+        self.capture_session
+            .begin(source, target, source_rate, max_frames)?;
+        if self.pads[pad_offset(target)].sample.is_none() {
+            self.confirm_capture()?;
+        }
+        Ok(())
+    }
+
+    pub fn confirm_capture(&mut self) -> Result<(), CaptureError> {
+        let phase = self
+            .capture_session
+            .phase()
+            .ok_or(CaptureError::NoActiveCapture)?;
+        let token = self.capture_session.token().expect("active token");
+        let source = self.capture_session.source().expect("active source");
+        if phase == CapturePhase::Confirm {
+            let buffer = CaptureBuffer::try_new(
+                token,
+                self.capture_session.target().expect("active target"),
+                source,
+                self.capture_session.source_rate().expect("active rate"),
+                self.capture_session
+                    .max_frames()
+                    .expect("active frame limit"),
+            )
+            .map_err(CaptureError::Command)?;
+            let audio = self.audio.as_mut().ok_or(CaptureError::AudioUnavailable)?;
+            if let Err(failure) = audio.begin_capture(buffer) {
+                let error = failure.error().clone();
+                drop(failure.into_command());
+                return Err(error);
+            }
+            self.capture_session.mark_arming()?;
+        } else if phase != CapturePhase::Arming {
+            return Err(CaptureError::IllegalTransition {
+                from: phase,
+                to: CapturePhase::Arming,
+            });
+        }
+        let audio = self.audio.as_mut().ok_or(CaptureError::AudioUnavailable)?;
+        if let Err(failure) = audio.start_capture(source, token) {
+            let error = failure.error().clone();
+            drop(failure.into_command());
+            return Err(error);
+        }
+        self.capture_session.mark_recording()?;
+        Ok(())
+    }
+
+    pub fn stop_capture(&mut self) -> Result<(), CaptureError> {
+        let phase = self
+            .capture_session
+            .phase()
+            .ok_or(CaptureError::NoActiveCapture)?;
+        if phase != CapturePhase::Recording {
+            return Err(CaptureError::IllegalTransition {
+                from: phase,
+                to: CapturePhase::Finalizing,
+            });
+        }
+        let source = self.capture_session.source().expect("active source");
+        let token = self.capture_session.token().expect("active token");
+        let audio = self.audio.as_mut().ok_or(CaptureError::AudioUnavailable)?;
+        if let Err(failure) = audio.stop_capture(source, token) {
+            let error = failure.error().clone();
+            drop(failure.into_command());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn cancel_capture(&mut self) -> Result<(), CaptureError> {
+        let phase = self
+            .capture_session
+            .phase()
+            .ok_or(CaptureError::NoActiveCapture)?;
+        if matches!(phase, CapturePhase::Arming | CapturePhase::Recording)
+            && let Some(audio) = self.audio.as_mut()
+        {
+            let source = self.capture_session.source().expect("active source");
+            let token = self.capture_session.token().expect("active token");
+            if let Err(failure) = audio.cancel_capture(source, token) {
+                let error = failure.error().clone();
+                drop(failure.into_command());
+                return Err(error);
+            }
+            return Ok(());
+        }
+        self.discard_capture_transaction();
+        Ok(())
+    }
+
+    pub fn retry_capture_finalization(&mut self) -> Result<(), CaptureError> {
+        if self.capture_source_pcm.is_none() {
+            return Err(CaptureError::RetryCompletionMissing);
+        }
+        self.capture_session
+            .retry_finalization_with_next_generation()?;
+        self.capture_worker_queued = false;
+        self.capture_engine_rate_in_flight = None;
+        if let Some(candidate) = self.capture_ready.take() {
+            self.queue_managed_release(candidate.id);
+        }
+        self.capture_session.set_managed_capture_id(None)?;
+        Ok(())
+    }
+
+    pub fn maintain_capture(&mut self) -> bool {
+        if let Some(result) = self.capture_worker_results.pop_front() {
+            return self.apply_capture_worker_result(result);
+        }
+        if self.capture_ready.is_some()
+            && self.capture_session.phase() == Some(CapturePhase::ReadyToInstall)
+        {
+            return self.install_ready_capture();
+        }
+        if self.capture_session.phase() == Some(CapturePhase::Finalizing)
+            && !self.capture_worker_queued
+        {
+            return self.queue_capture_finalization();
+        }
+        if self.capture_session.phase() == Some(CapturePhase::Finalizing)
+            && self.capture_worker_queued
+        {
+            return self.poll_capture_runtime_error_once();
+        }
+        if self.capture_session.phase() == Some(CapturePhase::Recording) {
+            return self.poll_capture_once();
+        }
+        self.queue_one_managed_release()
+    }
+
+    fn poll_capture_runtime_error_once(&mut self) -> bool {
+        let source = self
+            .capture_session
+            .source()
+            .expect("active capture source");
+        let Some(error) = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.capture_runtime_error(source))
+        else {
+            return false;
+        };
+        let message = error.to_string();
+        let _ = self.capture_session.mark_failed(message.clone());
+        self.capture_worker_queued = false;
+        self.capture_engine_rate_in_flight = None;
+        self.fail_audio(message);
+        true
+    }
+
+    fn poll_capture_once(&mut self) -> bool {
+        let source = self.capture_session.source().expect("recording source");
+        let mut maintenance = match self.audio.as_mut() {
+            Some(audio) => audio.poll_capture_maintenance(),
+            None => return false,
+        };
+        if let Some(error) = maintenance.runtime_error(source).cloned() {
+            let message = error.to_string();
+            let _ = self.capture_session.mark_failed(message.clone());
+            self.fail_audio(message);
+            return true;
+        }
+        let Some(outcome) = maintenance.take_completion(source) else {
+            return false;
+        };
+        match outcome {
+            CaptureOutcome::Cancelled(buffer) => {
+                let exact = self.capture_session.token() == Some(buffer.token())
+                    && self.capture_session.target() == Some(buffer.target())
+                    && self.capture_session.source() == Some(buffer.source())
+                    && self.capture_session.source_rate() == Some(buffer.sample_rate());
+                if exact {
+                    self.discard_capture_transaction();
+                    true
+                } else {
+                    false
+                }
+            }
+            CaptureOutcome::Completed(completion) => {
+                if completion.stereo.is_empty() {
+                    match self.capture_session.accept_completion(completion) {
+                        Ok(()) => {
+                            let _ = self
+                                .capture_session
+                                .mark_failed(CaptureError::EmptyCapture.to_string());
+                            self.status = CaptureError::EmptyCapture.to_string();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else if self.capture_session.accept_completion(completion).is_ok() {
+                    let completion = self
+                        .capture_session
+                        .completion()
+                        .expect("accepted completion remains retained");
+                    self.capture_hard_limit = completion.hard_limit;
+                    let stereo = self
+                        .capture_session
+                        .take_completion_stereo()
+                        .expect("accepted completion owns stereo");
+                    self.capture_source_pcm = Some(Arc::from(stereo.into_boxed_slice()));
+                    self.capture_worker_queued = false;
+                    self.capture_engine_rate_in_flight = None;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn queue_capture_finalization(&mut self) -> bool {
+        if self.pending_worker_requests.len() >= WORKER_CHANNEL_CAPACITY {
+            return false;
+        }
+        let Some(stereo) = self.capture_source_pcm.as_ref().map(Arc::clone) else {
+            let _ = self
+                .capture_session
+                .mark_failed("capture source ownership is missing");
+            return true;
+        };
+        let Some(engine_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
+            let _ = self
+                .capture_session
+                .mark_failed(CaptureError::AudioUnavailable.to_string());
+            return true;
+        };
+        self.pending_worker_requests
+            .push(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
+                token: self.capture_session.token().expect("finalizing token"),
+                generation: self
+                    .capture_session
+                    .generation()
+                    .expect("finalizing generation"),
+                target: self.capture_session.target().expect("finalizing target"),
+                source: self.capture_session.source().expect("finalizing source"),
+                source_rate: self.capture_session.source_rate().expect("finalizing rate"),
+                engine_rate,
+                stereo,
+                hard_limit: self.capture_hard_limit,
+            }));
+        self.capture_worker_queued = true;
+        self.capture_engine_rate_in_flight = Some(engine_rate);
+        true
+    }
+
+    fn apply_capture_worker_result(&mut self, result: WorkerResult) -> bool {
+        match result {
+            WorkerResult::ManagedCaptureReleased { id, result } => {
+                if self.managed_release_in_flight != Some(id) {
+                    return false;
+                }
+                self.managed_release_in_flight = None;
+                match result {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.pending_managed_releases.push_front(id);
+                        self.status = error.to_string();
+                        true
+                    }
+                }
+            }
+            WorkerResult::CaptureFinalized {
+                token,
+                generation,
+                target,
+                source,
+                source_rate,
+                engine_rate,
+                stereo,
+                hard_limit,
+                result,
+            } => {
+                let exact = self.capture_worker_queued
+                    && self.capture_engine_rate_in_flight == Some(engine_rate)
+                    && self.capture_session.token() == Some(token)
+                    && self.capture_session.generation() == Some(generation)
+                    && self.capture_session.target() == Some(target)
+                    && self.capture_session.source() == Some(source)
+                    && self.capture_session.source_rate() == Some(source_rate)
+                    && self.capture_hard_limit == hard_limit
+                    && self
+                        .capture_source_pcm
+                        .as_ref()
+                        .is_some_and(|owned| Arc::ptr_eq(owned, &stereo));
+                if !exact {
+                    if let Ok(candidate) = result {
+                        self.queue_managed_release(candidate.id);
+                    }
+                    return false;
+                }
+                self.capture_worker_queued = false;
+                self.capture_engine_rate_in_flight = None;
+                let current_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
+                if current_rate != Some(engine_rate) {
+                    if let Ok(candidate) = result {
+                        self.queue_managed_release(candidate.id);
+                    }
+                    if source == CaptureSource::Input && current_rate.is_some() {
+                        match self.capture_session.advance_finalization_generation() {
+                            Ok(_) => return true,
+                            Err(error) => {
+                                let _ = self.capture_session.mark_failed(error.to_string());
+                                self.status = error.to_string();
+                                return true;
+                            }
+                        }
+                    }
+                    let message = if source == CaptureSource::Resample {
+                        format!(
+                            "resampled output capture rate {source_rate} does not match engine rate {}",
+                            current_rate.unwrap_or(0)
+                        )
+                    } else {
+                        CaptureError::AudioUnavailable.to_string()
+                    };
+                    let _ = self.capture_session.mark_failed(message.clone());
+                    self.status = message;
+                    return true;
+                }
+                if source == CaptureSource::Resample && source_rate != engine_rate {
+                    if let Ok(candidate) = result {
+                        self.queue_managed_release(candidate.id);
+                    }
+                    let message = format!(
+                        "resampled output capture rate {source_rate} does not match engine rate {engine_rate}"
+                    );
+                    let _ = self.capture_session.mark_failed(message.clone());
+                    self.status = message;
+                    return true;
+                }
+                match result {
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = self.capture_session.mark_failed(message.clone());
+                        self.status = message;
+                        true
+                    }
+                    Ok(candidate)
+                        if candidate.sample.rendered.sample_rate() == engine_rate
+                            && candidate.sample.fingerprint == candidate.fingerprint
+                            && candidate.path.extension().is_some_and(|ext| ext == "wav") =>
+                    {
+                        let id = candidate.id;
+                        self.capture_ready = Some(candidate);
+                        self.capture_session
+                            .set_managed_capture_id(Some(id))
+                            .expect("active capture accepts managed identity");
+                        self.capture_session
+                            .mark_ready_to_install()
+                            .expect("exact finalization advances to ready");
+                        true
+                    }
+                    Ok(candidate) => {
+                        self.queue_managed_release(candidate.id);
+                        let message = "finalized capture tuple is inconsistent".to_owned();
+                        let _ = self.capture_session.mark_failed(message.clone());
+                        self.status = message;
+                        true
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn install_ready_capture(&mut self) -> bool {
+        let Some(candidate) = self.capture_ready.take() else {
+            return false;
+        };
+        let source = self.capture_session.source().expect("ready source");
+        let current_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
+        if current_rate != Some(candidate.sample.rendered.sample_rate()) {
+            let id = candidate.id;
+            self.queue_managed_release(id);
+            let _ = self.capture_session.set_managed_capture_id(None);
+            if source == CaptureSource::Input && current_rate.is_some() {
+                if let Err(error) = self.capture_session.advance_finalization_generation() {
+                    let _ = self.capture_session.mark_failed(error.to_string());
+                    self.status = error.to_string();
+                }
+            } else {
+                let message = "resample capture cannot be rerendered at a different output rate";
+                let _ = self.capture_session.mark_failed(message);
+                self.status = message.to_owned();
+            }
+            return true;
+        }
+        if self.ensure_project_mutation_available().is_err() {
+            self.capture_ready = Some(candidate);
+            self.status = CaptureError::ProjectRevisionExhausted.to_string();
+            return true;
+        }
+        let target = self.capture_session.target().expect("ready target");
+        let offset = pad_offset(target);
+        let settings = self.pads[offset].settings;
+        let install = self
+            .audio
+            .as_mut()
+            .expect("matching ready rate requires audio")
+            .install(target, Arc::clone(&candidate.sample.rendered), settings);
+        if let Err(error) = install {
+            self.capture_ready = Some(candidate);
+            self.status = error;
+            return true;
+        }
+
+        let generation = self.capture_session.generation().expect("ready generation");
+        self.retire_managed_capture_at(offset);
+        let label = candidate
+            .path
+            .file_name()
+            .unwrap_or(candidate.path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        self.pads[offset].source = Some(candidate.path);
+        self.pads[offset].label = label;
+        self.pads[offset].generation = generation;
+        self.pads[offset].state = PadLoadState::Ready;
+        self.pads[offset].sample = Some(candidate.sample.rendered);
+        self.pads[offset].preview =
+            crate::loader::downsample_preview(&candidate.sample.rendered_preview);
+        self.sample_editor.commits[offset].base = Some(candidate.sample.base);
+        self.sample_editor.commits[offset].source_generation = generation;
+        self.sample_editor.commits[offset].fingerprint = Some(candidate.fingerprint);
+        self.sample_editor.commits[offset].recipe = candidate.sample.recipe;
+        self.sample_editor.commits[offset].base_preview = Some(candidate.sample.base_preview);
+        self.sample_editor.commits[offset].rendered_preview =
+            Some(candidate.sample.rendered_preview);
+        self.sample_editor.commits[offset].managed_capture = Some(candidate.id);
+        self.sample_editor.undo[offset] = None;
+        self.current_session_bound[offset] = true;
+        self.reinstall_pending[offset] = false;
+        self.status = if self.capture_hard_limit {
+            "Captured sample installed · MAX".to_owned()
+        } else {
+            "Captured sample installed".to_owned()
+        };
+        self.commit_project_mutation();
+        let _ = self.capture_session.discard();
+        self.clear_capture_transaction_fields();
+        self.refresh_editor_for_offset(offset);
+        true
+    }
+
+    fn clear_capture_transaction_fields(&mut self) {
+        self.capture_source_pcm = None;
+        self.capture_hard_limit = false;
+        self.capture_worker_queued = false;
+        self.capture_engine_rate_in_flight = None;
+        self.capture_ready = None;
+    }
+
+    fn discard_capture_transaction(&mut self) {
+        if let Some(candidate) = self.capture_ready.take() {
+            self.queue_managed_release(candidate.id);
+        }
+        let _ = self.capture_session.discard();
+        self.clear_capture_transaction_fields();
+    }
+
+    fn queue_managed_release(&mut self, id: ManagedCaptureId) {
+        if self.managed_release_in_flight == Some(id) || self.pending_managed_releases.contains(&id)
+        {
+            return;
+        }
+        self.pending_managed_releases.push_back(id);
+    }
+
+    fn retire_managed_capture_at(&mut self, offset: usize) {
+        if let Some(id) = self.sample_editor.commits[offset].managed_capture.take() {
+            self.queue_managed_release(id);
+        }
+    }
+
+    fn queue_one_managed_release(&mut self) -> bool {
+        if self.managed_release_in_flight.is_some()
+            || self.pending_worker_requests.len() >= WORKER_CHANNEL_CAPACITY
+        {
+            return false;
+        }
+        let Some(id) = self.pending_managed_releases.pop_front() else {
+            return false;
+        };
+        self.pending_worker_requests
+            .push(WorkerRequest::ReleaseManagedCapture { id });
+        self.managed_release_in_flight = Some(id);
+        true
+    }
+
+    pub fn managed_release_in_flight(&self) -> Option<ManagedCaptureId> {
+        self.managed_release_in_flight
+    }
+
+    pub fn remove_pad_sample(&mut self, pad: PadId) -> Result<(), String> {
+        let offset = pad_offset(pad);
+        if self.pads[offset].sample.is_none() {
+            return Ok(());
+        }
+        self.ensure_project_mutation_available()?;
+        self.audio
+            .as_mut()
+            .ok_or_else(|| "audio device is unavailable".to_owned())?
+            .remove_sample(pad)?;
+        self.retire_managed_capture_at(offset);
+        let settings = self.pads[offset].settings;
+        self.pads[offset] = PadView {
+            settings,
+            generation: self.pads[offset].generation.saturating_add(1),
+            ..PadView::default()
+        };
+        self.sample_editor.commits[offset] = SampleCommit::default();
+        self.invalidate_pending_edit(offset);
+        self.sample_editor.undo[offset] = None;
+        self.current_session_bound[offset] = false;
+        self.reinstall_pending[offset] = false;
+        self.commit_project_mutation();
+        self.refresh_editor_for_offset(offset);
+        Ok(())
     }
 
     pub fn apply(&mut self, action: InputAction) {
@@ -1335,6 +2936,15 @@ impl App {
     }
 
     fn commit_project_open(&mut self, mut candidate: Box<ProjectOpenCandidate>, now: Instant) {
+        let managed_to_release: Vec<_> = self
+            .sample_editor
+            .commits
+            .iter_mut()
+            .filter_map(|commit| commit.managed_capture.take())
+            .collect();
+        for id in managed_to_release {
+            self.queue_managed_release(id);
+        }
         let mut pads: [PadView; PAD_VIEW_COUNT] = array::from_fn(|_| PadView::default());
         let mut commits: [SampleCommit; PAD_VIEW_COUNT] =
             array::from_fn(|_| SampleCommit::default());
@@ -1369,6 +2979,7 @@ impl App {
                 recipe: loaded.recipe,
                 base_preview: Some(loaded.base_preview),
                 rendered_preview: Some(loaded.rendered_preview),
+                managed_capture: None,
             };
         }
 
@@ -1891,6 +3502,9 @@ impl App {
     }
 
     pub fn project_snapshot(&self) -> Result<ProjectSaveSnapshot, ProjectSnapshotError> {
+        if let Some(phase) = self.capture_session.phase() {
+            return Err(ProjectSnapshotError::UnresolvedCapture(phase));
+        }
         if let Some(operation) = self.project_session.in_flight() {
             return Err(ProjectSnapshotError::PendingProjectOperation(
                 operation.token,
@@ -2489,8 +4103,33 @@ impl App {
                 candidate.decode_in_flight = None;
                 true
             }
-            WorkerRequest::FinalizeCapture(_)
-            | WorkerRequest::ReleaseManagedCapture { .. }
+            WorkerRequest::FinalizeCapture(request) => {
+                let exact = self.capture_worker_queued
+                    && self.capture_engine_rate_in_flight == Some(request.engine_rate)
+                    && self.capture_session.token() == Some(request.token)
+                    && self.capture_session.generation() == Some(request.generation)
+                    && self.capture_session.target() == Some(request.target)
+                    && self.capture_session.source() == Some(request.source)
+                    && self.capture_session.source_rate() == Some(request.source_rate)
+                    && self.capture_hard_limit == request.hard_limit
+                    && self
+                        .capture_source_pcm
+                        .as_ref()
+                        .is_some_and(|owned| Arc::ptr_eq(owned, &request.stereo));
+                if exact {
+                    self.capture_worker_queued = false;
+                    self.capture_engine_rate_in_flight = None;
+                }
+                exact
+            }
+            WorkerRequest::ReleaseManagedCapture { id }
+                if self.managed_release_in_flight == Some(id) =>
+            {
+                self.managed_release_in_flight = None;
+                self.pending_managed_releases.push_front(id);
+                true
+            }
+            WorkerRequest::ReleaseManagedCapture { .. }
             | WorkerRequest::ScanDirectory { .. }
             | WorkerRequest::Shutdown => false,
         };
@@ -2883,6 +4522,11 @@ impl App {
 
     pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
         let result = match result {
+            result @ (WorkerResult::CaptureFinalized { .. }
+            | WorkerResult::ManagedCaptureReleased { .. }) => {
+                self.capture_worker_results.push_back(result);
+                return true;
+            }
             WorkerResult::ProjectProbed {
                 token,
                 directory,
@@ -3174,6 +4818,9 @@ impl App {
                 && self.sample_editor.commits[offset].fingerprint == Some(mapping.fingerprint)
             {
                 self.pads[offset].source = Some(mapping.project_path.clone());
+                if receipt.kind == SaveKind::Explicit {
+                    self.retire_managed_capture_at(offset);
+                }
             }
         }
     }
@@ -4508,6 +6155,13 @@ impl App {
     }
 
     fn fail_audio(&mut self, error: String) {
+        if self.capture_session.phase().is_some()
+            && self.capture_session.phase() != Some(CapturePhase::Failed)
+        {
+            let _ = self.capture_session.mark_failed(error.clone());
+        }
+        self.capture_worker_queued = false;
+        self.capture_engine_rate_in_flight = None;
         self.audio = None;
         self.audio_format = None;
         self.recovery_cursor = None;
@@ -4841,6 +6495,8 @@ impl App {
             self.refresh_editor_for_offset(offset);
             return;
         }
+
+        self.retire_managed_capture_at(offset);
 
         let label = pending
             .path

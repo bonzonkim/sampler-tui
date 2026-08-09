@@ -35,26 +35,30 @@ impl Fixture {
 
     fn add_wav(&self, seed: f32) -> (String, sampler_core::AssetDigest) {
         let source = self.directory.join(format!("source-{seed}.wav"));
-        let mut writer = WavWriter::create(
-            &source,
-            WavSpec {
-                channels: 2,
-                sample_rate: 44_100,
-                bits_per_sample: 32,
-                sample_format: SampleFormat::Float,
-            },
-        )
-        .unwrap();
-        for frame in [[seed, -seed], [seed * 0.5, -seed * 0.5], [0.0, 0.0]] {
-            writer.write_sample(frame[0]).unwrap();
-            writer.write_sample(frame[1]).unwrap();
-        }
-        writer.finalize().unwrap();
+        write_wav(&source, seed);
         let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let relative = format!("audio/{}.wav", fingerprint.digest);
         fs::rename(&source, self.directory.join(&relative)).unwrap();
         (relative, fingerprint.digest)
     }
+}
+
+fn write_wav(path: &std::path::Path, seed: f32) {
+    let mut writer = WavWriter::create(
+        path,
+        WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for frame in [[seed, -seed], [seed * 0.5, -seed * 0.5], [0.0, 0.0]] {
+        writer.write_sample(frame[0]).unwrap();
+        writer.write_sample(frame[1]).unwrap();
+    }
+    writer.finalize().unwrap();
 }
 
 impl Drop for Fixture {
@@ -85,11 +89,17 @@ fn pattern(slot: PatternSlotId, pads: &[PadId]) -> ProjectPattern {
             .copied()
             .enumerate()
             .map(|(index, pad)| {
-                let raw_frame = 1_000 + index as u64;
+                let raw_frame = 22_050 + index as u64;
                 ProjectPatternEvent {
-                    event: PatternEvent::new(EventId(index as u64 + 1), pad, raw_frame, 1.0, None)
-                        .unwrap()
-                        .quantized(&transport, 0.0),
+                    event: PatternEvent::new(
+                        EventId(index as u64 + 1),
+                        pad,
+                        raw_frame,
+                        1.0,
+                        Some(22_050),
+                    )
+                    .unwrap()
+                    .quantized(&transport, 0.0),
                     raw_frame,
                 }
             })
@@ -152,7 +162,10 @@ fn snapshot_owns_only_referenced_committed_pads_and_revision() {
         vec![pad(1), pad(7)]
     );
     assert_eq!(snapshot.pattern().sample_rate, EXPORT_SAMPLE_RATE);
-    assert!(snapshot.loop_frames().unwrap() > 0);
+    assert_eq!(snapshot.loop_frames().unwrap(), 96_000);
+    assert_eq!(snapshot.pattern().events[0].raw_frame, 24_000);
+    assert_eq!(snapshot.pattern().events[0].event.frame, 24_000);
+    assert_eq!(snapshot.pattern().events[0].event.duration, Some(24_000));
 }
 
 #[test]
@@ -218,10 +231,12 @@ fn staging_rejects_mutated_assets_and_pre_decode_cancellation() {
     )
     .unwrap();
 
-    fs::write(&asset, b"mutated").unwrap();
+    write_wav(&asset, 0.9);
     assert!(matches!(
         stage_export_samples(&snapshot, &AtomicBool::new(false)),
-        Err(OfflineExportError::ProjectStore(_))
+        Err(OfflineExportError::ProjectStore(
+            sampler_tui::ProjectStoreError::AssetIntegrity { .. }
+        ))
     ));
     assert!(matches!(
         stage_export_samples(&snapshot, &AtomicBool::new(true)),
@@ -231,7 +246,7 @@ fn staging_rejects_mutated_assets_and_pre_decode_cancellation() {
 
 #[cfg(unix)]
 #[test]
-fn staging_rejects_a_symlink_substituted_after_snapshot_without_creating_output() {
+fn staging_rejects_a_symlink_substituted_after_snapshot() {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new("symlink");
@@ -251,15 +266,12 @@ fn staging_rejects_a_symlink_substituted_after_snapshot_without_creating_output(
     fs::copy(&asset, &replacement).unwrap();
     fs::remove_file(&asset).unwrap();
     symlink(&replacement, &asset).unwrap();
-    let output = fixture.directory.join("must-not-exist.wav");
-
     assert!(matches!(
         stage_export_samples(&snapshot, &AtomicBool::new(false)),
         Err(OfflineExportError::ProjectStore(
             sampler_tui::ProjectStoreError::SymlinkRejected { .. }
         ))
     ));
-    assert!(!output.exists());
 }
 
 #[test]
@@ -302,8 +314,9 @@ denominator = 4
 
 [[patterns.events]]
 id = 1
-frame = 0
+frame = 22050
 velocity = 1.0
+duration = 22050
 
 [patterns.events.pad]
 bank = 0
@@ -329,7 +342,10 @@ index = 1
         .unwrap();
         assert_eq!(snapshot.sample_rate(), EXPORT_SAMPLE_RATE);
         assert_eq!(snapshot.pattern().sample_rate, EXPORT_SAMPLE_RATE);
-        assert!(snapshot.loop_frames().unwrap() > 0);
+        assert_eq!(snapshot.loop_frames().unwrap(), 96_000);
+        assert_eq!(snapshot.pattern().events[0].raw_frame, 24_000);
+        assert_eq!(snapshot.pattern().events[0].event.frame, 24_000);
+        assert_eq!(snapshot.pattern().events[0].event.duration, Some(24_000));
     }
 }
 
@@ -406,9 +422,10 @@ denominator = 4
 
 [[patterns.events]]
 id = 1
-frame = 0
-raw_frame = 0
+frame = 22050
+raw_frame = 22050
 velocity = 1.0
+duration = 22050
 original_offset = 0
 
 [patterns.events.pad]

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{FileType as RustixFileType, Mode, OFlags};
 use sampler_audio::SampleBuffer;
 use sampler_core::SampleEditRecipe;
 
@@ -18,6 +18,7 @@ const CAPTURE_DIRECTORY_PREFIX: &str = "sampler-tui-capture-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureWritePoint {
+    BeforeRootIdentityAcquisition,
     BeforeRootOpen,
     BeforeTempDirectoryClone,
     BeforeTempIdentityClone,
@@ -186,15 +187,17 @@ impl CaptureStore {
             })?;
             match rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    let identity = path_identity(&parent, Path::new(&leaf)).map_err(|error| {
-                        io_error("inspect created capture directory", &root_path, error)
-                    })?;
                     let mut creation = CreatedDirectory {
                         parent: rollback_parent,
                         leaf: rollback_leaf,
-                        identity,
+                        identity: None,
                         armed: true,
                     };
+                    hook(CaptureWritePoint::BeforeRootIdentityAcquisition, &root_path)?;
+                    let identity = path_identity(&parent, Path::new(&leaf)).map_err(|error| {
+                        io_error("inspect created capture directory", &root_path, error)
+                    })?;
+                    creation.identity = Some(identity);
                     hook(CaptureWritePoint::BeforeRootOpen, &root_path)?;
                     let root_owned = rustix::fs::openat(
                         &parent,
@@ -540,14 +543,24 @@ struct FileIdentity {
 struct CreatedDirectory {
     parent: File,
     leaf: std::ffi::OsString,
-    identity: FileIdentity,
+    identity: Option<FileIdentity>,
     armed: bool,
 }
 
 impl Drop for CreatedDirectory {
     fn drop(&mut self) {
-        if self.armed && path_has_identity(&self.parent, Path::new(&self.leaf), self.identity) {
-            let _ = rustix::fs::unlinkat(&self.parent, &self.leaf, rustix::fs::AtFlags::REMOVEDIR);
+        if !self.armed {
+            return;
+        }
+        let leaf = Path::new(&self.leaf);
+        let safely_identified = match self.identity {
+            Some(identity) => path_has_identity(&self.parent, leaf, identity),
+            None => unidentified_root_has_created_shape(&self.parent, leaf),
+        };
+        if safely_identified
+            && rustix::fs::unlinkat(&self.parent, &self.leaf, rustix::fs::AtFlags::REMOVEDIR)
+                .is_ok()
+        {
             let _ = self.parent.sync_all();
         }
     }
@@ -716,6 +729,21 @@ fn path_identity(directory: &File, leaf: &Path) -> io::Result<FileIdentity> {
 
 fn path_has_identity(directory: &File, leaf: &Path, expected: FileIdentity) -> bool {
     path_identity(directory, leaf).is_ok_and(|actual| actual == expected)
+}
+
+/// `mkdirat` does not return a descriptor, so cleanup before the first successful `statat`
+/// cannot compare inode identity. The exclusive 256-bit leaf and private mode are the only
+/// portable evidence available in this interval. We attempt only non-recursive `REMOVEDIR`, and
+/// only for a directory that still has the creation mode; files, symlinks, mode-changed entries,
+/// and nonempty replacements are preserved. A same-authority replacement with another empty 0700
+/// directory is indistinguishable on POSIX and is the narrow documented limitation.
+fn unidentified_root_has_created_shape(directory: &File, leaf: &Path) -> bool {
+    let Ok(stat) = rustix::fs::statat(directory, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+    else {
+        return false;
+    };
+    RustixFileType::from_raw_mode(stat.st_mode) == RustixFileType::Directory
+        && stat.st_mode & 0o7777 == 0o700
 }
 
 fn os_entropy(bytes: &mut [u8; 32]) -> Result<(), CaptureStoreError> {
@@ -904,6 +932,72 @@ mod tests {
         })
         .unwrap();
         assert_eq!(retry.root_path(), root);
+    }
+
+    #[test]
+    fn root_identity_failure_removes_the_empty_owned_directory_and_retry_succeeds() {
+        let entropy = [0x59_u8; 32];
+        let root = std::env::temp_dir().join(format!(
+            "sampler-tui-capture-{}",
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+
+        let error = CaptureStore::new_with_controls(
+            |bytes| {
+                *bytes = entropy;
+                Ok(())
+            },
+            |point, _| injected_failure(point, CaptureWritePoint::BeforeRootIdentityAcquisition),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert!(!root.exists());
+        let retry = CaptureStore::new_with_entropy(|bytes| {
+            *bytes = entropy;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retry.root_path(), root);
+    }
+
+    #[test]
+    fn root_identity_failure_preserves_a_nonempty_foreign_replacement() {
+        let entropy = [0x5a_u8; 32];
+        let root = std::env::temp_dir().join(format!(
+            "sampler-tui-capture-{}",
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+
+        let error = CaptureStore::new_with_controls(
+            |bytes| {
+                *bytes = entropy;
+                Ok(())
+            },
+            |point, path| {
+                if point == CaptureWritePoint::BeforeRootIdentityAcquisition {
+                    fs::remove_dir(path).unwrap();
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("foreign"), b"foreign before identity").unwrap();
+                    return Err(injected_error(point));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert_eq!(
+            fs::read(root.join("foreign")).unwrap(),
+            b"foreign before identity"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

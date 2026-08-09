@@ -218,6 +218,7 @@ struct AudioVoice {
     envelope: Envelope,
     sequence: u64,
     pattern_voice: Option<PatternVoiceId>,
+    live_trigger: Option<LiveCommandId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -242,6 +243,7 @@ enum ScheduledAction {
         at_frame: Frame,
         sequence: u64,
         source: ActionSource,
+        target_live_trigger: Option<LiveCommandId>,
     },
 }
 
@@ -1042,6 +1044,9 @@ impl AudioEngine {
         let resolved_live_frame = self
             .rendered_frame
             .saturating_add(Frame::from(RELEASE_FRAMES));
+        // The controller's SPSC producer and this consumer are FIFO. Equal-frame insertion below
+        // is stable, so a tracked trigger is executed and acknowledged before its later release.
+        // Recording correlation intentionally relies on that engine order.
         let live_action = match self.ports.immediate_commands.peek() {
             Ok(AudioCommand::TriggerLive {
                 id,
@@ -1060,6 +1065,19 @@ impl AudioEngine {
                 at_frame: resolved_live_frame,
                 sequence: *sequence,
                 source: ActionSource::Live(*id),
+                target_live_trigger: None,
+            }),
+            Ok(AudioCommand::ReleaseOwnedLive {
+                id,
+                target_trigger_id,
+                pad,
+                sequence,
+            }) => Some(ScheduledAction::Release {
+                pad: *pad,
+                at_frame: resolved_live_frame,
+                sequence: *sequence,
+                source: ActionSource::Live(*id),
+                target_live_trigger: Some(*target_trigger_id),
             }),
             Ok(AudioCommand::Install {
                 slot,
@@ -1136,6 +1154,7 @@ impl AudioEngine {
                 at_frame: *at_frame,
                 sequence: *sequence,
                 source: ActionSource::Command,
+                target_live_trigger: None,
             }),
             Ok(_) => None,
             Err(_) => return false,
@@ -1292,7 +1311,8 @@ impl AudioEngine {
             AudioCommand::Trigger { .. }
             | AudioCommand::TriggerLive { .. }
             | AudioCommand::Release { .. }
-            | AudioCommand::ReleaseLive { .. } => {
+            | AudioCommand::ReleaseLive { .. }
+            | AudioCommand::ReleaseOwnedLive { .. } => {
                 self.invalid_commands = self.invalid_commands.saturating_add(1);
             }
         }
@@ -1692,7 +1712,11 @@ impl AudioEngine {
                     ActionSource::Pattern(id) => Some(id),
                     _ => None,
                 };
-                let triggered = self.trigger(pad, velocity, sequence, pattern_voice);
+                let live_trigger = match source {
+                    ActionSource::Live(id) => Some(id),
+                    _ => None,
+                };
+                let triggered = self.trigger(pad, velocity, sequence, pattern_voice, live_trigger);
                 if triggered {
                     self.executed_triggers = self.executed_triggers.saturating_add(1);
                     self.last_triggered_frame = Some(self.rendered_frame);
@@ -1705,6 +1729,7 @@ impl AudioEngine {
                 pad,
                 at_frame: _,
                 source,
+                target_live_trigger,
                 ..
             } => {
                 let valid = self.pad_binding(pad).slot.is_some();
@@ -1712,6 +1737,8 @@ impl AudioEngine {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
                 } else if let ActionSource::Pattern(id) = source {
                     self.release_pattern_voice(id);
+                } else if let Some(target_trigger_id) = target_live_trigger {
+                    self.release_owned_live_voice(pad, target_trigger_id);
                 } else {
                     self.release_sustained_live_voices(pad);
                 }
@@ -1751,6 +1778,7 @@ impl AudioEngine {
         velocity: f32,
         sequence: u64,
         pattern_voice: Option<PatternVoiceId>,
+        live_trigger: Option<LiveCommandId>,
     ) -> bool {
         let binding = *self.pad_binding(pad);
         let Some(slot) = binding.slot else {
@@ -1791,6 +1819,7 @@ impl AudioEngine {
             envelope: Envelope::attack(),
             sequence,
             pattern_voice,
+            live_trigger,
         });
         true
     }
@@ -1814,6 +1843,17 @@ impl AudioEngine {
     fn release_sustained_live_voices(&mut self, pad: PadId) {
         for voice in self.voices.iter_mut().flatten() {
             if voice.pad == pad && matches!(voice.mode, PlaybackMode::Gate | PlaybackMode::Loop) {
+                voice.envelope.begin_release();
+            }
+        }
+    }
+
+    fn release_owned_live_voice(&mut self, pad: PadId, trigger_id: LiveCommandId) {
+        for voice in self.voices.iter_mut().flatten() {
+            if voice.pad == pad
+                && voice.live_trigger == Some(trigger_id)
+                && matches!(voice.mode, PlaybackMode::Gate | PlaybackMode::Loop)
+            {
                 voice.envelope.begin_release();
             }
         }
@@ -2088,6 +2128,7 @@ fn scheduled_pattern_action(
             at_frame,
             sequence,
             source: ActionSource::Pattern(id),
+            target_live_trigger: None,
         },
     }
 }

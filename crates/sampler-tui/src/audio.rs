@@ -122,6 +122,13 @@ pub trait AudioPort {
     fn release_live_tracked(&mut self, _pad: PadId) -> Result<LiveCommandId, String> {
         Err("tracked live audio is unsupported".into())
     }
+    fn release_owned_live_tracked(
+        &mut self,
+        _pad: PadId,
+        _target_trigger_id: LiveCommandId,
+    ) -> Result<LiveCommandId, String> {
+        Err("tracked live audio is unsupported".into())
+    }
     fn install_pattern(
         &mut self,
         _snapshot: Arc<PatternSnapshot>,
@@ -273,6 +280,11 @@ trait SessionLike {
         velocity: f32,
     ) -> Result<LiveCommandId, Self::CommandError>;
     fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, Self::CommandError>;
+    fn release_owned_live_tracked(
+        &mut self,
+        pad: PadId,
+        target_trigger_id: LiveCommandId,
+    ) -> Result<LiveCommandId, Self::CommandError>;
     fn install_pattern(
         &mut self,
         snapshot: Arc<PatternSnapshot>,
@@ -438,6 +450,15 @@ impl SessionLike for AudioSession {
 
     fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, Self::CommandError> {
         self.controller_mut().release_live_tracked(pad)
+    }
+
+    fn release_owned_live_tracked(
+        &mut self,
+        pad: PadId,
+        target_trigger_id: LiveCommandId,
+    ) -> Result<LiveCommandId, Self::CommandError> {
+        self.controller_mut()
+            .release_owned_live_tracked(pad, target_trigger_id)
     }
 
     fn install_pattern(
@@ -709,6 +730,16 @@ where
     fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, String> {
         self.session_mut()
             .release_live_tracked(pad)
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_owned_live_tracked(
+        &mut self,
+        pad: PadId,
+        target_trigger_id: LiveCommandId,
+    ) -> Result<LiveCommandId, String> {
+        self.session_mut()
+            .release_owned_live_tracked(pad, target_trigger_id)
             .map_err(|error| error.to_string())
     }
 
@@ -1416,6 +1447,14 @@ mod tests {
         fn release_live_tracked(
             &mut self,
             _pad: PadId,
+        ) -> Result<LiveCommandId, Self::CommandError> {
+            Ok(LiveCommandId::FIRST)
+        }
+
+        fn release_owned_live_tracked(
+            &mut self,
+            _pad: PadId,
+            _target_trigger_id: LiveCommandId,
         ) -> Result<LiveCommandId, Self::CommandError> {
             Ok(LiveCommandId::FIRST)
         }

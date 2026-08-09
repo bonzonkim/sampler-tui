@@ -80,6 +80,30 @@ mod tests {
     }
 
     #[test]
+    fn owned_live_release_carries_a_distinct_ack_and_target_trigger_id() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        let trigger_id = controller.trigger_live_tracked(pad, 1.0).unwrap();
+        let release_id = controller
+            .release_owned_live_tracked(pad, trigger_id)
+            .unwrap();
+
+        assert_ne!(release_id, trigger_id);
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::TriggerLive { id, .. } if id == trigger_id
+        ));
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::ReleaseOwnedLive {
+                id,
+                target_trigger_id,
+                ..
+            } if id == release_id && target_trigger_id == trigger_id
+        ));
+    }
+
+    #[test]
     fn live_command_ids_admit_max_once_then_report_exhaustion() {
         let (mut controller, mut ports) = audio_channels();
         controller.set_next_live_id_for_test(u64::MAX);
@@ -934,6 +958,12 @@ pub enum AudioCommand {
         pad: PadId,
         sequence: u64,
     },
+    ReleaseOwnedLive {
+        id: LiveCommandId,
+        target_trigger_id: LiveCommandId,
+        pad: PadId,
+        sequence: u64,
+    },
     UpdatePad {
         pad: PadId,
         settings: PadSettings,
@@ -963,7 +993,9 @@ impl AudioCommand {
 
     pub fn live_id(&self) -> Option<LiveCommandId> {
         match self {
-            Self::TriggerLive { id, .. } | Self::ReleaseLive { id, .. } => Some(*id),
+            Self::TriggerLive { id, .. }
+            | Self::ReleaseLive { id, .. }
+            | Self::ReleaseOwnedLive { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -1634,6 +1666,30 @@ impl AudioController {
             .ok_or(ControlError::LiveCommandIdExhausted)?;
         let result = self.push_immediate_command(AudioCommand::ReleaseLive {
             id: live_id,
+            pad,
+            sequence,
+        });
+        if result.is_ok() {
+            self.advance_timed_sequence();
+            self.advance_live_id();
+        }
+        result.map(|()| live_id)
+    }
+
+    pub fn release_owned_live_tracked(
+        &mut self,
+        pad: PadId,
+        target_trigger_id: LiveCommandId,
+    ) -> Result<LiveCommandId, ControlError> {
+        self.ensure_open()?;
+        let sequence = self.next_timed_sequence;
+        let live_id = self
+            .next_live_id
+            .map(LiveCommandId)
+            .ok_or(ControlError::LiveCommandIdExhausted)?;
+        let result = self.push_immediate_command(AudioCommand::ReleaseOwnedLive {
+            id: live_id,
+            target_trigger_id,
             pad,
             sequence,
         });

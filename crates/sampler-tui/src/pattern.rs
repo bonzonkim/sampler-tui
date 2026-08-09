@@ -423,6 +423,77 @@ mod tests {
     }
 
     #[test]
+    fn live_ack_overflow_discards_lost_release_event_and_reuses_correlations() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(16), command(7), pad(), 0.5);
+        assert!(workspace.apply_ack(trigger_ack(7, 1_008)));
+        workspace.note_live_release(key(16), command(8));
+        workspace.note_live_trigger(key(16), command(9), pad(), 0.75);
+
+        let mut overflow = recording_telemetry(origin(1_000));
+        overflow.live_ack_overflows = 1;
+        workspace.maintain(&mut FakeAudio::default(), overflow);
+
+        assert!(workspace.selected_pattern().events().is_empty());
+        assert!(
+            workspace.export_project_patterns().unwrap()[0]
+                .events
+                .is_empty()
+        );
+        assert!(workspace.held_keys.iter().all(Option::is_none));
+        assert!(workspace.retiring_keys.iter().all(Option::is_none));
+
+        workspace.note_live_trigger(key(16), command(10), pad(), 1.0);
+        assert!(workspace.apply_ack(trigger_ack(10, 1_020)));
+        assert_eq!(workspace.selected_pattern().events().len(), 1);
+    }
+
+    #[test]
+    fn repeated_live_ack_overflows_keep_retrigger_capacity_reusable() {
+        let mut workspace = recording_workspace();
+        let mut audio = FakeAudio::default();
+
+        for cycle in 0..3_u64 {
+            let trigger = 20 + cycle * 3;
+            workspace.note_live_trigger(key(16), command(trigger), pad(), 1.0);
+            assert!(workspace.apply_ack(trigger_ack(trigger, 1_010 + cycle)));
+            workspace.note_live_release(key(16), command(trigger + 1));
+            workspace.note_live_trigger(key(16), command(trigger + 2), pad(), 1.0);
+
+            let mut overflow = recording_telemetry(origin(1_000));
+            overflow.live_ack_overflows = cycle + 1;
+            workspace.maintain(&mut audio, overflow);
+
+            assert!(workspace.selected_pattern().events().is_empty());
+            assert!(workspace.held_keys.iter().all(Option::is_none));
+            assert!(workspace.retiring_keys.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn four_rapid_retriggers_before_any_ack_commit_in_engine_fifo_order() {
+        let mut workspace = recording_workspace();
+        for (trigger, release) in [(30, 31), (32, 33), (34, 35)] {
+            workspace.note_live_trigger(key(16), command(trigger), pad(), 1.0);
+            workspace.note_live_release(key(16), command(release));
+        }
+        workspace.note_live_trigger(key(16), command(36), pad(), 1.0);
+
+        for (trigger, release, frame) in [(30, 31, 1_010), (32, 33, 1_020), (34, 35, 1_030)] {
+            assert!(workspace.apply_ack(trigger_ack(trigger, frame)));
+            assert!(workspace.apply_ack(release_ack(release, frame + 5)));
+        }
+        assert!(workspace.apply_ack(trigger_ack(36, 1_040)));
+
+        let events = workspace.selected_pattern().events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].duration, Some(5));
+        assert_eq!(events[1].duration, Some(5));
+        assert_eq!(events[2].duration, Some(5));
+        assert_eq!(events[3].duration, None);
+    }
+
+    #[test]
     fn one_shot_ack_records_no_duration_and_drops_its_release_correlation() {
         let mut workspace = recording_workspace();
         workspace.note_live_trigger_with_duration(key(0), command(7), pad(), 1.0, false);
@@ -1260,6 +1331,7 @@ struct HeldRecordingKey {
     trigger_id: Option<LiveCommandId>,
     release_id: Option<LiveCommandId>,
     event_id: Option<EventId>,
+    event_slot: Option<PatternSlotId>,
     trigger_frame: Option<u64>,
     trigger_absolute_frame: Option<u64>,
     record_duration: bool,
@@ -1303,6 +1375,7 @@ pub struct PatternWorkspace {
     recording: Option<RecordingState>,
     held_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
     retiring_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
+    observed_live_ack_overflows: u64,
     dirty_patterns: [Option<DirtyPattern>; PATTERN_SLOT_COUNT],
     next_dirty_ticket: u64,
     pending_snapshots: [Option<PendingSnapshot>; PATTERN_SLOT_COUNT],
@@ -1345,6 +1418,7 @@ impl PatternWorkspace {
             recording: None,
             held_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
             retiring_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
+            observed_live_ack_overflows: 0,
             dirty_patterns: array::from_fn(|_| {
                 Some(DirtyPattern {
                     generation: 0,
@@ -1703,6 +1777,7 @@ impl PatternWorkspace {
             trigger_id: Some(command),
             release_id: None,
             event_id: None,
+            event_slot: None,
             trigger_frame: None,
             trigger_absolute_frame: None,
             record_duration,
@@ -1785,6 +1860,7 @@ impl PatternWorkspace {
                     Ok(event_id) => {
                         let mut entry = entry;
                         entry.event_id = Some(event_id);
+                        entry.event_slot = Some(stamp.slot);
                         entry.trigger_frame = Some(frame);
                         entry.trigger_absolute_frame = Some(ack.frame);
                         self.set_recording_key(location, entry.record_duration.then_some(entry));
@@ -1982,6 +2058,7 @@ impl PatternWorkspace {
     ) -> PatternMaintenance {
         let mut result = PatternMaintenance::empty();
         result.reclaimed_snapshots = audio.reclaim_retired_patterns();
+        self.recover_from_live_ack_overflow(telemetry.live_ack_overflows);
 
         let mut acks = [LiveAck::EMPTY; MAX_ACKS_PER_MAINTENANCE];
         result.drained_acks = audio.drain_live_acks(&mut acks).min(acks.len());
@@ -2085,6 +2162,70 @@ impl PatternWorkspace {
             result.status = Some(status);
         }
         result
+    }
+
+    fn recover_from_live_ack_overflow(&mut self, live_ack_overflows: u64) {
+        if live_ack_overflows <= self.observed_live_ack_overflows {
+            self.observed_live_ack_overflows = live_ack_overflows;
+            return;
+        }
+        self.observed_live_ack_overflows = live_ack_overflows;
+
+        let mut removals = self
+            .held_keys
+            .iter()
+            .chain(self.retiring_keys.iter())
+            .flatten()
+            .filter_map(|entry| Some((entry.event_slot?, entry.event_id?)))
+            .collect::<Vec<_>>();
+        removals.sort_unstable_by_key(|(slot, event_id)| (slot.get(), event_id.0));
+        removals.dedup();
+
+        let mut removal_counts = [0_u64; PATTERN_SLOT_COUNT];
+        removals.retain(|(slot, event_id)| {
+            let index = usize::from(slot.get());
+            let unfinalized = self.patterns[index]
+                .event(*event_id)
+                .is_some_and(|event| event.duration.is_none());
+            if unfinalized {
+                removal_counts[index] += 1;
+            }
+            unfinalized
+        });
+        debug_assert!(removal_counts.iter().enumerate().all(|(index, count)| {
+            self.patterns[index]
+                .generation()
+                .checked_add(*count)
+                .is_some()
+        }));
+
+        self.held_keys.fill(None);
+        self.retiring_keys.fill(None);
+
+        let mut changed = [false; PATTERN_SLOT_COUNT];
+        let mut refresh_selection = false;
+        for (slot, event_id) in removals {
+            let index = usize::from(slot.get());
+            self.patterns[index]
+                .remove(event_id)
+                .expect("a correlated unfinalized event remains internally removable");
+            if self
+                .selected_event
+                .is_some_and(|selected| selected.slot == slot && selected.event_id == event_id)
+            {
+                self.selected_event = None;
+                refresh_selection = true;
+            }
+            changed[index] = true;
+        }
+        for (index, changed) in changed.into_iter().enumerate() {
+            if changed {
+                self.commit_project_pattern(index);
+            }
+        }
+        if refresh_selection {
+            self.refresh_selected_event();
+        }
     }
 
     fn slot_index(&self) -> usize {

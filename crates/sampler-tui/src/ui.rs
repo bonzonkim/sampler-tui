@@ -17,7 +17,7 @@ use crate::{
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const HELP_LINES: [&str; 17] = [
+const HELP_LINES: [&str; 20] = [
     "GLOBAL: Ctrl+R retries audio first when the device is unavailable",
     "Tab / Shift+Tab: cycle Perform / Pattern / Sample",
     "Space: play / stop selected pattern",
@@ -32,6 +32,9 @@ const HELP_LINES: [&str; 17] = [
     "plain z remains pad 13; Apply is in-memory only; Source file unchanged",
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
+    "CAPTURE: resample · record-input · capture-stop · capture-cancel",
+    "Recording: Enter stop · Esc review discard · pads/pattern stay live",
+    "Capture lifecycle: Finalize · Discard · Cancel are explicit choices",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
     "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
     "Ctrl+Q / Ctrl+C quit · Esc or ? close help",
@@ -301,7 +304,7 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "no (Shift stops)"
     };
-    let rows = [
+    let mut rows = vec![
         format!("Voices {:02}", telemetry.active_voices),
         format!("Late {}", telemetry.late_commands),
         format!("Invalid {}", telemetry.invalid_commands),
@@ -311,6 +314,14 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
         format!("Device {rate}Hz/{channels}ch"),
         perform_pattern_summary(app),
     ];
+    if let Some((source, target, elapsed, maximum, peak, hard_limit)) = capture_summary(app) {
+        rows.push(format!("CAP {source} · {target}"));
+        rows.push(format!("TIME {elapsed}/{maximum}"));
+        rows.push(format!(
+            "PEAK {peak}{}",
+            if hard_limit { " · MAX" } else { "" }
+        ));
+    }
     for (index, row) in rows.iter().enumerate() {
         let y = inner
             .y
@@ -388,7 +399,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
     match overlay {
-        Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 20, HELP_LINES),
+        Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 23, HELP_LINES),
         Overlay::Palette => render_palette(frame, area, app),
         Overlay::FilePicker => render_picker(frame, area, app),
         Overlay::DeviceError(error) => render_list_overlay(
@@ -560,7 +571,184 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
                 "Enter or Esc dismisses this error.".to_owned(),
             ],
         ),
+        Overlay::CaptureConfirm => {
+            let (source, target, prior) = capture_context(app);
+            render_list_overlay(
+                frame,
+                area,
+                &format!(" REPLACE PAD {target} "),
+                72,
+                8,
+                [
+                    format!("{source} will replace {prior} on pad {target}."),
+                    "The old pad stays audible until exact audio admission.".to_owned(),
+                    "Enter starts · Esc cancels without changing the old pad.".to_owned(),
+                    "Stop all and held-pad releases remain available.".to_owned(),
+                ],
+            );
+        }
+        Overlay::CaptureDiscard => {
+            let (source, target, _) = capture_context(app);
+            render_list_overlay(
+                frame,
+                area,
+                " DISCARD CAPTURE ",
+                72,
+                8,
+                [
+                    format!("Discard the {source} take for pad {target}?"),
+                    "The old pad remains unchanged.".to_owned(),
+                    "Enter discards · Esc keeps the capture.".to_owned(),
+                    "Stop all and held-pad releases remain available.".to_owned(),
+                ],
+            );
+        }
+        Overlay::ResolveCapture { action } => {
+            let (source, target, _) = capture_context(app);
+            render_list_overlay(
+                frame,
+                area,
+                " RESOLVE ACTIVE CAPTURE ",
+                72,
+                9,
+                [
+                    format!(
+                        "{source} for pad {target} is unresolved before {}.",
+                        project_action_name(*action)
+                    ),
+                    "Enter Finalize · Backspace Discard · Esc Cancel".to_owned(),
+                    "Finalize waits for exact worker and audio success.".to_owned(),
+                    "Discard waits until callback or worker ownership returns.".to_owned(),
+                    "Cancel abandons the project action and preserves the capture.".to_owned(),
+                ],
+            );
+        }
+        Overlay::CaptureProgress { action, discarding } => {
+            let (source, target, _) = capture_context(app);
+            let title = if *discarding {
+                " DISCARDING CAPTURE "
+            } else {
+                " FINALIZING CAPTURE "
+            };
+            let mut lines = vec![
+                format!("{source} · pad {target}"),
+                capture_progress_line(app),
+                if *discarding {
+                    "Waiting for exact callback or worker ownership.".to_owned()
+                } else {
+                    "Waiting for the exact callback, worker, and audio result.".to_owned()
+                },
+                "The old pad and project remain unchanged while waiting.".to_owned(),
+                "Stop all and held-pad releases remain available.".to_owned(),
+            ];
+            if let Some(action) = action {
+                lines.push(format!(
+                    "Then continue {} through the existing project lifecycle.",
+                    project_action_name(*action)
+                ));
+            }
+            render_list_overlay(frame, area, title, 72, 9, lines);
+        }
+        Overlay::CaptureFailed { action } => {
+            let (source, target, _) = capture_context(app);
+            let mut lines = vec![
+                format!("{source} · pad {target}"),
+                app.capture_session()
+                    .failure()
+                    .unwrap_or("capture failed")
+                    .to_owned(),
+                "The old pad and project remain unchanged.".to_owned(),
+            ];
+            if app.capture_session().failure_is_retryable() {
+                lines.push("R or Enter retries finalization from the retained take.".to_owned());
+            } else {
+                lines.push("This failure requires a fresh take; retry is unavailable.".to_owned());
+            }
+            lines.push(if action.is_some() {
+                "D/Backspace Discard · C/Esc Cancel project action".to_owned()
+            } else {
+                "D/Backspace Discard or Cancel capture · Ctrl+R retries audio".to_owned()
+            });
+            lines.push("Stop all and held-pad releases remain available.".to_owned());
+            render_list_overlay(frame, area, " CAPTURE FAILED ", 72, 10, lines);
+        }
     }
+}
+
+fn capture_summary(app: &App) -> Option<(&'static str, String, String, String, String, bool)> {
+    let session = app.capture_session();
+    let source = capture_source_name(session.source()?);
+    let target = pad_name(session.target()?);
+    let maximum = format_capture_time(session.max_frames()?, session.source_rate()?);
+    let status = app.capture_status_view().filter(|status| {
+        session.token() == Some(status.token)
+            && session.source() == Some(status.source)
+            && session.target() == Some(status.target)
+            && session.max_frames() == Some(status.max_frames)
+    });
+    let (elapsed, peak, hard_limit) = status.map_or_else(
+        || ("--:--.---".to_owned(), "---.---".to_owned(), false),
+        |status| {
+            (
+                format_capture_time(status.frames, session.source_rate().unwrap_or(1)),
+                format!("{:.3}", status.peak),
+                status.hard_limit,
+            )
+        },
+    );
+    Some((source, target, elapsed, maximum, peak, hard_limit))
+}
+
+fn capture_context(app: &App) -> (&'static str, String, String) {
+    let session = app.capture_session();
+    let source = session.source().map_or("CAPTURE", capture_source_name);
+    let target_pad = session.target().unwrap_or_else(sampler_core::PadId::first);
+    let target = pad_name(target_pad);
+    let offset = usize::from(u8::from(target_pad.bank())) * 16 + usize::from(target_pad.index());
+    let prior = app
+        .pads()
+        .get(offset)
+        .map(|pad| selected_sample_label(pad, app.pad_display_source(offset)))
+        .unwrap_or_else(|| "EMPTY PAD".to_owned());
+    (source, target, prior)
+}
+
+fn capture_progress_line(app: &App) -> String {
+    capture_summary(app).map_or_else(
+        || "Progress unavailable".to_owned(),
+        |(_, _, elapsed, maximum, peak, hard_limit)| {
+            format!(
+                "Elapsed {elapsed}/{maximum} · Peak {peak}{}",
+                if hard_limit { " · MAX" } else { "" }
+            )
+        },
+    )
+}
+
+const fn capture_source_name(source: sampler_audio::CaptureSource) -> &'static str {
+    match source {
+        sampler_audio::CaptureSource::Resample => "RESAMPLE",
+        sampler_audio::CaptureSource::Input => "INPUT",
+    }
+}
+
+fn pad_name(pad: sampler_core::PadId) -> String {
+    let bank = char::from(b'A'.saturating_add(u8::from(pad.bank())));
+    format!("{bank}{:02}", pad.index() + 1)
+}
+
+fn format_capture_time(frames: usize, sample_rate: u32) -> String {
+    if sample_rate == 0 {
+        return "--:--.---".to_owned();
+    }
+    let milliseconds = (frames as u128)
+        .saturating_mul(1_000)
+        .checked_div(u128::from(sample_rate))
+        .unwrap_or(0);
+    let minutes = milliseconds / 60_000;
+    let seconds = milliseconds / 1_000 % 60;
+    let millis = milliseconds % 1_000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 const fn project_action_name(action: ProjectAction) -> &'static str {
@@ -856,7 +1044,10 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::{Modifier, Style};
-    use sampler_audio::{Frame, SampleBuffer, SampleSlot, Telemetry};
+    use sampler_audio::{
+        CaptureBuffer, CaptureSource, CaptureState, CaptureStatus, Frame, SampleBuffer, SampleSlot,
+        Telemetry,
+    };
     use sampler_core::{PadId, PadSettings, ProjectDocument, ProjectId};
 
     use crate::audio::{AudioPort, CaptureSupport};
@@ -873,6 +1064,8 @@ mod tests {
         stop_error: Option<String>,
         telemetry: Option<Telemetry>,
         format_reads: Option<Rc<Cell<usize>>>,
+        capture_status: Option<CaptureStatus>,
+        capture_error: Option<crate::CaptureError>,
     }
 
     impl FakeAudio {
@@ -881,6 +1074,8 @@ mod tests {
                 stop_error: None,
                 telemetry: None,
                 format_reads: None,
+                capture_status: None,
+                capture_error: None,
             }
         }
 
@@ -899,6 +1094,16 @@ mod tests {
             self
         }
 
+        fn with_capture_status(mut self, status: CaptureStatus) -> Self {
+            self.capture_status = Some(status);
+            self
+        }
+
+        fn with_capture_error(mut self, error: crate::CaptureError) -> Self {
+            self.capture_error = Some(error);
+            self
+        }
+
         fn record_format_read(&self) {
             if let Some(reads) = &self.format_reads {
                 reads.set(reads.get().saturating_add(1));
@@ -908,7 +1113,82 @@ mod tests {
 
     impl AudioPort for FakeAudio {
         fn capture_support(&self) -> CaptureSupport {
-            CaptureSupport::Unsupported
+            if self.capture_status.is_some() {
+                CaptureSupport::Available
+            } else {
+                CaptureSupport::Unsupported
+            }
+        }
+
+        fn capture_source_rate(
+            &mut self,
+            source: CaptureSource,
+        ) -> Result<u32, crate::CaptureError> {
+            let status = self
+                .capture_status
+                .filter(|status| status.source == source)
+                .ok_or(crate::CaptureError::Unsupported)?;
+            Ok(match source {
+                CaptureSource::Resample => 48_000,
+                CaptureSource::Input => {
+                    if status.max_frames == 88_200 {
+                        44_100
+                    } else {
+                        48_000
+                    }
+                }
+            })
+        }
+
+        fn begin_capture(
+            &mut self,
+            _buffer: CaptureBuffer,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            Ok(())
+        }
+
+        fn start_capture(
+            &mut self,
+            _source: CaptureSource,
+            _token: u64,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            Ok(())
+        }
+
+        fn stop_capture(
+            &mut self,
+            _source: CaptureSource,
+            _token: u64,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            Ok(())
+        }
+
+        fn cancel_capture(
+            &mut self,
+            _source: CaptureSource,
+            _token: u64,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            Ok(())
+        }
+
+        fn capture_status(&mut self, source: CaptureSource) -> Option<CaptureStatus> {
+            self.capture_status.filter(|status| status.source == source)
+        }
+
+        fn capture_runtime_error(&mut self, source: CaptureSource) -> Option<crate::CaptureError> {
+            let error = self.capture_error.take()?;
+            if matches!(
+                (source, &error),
+                (
+                    CaptureSource::Resample,
+                    crate::CaptureError::OutputRuntime(_)
+                ) | (CaptureSource::Input, crate::CaptureError::InputRuntime(_))
+            ) {
+                Some(error)
+            } else {
+                self.capture_error = Some(error);
+                None
+            }
         }
 
         fn sample_rate(&self) -> u32 {
@@ -1719,7 +1999,7 @@ mod tests {
         let failed = App::without_audio("device disconnected");
 
         for (app, rect) in [
-            (help, (14, 5, 72, 20)),
+            (help, (14, 3, 72, 23)),
             (palette, (19, 12, 62, 5)),
             (picker, (14, 5, 72, 19)),
             (failed, (19, 11, 62, 7)),
@@ -2064,5 +2344,203 @@ mod tests {
     fn perform_header_renders_untitled_project_save_truth() {
         let snapshot = render_lines(80, 24, &ready_app()).join("\n");
         assert!(snapshot.contains("UNTITLED · SAVED"));
+    }
+
+    fn status_for(
+        source: CaptureSource,
+        frames: usize,
+        max_frames: usize,
+        peak: f32,
+        hard_limit: bool,
+    ) -> CaptureStatus {
+        CaptureStatus {
+            token: 1,
+            source,
+            target: pad(0),
+            state: CaptureState::Recording,
+            frames,
+            max_frames,
+            peak,
+            hard_limit,
+        }
+    }
+
+    fn recording_app(status: CaptureStatus) -> App {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready().with_capture_status(status)));
+        app.request_capture_with_limit_for_test(status.source, status.max_frames)
+            .unwrap();
+        let _ = app.maintain_capture();
+        app
+    }
+
+    #[test]
+    fn capture_recording_status_is_bounded_and_honest_for_both_sources_at_eighty_and_wide() {
+        let input = recording_app(status_for(
+            CaptureSource::Input,
+            66_150,
+            88_200,
+            0.75,
+            false,
+        ));
+        let resample = recording_app(status_for(
+            CaptureSource::Resample,
+            60_000,
+            96_000,
+            1.125,
+            false,
+        ));
+
+        for (app, source, elapsed, maximum, peak) in [
+            (&input, "INPUT", "00:01.500", "00:02.000", "0.750"),
+            (&resample, "RESAMPLE", "00:01.250", "00:02.000", "1.125"),
+        ] {
+            for width in [80, 118] {
+                let screen = render_lines(width, 24, app).join("\n");
+                for expected in [source, "A01", elapsed, maximum, peak] {
+                    assert!(
+                        screen.contains(expected),
+                        "missing {expected:?} at {width} columns:\n{screen}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_max_replacement_discard_finalizing_and_device_loss_are_explicit_overlays() {
+        let max = recording_app(status_for(
+            CaptureSource::Resample,
+            96_000,
+            96_000,
+            0.999,
+            true,
+        ));
+        let max_screen = render_lines(80, 24, &max).join("\n");
+        assert!(max_screen.contains("MAX"));
+        assert!(max_screen.contains("00:02.000"));
+
+        let status = status_for(CaptureSource::Resample, 24_000, 96_000, 0.5, false);
+        let mut replacement = loaded_states_app(FakeAudio::ready().with_capture_status(status));
+        let hat_path = std::path::PathBuf::from("/samples/HAT.wav");
+        let crate::WorkerRequest::LoadSample { generation, .. } = replacement
+            .begin_load(pad(4), hat_path.clone())
+            .expect("replace the pending fixture load")
+        else {
+            panic!("expected sample load")
+        };
+        assert!(replacement.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(4),
+            generation,
+            purpose: LoadPurpose::User,
+            path: hat_path,
+            result: Err(LoadSampleError::Decode("fixture load cancelled".to_owned())),
+        }));
+        let long_target = std::path::PathBuf::from(
+            "/samples/capture-target-with-an-intentionally-long-portable-source-name.wav",
+        );
+        let crate::WorkerRequest::LoadSample { generation, .. } = replacement
+            .begin_load(pad(0), long_target.clone())
+            .expect("replace the selected fixture sample")
+        else {
+            panic!("expected sample load")
+        };
+        assert!(
+            replacement.apply_worker_result(WorkerResult::Loaded {
+                pad: pad(0),
+                generation,
+                purpose: LoadPurpose::User,
+                path: long_target,
+                result: Ok(LoadedSample {
+                    fingerprint: crate::SourceFingerprint::from_encoded_bytes(
+                        std::path::Path::new("long-target.wav"),
+                        &[],
+                    )
+                    .unwrap(),
+                    base: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                    base_preview: Arc::new([PreviewColumn::default(); EDIT_PREVIEW_COLUMNS]),
+                    rendered: Arc::new(SampleBuffer::new(48_000, vec![0.0; 256]).unwrap()),
+                    rendered_preview: Arc::new([PreviewColumn::default(); EDIT_PREVIEW_COLUMNS]),
+                    recipe: sampler_core::SampleEditRecipe::identity(),
+                    source_rate: 48_000,
+                    source_frames: 128,
+                    duration: Duration::from_secs_f64(128.0 / 48_000.0),
+                }),
+            })
+        );
+        replacement
+            .request_capture_with_limit_for_test(CaptureSource::Resample, 96_000)
+            .unwrap();
+        let replacement_screen = render_lines(80, 24, &replacement).join("\n");
+        assert!(replacement_screen.contains("REPLACE PAD A01"));
+        assert!(replacement_screen.contains("CAPTURE-TARGET-WITH-AN-INTENTIONALLY-LONG"));
+        assert!(replacement_screen.contains('…'));
+        assert!(replacement_screen.contains("Enter"));
+        assert!(replacement_screen.contains("Esc"));
+
+        replacement.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        replacement.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let discard = render_lines(80, 24, &replacement).join("\n");
+        assert!(discard.contains("DISCARD CAPTURE"));
+        assert!(discard.contains("old pad remains unchanged"));
+
+        replacement.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        replacement.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let finalizing = render_lines(80, 24, &replacement).join("\n");
+        assert!(finalizing.contains("FINALIZING CAPTURE"));
+        assert!(finalizing.contains("exact callback, worker, and audio result"));
+
+        let error = "default input device disappeared while recording a path/label that is intentionally very long";
+        let mut failed = App::with_audio(Box::new(
+            FakeAudio::ready()
+                .with_capture_status(status_for(CaptureSource::Input, 4_410, 88_200, 0.25, false))
+                .with_capture_error(crate::CaptureError::InputRuntime(error.to_owned())),
+        ));
+        failed
+            .request_capture_with_limit_for_test(CaptureSource::Input, 88_200)
+            .unwrap();
+        assert!(failed.maintain_capture());
+        let failed_screen = render_lines(80, 24, &failed).join("\n");
+        assert!(failed_screen.contains("CAPTURE FAILED"));
+        assert!(failed_screen.contains("default input device disappeared"));
+        assert!(failed_screen.contains("Discard"));
+        assert!(failed_screen.contains("Cancel"));
+        assert!(!failed_screen.contains("Retry finalization"));
+    }
+
+    #[test]
+    fn capture_overlays_clear_stale_long_cells_and_safety_phrases_fit_seventy_columns() {
+        let error = "input device loss diagnostic with a deliberately long unique stale tail ZYXWVUTSRQPONMLK";
+        let mut app = App::with_audio(Box::new(
+            FakeAudio::ready()
+                .with_capture_status(status_for(CaptureSource::Input, 100, 88_200, 0.2, false))
+                .with_capture_error(crate::CaptureError::InputRuntime(error.to_owned())),
+        ));
+        app.request_capture_with_limit_for_test(CaptureSource::Input, 88_200)
+            .unwrap();
+        assert!(app.maintain_capture());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        app.cancel_capture().unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut after = String::new();
+        for y in 0..30 {
+            for x in 0..100 {
+                after.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(!after.contains("ZYXWVUTSRQPONMLK"));
+
+        for phrase in [
+            "Enter starts · Esc cancels without changing the old pad.",
+            "Enter discards · Esc keeps the capture.",
+            "Waiting for the exact callback, worker, and audio result.",
+            "Stop all and held-pad releases remain available.",
+            "Finalize · Discard · Cancel are explicit choices.",
+        ] {
+            assert!(super::display_width(phrase) <= 70, "too wide: {phrase}");
+        }
     }
 }

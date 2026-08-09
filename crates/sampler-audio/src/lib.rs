@@ -12,8 +12,8 @@ mod sample;
 
 pub use capture::{
     CaptureBuffer, CaptureCommand, CaptureCompletion, CaptureController, CaptureCore,
-    CaptureOutcome, CaptureSendFailure, CaptureSource, CaptureState, MAX_CAPTURE_FRAMES,
-    capture_channels,
+    CaptureOutcome, CaptureProgressSnapshot, CaptureSendFailure, CaptureSource, CaptureState,
+    MAX_CAPTURE_FRAMES, capture_channels,
 };
 pub use command::{
     AudioCommand, AudioController, COMMAND_CAPACITY, CaptureStatus, CommandConsumer, CriticalEvent,

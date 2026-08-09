@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sampler_core::PadId;
@@ -134,6 +134,13 @@ pub enum CaptureState {
     CompletionPending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureProgressSnapshot {
+    pub frames: usize,
+    pub peak: f32,
+    pub hard_limit: bool,
+}
+
 impl CaptureState {
     const IDLE: u8 = 0;
     const ARMED: u8 = 1;
@@ -162,6 +169,9 @@ impl CaptureState {
 struct CaptureShared {
     state: AtomicU8,
     failed: AtomicBool,
+    frames: AtomicUsize,
+    peak_bits: AtomicU32,
+    hard_limit: AtomicBool,
 }
 
 impl CaptureShared {
@@ -200,6 +210,26 @@ impl CaptureShared {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    fn reset_progress(&self) {
+        self.frames.store(0, Ordering::Release);
+        self.peak_bits.store(0.0_f32.to_bits(), Ordering::Release);
+        self.hard_limit.store(false, Ordering::Release);
+    }
+
+    fn publish_progress(&self, frames: usize, peak: f32, hard_limit: bool) {
+        self.frames.store(frames, Ordering::Release);
+        self.peak_bits.store(peak.to_bits(), Ordering::Release);
+        self.hard_limit.store(hard_limit, Ordering::Release);
+    }
+
+    fn progress(&self) -> CaptureProgressSnapshot {
+        CaptureProgressSnapshot {
+            frames: self.frames.load(Ordering::Acquire),
+            peak: f32::from_bits(self.peak_bits.load(Ordering::Acquire)),
+            hard_limit: self.hard_limit.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -271,6 +301,10 @@ impl CaptureController {
         self.shared.state()
     }
 
+    pub fn progress(&self) -> CaptureProgressSnapshot {
+        self.shared.progress()
+    }
+
     pub(crate) fn failure_handle(&self) -> CaptureFailureHandle {
         CaptureFailureHandle {
             shared: Arc::clone(&self.shared),
@@ -333,8 +367,11 @@ impl CaptureCore {
         buffer.stereo.push(left);
         buffer.stereo.push(right);
         self.peak = self.peak.max(left.abs()).max(right.abs());
+        let frames = buffer.stereo.len() / 2;
+        let hard_limit = frames == buffer.max_frames;
+        self.shared.publish_progress(frames, self.peak, hard_limit);
 
-        if buffer.stereo.len() / 2 == buffer.max_frames {
+        if hard_limit {
             self.finish_completed(true);
         }
     }
@@ -368,6 +405,7 @@ impl CaptureCore {
         }
         self.active = Some(buffer);
         self.peak = 0.0;
+        self.shared.reset_progress();
         self.set_state(CaptureState::Armed);
     }
 
@@ -493,6 +531,9 @@ pub fn capture_channels(
     let shared = Arc::new(CaptureShared {
         state: AtomicU8::new(CaptureState::IDLE),
         failed: AtomicBool::new(false),
+        frames: AtomicUsize::new(0),
+        peak_bits: AtomicU32::new(0.0_f32.to_bits()),
+        hard_limit: AtomicBool::new(false),
     });
     (
         CaptureController {
@@ -755,5 +796,41 @@ mod tests {
         };
         assert_eq!(returned.stereo.as_ptr(), first_allocation);
         assert_eq!(core.state(), CaptureState::Idle);
+    }
+
+    #[test]
+    fn controller_progress_reports_exact_callback_frames_peak_and_hard_limit() {
+        let (mut controller, mut core) = capture_channels(4, 1);
+        controller.arm(buffer(61, 2)).unwrap();
+        core.poll_commands();
+        controller.start(61).unwrap();
+        core.poll_commands();
+
+        assert_eq!(
+            controller.progress(),
+            CaptureProgressSnapshot {
+                frames: 0,
+                peak: 0.0,
+                hard_limit: false,
+            }
+        );
+        core.push_frame([0.25, -0.5]);
+        assert_eq!(
+            controller.progress(),
+            CaptureProgressSnapshot {
+                frames: 1,
+                peak: 0.5,
+                hard_limit: false,
+            }
+        );
+        core.push_frame([1.25, -0.75]);
+        assert_eq!(
+            controller.progress(),
+            CaptureProgressSnapshot {
+                frames: 2,
+                peak: 1.25,
+                hard_limit: true,
+            }
+        );
     }
 }

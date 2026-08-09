@@ -197,6 +197,7 @@ impl<O: KeyboardEnhancementOps> Drop for KeyboardEnhancementGuard<O> {
 trait EventLoopApp {
     fn should_quit(&self) -> bool;
     fn maintain_audio(&mut self) -> bool;
+    fn maintain_capture(&mut self) -> bool;
     fn maintain_project(&mut self, now: Instant) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
     fn take_worker_requests(&mut self) -> Vec<WorkerRequest>;
@@ -214,6 +215,10 @@ impl EventLoopApp for App {
 
     fn maintain_audio(&mut self) -> bool {
         App::maintain_audio(self)
+    }
+
+    fn maintain_capture(&mut self) -> bool {
+        App::maintain_capture(self)
     }
 
     fn maintain_project(&mut self, now: Instant) -> bool {
@@ -333,6 +338,8 @@ where
             }
         }
     }
+
+    state.dirty |= app.maintain_capture();
 
     state.dirty |= app.maintain_project(now);
 
@@ -815,6 +822,10 @@ mod tests {
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     };
+    use sampler_audio::{
+        CaptureBuffer, CaptureOutcome, CaptureSource, Frame, SampleBuffer, SampleSlot,
+    };
+    use sampler_core::{PadId, PadSettings};
 
     use super::*;
 
@@ -868,6 +879,10 @@ mod tests {
 
         fn maintain_audio(&mut self) -> bool {
             self.maintenance_calls += 1;
+            false
+        }
+
+        fn maintain_capture(&mut self) -> bool {
             false
         }
 
@@ -1026,6 +1041,10 @@ mod tests {
                 self.0.lock().unwrap().push("audio");
                 false
             }
+            fn maintain_capture(&mut self) -> bool {
+                self.0.lock().unwrap().push("capture");
+                false
+            }
             fn maintain_project(&mut self, _now: Instant) -> bool {
                 self.0.lock().unwrap().push("project");
                 true
@@ -1107,6 +1126,7 @@ mod tests {
             [
                 "audio",
                 "worker-result",
+                "capture",
                 "project",
                 "poll",
                 "event",
@@ -1219,6 +1239,136 @@ mod tests {
         .unwrap();
 
         assert_eq!(drawer.draws, 0);
+    }
+
+    struct CaptureTerminalAudio {
+        owned: Option<CaptureBuffer>,
+    }
+
+    impl AudioPort for CaptureTerminalAudio {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+
+        fn render_horizon(&self) -> Frame {
+            0
+        }
+
+        fn install(
+            &mut self,
+            _pad: PadId,
+            _sample: Arc<SampleBuffer>,
+            _settings: PadSettings,
+        ) -> Result<SampleSlot, String> {
+            SampleSlot::new(0).map_err(|error| error.to_string())
+        }
+
+        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_pad(&mut self, _pad: PadId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_all(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reclaim_retired(&mut self) -> usize {
+            0
+        }
+
+        fn latest_telemetry(&mut self) -> Option<sampler_audio::Telemetry> {
+            None
+        }
+
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            None
+        }
+
+        fn capture_support(&self) -> crate::audio::CaptureSupport {
+            crate::audio::CaptureSupport::Available
+        }
+
+        fn capture_source_rate(
+            &mut self,
+            _source: CaptureSource,
+        ) -> Result<u32, crate::CaptureError> {
+            Ok(48_000)
+        }
+
+        fn begin_capture(
+            &mut self,
+            buffer: CaptureBuffer,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            self.owned = Some(buffer);
+            Ok(())
+        }
+
+        fn start_capture(
+            &mut self,
+            _source: CaptureSource,
+            _token: u64,
+        ) -> Result<(), crate::audio::CaptureCommandFailure> {
+            Ok(())
+        }
+
+        fn capture_completion(&mut self, _source: CaptureSource) -> Option<CaptureOutcome> {
+            self.owned.take().map(CaptureOutcome::Cancelled)
+        }
+    }
+
+    struct AppDrawer {
+        draws: usize,
+    }
+
+    impl EventLoopDrawer<App> for AppDrawer {
+        fn draw(&mut self, _app: &App) -> io::Result<()> {
+            self.draws += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn event_loop_advances_capture_ownership_before_project_maintenance_and_draw() {
+        let now = Instant::now();
+        let mut app = App::with_audio(Box::new(CaptureTerminalAudio { owned: None }));
+        app.request_capture_with_limit_for_test(CaptureSource::Resample, 8)
+            .unwrap();
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(crate::CapturePhase::Recording)
+        );
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker::default();
+        let mut drawer = AppDrawer { draws: 0 };
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        run_iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.capture_session().phase(), None);
+        assert_eq!(drawer.draws, 1);
     }
 
     #[test]

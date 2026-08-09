@@ -100,6 +100,10 @@ pub enum PaletteCommand {
     Mode(PlaybackMode),
     ApplySample,
     UndoSample,
+    Resample,
+    RecordInput,
+    CaptureStop,
+    CaptureCancel,
 }
 
 pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
@@ -147,6 +151,12 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "mode" => parse_mode(remainder).map(PaletteCommand::Mode),
         "apply-sample" => no_arguments(remainder, "apply-sample", PaletteCommand::ApplySample),
         "undo-sample" => no_arguments(remainder, "undo-sample", PaletteCommand::UndoSample),
+        "resample" => no_arguments(remainder, "resample", PaletteCommand::Resample),
+        "record-input" => no_arguments(remainder, "record-input", PaletteCommand::RecordInput),
+        "capture-stop" => no_arguments(remainder, "capture-stop", PaletteCommand::CaptureStop),
+        "capture-cancel" => {
+            no_arguments(remainder, "capture-cancel", PaletteCommand::CaptureCancel)
+        }
         _ => Err(format!("unknown command: {command}")),
     }
 }
@@ -477,5 +487,22 @@ mod tests {
             parse_palette("mode loop now"),
             Err("mode must be oneshot, gate, or loop".into())
         );
+    }
+
+    #[test]
+    fn capture_commands_are_no_argument_commands_and_reject_every_trailing_token() {
+        for command in ["resample", "record-input", "capture-stop", "capture-cancel"] {
+            assert!(
+                parse_palette(command).is_ok(),
+                "{command} must be recognized"
+            );
+            for suffix in [" now", " 1", "\t--force", " trailing tokens"] {
+                assert_eq!(
+                    parse_palette(&format!("{command}{suffix}")),
+                    Err(format!("{command} does not accept arguments")),
+                    "{command} accepted {suffix:?}",
+                );
+            }
+        }
     }
 }

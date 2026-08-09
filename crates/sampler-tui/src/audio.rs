@@ -4,10 +4,10 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use sampler_audio::{
-    AudioSession, CaptureBuffer, CaptureCommand, CaptureOutcome, CaptureSendFailure, CaptureSource,
-    CaptureStatus, ControlError, DeviceError, Frame, InputCaptureSession, LiveAck, LiveCommandId,
-    PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT,
-    SampleBuffer, SampleSlot, Telemetry,
+    AudioSession, CaptureBuffer, CaptureCommand, CaptureOutcome, CaptureProgressSnapshot,
+    CaptureSendFailure, CaptureSource, CaptureStatus, ControlError, DeviceError, Frame,
+    InputCaptureSession, LiveAck, LiveCommandId, PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot,
+    PatternSwitch, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot, Telemetry,
 };
 use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
 
@@ -313,6 +313,7 @@ trait InputSessionLike {
     fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
     fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
     fn capture_status(&mut self) -> Option<CaptureStatus>;
+    fn capture_progress(&mut self) -> CaptureProgressSnapshot;
     fn capture_completion(&mut self) -> Option<CaptureOutcome>;
     fn capture_state(&mut self) -> sampler_audio::CaptureState;
     fn poll_error(&mut self) -> Option<String>;
@@ -341,6 +342,10 @@ impl InputSessionLike for InputCaptureSession {
 
     fn capture_status(&mut self) -> Option<CaptureStatus> {
         None
+    }
+
+    fn capture_progress(&mut self) -> CaptureProgressSnapshot {
+        self.controller_mut().progress()
     }
 
     fn capture_completion(&mut self) -> Option<CaptureOutcome> {
@@ -912,16 +917,18 @@ where
                 let identity = self
                     .active_capture
                     .filter(|identity| identity.source == CaptureSource::Input)?;
-                let state = self.input.as_mut()?.capture_state();
+                let input = self.input.as_mut()?;
+                let state = input.capture_state();
+                let progress = input.capture_progress();
                 Some(CaptureStatus {
                     token: identity.token,
                     source: identity.source,
                     target: identity.target,
                     state,
-                    frames: 0,
+                    frames: progress.frames,
                     max_frames: identity.max_frames,
-                    peak: 0.0,
-                    hard_limit: false,
+                    peak: progress.peak,
+                    hard_limit: progress.hard_limit,
                 })
             }
         }
@@ -1007,10 +1014,10 @@ mod tests {
 
     use sampler_audio::{
         CaptureBuffer, CaptureCommand, CaptureController, CaptureCore,
-        CaptureError as CoreCaptureError, CaptureOutcome, CaptureSendFailure, CaptureSource,
-        CaptureState, CaptureStatus, ControlError, LiveAck, LiveCommandId, PatternRetirement,
-        PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels,
-        capture_channels,
+        CaptureError as CoreCaptureError, CaptureOutcome, CaptureProgressSnapshot,
+        CaptureSendFailure, CaptureSource, CaptureState, CaptureStatus, ControlError, LiveAck,
+        LiveCommandId, PatternRetirement, PatternSnapshotSlot, PatternSwitch, SampleBuffer,
+        SampleSlot, Telemetry, audio_channels, capture_channels,
     };
     use sampler_core::{
         EditablePattern, Meter, PadId, PadSettings, PatternSlotId, PatternSnapshot, Resolution,
@@ -1515,6 +1522,10 @@ mod tests {
             None
         }
 
+        fn capture_progress(&mut self) -> CaptureProgressSnapshot {
+            self.controller.inner.progress()
+        }
+
         fn capture_completion(&mut self) -> Option<CaptureOutcome> {
             self.polls.set(self.polls.get() + 1);
             self.controller.inner.try_next_outcome()
@@ -1816,6 +1827,9 @@ mod tests {
         assert_eq!(status.token, 1);
         assert_eq!(status.max_frames, 2);
         port.start_capture(CaptureSource::Input, 1).unwrap();
+        let status = port.capture_status(CaptureSource::Input).unwrap();
+        assert_eq!(status.frames, 1);
+        assert_eq!(status.peak, 0.5);
         port.stop_capture(CaptureSource::Input, 1).unwrap();
 
         let maintenance = port.poll_capture_maintenance();

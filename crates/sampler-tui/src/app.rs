@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sampler_audio::{
-    CaptureBuffer, CaptureOutcome, CaptureSource, MAX_CAPTURE_FRAMES, SampleBuffer, Telemetry,
-    TransportStamp,
+    CaptureBuffer, CaptureOutcome, CaptureSource, CaptureState, CaptureStatus, MAX_CAPTURE_FRAMES,
+    SampleBuffer, Telemetry, TransportStamp,
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
@@ -66,6 +66,7 @@ mod capture_task7_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
         CaptureBuffer, CaptureCompletion, CaptureOutcome, CaptureSource, CaptureStatus, Frame,
         LiveCommandId, MAX_CAPTURE_FRAMES, PatternSnapshotSlot, SampleBuffer, SampleSlot,
@@ -73,10 +74,11 @@ mod capture_task7_tests {
     };
     use sampler_core::{BankId, PadId, PadSettings, PatternSnapshot, ProjectId, SampleEditRecipe};
 
-    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn};
+    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, ProjectAction};
     use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
     use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
+    use crate::input::InputAction;
     use crate::loader::{
         CaptureFinalizeError, FinalizeCaptureRequest, LoadPurpose, LoadedSample,
         ProjectSaveWorkerRequest, WorkerRequest, WorkerResult, WorkerSendError,
@@ -96,6 +98,9 @@ mod capture_task7_tests {
         Start(CaptureSource, u64),
         Stop(CaptureSource, u64),
         Cancel(CaptureSource, u64),
+        Trigger(PadId),
+        Release(PadId),
+        StopAll,
         Install(PadId, usize),
         Remove(PadId),
     }
@@ -198,7 +203,8 @@ mod capture_task7_tests {
             state.installed.push(sample);
             SampleSlot::new(0).map_err(|error| error.to_string())
         }
-        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+        fn trigger(&mut self, pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            self.0.0.borrow_mut().calls.push(CaptureCall::Trigger(pad));
             Ok(())
         }
         fn trigger_live_tracked(
@@ -208,7 +214,8 @@ mod capture_task7_tests {
         ) -> Result<LiveCommandId, String> {
             Ok(LiveCommandId::FIRST)
         }
-        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+        fn release(&mut self, pad: PadId, _at: Frame) -> Result<(), String> {
+            self.0.0.borrow_mut().calls.push(CaptureCall::Release(pad));
             Ok(())
         }
         fn release_live_tracked(&mut self, _pad: PadId) -> Result<LiveCommandId, String> {
@@ -228,6 +235,7 @@ mod capture_task7_tests {
             Ok(())
         }
         fn stop_all(&mut self) -> Result<(), String> {
+            self.0.0.borrow_mut().calls.push(CaptureCall::StopAll);
             Ok(())
         }
         fn update_pad(&mut self, _pad: PadId, _settings: PadSettings) -> Result<(), String> {
@@ -1356,6 +1364,385 @@ mod capture_task7_tests {
             }
         )));
     }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn release(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    #[test]
+    fn capture_lifecycle_confirmation_recording_controls_and_performance_routing_are_explicit() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        install_imported(&mut app, pad(0), "occupied-before-capture.wav");
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+
+        app.request_capture_with_limit_for_test(CaptureSource::Resample, 96_000)
+            .unwrap();
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Confirm));
+        assert!(
+            app.overlay().is_some(),
+            "replacement confirmation must be modal"
+        );
+
+        app.apply_key(press(KeyCode::Enter));
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+        assert!(
+            app.overlay().is_none(),
+            "recording is a nonblocking presentation"
+        );
+
+        app.apply_key(press(KeyCode::Char('1')));
+        assert!(app.is_pad_held(0));
+        assert!(probe.calls().contains(&CaptureCall::Trigger(pad(0))));
+        app.apply_key(release(KeyCode::Char('1')));
+        assert!(!app.is_pad_held(0));
+        assert!(probe.calls().contains(&CaptureCall::Release(pad(0))));
+
+        app.apply_key(press(KeyCode::Tab));
+        assert_eq!(app.workspace_view(), crate::WorkspaceView::Pattern);
+        app.apply_key(press(KeyCode::Right));
+        assert_eq!(app.patterns().cursor().step(), 1);
+        app.apply_key(press(KeyCode::Tab));
+        app.apply_key(press(KeyCode::Tab));
+        assert_eq!(app.workspace_view(), crate::WorkspaceView::Perform);
+
+        app.apply_key(press(KeyCode::Enter));
+        assert!(matches!(
+            probe.calls().last(),
+            Some(CaptureCall::Stop(_, _))
+        ));
+        assert!(app.overlay().is_some(), "stopping/finalizing must be modal");
+    }
+
+    #[test]
+    fn capture_lifecycle_escape_confirms_discard_explicit_cancel_waits_for_ownership_and_palette_keys_remain_text()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Input, 16);
+
+        app.apply_key(press(KeyCode::Esc));
+        assert!(app.overlay().is_some(), "Escape must ask before discarding");
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+        app.apply_key(press(KeyCode::Esc));
+        assert!(app.overlay().is_none(), "second Escape keeps the take");
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("capture-cancel".to_owned()));
+        app.apply_key(press(KeyCode::Enter));
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+        assert!(matches!(
+            probe.calls().last(),
+            Some(CaptureCall::Cancel(_, _))
+        ));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+
+        let (audio, _) = CaptureAudio::new(48_000, 44_100);
+        let mut command = App::with_audio(Box::new(audio));
+        command.open_palette();
+        command.apply_terminal_event(Event::Paste("resample".to_owned()));
+        command.apply_key(press(KeyCode::Char('1')));
+        assert_eq!(command.palette_text(), "resample1");
+        assert_eq!(command.capture_session().phase(), None);
+    }
+
+    fn app_at_capture_phase(phase: CapturePhase) -> App {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        if phase == CapturePhase::Confirm {
+            install_imported(&mut app, pad(0), "occupied.wav");
+            app.request_capture_with_limit_for_test(CaptureSource::Resample, 8)
+                .unwrap();
+            return app;
+        }
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        if phase == CapturePhase::Recording {
+            return app;
+        }
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        if phase == CapturePhase::Finalizing {
+            return app;
+        }
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        if phase == CapturePhase::Failed {
+            assert!(app.apply_worker_result(finalized(
+                &request,
+                Err(CaptureFinalizeError::Prepare("encode failed".to_owned())),
+            )));
+            assert!(app.maintain_capture());
+            return app;
+        }
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(90, 48_000, b"ready")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(phase, CapturePhase::ReadyToInstall);
+        app
+    }
+
+    #[test]
+    fn capture_lifecycle_quit_and_open_cancel_preserve_every_unresolved_phase() {
+        for phase in [
+            CapturePhase::Confirm,
+            CapturePhase::Recording,
+            CapturePhase::Finalizing,
+            CapturePhase::ReadyToInstall,
+            CapturePhase::Failed,
+        ] {
+            for action in [ProjectAction::Quit, ProjectAction::Open] {
+                let mut app = app_at_capture_phase(phase);
+                match action {
+                    ProjectAction::Quit => app.apply(InputAction::Quit),
+                    ProjectAction::Open => app.request_open_project_interactive("next-project"),
+                }
+                assert!(!app.should_quit(), "{action:?} bypassed {phase:?}");
+                assert!(
+                    app.project_open_stage().is_none(),
+                    "open bypassed {phase:?}"
+                );
+                assert!(
+                    app.overlay().is_some(),
+                    "{action:?} did not offer capture choices"
+                );
+
+                app.apply_key(press(KeyCode::Esc));
+                assert_eq!(app.capture_session().phase(), Some(phase));
+                assert!(!app.should_quit());
+                assert!(app.project_open_stage().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn capture_lifecycle_finalize_waits_for_worker_and_audio_then_enters_existing_project_resolution()
+     {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        app.request_open_project_interactive("next-project");
+        app.apply_key(press(KeyCode::Enter));
+        assert!(
+            !probe
+                .calls()
+                .iter()
+                .any(|call| matches!(call, CaptureCall::Install(..)))
+        );
+        assert!(app.project_open_stage().is_none());
+
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(91, 48_000, b"lifecycle")),
+        )));
+        assert!(app.maintain_capture());
+        probe.fail_next_install();
+        assert!(app.maintain_capture());
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(
+            app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::UnsavedProject {
+                action: ProjectAction::Open
+            })
+        ));
+        assert!(app.project_open_stage().is_none());
+    }
+
+    #[test]
+    fn capture_lifecycle_discard_waits_for_callback_or_worker_ownership_before_continuing() {
+        let (audio, _probe) = CaptureAudio::new(48_000, 44_100);
+        let mut recording = App::with_audio(Box::new(audio));
+        start_capture(&mut recording, CaptureSource::Input, 8);
+        recording.apply(InputAction::Quit);
+        recording.apply_key(press(KeyCode::Backspace));
+        assert!(!recording.should_quit());
+        assert_eq!(
+            recording.capture_session().phase(),
+            Some(CapturePhase::Recording)
+        );
+        assert!(recording.maintain_capture());
+        assert!(recording.should_quit());
+
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut worker = App::with_audio(Box::new(audio));
+        start_capture(&mut worker, CaptureSource::Resample, 8);
+        probe.complete(completion(
+            &worker,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(worker.maintain_capture());
+        assert!(worker.maintain_capture());
+        let request = take_finalize(&mut worker);
+        worker.request_open_project_interactive("next-project");
+        worker.apply_key(press(KeyCode::Backspace));
+        assert!(worker.project_open_stage().is_none());
+        assert_eq!(
+            worker.capture_session().phase(),
+            Some(CapturePhase::Finalizing)
+        );
+
+        assert!(worker.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(92, 48_000, b"discarded")),
+        )));
+        assert!(worker.maintain_capture());
+        assert_eq!(worker.capture_session().phase(), None);
+        assert!(worker.project_open_stage().is_some());
+        assert!(
+            worker
+                .pending_managed_releases
+                .contains(&ManagedCaptureId::new(92))
+        );
+    }
+
+    #[test]
+    fn capture_lifecycle_failed_finalize_is_cancelable_and_only_typed_worker_failure_retries() {
+        let mut retryable = app_at_capture_phase(CapturePhase::Failed);
+        let before_generation = retryable.capture_session().generation();
+        retryable.apply(InputAction::Quit);
+        retryable.apply_key(press(KeyCode::Enter));
+        assert_eq!(
+            retryable.capture_session().generation(),
+            before_generation.and_then(|value| value.checked_add(1))
+        );
+        assert_eq!(
+            retryable.capture_session().phase(),
+            Some(CapturePhase::Finalizing)
+        );
+
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut device = App::with_audio(Box::new(audio));
+        start_capture(&mut device, CaptureSource::Input, 8);
+        probe.fail_device(CaptureSource::Input, "input device disappeared");
+        assert!(device.maintain_capture());
+        let before = (
+            device.capture_session().generation(),
+            device.capture_session().failure_cause(),
+        );
+        device.apply(InputAction::Quit);
+        device.apply_key(press(KeyCode::Enter));
+        assert_eq!(
+            (
+                device.capture_session().generation(),
+                device.capture_session().failure_cause(),
+            ),
+            before
+        );
+        device.apply_key(press(KeyCode::Esc));
+        assert_eq!(device.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(!device.should_quit());
+        device.apply_key(press(KeyCode::Char('c')));
+        assert_eq!(device.capture_session().phase(), None);
+    }
+
+    #[test]
+    fn capture_lifecycle_stop_all_and_held_pad_release_pass_through_every_capture_presentation() {
+        let mut presentations = Vec::new();
+        for phase in [
+            CapturePhase::Confirm,
+            CapturePhase::Recording,
+            CapturePhase::Finalizing,
+            CapturePhase::ReadyToInstall,
+            CapturePhase::Failed,
+        ] {
+            presentations.push((phase, app_at_capture_phase(phase)));
+        }
+        let mut discard = app_at_capture_phase(CapturePhase::Recording);
+        discard.apply_key(press(KeyCode::Esc));
+        presentations.push((CapturePhase::Recording, discard));
+        let mut lifecycle = app_at_capture_phase(CapturePhase::Recording);
+        lifecycle.apply(InputAction::Quit);
+        presentations.push((CapturePhase::Recording, lifecycle));
+
+        for (phase, mut app) in presentations {
+            app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+                release_events: true,
+            });
+            app.apply(InputAction::PadPress(0));
+            assert!(app.is_pad_held(0), "setup failed for {phase:?}");
+            app.apply_key(release(KeyCode::Char('1')));
+            assert!(!app.is_pad_held(0), "release was swallowed for {phase:?}");
+
+            app.apply(InputAction::PadPress(0));
+            assert!(app.is_pad_held(0), "second setup failed for {phase:?}");
+            app.apply_key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ));
+            assert!(!app.is_pad_held(0), "Stop All was swallowed for {phase:?}");
+            assert_eq!(app.capture_session().phase(), Some(phase));
+        }
+    }
+
+    #[test]
+    fn capture_lifecycle_every_palette_command_routes_to_the_typed_capture_api() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("record-input".to_owned()));
+        app.apply_key(press(KeyCode::Enter));
+        assert_eq!(app.capture_session().source(), Some(CaptureSource::Input));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("capture-stop".to_owned()));
+        app.apply_key(press(KeyCode::Enter));
+        assert!(matches!(
+            probe.calls().last(),
+            Some(CaptureCall::Stop(_, _))
+        ));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("capture-cancel".to_owned()));
+        app.apply_key(press(KeyCode::Enter));
+        assert!(matches!(
+            probe.calls().last(),
+            Some(CaptureCall::Cancel(_, _))
+        ));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("resample".to_owned()));
+        app.apply_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.capture_session().source(),
+            Some(CaptureSource::Resample)
+        );
+    }
 }
 
 impl fmt::Display for ProjectSaveError {
@@ -1654,6 +2041,18 @@ pub enum Overlay {
     DiscardSample {
         pad: PadId,
     },
+    CaptureConfirm,
+    CaptureDiscard,
+    ResolveCapture {
+        action: ProjectAction,
+    },
+    CaptureProgress {
+        action: Option<ProjectAction>,
+        discarding: bool,
+    },
+    CaptureFailed {
+        action: Option<ProjectAction>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1679,6 +2078,8 @@ impl PendingProjectAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectLifecycleWait {
+    CaptureFinalize,
+    CaptureDiscard,
     SampleApply,
     ChoosingProject,
     Saving {
@@ -1716,6 +2117,8 @@ pub struct App {
     capture_worker_queued: bool,
     capture_engine_rate_in_flight: Option<u32>,
     capture_ready: Option<ManagedCapture>,
+    capture_status: Option<CaptureStatus>,
+    capture_discard_pending: bool,
     capture_worker_results: VecDeque<WorkerResult>,
     pending_managed_releases: VecDeque<ManagedCaptureId>,
     managed_release_in_flight: Option<ManagedCaptureId>,
@@ -1795,6 +2198,8 @@ impl App {
             capture_worker_queued: false,
             capture_engine_rate_in_flight: None,
             capture_ready: None,
+            capture_status: None,
+            capture_discard_pending: false,
             capture_worker_results: VecDeque::new(),
             pending_managed_releases: VecDeque::new(),
             managed_release_in_flight: None,
@@ -1885,6 +2290,10 @@ impl App {
         &mut self.capture_session
     }
 
+    pub const fn capture_status_view(&self) -> Option<CaptureStatus> {
+        self.capture_status
+    }
+
     pub fn request_resample(&mut self) -> Result<(), CaptureError> {
         self.request_capture(CaptureSource::Resample, MAX_CAPTURE_FRAMES)
     }
@@ -1951,6 +2360,9 @@ impl App {
             .begin(source, target, source_rate, max_frames)?;
         if self.pads[pad_offset(target)].sample.is_none() {
             self.confirm_capture()?;
+        } else {
+            self.overlay = Some(Overlay::CaptureConfirm);
+            self.status = "Confirm replacement before capture starts".to_owned();
         }
         Ok(())
     }
@@ -1993,6 +2405,9 @@ impl App {
             return Err(error);
         }
         self.capture_session.mark_recording()?;
+        self.capture_status = None;
+        self.overlay = None;
+        self.status = "Capture recording · Enter stops · Esc reviews discard".to_owned();
         Ok(())
     }
 
@@ -2015,6 +2430,11 @@ impl App {
             drop(failure.into_command());
             return Err(error);
         }
+        self.overlay = Some(Overlay::CaptureProgress {
+            action: self.pending_capture_project_action(),
+            discarding: false,
+        });
+        self.status = "Stopping capture and waiting for exact callback ownership…".to_owned();
         Ok(())
     }
 
@@ -2033,9 +2453,24 @@ impl App {
                 drop(failure.into_command());
                 return Err(error);
             }
+            self.capture_discard_pending = true;
+            self.overlay = Some(Overlay::CaptureProgress {
+                action: self.pending_capture_project_action(),
+                discarding: true,
+            });
+            self.status = "Discarding capture after callback ownership returns…".to_owned();
             return Ok(());
         }
-        self.discard_capture_transaction();
+        if phase == CapturePhase::Finalizing && self.capture_worker_queued {
+            self.capture_discard_pending = true;
+            self.overlay = Some(Overlay::CaptureProgress {
+                action: self.pending_capture_project_action(),
+                discarding: true,
+            });
+            self.status = "Discarding capture after exact worker ownership returns…".to_owned();
+            return Ok(());
+        }
+        self.finish_capture_discard();
         Ok(())
     }
 
@@ -2051,12 +2486,45 @@ impl App {
             self.queue_managed_release(candidate.id);
         }
         self.capture_session.set_managed_capture_id(None)?;
+        self.overlay = Some(Overlay::CaptureProgress {
+            action: self.pending_capture_project_action(),
+            discarding: false,
+        });
+        self.status = "Retrying capture finalization…".to_owned();
         Ok(())
+    }
+
+    fn pending_capture_project_action(&self) -> Option<ProjectAction> {
+        matches!(
+            self.project_lifecycle_wait,
+            Some(ProjectLifecycleWait::CaptureFinalize | ProjectLifecycleWait::CaptureDiscard)
+        )
+        .then(|| {
+            self.pending_project_action
+                .as_ref()
+                .map(PendingProjectAction::label)
+        })
+        .flatten()
     }
 
     pub fn maintain_capture(&mut self) -> bool {
         if let Some(result) = self.capture_worker_results.pop_front() {
             return self.apply_capture_worker_result(result);
+        }
+        if self.capture_discard_pending
+            && matches!(
+                self.capture_session.phase(),
+                Some(
+                    CapturePhase::Confirm
+                        | CapturePhase::Finalizing
+                        | CapturePhase::ReadyToInstall
+                        | CapturePhase::Failed
+                )
+            )
+            && !self.capture_worker_queued
+        {
+            self.finish_capture_discard();
+            return true;
         }
         if self.capture_ready.is_some()
             && self.capture_session.phase() == Some(CapturePhase::ReadyToInstall)
@@ -2071,6 +2539,12 @@ impl App {
         if self.capture_session.phase() == Some(CapturePhase::Finalizing)
             && self.capture_worker_queued
         {
+            if self.capture_discard_pending {
+                if self.poll_capture_runtime_error_once() {
+                    return true;
+                }
+                return self.queue_one_managed_release();
+            }
             return self.poll_capture_runtime_error_once();
         }
         if self.capture_session.phase() == Some(CapturePhase::Recording) {
@@ -2103,9 +2577,26 @@ impl App {
 
     fn poll_capture_once(&mut self) -> bool {
         let source = self.capture_session.source().expect("recording source");
+        let status_changed = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.capture_status(source))
+            .filter(|status| {
+                self.capture_session.token() == Some(status.token)
+                    && self.capture_session.target() == Some(status.target)
+                    && self.capture_session.source() == Some(status.source)
+                    && self.capture_session.max_frames() == Some(status.max_frames)
+                    && status.frames <= status.max_frames
+                    && status.peak.is_finite()
+            })
+            .is_some_and(|status| {
+                let changed = self.capture_status != Some(status);
+                self.capture_status = Some(status);
+                changed
+            });
         let mut maintenance = match self.audio.as_mut() {
             Some(audio) => audio.poll_capture_maintenance(),
-            None => return false,
+            None => return status_changed,
         };
         if let Some(error) = maintenance.runtime_error(source).cloned() {
             let message = error.to_string();
@@ -2116,7 +2607,7 @@ impl App {
             return true;
         }
         let Some(outcome) = maintenance.take_completion(source) else {
-            return false;
+            return status_changed;
         };
         match outcome {
             CaptureOutcome::Cancelled(buffer) => {
@@ -2125,7 +2616,7 @@ impl App {
                     && self.capture_session.source() == Some(buffer.source())
                     && self.capture_session.source_rate() == Some(buffer.sample_rate());
                 if exact {
-                    self.discard_capture_transaction();
+                    self.finish_capture_discard();
                     true
                 } else {
                     false
@@ -2139,6 +2630,9 @@ impl App {
                                 .capture_session
                                 .mark_failed(CaptureError::EmptyCapture.to_string());
                             self.status = CaptureError::EmptyCapture.to_string();
+                            self.overlay = Some(Overlay::CaptureFailed {
+                                action: self.pending_capture_project_action(),
+                            });
                             true
                         }
                         Err(_) => false,
@@ -2149,6 +2643,19 @@ impl App {
                         .completion()
                         .expect("accepted completion remains retained");
                     self.capture_hard_limit = completion.hard_limit;
+                    self.capture_status = Some(CaptureStatus {
+                        token: completion.token,
+                        source: completion.source,
+                        target: completion.target,
+                        state: CaptureState::Idle,
+                        frames: completion.stereo.len() / 2,
+                        max_frames: self
+                            .capture_session
+                            .max_frames()
+                            .expect("accepted capture frame limit"),
+                        peak: completion.peak,
+                        hard_limit: completion.hard_limit,
+                    });
                     let stereo = self
                         .capture_session
                         .take_completion_stereo()
@@ -2156,6 +2663,11 @@ impl App {
                     self.capture_source_pcm = Some(Arc::from(stereo.into_boxed_slice()));
                     self.capture_worker_queued = false;
                     self.capture_engine_rate_in_flight = None;
+                    self.overlay = Some(Overlay::CaptureProgress {
+                        action: self.pending_capture_project_action(),
+                        discarding: false,
+                    });
+                    self.status = "Finalizing capture on the worker…".to_owned();
                     true
                 } else {
                     false
@@ -2172,6 +2684,9 @@ impl App {
             let _ = self
                 .capture_session
                 .mark_failed("capture source ownership is missing");
+            self.overlay = Some(Overlay::CaptureFailed {
+                action: self.pending_capture_project_action(),
+            });
             return true;
         };
         let Some(engine_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
@@ -2179,6 +2694,9 @@ impl App {
                 CaptureFailureCause::DeviceRuntime,
                 CaptureError::AudioUnavailable.to_string(),
             );
+            self.overlay = Some(Overlay::CaptureFailed {
+                action: self.pending_capture_project_action(),
+            });
             return true;
         };
         self.pending_worker_requests
@@ -2247,6 +2765,13 @@ impl App {
                 }
                 self.capture_worker_queued = false;
                 self.capture_engine_rate_in_flight = None;
+                if self.capture_discard_pending {
+                    if let Ok(candidate) = result {
+                        self.queue_managed_release(candidate.id);
+                    }
+                    self.finish_capture_discard();
+                    return true;
+                }
                 let current_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
                 if current_rate != Some(engine_rate) {
                     if let Ok(candidate) = result {
@@ -2258,6 +2783,9 @@ impl App {
                             Err(error) => {
                                 let _ = self.capture_session.mark_failed(error.to_string());
                                 self.status = error.to_string();
+                                self.overlay = Some(Overlay::CaptureFailed {
+                                    action: self.pending_capture_project_action(),
+                                });
                                 return true;
                             }
                         }
@@ -2279,6 +2807,9 @@ impl App {
                         .capture_session
                         .mark_failed_with_cause(cause, message.clone());
                     self.status = message;
+                    self.overlay = Some(Overlay::CaptureFailed {
+                        action: self.pending_capture_project_action(),
+                    });
                     return true;
                 }
                 if source == CaptureSource::Resample && source_rate != engine_rate {
@@ -2290,6 +2821,9 @@ impl App {
                     );
                     let _ = self.capture_session.mark_failed(message.clone());
                     self.status = message;
+                    self.overlay = Some(Overlay::CaptureFailed {
+                        action: self.pending_capture_project_action(),
+                    });
                     return true;
                 }
                 match result {
@@ -2300,6 +2834,9 @@ impl App {
                             message.clone(),
                         );
                         self.status = message;
+                        self.overlay = Some(Overlay::CaptureFailed {
+                            action: self.pending_capture_project_action(),
+                        });
                         true
                     }
                     Ok(candidate)
@@ -2315,6 +2852,12 @@ impl App {
                         self.capture_session
                             .mark_ready_to_install()
                             .expect("exact finalization advances to ready");
+                        self.overlay = Some(Overlay::CaptureProgress {
+                            action: self.pending_capture_project_action(),
+                            discarding: false,
+                        });
+                        self.status =
+                            "Capture finalized; waiting for exact audio admission…".to_owned();
                         true
                     }
                     Ok(candidate) => {
@@ -2322,6 +2865,9 @@ impl App {
                         let message = "finalized capture tuple is inconsistent".to_owned();
                         let _ = self.capture_session.mark_failed(message.clone());
                         self.status = message;
+                        self.overlay = Some(Overlay::CaptureFailed {
+                            action: self.pending_capture_project_action(),
+                        });
                         true
                     }
                 }
@@ -2344,11 +2890,17 @@ impl App {
                 if let Err(error) = self.capture_session.advance_finalization_generation() {
                     let _ = self.capture_session.mark_failed(error.to_string());
                     self.status = error.to_string();
+                    self.overlay = Some(Overlay::CaptureFailed {
+                        action: self.pending_capture_project_action(),
+                    });
                 }
             } else {
                 let message = "resample capture cannot be rerendered at a different output rate";
                 let _ = self.capture_session.mark_failed(message);
                 self.status = message.to_owned();
+                self.overlay = Some(Overlay::CaptureFailed {
+                    action: self.pending_capture_project_action(),
+                });
             }
             return true;
         }
@@ -2405,7 +2957,12 @@ impl App {
         self.commit_project_mutation();
         let _ = self.capture_session.discard();
         self.clear_capture_transaction_fields();
+        self.overlay = None;
         self.refresh_editor_for_offset(offset);
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureFinalize) {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
         true
     }
 
@@ -2415,6 +2972,8 @@ impl App {
         self.capture_worker_queued = false;
         self.capture_engine_rate_in_flight = None;
         self.capture_ready = None;
+        self.capture_status = None;
+        self.capture_discard_pending = false;
     }
 
     fn discard_capture_transaction(&mut self) {
@@ -2423,6 +2982,16 @@ impl App {
         }
         let _ = self.capture_session.discard();
         self.clear_capture_transaction_fields();
+    }
+
+    fn finish_capture_discard(&mut self) {
+        self.discard_capture_transaction();
+        self.overlay = None;
+        self.status = "Capture discarded; prior pad unchanged".to_owned();
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureDiscard) {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
     }
 
     fn queue_managed_release(&mut self, id: ManagedCaptureId) {
@@ -2547,6 +3116,11 @@ impl App {
                         | Overlay::ProjectLifecycleProgress { .. }
                         | Overlay::ProjectSaveProgress
                         | Overlay::ProjectError { .. }
+                        | Overlay::CaptureConfirm
+                        | Overlay::CaptureDiscard
+                        | Overlay::ResolveCapture { .. }
+                        | Overlay::CaptureProgress { .. }
+                        | Overlay::CaptureFailed { .. }
                 )
             );
             match action {
@@ -2564,6 +3138,10 @@ impl App {
         }
         if self.audio.is_none() && is_explicit_device_retry(key) {
             self.device_retry_requests = self.device_retry_requests.saturating_add(1);
+            return;
+        }
+
+        if self.apply_capture_key(key) {
             return;
         }
 
@@ -2590,6 +3168,13 @@ impl App {
             Some(Overlay::ClearPattern { .. }) => self.apply_clear_pattern_key(key),
             Some(Overlay::ApplySample { .. }) => self.apply_sample_apply_key(key),
             Some(Overlay::DiscardSample { .. }) => self.apply_sample_discard_key(key),
+            Some(
+                Overlay::CaptureConfirm
+                | Overlay::CaptureDiscard
+                | Overlay::ResolveCapture { .. }
+                | Overlay::CaptureProgress { .. }
+                | Overlay::CaptureFailed { .. },
+            ) => {}
             None => self.apply_workspace_key(key),
         }
     }
@@ -2875,6 +3460,12 @@ impl App {
             return;
         };
         let label = action.label();
+        if self.capture_session.phase().is_some() {
+            self.project_lifecycle_wait = None;
+            self.overlay = Some(Overlay::ResolveCapture { action: label });
+            self.status = "Resolve the active capture before the project action".to_owned();
+            return;
+        }
         if self.editor.is_dirty() {
             self.project_lifecycle_wait = None;
             self.overlay = Some(Overlay::ResolveSampleDraft {
@@ -2921,6 +3512,170 @@ impl App {
         self.project_lifecycle_wait = None;
         self.overlay = None;
         self.status = "Project action cancelled".to_owned();
+    }
+
+    fn cancel_project_action_preserving_capture(&mut self) {
+        self.pending_project_action = None;
+        self.project_lifecycle_wait = None;
+        self.status = "Project action cancelled; capture preserved".to_owned();
+        self.restore_capture_presentation();
+    }
+
+    fn restore_capture_presentation(&mut self) {
+        let action = self.pending_capture_project_action();
+        self.overlay = match self.capture_session.phase() {
+            Some(CapturePhase::Confirm) => Some(Overlay::CaptureConfirm),
+            Some(CapturePhase::Recording) => None,
+            Some(CapturePhase::Finalizing | CapturePhase::ReadyToInstall) => {
+                Some(Overlay::CaptureProgress {
+                    action,
+                    discarding: self.capture_discard_pending,
+                })
+            }
+            Some(CapturePhase::Failed) => Some(Overlay::CaptureFailed { action }),
+            Some(CapturePhase::Arming) => Some(Overlay::CaptureProgress {
+                action,
+                discarding: self.capture_discard_pending,
+            }),
+            None => None,
+        };
+    }
+
+    fn apply_capture_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press || key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        match self.overlay.clone() {
+            Some(Overlay::CaptureConfirm) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Err(error) = self.confirm_capture() {
+                            self.status = error.to_string();
+                            self.overlay = Some(Overlay::CaptureFailed { action: None });
+                        }
+                    }
+                    KeyCode::Esc => self.finish_capture_discard(),
+                    _ => {}
+                }
+                true
+            }
+            Some(Overlay::CaptureDiscard) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Err(error) = self.cancel_capture() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.overlay = None;
+                        self.status =
+                            "Capture preserved · Enter stops · Esc reviews discard".to_owned();
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Some(Overlay::ResolveCapture { .. }) => {
+                match key.code {
+                    KeyCode::Enter => self.finalize_capture_for_project_action(),
+                    KeyCode::Backspace => {
+                        self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
+                        if let Err(error) = self.cancel_capture() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('c' | 'C') => {
+                        self.cancel_project_action_preserving_capture()
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Some(Overlay::CaptureProgress { .. }) => true,
+            Some(Overlay::CaptureFailed { action }) => {
+                match key.code {
+                    KeyCode::Char('r' | 'R') | KeyCode::Enter
+                        if self.capture_session.failure_is_retryable() =>
+                    {
+                        if action.is_some() {
+                            self.project_lifecycle_wait =
+                                Some(ProjectLifecycleWait::CaptureFinalize);
+                        }
+                        if let Err(error) = self.retry_capture_finalization() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    KeyCode::Char('d' | 'D') | KeyCode::Backspace => {
+                        if action.is_some() {
+                            self.project_lifecycle_wait =
+                                Some(ProjectLifecycleWait::CaptureDiscard);
+                        }
+                        if let Err(error) = self.cancel_capture() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('c' | 'C') if action.is_some() => {
+                        self.cancel_project_action_preserving_capture()
+                    }
+                    KeyCode::Char('c' | 'C') => {
+                        if let Err(error) = self.cancel_capture() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    _ => {
+                        if key.code == KeyCode::Enter {
+                            self.status = self.capture_session.failure_cause().map_or_else(
+                                || "Capture finalization cannot be retried".to_owned(),
+                                |cause| format!("Capture failure {cause:?} requires a fresh take"),
+                            );
+                        }
+                    }
+                }
+                true
+            }
+            Some(_) => false,
+            None if self.capture_session.phase() == Some(CapturePhase::Recording) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Err(error) = self.stop_capture() {
+                            self.status = error.to_string();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.overlay = Some(Overlay::CaptureDiscard);
+                        self.status = "Confirm whether to discard the active capture".to_owned();
+                    }
+                    _ => return false,
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn finalize_capture_for_project_action(&mut self) {
+        self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureFinalize);
+        let result = match self.capture_session.phase() {
+            Some(CapturePhase::Confirm) => self.confirm_capture(),
+            Some(CapturePhase::Recording) => self.stop_capture(),
+            Some(CapturePhase::Finalizing | CapturePhase::ReadyToInstall) => {
+                self.restore_capture_presentation();
+                Ok(())
+            }
+            Some(CapturePhase::Failed) => self.retry_capture_finalization(),
+            Some(CapturePhase::Arming) => Ok(()),
+            None => Err(CaptureError::NoActiveCapture),
+        };
+        if let Err(error) = result {
+            self.project_lifecycle_wait = None;
+            self.status = error.to_string();
+            self.overlay = Some(Overlay::CaptureFailed {
+                action: self
+                    .pending_project_action
+                    .as_ref()
+                    .map(PendingProjectAction::label),
+            });
+        }
     }
 
     fn reconfirm_project_action(&mut self, status: &str) {
@@ -5494,6 +6249,33 @@ impl App {
                     self.request_editor_undo();
                 }
             }
+            PaletteCommand::Resample => {
+                let result = self.request_resample();
+                self.finish_capture_palette_command(result);
+            }
+            PaletteCommand::RecordInput => {
+                let result = self.request_input_recording();
+                self.finish_capture_palette_command(result);
+            }
+            PaletteCommand::CaptureStop => {
+                let result = self.stop_capture();
+                self.finish_capture_palette_command(result);
+            }
+            PaletteCommand::CaptureCancel => {
+                let result = self.cancel_capture();
+                self.finish_capture_palette_command(result);
+            }
+        }
+    }
+
+    fn finish_capture_palette_command(&mut self, result: Result<(), CaptureError>) {
+        match result {
+            Ok(()) => {
+                if self.overlay == Some(Overlay::Palette) {
+                    self.overlay = None;
+                }
+            }
+            Err(error) => self.palette_error = Some(error.to_string()),
         }
     }
 
@@ -6478,7 +7260,8 @@ impl App {
     }
 
     fn fail_audio(&mut self, error: String) {
-        if self.capture_session.phase().is_some() {
+        let capture_active = self.capture_session.phase().is_some();
+        if capture_active {
             let _ = self
                 .capture_session
                 .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, error.clone());
@@ -6500,7 +7283,16 @@ impl App {
             pad.active = false;
         }
         self.status = error.clone();
-        self.overlay = Some(Overlay::DeviceError(error));
+        self.overlay = if capture_active {
+            Some(Overlay::CaptureFailed {
+                action: self
+                    .pending_project_action
+                    .as_ref()
+                    .map(PendingProjectAction::label),
+            })
+        } else {
+            Some(Overlay::DeviceError(error))
+        };
         self.sync_editor_to_selected_pad();
     }
 
@@ -6621,6 +7413,9 @@ impl App {
         self.status = local_error.unwrap_or_else(|| "audio device connected".to_owned());
         self.pump_recovery_requests();
         self.sync_editor_to_selected_pad();
+        if self.capture_session.phase() == Some(CapturePhase::Failed) {
+            self.restore_capture_presentation();
+        }
         if self.pending_project_action.is_some() && self.project_lifecycle_wait.is_none() {
             self.advance_project_action();
         }

@@ -691,7 +691,7 @@ mod mixer_task6_tests {
         assert!(!app.maintain_project(Instant::now()));
         assert_eq!(app.master_mix(), nondefault);
         assert_eq!(app.project_session.project_id(), old_project_id);
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
         assert_eq!(
             probe.calls().last(),
             Some(&MixerAudioCall::UpdateMasterMix(
@@ -700,7 +700,7 @@ mod mixer_task6_tests {
         );
 
         assert!(app.maintain_project(Instant::now()));
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 3);
         assert_eq!(
             probe.calls().last(),
             Some(&MixerAudioCall::UpdateMasterMix(
@@ -4255,7 +4255,7 @@ struct RecoveryCleanup {
 
 #[derive(Debug, Clone)]
 enum InFlightProjectOperation {
-    Save(PendingProjectSave),
+    Save(Box<PendingProjectSave>),
     Cleanup(RecoveryCleanup),
 }
 
@@ -4267,6 +4267,7 @@ struct StagedProjectPad {
 }
 
 enum ProjectAdmission {
+    MidiOwners,
     StopAll,
     Master,
     Pads(usize),
@@ -6871,6 +6872,21 @@ impl App {
             return false;
         };
         let mut changed = false;
+        if let ProjectOpenOperation::Staging(candidate) = &mut operation
+            && candidate.decode_in_flight.is_none()
+            && candidate.next_decode == candidate.document.pads.len()
+            && matches!(candidate.admission, ProjectAdmission::MidiOwners)
+        {
+            match self.release_all_midi_owners() {
+                Ok(()) => {
+                    self.cancel_midi_learn();
+                    candidate.progress.admitted_actions += 1;
+                    candidate.admission = ProjectAdmission::StopAll;
+                    changed = true;
+                }
+                Err(error) => self.status = error,
+            }
+        }
         match &mut operation {
             ProjectOpenOperation::Probing {
                 progress,
@@ -6941,10 +6957,9 @@ impl App {
                         ProjectAdmission::StopAll => match audio.stop_all() {
                             Ok(()) => {
                                 candidate.progress.phase = ProjectOpenPhase::Admitting;
-                                candidate.progress.admitted_actions = 1;
+                                candidate.progress.admitted_actions += 1;
                                 candidate.admission = ProjectAdmission::Master;
                                 self.held_pad_by_key.fill(None);
-                                self.midi_owned_pads.fill(None);
                                 changed = true;
                             }
                             Err(error) => self.status = error,
@@ -7016,7 +7031,7 @@ impl App {
                                         );
                                     } else {
                                         candidate.admission = ProjectAdmission::StopAll;
-                                        candidate.progress.admitted_actions = 0;
+                                        candidate.progress.admitted_actions = 1;
                                         self.status = format!(
                                             "Project admission failed ({error}); committed audio restored"
                                         );
@@ -7051,7 +7066,7 @@ impl App {
                             ) {
                                 Ok(()) => {
                                     candidate.admission = ProjectAdmission::StopAll;
-                                    candidate.progress.admitted_actions = 0;
+                                    candidate.progress.admitted_actions = 1;
                                     self.status =
                                         "Committed audio restored; restarting project admission"
                                             .to_owned();
@@ -7083,7 +7098,7 @@ impl App {
                                 self.status = pattern_status_text(&status);
                             }
                         }
-                        ProjectAdmission::Complete => {}
+                        ProjectAdmission::MidiOwners | ProjectAdmission::Complete => {}
                     }
                 }
             }
@@ -7168,6 +7183,7 @@ impl App {
         self.pads = pads;
         self.pad_mixes = pad_mixes;
         self.master_mix = candidate.document.master_mix;
+        self.midi_settings = candidate.document.midi;
         self.patterns = candidate.patterns;
         self.project_session = ProjectSession::opened(
             candidate.document.project_id,
@@ -7270,7 +7286,7 @@ impl App {
                 staged_pads: 0,
                 total_pads: recovery.pads.len(),
                 admitted_actions: 0,
-                total_actions: 1 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
+                total_actions: 3 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
             };
             self.project_open = Some(ProjectOpenOperation::ChoosingRecovery(Box::new(
                 ProjectRecoveryChoiceState {
@@ -7345,7 +7361,7 @@ impl App {
             staged_pads: 0,
             total_pads: document.pads.len(),
             admitted_actions: 0,
-            total_actions: 2 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
+            total_actions: 3 + PAD_VIEW_COUNT + sampler_core::PATTERN_SLOT_COUNT,
         };
         Ok(ProjectOpenOperation::Staging(Box::new(
             ProjectOpenCandidate {
@@ -7359,7 +7375,7 @@ impl App {
                 engine_rate: sample_rate,
                 saved_revision,
                 restored_recovery,
-                admission: ProjectAdmission::StopAll,
+                admission: ProjectAdmission::MidiOwners,
             },
         )))
     }
@@ -7690,7 +7706,7 @@ impl App {
                 },
             )));
         self.project_session.set_in_flight(Some(descriptor));
-        self.in_flight_project = Some(InFlightProjectOperation::Save(save));
+        self.in_flight_project = Some(InFlightProjectOperation::Save(Box::new(save)));
     }
 
     pub fn project_snapshot(&self) -> Result<ProjectSaveSnapshot, ProjectSnapshotError> {
@@ -7751,6 +7767,7 @@ impl App {
             name: self.project_session.name().to_owned(),
             revision: self.project_session.current_revision(),
             master_mix: self.master_mix,
+            midi: self.midi_settings,
             pads,
             patterns,
         })
@@ -8416,6 +8433,7 @@ impl App {
             unreachable!()
         };
         self.project_session.set_in_flight(None);
+        let save = *save;
         if error == WorkerSendError::WorkerBusy {
             match save.descriptor.kind {
                 SaveKind::Explicit => self.pending_explicit_save = Some(save),
@@ -9235,10 +9253,12 @@ impl App {
     }
 
     fn apply_project_open_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press
-            || self
-                .project_open_stage()
-                .is_none_or(|stage| stage.phase != ProjectOpenPhase::AwaitingRecoveryChoice)
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self
+            .project_open_stage()
+            .is_none_or(|stage| stage.phase != ProjectOpenPhase::AwaitingRecoveryChoice)
         {
             return;
         }
@@ -10752,7 +10772,7 @@ impl App {
                 candidate.patterns = patterns;
             }
             candidate.admission = ProjectAdmission::StopAll;
-            candidate.progress.admitted_actions = 0;
+            candidate.progress.admitted_actions = 1;
             self.overlay = Some(Overlay::ProjectOpenProgress);
             self.status = if restart_staging {
                 "Audio rate changed; restaging project audio".to_owned()
@@ -16670,6 +16690,27 @@ mod tests {
         .unwrap()
     }
 
+    fn project_open_document_with_midi(
+        project_id: sampler_core::ProjectId,
+        name: &str,
+        revision: u64,
+        pads: Vec<sampler_core::ProjectPad>,
+        midi: MidiSettings,
+    ) -> sampler_core::ProjectDocument {
+        sampler_core::ProjectDocument::new_v4(
+            project_id,
+            name,
+            revision,
+            pads,
+            PatternWorkspace::new(48_000)
+                .export_project_patterns()
+                .unwrap(),
+            sampler_core::MasterMixSettings::default(),
+            midi,
+        )
+        .unwrap()
+    }
+
     fn project_open_pad(pad: PadId, settings: PadSettings) -> sampler_core::ProjectPad {
         let fingerprint =
             crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
@@ -17144,6 +17185,81 @@ mod tests {
     }
 
     #[test]
+    fn stale_project_stage_result_cannot_consume_the_newer_midi_candidate() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let first_midi = MidiSettings::default()
+            .learn_swap(BankId::new(1).unwrap(), 0, midi_note(80))
+            .unwrap();
+        let first = project_open_document_with_midi(
+            sampler_core::ProjectId::from_bytes([0xb1; 16]),
+            "First",
+            7,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+            first_midi,
+        );
+        let first_token = app.request_open_project("first").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token: first_token,
+            directory: "first".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "first".into(),
+                explicit: Some(Ok(first)),
+                recovery: None,
+            }),
+        }));
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(first_request)] = requests.as_slice() else {
+            panic!("expected first stage request")
+        };
+        let first_request = (**first_request).clone();
+        app.cancel_project_open().unwrap();
+
+        let newer_midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(12)))
+            .learn_swap(BankId::new(8).unwrap(), 4, midi_note(101))
+            .unwrap();
+        let newer = project_open_document_with_midi(
+            sampler_core::ProjectId::from_bytes([0xb2; 16]),
+            "Newer",
+            8,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+            newer_midi,
+        );
+        let newer_token = app.request_open_project("newer").unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token: newer_token,
+            directory: "newer".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "newer".into(),
+                explicit: Some(Ok(newer)),
+                recovery: None,
+            }),
+        }));
+        assert!(app.maintain_project(Instant::now()));
+        let requests = app.take_worker_requests();
+        let [WorkerRequest::StageProjectSample(newer_request)] = requests.as_slice() else {
+            panic!("expected newer stage request")
+        };
+        let newer_request = (**newer_request).clone();
+        let fingerprint =
+            crate::SourceFingerprint::from_encoded_bytes(path("fixture.wav"), &[]).unwrap();
+
+        assert!(!app.apply_worker_result(staged_project_result(&first_request, fingerprint,)));
+        let Some(super::ProjectOpenOperation::Staging(candidate)) = app.project_open.as_ref()
+        else {
+            panic!("newer candidate must remain staged")
+        };
+        assert_eq!(candidate.document.midi, newer_midi);
+        assert_eq!(
+            candidate.decode_in_flight,
+            Some((pad(0, 0), newer_request.generation))
+        );
+    }
+
+    #[test]
     fn project_open_collects_all_exact_stage_results_before_audio_admission() {
         let audio = FakeAudio::ready(48_000, 2);
         let calls = audio.call_log();
@@ -17342,6 +17458,66 @@ mod tests {
     }
 
     #[test]
+    fn project_open_restore_and_discard_commit_the_chosen_exact_midi_document() {
+        let project_id = sampler_core::ProjectId::from_bytes([0xac; 16]);
+        let explicit_midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(3)))
+            .learn_swap(BankId::new(0).unwrap(), 1, midi_note(70))
+            .unwrap();
+        let recovery_midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(14)))
+            .learn_swap(BankId::new(9).unwrap(), 15, midi_note(7))
+            .unwrap()
+            .unmap(BankId::new(2).unwrap(), 5)
+            .unwrap();
+
+        for (choice, expected) in [
+            (crate::RecoveryChoice::Restore, recovery_midi),
+            (crate::RecoveryChoice::Discard, explicit_midi),
+        ] {
+            let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+            let token = app.request_open_project("choice").unwrap();
+            app.take_worker_requests();
+            assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+                token,
+                directory: "choice".into(),
+                result: Ok(crate::ProjectProbe {
+                    directory: "choice".into(),
+                    explicit: Some(Ok(project_open_document_with_midi(
+                        project_id,
+                        "Explicit",
+                        4,
+                        Vec::new(),
+                        explicit_midi,
+                    ))),
+                    recovery: Some(Ok(project_open_document_with_midi(
+                        project_id,
+                        "Recovery",
+                        6,
+                        Vec::new(),
+                        recovery_midi,
+                    ))),
+                }),
+            }));
+            app.choose_project_recovery(choice).unwrap();
+            if choice == crate::RecoveryChoice::Discard {
+                app.take_worker_requests();
+                assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+                    token,
+                    directory: "choice".into(),
+                    project_id,
+                    revision: 6,
+                    result: Ok(()),
+                }));
+            }
+            while app.project_open_stage().is_some() {
+                assert!(app.maintain_project(Instant::now()));
+            }
+            assert_eq!(app.midi_settings, expected);
+        }
+    }
+
+    #[test]
     fn project_open_discard_cannot_be_cancelled_after_exact_deletion_is_queued() {
         let mut app = project_app();
         let before = app.project_snapshot().unwrap();
@@ -17511,7 +17687,7 @@ mod tests {
 
         assert!(app.maintain_project(Instant::now()));
         assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 3);
         assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
 
         for offset in 0..super::PAD_VIEW_COUNT {
@@ -17548,6 +17724,97 @@ mod tests {
         assert_eq!(app.pad(pad(0, 1)).settings, settings);
         assert_eq!(app.pad(pad(0, 1)).state, PadLoadState::Ready);
         assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Empty);
+    }
+
+    #[test]
+    fn project_open_midi_release_failure_preserves_exact_old_engine_and_app_for_cancel() {
+        let audio =
+            FakeAudio::ready(48_000, 2).failing_owned_release_at(2, "second release rejected");
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.patterns
+            .start_recording(TransportStamp {
+                slot: PatternSlotId::new(0).unwrap(),
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.apply_midi_event(midi_on(2, 37, 127));
+        let old_snapshot = app.project_snapshot().unwrap();
+        let old_owners = app.midi_owned_pads.clone();
+        let old_pattern = app.patterns.selected_pattern().events().to_vec();
+        let candidate_midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(5)))
+            .learn_swap(BankId::new(6).unwrap(), 1, midi_note(99))
+            .unwrap();
+        let document = project_open_document_with_midi(
+            sampler_core::ProjectId::from_bytes([0xa7; 16]),
+            "Candidate",
+            23,
+            Vec::new(),
+            candidate_midi,
+        );
+        stage_project_open(&mut app, "candidate", document);
+        app.arm_midi_learn();
+        let old_learn = app.midi_learn_target();
+        calls.clear();
+
+        assert!(!app.maintain_project(Instant::now()));
+
+        assert!(app.project_open_stage().is_some());
+        assert_eq!(
+            app.project_open_stage().unwrap().phase,
+            crate::ProjectOpenPhase::Staging
+        );
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+        assert_eq!(app.midi_owned_pads, old_owners);
+        assert_eq!(app.patterns.selected_pattern().events(), old_pattern);
+        assert_eq!(app.midi_learn_target(), old_learn);
+        assert!(app.status().contains("second release rejected"));
+        app.cancel_project_open().unwrap();
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+    }
+
+    #[test]
+    fn project_open_midi_release_failure_retries_before_any_candidate_audio() {
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release rejected");
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(2, 36, 127));
+        let candidate_midi =
+            MidiSettings::default().with_channel(MidiChannelFilter::Channel(midi_channel(5)));
+        let document = project_open_document_with_midi(
+            sampler_core::ProjectId::from_bytes([0xa8; 16]),
+            "Candidate",
+            24,
+            Vec::new(),
+            candidate_midi,
+        );
+        stage_project_open(&mut app, "candidate-retry", document);
+        calls.clear();
+
+        assert!(!app.maintain_project(Instant::now()));
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+                AudioCall::StopAll,
+            ]
+        );
+
+        while app.project_open_stage().is_some() {
+            assert!(app.maintain_project(Instant::now()));
+        }
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(app.midi_settings, candidate_midi);
+        assert_eq!(app.project_revision(), 24);
+        assert!(app.midi_owned_pads.iter().all(Option::is_none));
     }
 
     #[test]
@@ -17631,6 +17898,19 @@ mod tests {
         let audio = FakeAudio::ready(48_000, 2).failing_install("install rejected");
         let calls = audio.call_log();
         let mut app = App::with_audio(Box::new(audio));
+        app.patterns
+            .start_recording(TransportStamp {
+                slot: PatternSlotId::new(0).unwrap(),
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.apply_midi_event(midi_on(2, 37, 127));
+        let old_snapshot = app.project_snapshot().unwrap();
+        let old_owners = app.midi_owned_pads.clone();
+        let old_pattern = app.patterns.selected_pattern().events().to_vec();
         let document = project_open_document(
             sampler_core::ProjectId::from_bytes([0x7b; 16]),
             "Project B",
@@ -17638,20 +17918,31 @@ mod tests {
             vec![project_open_pad(pad(0, 0), PadSettings::default())],
         );
         stage_project_open(&mut app, "project-b", document);
+        calls.clear();
         assert!(app.maintain_project(Instant::now()));
-        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+                AudioCall::TrackedOwnedRelease(pad(0, 1), midi_command(2)),
+                AudioCall::StopAll,
+            ]
+        );
 
         assert!(app.maintain_project(Instant::now()));
-        assert_eq!(calls.snapshot(), [AudioCall::StopAll]);
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 3);
 
         assert!(!app.maintain_project(Instant::now()));
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 0);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
         assert!(app.status().contains("committed audio restored"));
+        assert_eq!(app.project_snapshot().unwrap(), old_snapshot);
+        assert_ne!(app.midi_owned_pads, old_owners);
+        assert!(app.midi_owned_pads.iter().all(Option::is_none));
+        assert_eq!(app.patterns.selected_pattern().events(), old_pattern);
 
         assert!(app.maintain_project(Instant::now()));
         assert_eq!(calls.snapshot().last(), Some(&AudioCall::StopAll));
-        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 1);
+        assert_eq!(app.project_open_stage().unwrap().admitted_actions, 2);
     }
 
     #[test]
@@ -17818,6 +18109,48 @@ mod tests {
         );
         assert_eq!(retry.request.directory, first.request.directory);
         assert!(retry.request.save_as);
+    }
+
+    #[test]
+    fn save_as_move_and_fresh_open_preserve_the_exact_midi_settings() {
+        let now = Instant::now();
+        let midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(10)))
+            .learn_swap(BankId::new(1).unwrap(), 6, midi_note(82))
+            .unwrap()
+            .learn_swap(BankId::new(8).unwrap(), 11, midi_note(23))
+            .unwrap()
+            .unmap(BankId::new(5).unwrap(), 4)
+            .unwrap();
+        let mut source = project_app();
+        source.update_midi_settings(midi).unwrap();
+
+        source.request_save_as("first-location").unwrap();
+        assert!(source.maintain_project(now));
+        let first = take_project_save(&mut source);
+        assert_eq!(first.request.snapshot.midi, midi);
+        assert!(source.apply_worker_result(save_result(&first, Vec::new())));
+
+        source.request_save_as("moved-location").unwrap();
+        assert!(source.maintain_project(now + Duration::from_secs(1)));
+        let moved = take_project_save(&mut source);
+        assert!(moved.request.save_as);
+        assert_eq!(moved.request.snapshot.midi, midi);
+        assert!(source.apply_worker_result(save_result(&moved, Vec::new())));
+
+        let mut fresh = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        let document = project_open_document_with_midi(
+            moved.request.snapshot.project_id,
+            &moved.request.snapshot.name,
+            moved.request.snapshot.revision,
+            Vec::new(),
+            moved.request.snapshot.midi,
+        );
+        stage_project_open(&mut fresh, "moved-location", document);
+        while fresh.project_open_stage().is_some() {
+            assert!(fresh.maintain_project(now + Duration::from_secs(2)));
+        }
+        assert_eq!(fresh.midi_settings, midi);
     }
 
     #[test]
@@ -17989,6 +18322,71 @@ mod tests {
         let request = take_project_save(&mut app);
         assert_eq!(request.request.kind, SaveKind::Explicit);
         assert_eq!(request.request.snapshot.revision, app.project_revision());
+    }
+
+    #[test]
+    fn midi_mapping_revision_autosaves_exactly_but_runtime_port_lifecycle_does_not() {
+        let now = Instant::now();
+        let mut mapping = project_app();
+        name_project(&mut mapping, "mapped", now);
+        mapping.request_save().unwrap();
+        assert!(mapping.maintain_project(now));
+        let initial_save = take_project_save(&mut mapping);
+        assert!(mapping.apply_worker_result(save_result(&initial_save, Vec::new())));
+        assert!(mapping.maintain_project(now));
+        let cleanup = take_recovery_cleanup(&mut mapping);
+        assert!(
+            mapping.apply_worker_result(WorkerResult::RecoveryDiscarded {
+                token: cleanup.token,
+                directory: cleanup.directory,
+                project_id: cleanup.project_id,
+                revision: cleanup.revision,
+                result: Ok(()),
+            })
+        );
+        let midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(midi_channel(6)))
+            .learn_swap(BankId::new(0).unwrap(), 2, midi_note(88))
+            .unwrap()
+            .learn_swap(BankId::new(7).unwrap(), 13, midi_note(19))
+            .unwrap()
+            .unmap(BankId::new(3).unwrap(), 9)
+            .unwrap();
+        mapping.update_midi_settings(midi).unwrap();
+        assert!(mapping.maintain_project(now + Duration::from_secs(3)));
+        let recovery = take_project_save(&mut mapping);
+        assert_eq!(recovery.request.kind, SaveKind::Recovery);
+        assert_eq!(recovery.request.snapshot.midi, midi);
+        assert_eq!(
+            recovery.request.snapshot.revision,
+            mapping.project_revision()
+        );
+
+        let (service, _) = fake_midi_service([("a", "Keys")]);
+        let mut runtime = App::with_audio_and_midi(Box::new(FakeAudio::ready(48_000, 2)), service);
+        name_project(&mut runtime, "runtime", now);
+        runtime.request_save().unwrap();
+        assert!(runtime.maintain_project(now));
+        let clean_save = take_project_save(&mut runtime);
+        assert!(runtime.apply_worker_result(save_result(&clean_save, Vec::new())));
+        assert!(runtime.maintain_project(now));
+        let cleanup = take_recovery_cleanup(&mut runtime);
+        assert!(
+            runtime.apply_worker_result(WorkerResult::RecoveryDiscarded {
+                token: cleanup.token,
+                directory: cleanup.directory,
+                project_id: cleanup.project_id,
+                revision: cleanup.revision,
+                result: Ok(()),
+            })
+        );
+        let clean_revision = runtime.project_revision();
+        runtime.list_midi_ports().unwrap();
+        runtime.connect_midi_port(0).unwrap();
+        runtime.disconnect_midi_port().unwrap();
+        assert_eq!(runtime.project_revision(), clean_revision);
+        assert!(!runtime.maintain_project(now + Duration::from_secs(3)));
+        assert!(runtime.take_worker_requests().is_empty());
     }
 
     #[test]
@@ -19049,6 +19447,7 @@ mod tests {
             panic!("project fixture must enter staging")
         };
         candidate.progress.phase = crate::ProjectOpenPhase::Admitting;
+        candidate.admission = super::ProjectAdmission::MidiOwners;
         app.project_open = Some(super::ProjectOpenOperation::Staging(candidate));
         app.apply_midi_event(midi_on(1, 40, 127));
         app.apply_midi_event(midi_off(1, 39));
@@ -19072,6 +19471,7 @@ mod tests {
                 AudioCall::TrackedTrigger(pad(0, 3), 1.0),
                 AudioCall::TrackedTrigger(pad(0, 5), 1.0),
                 AudioCall::TrackedOwnedRelease(pad(0, 3), midi_command(3)),
+                AudioCall::TrackedOwnedRelease(pad(0, 5), midi_command(4)),
                 AudioCall::StopAll,
                 AudioCall::TrackedTrigger(pad(0, 5), 1.0),
             ]
@@ -19226,5 +19626,21 @@ mod tests {
         engine.render_frames(129, |_| {});
 
         assert_eq!(engine.active_voices(), 1);
+    }
+
+    #[test]
+    fn project_snapshot_contains_the_exact_app_owned_midi_settings() {
+        let mut app = project_app();
+        let midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(MidiChannel::new(9).unwrap()))
+            .learn_swap(BankId::new(1).unwrap(), 3, MidiNote::new(90).unwrap())
+            .unwrap()
+            .learn_swap(BankId::new(8).unwrap(), 12, MidiNote::new(17).unwrap())
+            .unwrap()
+            .unmap(BankId::new(4).unwrap(), 6)
+            .unwrap();
+        app.midi_settings = midi;
+
+        assert_eq!(app.project_snapshot().unwrap().midi, midi);
     }
 }

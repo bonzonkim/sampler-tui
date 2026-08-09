@@ -678,6 +678,7 @@ pub struct ProjectSaveSnapshot {
     pub name: String,
     pub revision: u64,
     pub master_mix: MasterMixSettings,
+    pub midi: sampler_core::MidiSettings,
     pub pads: Vec<ProjectSavePad>,
     pub patterns: Vec<ProjectPattern>,
 }
@@ -916,7 +917,7 @@ impl ProjectStore {
             document_pads,
             request.snapshot.patterns.clone(),
             request.snapshot.master_mix,
-            sampler_core::MidiSettings::default(),
+            request.snapshot.midi,
         )?;
         let directory = prepare_project_directory(
             &request.directory,
@@ -1860,7 +1861,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use sampler_core::{PadId, PadSettings, ProjectId, ProjectPattern, SampleEditRecipe};
+    use sampler_core::{
+        BankId, MidiChannel, MidiChannelFilter, MidiNote, MidiSettings, PadId, PadSettings,
+        ProjectId, ProjectPattern, SampleEditRecipe,
+    };
     use sha2::{Digest, Sha256};
 
     use super::*;
@@ -1930,6 +1934,7 @@ mod tests {
                     name: "fixture".to_owned(),
                     revision,
                     master_mix: sampler_core::MasterMixSettings::default(),
+                    midi: sampler_core::MidiSettings::default(),
                     pads: vec![ProjectSavePad {
                         pad: PadId::first(),
                         source_path: self.source.clone(),
@@ -2118,6 +2123,30 @@ mod tests {
             2,
             "valid recovery must survive corrupt explicit metadata"
         );
+    }
+
+    #[test]
+    fn explicit_and_recovery_saves_probe_the_exact_midi_settings() {
+        let fixture = ProjectFixture::new();
+        let midi = MidiSettings::default()
+            .with_channel(MidiChannelFilter::Channel(MidiChannel::new(11).unwrap()))
+            .learn_swap(BankId::new(0).unwrap(), 2, MidiNote::new(81).unwrap())
+            .unwrap()
+            .learn_swap(BankId::new(7).unwrap(), 15, MidiNote::new(12).unwrap())
+            .unwrap()
+            .unmap(BankId::new(3).unwrap(), 4)
+            .unwrap();
+
+        let mut explicit = fixture.request(4, SaveKind::Explicit);
+        explicit.snapshot.midi = midi;
+        fixture.store.save(explicit).unwrap();
+        let mut recovery = fixture.request(5, SaveKind::Recovery);
+        recovery.snapshot.midi = midi;
+        fixture.store.save(recovery).unwrap();
+
+        let probe = fixture.store.probe(&fixture.directory).unwrap();
+        assert_eq!(probe.explicit.unwrap().unwrap().midi, midi);
+        assert_eq!(probe.recovery.unwrap().unwrap().midi, midi);
     }
 
     #[test]

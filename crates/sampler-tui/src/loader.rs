@@ -1096,6 +1096,7 @@ mod tests {
                 name: format!("project-{revision}"),
                 revision,
                 master_mix: sampler_core::MasterMixSettings::default(),
+                midi: sampler_core::MidiSettings::default(),
                 pads: Vec::new(),
                 patterns: Vec::new(),
             },
@@ -1327,6 +1328,7 @@ mod tests {
                             name: "extensionless".to_owned(),
                             revision: 25,
                             master_mix: sampler_core::MasterMixSettings::default(),
+                            midi: sampler_core::MidiSettings::default(),
                             pads: vec![ProjectSavePad {
                                 pad,
                                 source_path: source,

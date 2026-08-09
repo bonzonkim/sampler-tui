@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 
 use sampler_audio::ControlError;
 use sampler_core::{
-    BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
-    PatternSlotId, PlaybackMode, ReverbSettings, SAMPLE_PHASE_SCALE, SampleEditRecipe,
+    BankId, ChokeGroup, DelaySettings, MasterMixSettings, MidiChannel, MidiChannelFilter, MidiNote,
+    PadId, PadMixSettings, PadSettings, PatternSlotId, PlaybackMode, ReverbSettings,
+    SAMPLE_PHASE_SCALE, SampleEditRecipe,
 };
-use sampler_tui::{InputAction, ProjectOpenPhase, ProjectStore, RecoveryChoice, WorkerHandle};
+use sampler_tui::{
+    InputAction, MidiEvent, ProjectOpenPhase, ProjectStore, RecoveryChoice, WorkerHandle,
+};
 
 use mixer_harness::{FixtureTree, Harness};
 
@@ -203,6 +206,46 @@ fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     source.palette("bars 2");
     source.palette("resolution 1/32");
     source.record_hit(7);
+    source.palette("midi-channel 10");
+    source.palette("select 4");
+    source.palette("midi-unmap");
+    source.app.apply(InputAction::BankDelta(1));
+    source.palette("select 7");
+    source.palette("midi-learn");
+    source.app.apply_midi_event(MidiEvent::NoteOn {
+        channel: MidiChannel::new(10).unwrap(),
+        note: MidiNote::new(88).unwrap(),
+        velocity: 100,
+    });
+    source.app.apply(InputAction::BankDelta(-1));
+    source.palette("select 3");
+    source.palette("midi-learn");
+    source.app.apply_midi_event(MidiEvent::NoteOn {
+        channel: MidiChannel::new(10).unwrap(),
+        note: MidiNote::new(80).unwrap(),
+        velocity: 90,
+    });
+    let midi_before_save = source.app.midi_settings();
+    assert_eq!(
+        midi_before_save.channel(),
+        MidiChannelFilter::Channel(MidiChannel::new(10).unwrap())
+    );
+    assert_eq!(
+        midi_before_save.bank(BankId::new(0).unwrap()).note(3),
+        Ok(None)
+    );
+    assert_eq!(
+        midi_before_save
+            .bank(BankId::new(0).unwrap())
+            .owner(MidiNote::new(80).unwrap()),
+        Some(2)
+    );
+    assert_eq!(
+        midi_before_save
+            .bank(BankId::new(1).unwrap())
+            .owner(MidiNote::new(88).unwrap()),
+        Some(6)
+    );
     let editable_before_save = source.app.project_snapshot().unwrap();
     let fingerprint_a = editable_before_save
         .pads
@@ -227,6 +270,7 @@ fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     assert_eq!(document.pads.len(), 2);
     assert_eq!(document.patterns.len(), 16);
     assert_eq!(document.master_mix, master_mix);
+    assert_eq!(document.midi, midi_before_save);
     assert_eq!(
         document
             .pads
@@ -286,6 +330,8 @@ fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     assert_eq!(reopened.app.pad_mix(pad(7)), mix_b);
     assert_eq!(reopened.app.master_mix(), master_mix);
     assert_eq!(after_open.master_mix, master_mix);
+    assert_eq!(after_open.midi, midi_before_save);
+    assert_eq!(reopened.app.midi_settings(), midi_before_save);
     assert_eq!(reopened.app.committed_sample_recipe(pad(0)), Some(recipe_a));
     assert_eq!(reopened.app.committed_sample_recipe(pad(7)), Some(recipe_b));
     let reopened_a = reopened.app.pad(pad(0)).sample.as_ref().unwrap();
@@ -665,8 +711,8 @@ fn mixer_project_open_pad_install_backpressure_rolls_back_before_clean_retry() {
     assert!(target.app.maintain_project(now));
     assert_eq!(
         target.app.project_open_stage().unwrap().admitted_actions,
-        2,
-        "StopAll and master must admit before targeting the first pad install"
+        3,
+        "MIDI release, StopAll, and master must admit before the first pad install"
     );
     target.engine.render_frames(0, |_| {});
     let blocked_progress = target.app.project_open_stage().unwrap().clone();
@@ -694,15 +740,15 @@ fn mixer_project_open_pad_install_backpressure_rolls_back_before_clean_retry() {
     assert!(target.app.maintain_project(now));
     assert_eq!(
         target.app.project_open_stage().unwrap().admitted_actions,
-        0,
-        "rollback completes before candidate admission restarts"
+        1,
+        "rollback retains the already-admitted MIDI release before retry"
     );
     assert!(target.app.maintain_project(now));
     assert!(target.app.maintain_project(now));
     assert!(target.app.maintain_project(now));
     assert_eq!(
         target.app.project_open_stage().unwrap().admitted_actions,
-        3,
+        4,
         "clean retry replays StopAll and master before the first pad install"
     );
     target.finish_open(now);

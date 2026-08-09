@@ -8,8 +8,8 @@ use sampler_audio::{
     audio_channels_with_test_capacities, write_frames,
 };
 use sampler_core::{
-    BankId, EditablePattern, EventId, Meter, PadMixSettings, PatternEvent, PatternSlotId,
-    PlaybackMode, Resolution, Tempo, Transport,
+    BankId, DelaySettings, EditablePattern, EventId, MasterMixSettings, Meter, PadMixSettings,
+    PatternEvent, PatternSlotId, PlaybackMode, Resolution, ReverbSettings, Tempo, Transport,
 };
 
 struct CountingAllocator {
@@ -598,6 +598,81 @@ fn measure_bounded_capture_ownership() {
     assert_eq!(cancelled.stereo().len(), 2);
 }
 
+fn measure_fx_commands_telemetry_and_capture_completion() {
+    let (mut controller, ports) = audio_channels();
+    let mut engine = AudioEngine::new(100, ports).unwrap();
+    let pad = PadId::first();
+    let looping = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
+    controller
+        .install(
+            pad,
+            Arc::new(SampleBuffer::new(100, vec![0.5; 512]).unwrap()),
+            looping,
+            PadMixSettings::new(false, 0.5, 0.5).unwrap(),
+        )
+        .unwrap();
+    controller
+        .update_master_mix(
+            MasterMixSettings::new(
+                0.0,
+                DelaySettings::new(true, 20, 0.25, -6.0).unwrap(),
+                ReverbSettings::new(true, 0.5, 0.25, -6.0).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    engine.render_frames(16, |_| {});
+
+    let capture = CaptureBuffer::try_new(800, pad, CaptureSource::Resample, 100, 32).unwrap();
+    let capture_allocation = capture.stereo().as_ptr();
+    controller.arm_capture(capture).unwrap();
+    engine.render_frames(0, |_| {});
+    controller.start_capture(800).unwrap();
+    controller
+        .update_pad(
+            pad,
+            PadSettings::new(PlaybackMode::Loop, -3.0, -0.5, 0.0, None).unwrap(),
+        )
+        .unwrap();
+    controller
+        .update_pad_mix(pad, PadMixSettings::new(false, 1.0, 0.75).unwrap())
+        .unwrap();
+    controller
+        .update_master_mix(
+            MasterMixSettings::new(
+                -1.0,
+                DelaySettings::new(true, 10, 0.5, -3.0).unwrap(),
+                ReverbSettings::new(true, 0.8, 0.4, -3.0).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    controller
+        .trigger(pad, engine.rendered_frame(), 1.0)
+        .unwrap();
+    assert!(controller.latest_telemetry().is_some());
+
+    assert_zero_callback_activity("fx commands, telemetry, and capture completion", || {
+        engine.render_frames(64, |_| {});
+    });
+
+    assert!(engine.active_voices() > 0);
+    assert!(controller.latest_telemetry().is_some());
+    let status = controller
+        .capture_status()
+        .expect("measured callback must publish capture progress");
+    assert_eq!(status.state, CaptureState::Idle);
+    assert_eq!(status.frames, 32);
+    assert!(status.peak > 0.0);
+    assert!(status.hard_limit);
+    let Some(CaptureOutcome::Completed(completion)) = controller.try_capture_completion() else {
+        panic!("measured callback must publish capture completion")
+    };
+    assert_eq!(completion.stereo.as_ptr(), capture_allocation);
+    assert_eq!(completion.stereo.len(), 64);
+    assert!(completion.hard_limit);
+}
+
 #[test]
 fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_warmed_loop_render();
@@ -614,4 +689,5 @@ fn callback_scenarios_allocate_and_deallocate_nothing() {
     measure_pattern_playback_acknowledgement_and_retirement();
     measure_exact_duration_pattern_releases();
     measure_bounded_capture_ownership();
+    measure_fx_commands_telemetry_and_capture_completion();
 }

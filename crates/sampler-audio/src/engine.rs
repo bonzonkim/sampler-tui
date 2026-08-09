@@ -2396,6 +2396,90 @@ mod tests {
     }
 
     #[test]
+    fn post_master_fx_capture_matches_the_final_output_bitwise() {
+        fn render_fixture(
+            master: MasterMixSettings,
+            capture_token: Option<u64>,
+        ) -> (Vec<[f32; 2]>, Option<CaptureOutcome>) {
+            let (mut controller, ports) = audio_channels();
+            let mut engine = AudioEngine::new(1_000, ports).unwrap();
+            let pad = PadId::first();
+            let mut impulse = vec![0.0; 512];
+            impulse[0] = 1.0;
+            controller
+                .install(
+                    pad,
+                    Arc::new(SampleBuffer::new(1_000, impulse).unwrap()),
+                    PadSettings::new(PlaybackMode::OneShot, 0.0, -1.0, 0.0, None).unwrap(),
+                    PadMixSettings::new(false, 1.0, 1.0).unwrap(),
+                )
+                .unwrap();
+            controller.update_master_mix(master).unwrap();
+            engine.render_frames(128, |_| {});
+
+            if let Some(token) = capture_token {
+                controller
+                    .arm_capture(resample_buffer(token, pad, 1_000, 512))
+                    .unwrap();
+                engine.render_frames(0, |_| {});
+                controller.start_capture(token).unwrap();
+                engine.render_frames(0, |_| {});
+            }
+
+            controller
+                .trigger(pad, engine.rendered_frame(), 1.0)
+                .unwrap();
+            let mut rendered = Vec::with_capacity(256);
+            engine.render_frames(256, |frame| rendered.push(frame));
+
+            let completion = capture_token.map(|token| {
+                controller.stop_capture(token).unwrap();
+                engine.render_frames(0, |_| {});
+                let CaptureOutcome::Completed(completion) = controller
+                    .try_capture_completion()
+                    .expect("post-master capture completion")
+                else {
+                    panic!("post-master capture must complete")
+                };
+                completion
+            });
+            (rendered, completion.map(CaptureOutcome::Completed))
+        }
+
+        let dry = render_fixture(MasterMixSettings::default(), None).0;
+        let effects = MasterMixSettings::new(
+            0.0,
+            DelaySettings::new(true, 10, 0.5, 0.0).unwrap(),
+            ReverbSettings::new(true, 0.8, 0.4, 0.0).unwrap(),
+        )
+        .unwrap();
+        let (rendered, completion) = render_fixture(effects, Some(201));
+        let Some(CaptureOutcome::Completed(completion)) = completion else {
+            panic!("post-master capture fixture must return a completion")
+        };
+
+        assert_eq!(completion.stereo.len(), rendered.len() * 2);
+        for (captured, output) in completion.stereo.chunks_exact(2).zip(&rendered) {
+            assert_eq!(
+                [captured[0].to_bits(), captured[1].to_bits()],
+                [output[0].to_bits(), output[1].to_bits()],
+                "capture must contain the exact final post-master output"
+            );
+        }
+        assert!(
+            completion
+                .stereo
+                .chunks_exact(2)
+                .zip(&dry)
+                .any(|(captured, dry)| {
+                    captured[0].to_bits() != dry[0].to_bits()
+                        || captured[1].to_bits() != dry[1].to_bits()
+                }),
+            "enabled effects must differ from the default dry render"
+        );
+    }
+
+    #[test]
     fn resample_capture_status_is_copy_only_and_hard_limit_stops_exactly() {
         fn assert_copy<T: Copy>(_: T) {}
 

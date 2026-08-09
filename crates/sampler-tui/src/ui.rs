@@ -18,13 +18,14 @@ use crate::{
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const HELP_LINES: [&str; 20] = [
+const HELP_LINES: [&str; 21] = [
     "Tab / Shift+Tab: cycle Perform / Pattern / Sample / Mixer",
     "PATTERN: Space play/stop · Ctrl+R overdub · ,/. previous/next",
     "Arrows/PgUp/PgDn cursor/bar · Enter/Delete toggle/remove",
     "+ / - / u / Ctrl+Delete: velocity / undo / clear",
     "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
-    "Apply is in-memory only · Source file unchanged · pitch/mode controls",
+    "Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
+    "plain z remains pad 13; Apply is in-memory only; Source file unchanged",
     "MIXER: Ctrl+Left/Right section · Up/Down field · Left/Right edit",
     "Enter toggle · Backspace reset · Esc Perform",
     "unsupported edits: use : command palette",
@@ -35,7 +36,7 @@ const HELP_LINES: [&str; 20] = [
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
     "CAPTURE: resample · record-input · capture-stop · capture-cancel",
-    "Enter stop · Esc review · Finalize · Discard · Cancel explicit",
+    "Recording: Enter stop · Esc review discard · pads/pattern stay live",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
     "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
     "Ctrl+Q / Ctrl+C quit · Esc or ? close help · Ctrl+R retries audio",
@@ -1876,7 +1877,10 @@ mod tests {
         assert!(screen.contains("Note On 0=Off"));
         assert!(screen.contains("notes 36..51 map to pads 1..16 in every bank"));
         assert!(screen.contains("Enter toggle · Backspace reset · Esc Perform"));
-        assert!(screen.contains("Finalize · Discard · Cancel explicit"));
+        assert!(screen.contains("Up/Down pitch · o/g/l mode"));
+        assert!(screen.contains("Ctrl+Z undo"));
+        assert!(screen.contains("plain z remains pad 13"));
+        assert!(screen.contains("pads/pattern stay live"));
     }
 
     #[test]

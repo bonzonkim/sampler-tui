@@ -1625,15 +1625,15 @@ use std::{array, sync::Arc};
 use sampler_audio::{LiveAck, LiveAckKind, LiveCommandId, Telemetry, TransportStamp};
 use sampler_core::pattern::scale_frame_phase;
 use sampler_core::{
-    BankId, EditablePattern, EventId, Meter, PATTERN_SLOT_COUNT, PadId, PatternCompileError,
-    PatternEditError, PatternEvent, PatternSlotId, PatternSnapshot, ProjectError, ProjectPattern,
-    Resolution, Tempo, Transport,
+    BankId, EditablePattern, EventId, MIDI_OWNERSHIP_COUNT, Meter, PATTERN_SLOT_COUNT, PadId,
+    PatternCompileError, PatternEditError, PatternEvent, PatternSlotId, PatternSnapshot,
+    ProjectError, ProjectPattern, Resolution, Tempo, Transport,
 };
 
 use crate::AudioPort;
 
 pub const MAX_RECORDING_KEYS: usize = 16;
-const MAX_LIVE_RECORDING_KEYS: usize = MAX_RECORDING_KEYS + 16 * 128;
+const MAX_LIVE_RECORDING_KEYS: usize = MAX_RECORDING_KEYS + MIDI_OWNERSHIP_COUNT;
 pub const MAX_ACKS_PER_MAINTENANCE: usize = 64;
 /// Maximum loop-length transitions retained while Gate/Loop acknowledgements are outstanding.
 ///

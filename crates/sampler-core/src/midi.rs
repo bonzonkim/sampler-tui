@@ -5,6 +5,10 @@ use crate::{
     pad::{BANK_COUNT, PADS_PER_BANK},
 };
 
+pub const MIDI_CHANNEL_COUNT: usize = 16;
+pub const MIDI_NOTE_COUNT: usize = 128;
+pub const MIDI_OWNERSHIP_COUNT: usize = MIDI_CHANNEL_COUNT * MIDI_NOTE_COUNT;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub struct MidiNote(u8);
@@ -314,7 +318,10 @@ mod tests {
 
     use crate::{BankId, ModelError};
 
-    use super::{MidiBankMap, MidiChannel, MidiChannelFilter, MidiNote, MidiSettings};
+    use super::{
+        MIDI_CHANNEL_COUNT, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MidiBankMap, MidiChannel,
+        MidiChannelFilter, MidiNote, MidiSettings,
+    };
 
     const DEFAULT_NOTES: [u8; 16] = [
         36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
@@ -326,6 +333,13 @@ mod tests {
 
     fn bank(value: u8) -> BankId {
         BankId::new(value).unwrap()
+    }
+
+    #[test]
+    fn midi_ownership_dimensions_cover_every_channel_note_pair() {
+        assert_eq!(MIDI_CHANNEL_COUNT, 16);
+        assert_eq!(MIDI_NOTE_COUNT, 128);
+        assert_eq!(MIDI_OWNERSHIP_COUNT, 2_048);
     }
 
     #[test]

@@ -195,6 +195,42 @@ mod tests {
     }
 
     #[test]
+    fn production_batch_admits_every_reachable_midi_owner_atomically() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        let target = LiveCommandId::new(40).unwrap();
+        let releases = vec![(pad, target); MIDI_OWNERSHIP_COUNT];
+
+        let ids = controller.release_owned_live_batch(&releases).unwrap();
+
+        assert_eq!(ids.len(), MIDI_OWNERSHIP_COUNT);
+        for expected_id in ids {
+            assert!(matches!(
+                ports.immediate_commands.pop().unwrap(),
+                AudioCommand::ReleaseOwnedLive { id, .. } if id == expected_id
+            ));
+        }
+    }
+
+    #[test]
+    fn production_batch_rejects_one_over_reachable_midi_owner_limit_without_partial_admission() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        let target = LiveCommandId::new(40).unwrap();
+        let releases = vec![(pad, target); MIDI_OWNERSHIP_COUNT + 1];
+
+        assert_eq!(
+            controller.release_owned_live_batch(&releases),
+            Err(ControlError::CommandQueueFull)
+        );
+        assert!(ports.immediate_commands.pop().is_err());
+        assert_eq!(
+            controller.trigger_live_tracked(pad, 1.0).unwrap(),
+            LiveCommandId::FIRST
+        );
+    }
+
+    #[test]
     fn live_command_ids_admit_max_once_then_report_exhaustion() {
         let (mut controller, mut ports) = audio_channels();
         controller.set_next_live_id_for_test(u64::MAX);
@@ -883,7 +919,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use rtrb::{Consumer, PeekError, PopError, Producer, RingBuffer};
 use sampler_core::{
-    Frame, MasterMixSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PatternSnapshot,
+    Frame, MIDI_OWNERSHIP_COUNT, MasterMixSettings, PadId, PadMixSettings, PadSettings,
+    PatternSlotId, PatternSnapshot,
 };
 
 use crate::{
@@ -892,7 +929,7 @@ use crate::{
     SampleSlot, capture_channels,
 };
 
-pub const COMMAND_CAPACITY: usize = 1024;
+pub const COMMAND_CAPACITY: usize = MIDI_OWNERSHIP_COUNT;
 pub const RECOVERY_COMMAND_CAPACITY: usize = 32;
 pub const RETIREMENT_CAPACITY: usize = 256;
 pub const TELEMETRY_CAPACITY: usize = 64;

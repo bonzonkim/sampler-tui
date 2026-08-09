@@ -13,8 +13,9 @@ use sampler_audio::{
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, MasterMixSettings, MidiChannelFilter, MidiNote, MidiSettings, PadId, PadMixSettings,
-    PadSettings, PatternSlotId, PlaybackMode, ProjectDocument, ProjectId, SampleEditRecipe,
+    BankId, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MasterMixSettings, MidiChannelFilter, MidiNote,
+    MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PlaybackMode, ProjectDocument,
+    ProjectId, SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -49,7 +50,6 @@ pub const PAD_VIEW_COUNT: usize = 160;
 pub const EDIT_PREVIEW_COLUMNS: usize = 1_024;
 pub const PREVIEW_COLUMNS: usize = 64;
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
-const MIDI_OWNERSHIP_COUNT: usize = 16 * 128;
 const MIDI_RECORDING_KEY_OFFSET: usize = PADS_PER_BANK as usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5940,9 +5940,10 @@ impl App {
         }
         self.ensure_project_mutation_available()?;
         self.release_midi_owners_where(|owner, owned| {
-            let channel = sampler_core::MidiChannel::new((owner / 128 + 1) as u8)
+            let channel = sampler_core::MidiChannel::new((owner / MIDI_NOTE_COUNT + 1) as u8)
                 .expect("MIDI ownership channel is bounded");
-            let note = MidiNote::new((owner % 128) as u8).expect("MIDI ownership note is bounded");
+            let note = MidiNote::new((owner % MIDI_NOTE_COUNT) as u8)
+                .expect("MIDI ownership note is bounded");
             let remains_mapped = candidate.channel().accepts(channel)
                 && candidate.bank(owned.pad.bank()).owner(note) == Some(owned.pad.index());
             !remains_mapped
@@ -11235,7 +11236,7 @@ fn pad_offset(pad: PadId) -> usize {
 }
 
 fn midi_owner_index(channel: u8, note: u8) -> usize {
-    usize::from(channel - 1) * 128 + usize::from(note)
+    usize::from(channel - 1) * MIDI_NOTE_COUNT + usize::from(note)
 }
 
 fn pad_from_offset(offset: usize) -> PadId {
@@ -11320,7 +11321,8 @@ mod tests {
     };
 
     use super::{
-        App, EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, RecoveryCleanup,
+        App, EDIT_PREVIEW_COLUMNS, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MidiOwnedVoice,
+        PADS_PER_BANK, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, RecoveryCleanup,
         SampleEditStatus,
     };
     use crate::pattern::{PatternWorkspace, WorkspaceView};
@@ -18326,7 +18328,7 @@ mod tests {
     }
 
     fn midi_owner_index(channel: u8, note: u8) -> usize {
-        usize::from(channel - 1) * 128 + usize::from(note)
+        usize::from(channel - 1) * MIDI_NOTE_COUNT + usize::from(note)
     }
 
     fn midi_command(value: u64) -> LiveCommandId {
@@ -18475,6 +18477,25 @@ mod tests {
         assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
         assert!(app.midi_owned_pads[midi_owner_index(2, 37)].is_some());
         assert_eq!(app.patterns.selected_pattern().events(), before_pattern);
+    }
+
+    #[test]
+    fn midi_collective_release_admits_the_exact_maximum_ownership_table_on_production_audio() {
+        let (audio, controller, mut engine) = EngineAudio::harness(48_000);
+        let mut app = App::with_audio(Box::new(audio));
+        engine.render_frames(1, |_| {});
+        assert_eq!(app.midi_owned_pads.len(), MIDI_OWNERSHIP_COUNT);
+        for (index, owner) in app.midi_owned_pads.iter_mut().enumerate() {
+            *owner = Some(MidiOwnedVoice {
+                pad: pad(0, (index % usize::from(PADS_PER_BANK)) as u8),
+                trigger_id: LiveCommandId::new((index + 1) as u64).unwrap(),
+            });
+        }
+
+        app.release_all_midi_owners().unwrap();
+
+        assert!(app.midi_owned_pads.iter().all(Option::is_none));
+        assert_eq!(controller.borrow().command_overflows(), 0);
     }
 
     #[test]

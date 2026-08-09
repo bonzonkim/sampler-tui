@@ -9,7 +9,10 @@ pub mod transport;
 pub mod voice;
 
 pub use error::{PatternCompileError, PatternEditError, SampleEditError};
-pub use midi::{MidiBankMap, MidiChannel, MidiChannelFilter, MidiNote, MidiSettings};
+pub use midi::{
+    MIDI_CHANNEL_COUNT, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MidiBankMap, MidiChannel,
+    MidiChannelFilter, MidiNote, MidiSettings,
+};
 pub use mixer::{DelaySettings, MasterMixSettings, PadMixSettings, ReverbSettings};
 pub use pad::{BankId, ChokeGroup, ModelError, PadId, PadSettings, PlaybackMode};
 pub use pattern::{

@@ -191,14 +191,21 @@ fn measure_live_and_recovery_command_ingestion() {
             PadMixSettings::default(),
         )
         .unwrap();
-    controller.trigger_live(PadId::first(), 0.75).unwrap();
-    controller.release_live(PadId::first()).unwrap();
+    let trigger = controller
+        .trigger_live_tracked(PadId::first(), 0.75)
+        .unwrap();
+    controller
+        .release_owned_live_tracked(PadId::first(), trigger)
+        .unwrap();
 
-    assert_zero_callback_activity("live and recovery command ingestion", || {
-        engine.render_frames(32, |_| {});
-        engine.render_frames(32, |_| {});
-        engine.render_frames(1, |_| {});
-    });
+    assert_zero_callback_activity(
+        "tracked owned-release and recovery command ingestion",
+        || {
+            engine.render_frames(32, |_| {});
+            engine.render_frames(32, |_| {});
+            engine.render_frames(1, |_| {});
+        },
+    );
     assert_eq!(engine.executed_triggers(), 1);
 
     let invalid = Arc::new(SampleBuffer::new(44_100, vec![0.25; 16]).unwrap());

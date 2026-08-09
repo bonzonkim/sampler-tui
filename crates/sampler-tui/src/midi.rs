@@ -1203,7 +1203,11 @@ mod tests {
                     assert!(!port.backend_id().is_empty());
                 }
             }
-            Err(MidiServiceError::BackendInit(_)) | Err(MidiServiceError::PortEnumeration(_)) => {}
+            Err(MidiServiceError::BackendInit(_))
+            | Err(MidiServiceError::PortEnumeration(_))
+            // A physical port may disappear between the backend snapshot and its name lookup;
+            // that environmental hotplug race does not make this hardware-independent smoke fail.
+            | Err(MidiServiceError::PortName { .. }) => {}
             Err(error) => panic!("unexpected real MIDI discovery error: {error}"),
         }
     }

@@ -51,8 +51,28 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static COUNTS: CountingAllocator = CountingAllocator::new();
 
+fn calibrate_counting_allocator() {
+    COUNTS.reset_and_enable();
+    let allocation = Box::new([0_u8; 64]);
+    std::hint::black_box(allocation.as_ptr());
+    COUNTS.disable();
+    assert!(
+        COUNTS.allocations.load(Ordering::Relaxed) > 0,
+        "calibration allocation must be observable"
+    );
+
+    COUNTS.reset_and_enable();
+    drop(allocation);
+    COUNTS.disable();
+    assert!(
+        COUNTS.deallocations.load(Ordering::Relaxed) > 0,
+        "calibration deallocation must be observable"
+    );
+}
+
 #[test]
 fn callback_parse_push_and_full_ring_overflow_allocate_and_deallocate_nothing() {
+    calibrate_counting_allocator();
     let (mut producer, consumer) = midi_ingress();
     let note_on = [0x90, 60, 100];
     let unsupported = [0xb0, 1, 127];

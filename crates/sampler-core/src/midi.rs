@@ -427,6 +427,12 @@ mod tests {
     #[test]
     fn learn_swap_deterministically_preserves_the_displaced_assignment_and_uniqueness() {
         let original = MidiBankMap::default();
+        assert_eq!(original.learn_swap(0, note(36)), Ok(original));
+        assert_eq!(
+            original.learn_swap(16, note(60)),
+            Err(ModelError::PadOutOfRange(16))
+        );
+
         let swapped = original.learn_swap(0, note(40)).unwrap();
         assert_eq!(swapped.note(0).unwrap(), Some(note(40)));
         assert_eq!(swapped.note(4).unwrap(), Some(note(36)));
@@ -446,6 +452,10 @@ mod tests {
     #[test]
     fn settings_operations_replace_only_the_requested_bank_and_return_candidates() {
         let original = MidiSettings::default();
+        assert_eq!(
+            original.learn_swap(bank(0), 16, note(60)),
+            Err(ModelError::PadOutOfRange(16))
+        );
         let mapped = original.map(bank(3), 2, note(90)).unwrap();
         assert_eq!(original.bank(bank(3)).note(2).unwrap(), Some(note(38)));
         assert_eq!(mapped.bank(bank(3)).note(2).unwrap(), Some(note(90)));
@@ -539,6 +549,10 @@ mod tests {
             toml::from_str::<MidiBankMap>(&valid).unwrap(),
             MidiBankMap::default()
         );
+        assert!(
+            toml::from_str::<MidiBankMap>(&format!("{valid}\nunknown = true")).is_err(),
+            "standalone bank maps must reject unknown fields"
+        );
 
         let duplicate = "notes = [36, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51]";
         assert!(toml::from_str::<MidiBankMap>(duplicate).is_err());
@@ -550,6 +564,10 @@ mod tests {
         assert_eq!(
             toml::from_str::<MidiSettings>(&serialized).unwrap(),
             default
+        );
+        assert!(
+            toml::from_str::<MidiSettings>(&format!("unknown = true\n{serialized}")).is_err(),
+            "standalone MIDI settings must reject unknown fields"
         );
         let duplicated_settings = serialized.replacen("36, 37", "36, 36", 1);
         assert!(toml::from_str::<MidiSettings>(&duplicated_settings).is_err());

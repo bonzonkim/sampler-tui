@@ -7,6 +7,7 @@ pub mod diagnostic;
 pub mod file_picker;
 pub mod input;
 pub mod loader;
+pub mod midi;
 pub mod mixer;
 pub mod palette;
 pub mod pattern;
@@ -35,6 +36,10 @@ pub use loader::{
     MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, ProjectSaveWorkerRequest, ProjectToken,
     RenderedSample, StageProjectSampleRequest, WorkerHandle, WorkerPanicked, WorkerRequest,
     WorkerResult, WorkerSendError, WorkerSendFailure, downsample_preview,
+};
+pub use midi::{
+    MAX_MIDI_DRAIN, MIDI_INGRESS_CAPACITY, MidiEvent, MidiIngressConsumer, MidiIngressProducer,
+    midi_ingress, parse_midi_message,
 };
 pub use mixer::{
     DelayField, MasterField, MixerAction, MixerContext, MixerCursor, MixerIntent, MixerSection,

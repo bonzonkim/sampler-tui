@@ -10,6 +10,7 @@ crossterm.workspace = true
 getrandom.workspace = true
 hound = "3.5.1"
 ratatui.workspace = true
+rtrb.workspace = true
 sampler-audio = { path = "../sampler-audio" }
 sampler-core = { path = "../sampler-core" }
 rustix.workspace = true

@@ -533,6 +533,8 @@ pub enum OfflineExportError {
     TokenExhausted,
     #[error("offline export was cancelled")]
     Cancelled,
+    #[error("offline export request panicked")]
+    ExportPanicked,
     #[error("offline export snapshot was not created from a persisted project")]
     SnapshotNotProjectBacked,
     #[error("offline export project source staging failed: {0}")]

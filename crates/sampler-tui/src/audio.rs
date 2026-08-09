@@ -1111,6 +1111,9 @@ pub fn open_default_audio() -> Result<Box<dyn AudioPort>, String> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::count_test_thread_allocations;
+
+#[cfg(test)]
 mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::{Cell, RefCell};
@@ -1148,16 +1151,63 @@ mod tests {
 
     thread_local! {
         static IS_APP_OWNER_THREAD: Cell<bool> = const { Cell::new(false) };
+        static TEST_ALLOCATION_COUNTS: Cell<Option<TestAllocationCounts>> = const { Cell::new(None) };
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct TestAllocationCounts {
+        pub(crate) allocations: usize,
+        pub(crate) deallocations: usize,
+    }
+
+    pub(crate) fn count_test_thread_allocations<T>(
+        operation: impl FnOnce() -> T,
+    ) -> (T, TestAllocationCounts) {
+        struct Reset;
+
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ALLOCATION_COUNTS.with(|counts| counts.set(None));
+            }
+        }
+
+        TEST_ALLOCATION_COUNTS.with(|counts| {
+            assert!(
+                counts.get().is_none(),
+                "allocation tracking cannot be nested"
+            );
+            counts.set(Some(TestAllocationCounts {
+                allocations: 0,
+                deallocations: 0,
+            }));
+        });
+        let reset = Reset;
+        let result = operation();
+        let counts = TEST_ALLOCATION_COUNTS.with(Cell::get).unwrap();
+        drop(reset);
+        (result, counts)
     }
 
     // SAFETY: Every operation delegates to `System` with the unchanged pointer/layout contract.
     unsafe impl GlobalAlloc for CaptureTrackingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = TEST_ALLOCATION_COUNTS.try_with(|counts| {
+                if let Some(mut current) = counts.get() {
+                    current.allocations += 1;
+                    counts.set(Some(current));
+                }
+            });
             // SAFETY: The caller provides the allocation layout required by `GlobalAlloc`.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            let _ = TEST_ALLOCATION_COUNTS.try_with(|counts| {
+                if let Some(mut current) = counts.get() {
+                    current.deallocations += 1;
+                    counts.set(Some(current));
+                }
+            });
             if TRACKED_ALLOCATION
                 .compare_exchange(pointer as usize, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()

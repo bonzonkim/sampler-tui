@@ -208,6 +208,7 @@ pub struct AtomicWavPublisher {
     destination_leaf: std::ffi::OsString,
     destination: PathBuf,
     written_frames: u64,
+    publication_linked: bool,
     io: PublisherIo,
     #[cfg(test)]
     mutation_hook: MutationHook,
@@ -301,6 +302,7 @@ impl AtomicWavPublisher {
             destination_leaf,
             destination: destination.to_path_buf(),
             written_frames: 0,
+            publication_linked: false,
             io,
             #[cfg(test)]
             mutation_hook,
@@ -369,7 +371,9 @@ impl AtomicWavPublisher {
             &self.parent,
             Path::new(&self.destination_leaf),
         ) {
-            Ok(NoReplacePublication::Published) => {}
+            Ok(NoReplacePublication::Published) => {
+                self.publication_linked = true;
+            }
             Ok(NoReplacePublication::DestinationExists) => {
                 return Err(OfflineExportError::DestinationExists(
                     self.destination.clone(),
@@ -389,6 +393,7 @@ impl AtomicWavPublisher {
                 Err(cleanup) => Err(cleanup),
             };
         }
+        self.publication_linked = false;
 
         Ok(OfflineExportReceipt {
             token,
@@ -443,6 +448,7 @@ impl AtomicWavPublisher {
             path: self.destination.clone(),
             kind: io::Error::from(error).kind(),
         })?;
+        self.publication_linked = false;
         self.io
             .sync_directory(&self.parent)
             .map_err(|error| OfflineExportError::Cleanup {
@@ -457,6 +463,14 @@ impl AtomicWavPublisher {
     #[cfg(test)]
     fn mutate(&mut self, point: PublisherCheckpoint) {
         (self.mutation_hook)(point);
+    }
+}
+
+impl Drop for AtomicWavPublisher {
+    fn drop(&mut self) {
+        if self.publication_linked {
+            let _ = self.rollback_publication();
+        }
     }
 }
 

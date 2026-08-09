@@ -3,8 +3,9 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -362,11 +363,29 @@ struct ExportProgressSnapshot {
     total_units: u64,
 }
 
-#[derive(Default)]
 struct CoalescedExportProgress {
-    latest: AtomicPtr<ExportProgressSnapshot>,
+    sender: crossbeam_channel::Sender<ExportProgressSnapshot>,
+    receiver: crossbeam_channel::Receiver<ExportProgressSnapshot>,
     #[cfg(test)]
     consumer_gate: Mutex<()>,
+}
+
+impl Default for CoalescedExportProgress {
+    fn default() -> Self {
+        let (sender, receiver) = crossbeam_channel::bounded(PROGRESS_CHANNEL_CAPACITY);
+        #[cfg(test)]
+        let consumer_gate = {
+            let gate = Mutex::new(());
+            drop(gate.lock().unwrap_or_else(|error| error.into_inner()));
+            gate
+        };
+        Self {
+            sender,
+            receiver,
+            #[cfg(test)]
+            consumer_gate,
+        }
+    }
 }
 
 impl CoalescedExportProgress {
@@ -380,17 +399,31 @@ impl CoalescedExportProgress {
             debug_assert!(false, "progress slot accepts only export progress");
             return;
         };
-        let next = Box::into_raw(Box::new(ExportProgressSnapshot {
+        let next = ExportProgressSnapshot {
             token,
             completed_units,
             total_units,
-        }));
-        let previous = self.latest.swap(next, Ordering::AcqRel);
-        if !previous.is_null() {
-            // SAFETY: every non-null pointer in `latest` originates from `Box::into_raw`. Atomic
-            // swap transfers the single slot ownership to exactly one producer or consumer; no
-            // thread dereferences a pointer without first removing it from the slot.
-            unsafe { drop(Box::from_raw(previous)) };
+        };
+        match self.sender.try_send(next) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(next)) => {
+                // Production has one progress producer: the loader worker. The only race is the
+                // consumer removing the stale value first, so this nonblocking drain followed by
+                // one nonblocking retry always installs `next` without waiting.
+                let _ = self.receiver.try_recv();
+                match self.sender.try_send(next) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        unreachable!("the progress slot has exactly one producer")
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        unreachable!("the progress slot owns both channel endpoints")
+                    }
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                unreachable!("the progress slot owns both channel endpoints")
+            }
         }
     }
 
@@ -400,29 +433,14 @@ impl CoalescedExportProgress {
             .consumer_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let snapshot = self.latest.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if snapshot.is_null() {
-            return None;
-        }
-        // SAFETY: the swap removed the pointer from the only shared slot and transferred its
-        // unique Box ownership to this consumer. The producer can no longer observe or free it.
-        let snapshot = unsafe { Box::from_raw(snapshot) };
-        Some(WorkerResult::ExportProgress {
-            token: snapshot.token,
-            completed_units: snapshot.completed_units,
-            total_units: snapshot.total_units,
-        })
-    }
-}
-
-impl Drop for CoalescedExportProgress {
-    fn drop(&mut self) {
-        let snapshot = *self.latest.get_mut();
-        if !snapshot.is_null() {
-            // SAFETY: `&mut self` proves no concurrent access. The remaining pointer still has
-            // the unique Box ownership installed by `publish` and was never removed by `take`.
-            unsafe { drop(Box::from_raw(snapshot)) };
-        }
+        self.receiver
+            .try_recv()
+            .ok()
+            .map(|snapshot| WorkerResult::ExportProgress {
+                token: snapshot.token,
+                completed_units: snapshot.completed_units,
+                total_units: snapshot.total_units,
+            })
     }
 }
 
@@ -938,7 +956,17 @@ fn worker_loop_with_store_and_asset_hook(
                 let revision = request.snapshot().revision();
                 let destination = request.destination().to_path_buf();
                 let cancel = request.cancellation();
-                let result = run_export(request, &export_progress, &hooks);
+                let result = match catch_unwind(AssertUnwindSafe(|| {
+                    run_export(request, &export_progress, &hooks)
+                })) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        // Panic payloads can have a destructor that panics. Forget the opaque
+                        // payload so disposal cannot escape this request-scoped catch boundary.
+                        std::mem::forget(payload);
+                        Err(OfflineExportError::ExportPanicked)
+                    }
+                };
                 export_cancels.remove(&cancel);
                 WorkerResult::ExportFinished {
                     token,
@@ -1430,7 +1458,7 @@ mod tests {
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1819,13 +1847,20 @@ mod tests {
 
     #[test]
     fn coalesced_export_progress_retains_the_latest_update_under_consumer_contention() {
-        let progress = CoalescedExportProgress::default();
+        let progress = Arc::new(CoalescedExportProgress::default());
         progress.publish(WorkerResult::ExportProgress {
             token: crate::ExportToken::new(1),
             completed_units: 1,
             total_units: 8,
         });
         let held = progress.consumer_gate.lock().unwrap();
+        let consumer_progress = Arc::clone(&progress);
+        let (started_sender, started_receiver) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            consumer_progress.take()
+        });
+        started_receiver.recv().unwrap();
 
         progress.publish(WorkerResult::ExportProgress {
             token: crate::ExportToken::new(2),
@@ -1835,13 +1870,65 @@ mod tests {
         drop(held);
 
         assert_eq!(
-            progress.take(),
+            consumer.join().unwrap(),
             Some(WorkerResult::ExportProgress {
                 token: crate::ExportToken::new(2),
                 completed_units: 7,
                 total_units: 8,
             })
         );
+    }
+
+    #[test]
+    fn coalesced_export_progress_allocates_only_during_construction() {
+        let (calibration, allocation_counts) =
+            crate::audio::count_test_thread_allocations(|| Box::new([0_u8; 64]));
+        assert!(allocation_counts.allocations > 0);
+        let (_, deallocation_counts) =
+            crate::audio::count_test_thread_allocations(|| drop(calibration));
+        assert!(deallocation_counts.deallocations > 0);
+
+        let (progress, construction_counts) =
+            crate::audio::count_test_thread_allocations(CoalescedExportProgress::default);
+        assert!(construction_counts.allocations > 0);
+        assert_eq!(construction_counts.deallocations, 0);
+
+        let (_, baseline_counts) = crate::audio::count_test_thread_allocations(|| ());
+        assert_eq!(baseline_counts.allocations, 0);
+        assert_eq!(baseline_counts.deallocations, 0);
+        let (_, empty_take_counts) =
+            crate::audio::count_test_thread_allocations(|| std::hint::black_box(progress.take()));
+        assert_eq!(empty_take_counts.allocations, 0);
+        assert_eq!(empty_take_counts.deallocations, 0);
+        let (_, first_publish_counts) = crate::audio::count_test_thread_allocations(|| {
+            progress.publish(WorkerResult::ExportProgress {
+                token: crate::ExportToken::new(100),
+                completed_units: 1,
+                total_units: 2,
+            });
+        });
+        assert_eq!(first_publish_counts.allocations, 0);
+        assert_eq!(first_publish_counts.deallocations, 0);
+        let (_, first_take_counts) =
+            crate::audio::count_test_thread_allocations(|| std::hint::black_box(progress.take()));
+        assert_eq!(first_take_counts.allocations, 0);
+        assert_eq!(first_take_counts.deallocations, 0);
+
+        let (_, update_counts) = crate::audio::count_test_thread_allocations(|| {
+            for token in 1..=64 {
+                progress.publish(WorkerResult::ExportProgress {
+                    token: crate::ExportToken::new(token),
+                    completed_units: token * 2,
+                    total_units: token * 3,
+                });
+                if token.is_multiple_of(3) {
+                    std::hint::black_box(progress.take());
+                }
+            }
+            std::hint::black_box(progress.take());
+        });
+        assert_eq!(update_counts.allocations, 0);
+        assert_eq!(update_counts.deallocations, 0);
     }
 
     #[test]
@@ -2072,6 +2159,146 @@ mod tests {
         assert_eq!(reader.spec().sample_rate, crate::EXPORT_SAMPLE_RATE);
         assert_eq!(reader.duration(), 48_000);
         assert!(export_temp_entries(project.path()).is_empty());
+    }
+
+    #[test]
+    fn export_panic_is_one_typed_terminal_and_the_next_saturated_request_completes() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("injected panic payload destructor");
+            }
+        }
+
+        let (first_project, first_request, _) = project_backed_export_request("panic-first", 113);
+        let first_destination = first_request.destination().to_path_buf();
+        let first_project_id = first_request.snapshot().project_id();
+        let first_revision = first_request.snapshot().revision();
+        let (second_project, second_request, second_cancel) =
+            project_backed_export_request("panic-second", 114);
+        let second_destination = second_request.destination().to_path_buf();
+        let second_project_id = second_request.snapshot().project_id();
+        let second_revision = second_request.snapshot().revision();
+        let before_publish_visits = Arc::new(AtomicUsize::new(0));
+        let hook_before_publish_visits = Arc::clone(&before_publish_visits);
+        let panic_after_link = Arc::new(AtomicBool::new(true));
+        let hook_panic_after_link = Arc::clone(&panic_after_link);
+        let gate = Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        ));
+        let hook_gate = Arc::clone(&gate);
+        let hook = Arc::new(move |checkpoint| {
+            if checkpoint == PublisherCheckpoint::BeforeDirectorySync
+                && hook_panic_after_link.swap(false, Ordering::AcqRel)
+            {
+                std::panic::panic_any(PanicOnDrop);
+            }
+            if checkpoint == PublisherCheckpoint::BeforePublish
+                && hook_before_publish_visits.fetch_add(1, Ordering::AcqRel) == 1
+            {
+                let (lock, changed) = &*hook_gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                changed.notify_all();
+                while !state.1 {
+                    state = changed.wait(state).unwrap();
+                }
+            }
+        });
+        let (request_sender, request_receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let export_cancels = Arc::new(InFlightExportCancels::default());
+        let admission = WorkerAdmission::new(request_sender, Arc::clone(&export_cancels));
+        admission
+            .try_send(WorkerRequest::Export(first_request))
+            .unwrap();
+        admission
+            .try_send(WorkerRequest::Export(second_request))
+            .unwrap();
+        let worker_export_cancels = Arc::clone(&export_cancels);
+        let worker = thread::spawn(move || {
+            worker_loop_with_export_hook(
+                request_receiver,
+                result_sender,
+                hook,
+                worker_export_cancels,
+            )
+        });
+
+        {
+            let (lock, changed) = &*gate;
+            let state = lock.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "second export did not reach publish fence"
+            );
+            drop(state);
+        }
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WorkerResult::ExportFinished {
+                token,
+                project_id,
+                revision,
+                ref destination,
+                result: Err(crate::OfflineExportError::ExportPanicked),
+            } if token == crate::ExportToken::new(113)
+                && project_id == first_project_id
+                && revision == first_revision
+                && *destination == first_destination
+        ));
+        assert!(!first_destination.exists());
+        assert!(export_temp_entries(first_project.path()).is_empty());
+        assert_eq!(
+            *export_cancels
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![second_cancel]
+        );
+
+        {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            changed.notify_all();
+        }
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WorkerResult::ExportFinished {
+                token,
+                project_id,
+                revision,
+                ref destination,
+                result: Ok(ref receipt),
+            } if token == crate::ExportToken::new(114)
+                && project_id == second_project_id
+                && revision == second_revision
+                && *destination == second_destination
+                && receipt.token == token
+                && receipt.destination == second_destination
+        ));
+        admission.try_send(WorkerRequest::Shutdown).unwrap();
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        worker.join().unwrap();
+
+        assert!(second_destination.is_file());
+        assert!(export_temp_entries(second_project.path()).is_empty());
+        assert!(
+            export_cancels
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]

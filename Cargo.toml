@@ -8,6 +8,7 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 cpal = "0.18.1"
 getrandom = "0.3.4"

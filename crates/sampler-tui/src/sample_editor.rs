@@ -761,8 +761,10 @@ mod tests {
     fn workspace_view_cycles_through_sample_in_both_directions() {
         assert_eq!(WorkspaceView::Perform.next(), WorkspaceView::Pattern);
         assert_eq!(WorkspaceView::Pattern.next(), WorkspaceView::Sample);
-        assert_eq!(WorkspaceView::Sample.next(), WorkspaceView::Perform);
-        assert_eq!(WorkspaceView::Perform.previous(), WorkspaceView::Sample);
+        assert_eq!(WorkspaceView::Sample.next(), WorkspaceView::Mixer);
+        assert_eq!(WorkspaceView::Mixer.next(), WorkspaceView::Perform);
+        assert_eq!(WorkspaceView::Perform.previous(), WorkspaceView::Mixer);
+        assert_eq!(WorkspaceView::Mixer.previous(), WorkspaceView::Sample);
         assert_eq!(WorkspaceView::Sample.previous(), WorkspaceView::Pattern);
     }
 

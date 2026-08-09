@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sampler_core::{BankId, PlaybackMode, Resolution};
+use sampler_core::{BankId, ChokeGroup, PlaybackMode, Resolution};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
@@ -104,6 +104,21 @@ pub enum PaletteCommand {
     RecordInput,
     CaptureStop,
     CaptureCancel,
+    PadLevel(f32),
+    PadPan(f32),
+    PadMute(bool),
+    PadChoke(Option<ChokeGroup>),
+    DelaySend(f32),
+    ReverbSend(f32),
+    MasterLevel(f32),
+    DelayEnable(bool),
+    DelayTime(u16),
+    DelayFeedback(f32),
+    DelayReturn(f32),
+    ReverbEnable(bool),
+    ReverbRoom(f32),
+    ReverbDamping(f32),
+    ReverbReturn(f32),
 }
 
 pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
@@ -157,8 +172,60 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "capture-cancel" => {
             no_arguments(remainder, "capture-cancel", PaletteCommand::CaptureCancel)
         }
+        "pad-level" => parse_finite_range(remainder, -60.0, 6.0, "pad-level must be -60..6")
+            .map(|value| PaletteCommand::PadLevel(value as f32)),
+        "pad-pan" => parse_finite_range(remainder, -1.0, 1.0, "pad-pan must be -1..1")
+            .map(|value| PaletteCommand::PadPan(value as f32)),
+        "pad-mute" => parse_toggle(remainder, "pad-mute").map(PaletteCommand::PadMute),
+        "pad-choke" => parse_choke(remainder).map(PaletteCommand::PadChoke),
+        "delay-send" => parse_finite_range(remainder, 0.0, 1.0, "delay-send must be 0..1")
+            .map(|value| PaletteCommand::DelaySend(value as f32)),
+        "reverb-send" => parse_finite_range(remainder, 0.0, 1.0, "reverb-send must be 0..1")
+            .map(|value| PaletteCommand::ReverbSend(value as f32)),
+        "master-level" => parse_finite_range(remainder, -60.0, 6.0, "master-level must be -60..6")
+            .map(|value| PaletteCommand::MasterLevel(value as f32)),
+        "delay-enable" => parse_toggle(remainder, "delay-enable").map(PaletteCommand::DelayEnable),
+        "delay-time" => parse_delay_time(remainder).map(PaletteCommand::DelayTime),
+        "delay-feedback" => {
+            parse_finite_range(remainder, 0.0, 0.95, "delay-feedback must be 0..0.95")
+                .map(|value| PaletteCommand::DelayFeedback(value as f32))
+        }
+        "delay-return" => parse_finite_range(remainder, -60.0, 6.0, "delay-return must be -60..6")
+            .map(|value| PaletteCommand::DelayReturn(value as f32)),
+        "reverb-enable" => {
+            parse_toggle(remainder, "reverb-enable").map(PaletteCommand::ReverbEnable)
+        }
+        "reverb-room" => parse_finite_range(remainder, 0.0, 1.0, "reverb-room must be 0..1")
+            .map(|value| PaletteCommand::ReverbRoom(value as f32)),
+        "reverb-damping" => parse_finite_range(remainder, 0.0, 1.0, "reverb-damping must be 0..1")
+            .map(|value| PaletteCommand::ReverbDamping(value as f32)),
+        "reverb-return" => {
+            parse_finite_range(remainder, -60.0, 6.0, "reverb-return must be -60..6")
+                .map(|value| PaletteCommand::ReverbReturn(value as f32))
+        }
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_choke(input: &str) -> Result<Option<ChokeGroup>, String> {
+    let token = single_token(input, "pad-choke must be off or 1..16")?;
+    if token == "off" {
+        return Ok(None);
+    }
+    token
+        .parse::<u8>()
+        .ok()
+        .and_then(|value| ChokeGroup::new(value).ok())
+        .map(Some)
+        .ok_or_else(|| "pad-choke must be off or 1..16".to_owned())
+}
+
+fn parse_delay_time(input: &str) -> Result<u16, String> {
+    single_token(input, "delay-time must be 10..2000")?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| (10..=2_000).contains(value))
+        .ok_or_else(|| "delay-time must be 10..2000".to_owned())
 }
 
 fn parse_project_path(input: &str, command: &str) -> Result<PathBuf, String> {
@@ -292,7 +359,7 @@ fn no_arguments(
 mod tests {
     use std::path::PathBuf;
 
-    use sampler_core::{BankId, PlaybackMode, Resolution};
+    use sampler_core::{BankId, ChokeGroup, PlaybackMode, Resolution};
 
     use super::{LineEditor, PaletteCommand, parse_palette};
 
@@ -503,6 +570,105 @@ mod tests {
                     "{command} accepted {suffix:?}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mixer_commands_parse_every_literal_typed_value() {
+        assert_eq!(
+            parse_palette("pad-level -12.5"),
+            Ok(PaletteCommand::PadLevel(-12.5))
+        );
+        assert_eq!(
+            parse_palette("pad-pan 0.25"),
+            Ok(PaletteCommand::PadPan(0.25))
+        );
+        assert_eq!(
+            parse_palette("pad-mute on"),
+            Ok(PaletteCommand::PadMute(true))
+        );
+        assert_eq!(
+            parse_palette("pad-choke off"),
+            Ok(PaletteCommand::PadChoke(None))
+        );
+        assert_eq!(
+            parse_palette("pad-choke 16"),
+            Ok(PaletteCommand::PadChoke(Some(ChokeGroup::new(16).unwrap())))
+        );
+        assert_eq!(
+            parse_palette("delay-send 0.25"),
+            Ok(PaletteCommand::DelaySend(0.25))
+        );
+        assert_eq!(
+            parse_palette("reverb-send 0.75"),
+            Ok(PaletteCommand::ReverbSend(0.75))
+        );
+        assert_eq!(
+            parse_palette("master-level 6"),
+            Ok(PaletteCommand::MasterLevel(6.0))
+        );
+        assert_eq!(
+            parse_palette("delay-enable off"),
+            Ok(PaletteCommand::DelayEnable(false))
+        );
+        assert_eq!(
+            parse_palette("delay-time 2000"),
+            Ok(PaletteCommand::DelayTime(2000))
+        );
+        assert_eq!(
+            parse_palette("delay-feedback 0.95"),
+            Ok(PaletteCommand::DelayFeedback(0.95))
+        );
+        assert_eq!(
+            parse_palette("delay-return -60"),
+            Ok(PaletteCommand::DelayReturn(-60.0))
+        );
+        assert_eq!(
+            parse_palette("reverb-enable on"),
+            Ok(PaletteCommand::ReverbEnable(true))
+        );
+        assert_eq!(
+            parse_palette("reverb-room 0.5"),
+            Ok(PaletteCommand::ReverbRoom(0.5))
+        );
+        assert_eq!(
+            parse_palette("reverb-damping 1"),
+            Ok(PaletteCommand::ReverbDamping(1.0))
+        );
+        assert_eq!(
+            parse_palette("reverb-return 6"),
+            Ok(PaletteCommand::ReverbReturn(6.0))
+        );
+    }
+
+    #[test]
+    fn mixer_commands_reject_missing_extra_nonfinite_and_out_of_range_values() {
+        for input in [
+            "pad-level",
+            "pad-level 0 extra",
+            "pad-level NaN",
+            "pad-level -60.1",
+            "pad-pan inf",
+            "pad-pan 1.01",
+            "pad-mute yes",
+            "pad-choke 0",
+            "pad-choke 17",
+            "delay-send -0.01",
+            "reverb-send 1.01",
+            "master-level 6.1",
+            "delay-enable true",
+            "delay-time 9",
+            "delay-time 2001",
+            "delay-time 10.5",
+            "delay-feedback 0.96",
+            "delay-return -61",
+            "reverb-enable",
+            "reverb-room NaN",
+            "reverb-room 1.01",
+            "reverb-damping -0.01",
+            "reverb-return inf",
+        ] {
+            assert!(parse_palette(input).is_err(), "accepted invalid {input:?}");
         }
     }
 }

@@ -1024,6 +1024,7 @@ pub enum WorkspaceView {
     Perform,
     Pattern,
     Sample,
+    Mixer,
 }
 
 impl WorkspaceView {
@@ -1031,16 +1032,36 @@ impl WorkspaceView {
         match self {
             Self::Perform => Self::Pattern,
             Self::Pattern => Self::Sample,
-            Self::Sample => Self::Perform,
+            Self::Sample => Self::Mixer,
+            Self::Mixer => Self::Perform,
         }
     }
 
     pub const fn previous(self) -> Self {
         match self {
-            Self::Perform => Self::Sample,
+            Self::Perform => Self::Mixer,
             Self::Pattern => Self::Perform,
             Self::Sample => Self::Pattern,
+            Self::Mixer => Self::Sample,
         }
+    }
+}
+
+#[cfg(test)]
+mod mixer_task8_view_tests {
+    use super::WorkspaceView;
+
+    #[test]
+    fn workspace_cycles_through_four_views_in_both_directions() {
+        assert_eq!(WorkspaceView::Perform.next(), WorkspaceView::Pattern);
+        assert_eq!(WorkspaceView::Pattern.next(), WorkspaceView::Sample);
+        assert_eq!(WorkspaceView::Sample.next(), WorkspaceView::Mixer);
+        assert_eq!(WorkspaceView::Mixer.next(), WorkspaceView::Perform);
+
+        assert_eq!(WorkspaceView::Perform.previous(), WorkspaceView::Mixer);
+        assert_eq!(WorkspaceView::Mixer.previous(), WorkspaceView::Sample);
+        assert_eq!(WorkspaceView::Sample.previous(), WorkspaceView::Pattern);
+        assert_eq!(WorkspaceView::Pattern.previous(), WorkspaceView::Perform);
     }
 }
 

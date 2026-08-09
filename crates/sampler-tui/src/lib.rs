@@ -7,6 +7,7 @@ pub mod diagnostic;
 pub mod file_picker;
 pub mod input;
 pub mod loader;
+pub mod mixer;
 pub mod palette;
 pub mod pattern;
 pub mod project_session;
@@ -33,6 +34,10 @@ pub use loader::{
     MAX_ENCODED_FILE_BYTES, MAX_PREPARED_FRAMES, ProjectSaveWorkerRequest, ProjectToken,
     RenderedSample, StageProjectSampleRequest, WorkerHandle, WorkerPanicked, WorkerRequest,
     WorkerResult, WorkerSendError, WorkerSendFailure, downsample_preview,
+};
+pub use mixer::{
+    DelayField, MasterField, MixerAction, MixerContext, MixerCursor, MixerIntent, MixerSection,
+    PadField, ReverbField,
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{

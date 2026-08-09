@@ -28,6 +28,7 @@ use crate::loader::{
     ProjectSaveWorkerRequest, ProjectToken, RenderedSample, StageProjectSampleRequest,
     WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
+use crate::mixer::{MixerAction, MixerContext, MixerCursor, MixerIntent};
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
 use crate::project_session::{
@@ -59,6 +60,7 @@ pub enum ProjectSaveError {
 
 #[cfg(test)]
 mod mixer_task6_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
@@ -75,13 +77,16 @@ mod mixer_task6_tests {
     };
 
     use super::{
-        App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, ProjectAdmission,
+        App, EDIT_PREVIEW_COLUMNS, Overlay, PadLoadState, PreviewColumn, ProjectAdmission,
         ProjectOpenOperation, StagedProjectPad, pad_offset,
     };
+    use crate::KeyboardCapabilities;
     use crate::audio::{AudioPort, CaptureSupport};
     use crate::capture::CapturePhase;
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
     use crate::loader::{LoadedSample, ProjectToken, WorkerRequest, WorkerResult};
+    use crate::mixer::{MixerSection, PadField};
+    use crate::pattern::WorkspaceView;
     use crate::project_store::SourceFingerprint;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +105,8 @@ mod mixer_task6_tests {
         UpdatePadMix(PadId, PadMixSettings),
         UpdateMasterMix(MasterMixSettings),
         RemoveSample(PadId),
+        Trigger(PadId),
+        Release(PadId),
     }
 
     struct MixerAudioState {
@@ -226,11 +233,21 @@ mod mixer_task6_tests {
             SampleSlot::new(0).map_err(|error| error.to_string())
         }
 
-        fn trigger(&mut self, _pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+        fn trigger(&mut self, pad: PadId, _at: Frame, _velocity: f32) -> Result<(), String> {
+            self.0
+                .0
+                .borrow_mut()
+                .calls
+                .push(MixerAudioCall::Trigger(pad));
             Ok(())
         }
 
-        fn release(&mut self, _pad: PadId, _at: Frame) -> Result<(), String> {
+        fn release(&mut self, pad: PadId, _at: Frame) -> Result<(), String> {
+            self.0
+                .0
+                .borrow_mut()
+                .calls
+                .push(MixerAudioCall::Release(pad));
             Ok(())
         }
 
@@ -928,6 +945,121 @@ mod mixer_task6_tests {
             assert_eq!(app.managed_release_in_flight(), None);
             assert!(app.pending_managed_releases.is_empty());
         }
+    }
+
+    #[test]
+    fn mixer_task8_keys_commit_exact_audio_first_values_and_preserve_failures_and_noops() {
+        let (mut app, probe, target) = loaded_mixer_app();
+        app.patterns.set_view(WorkspaceView::Mixer);
+        let revision = app.project_revision();
+
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let raised = PadSettings::new(PlaybackMode::OneShot, 1.0, 0.0, 0.0, None).unwrap();
+        assert_eq!(app.pad(target).settings, raised);
+        assert_eq!(app.project_revision(), revision + 1);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdatePad(target, raised))
+        );
+
+        app.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let muted = PadMixSettings::new(true, 0.0, 0.0).unwrap();
+        assert_eq!(app.pad_mix(target), muted);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdatePadMix(target, muted))
+        );
+
+        app.apply_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(app.mixer_cursor().section(), MixerSection::Reverb);
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(app.mixer_cursor().section(), MixerSection::Master);
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let master =
+            MasterMixSettings::new(1.0, DelaySettings::default(), ReverbSettings::default())
+                .unwrap();
+        assert_eq!(app.master_mix(), master);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdateMasterMix(master))
+        );
+
+        probe.fail_next(MixerAudioCallKind::UpdateMasterMix);
+        let before = (app.master_mix(), app.project_revision());
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!((app.master_mix(), app.project_revision()), before);
+        assert_eq!(
+            probe.calls().last(),
+            Some(&MixerAudioCall::UpdateMasterMix(
+                MasterMixSettings::new(2.0, DelaySettings::default(), ReverbSettings::default(),)
+                    .unwrap()
+            ))
+        );
+
+        app.update_master_mix(
+            MasterMixSettings::new(6.0, DelaySettings::default(), ReverbSettings::default())
+                .unwrap(),
+        )
+        .unwrap();
+        let before = (app.project_revision(), probe.calls());
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!((app.project_revision(), probe.calls()), before);
+    }
+
+    #[test]
+    fn mixer_task8_global_routing_pad_selection_and_four_view_keys_have_priority() {
+        let (mut app, probe, _) = loaded_mixer_app();
+        app.patterns.set_view(WorkspaceView::Mixer);
+        assert_eq!(app.mixer_cursor().pad_field(), PadField::Level);
+
+        app.set_keyboard_capabilities(KeyboardCapabilities {
+            release_events: true,
+        });
+        app.apply_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(app.selected_pad(), 5);
+        assert_eq!(probe.calls().last(), Some(&MixerAudioCall::Trigger(pad(5))));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(probe.calls().last(), Some(&MixerAudioCall::Release(pad(5))));
+
+        app.apply_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.overlay(), Some(&Overlay::Help));
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(app.mixer_cursor().section(), MixerSection::Pad);
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.apply_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(app.overlay(), Some(&Overlay::Palette));
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(app.mixer_cursor().section(), MixerSection::Pad);
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.overlay = Some(Overlay::ProjectSaveProgress);
+        app.apply_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(app.mixer_cursor().section(), MixerSection::Pad);
+        app.overlay = None;
+
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.workspace_view(), WorkspaceView::Perform);
+        for expected in [
+            WorkspaceView::Pattern,
+            WorkspaceView::Sample,
+            WorkspaceView::Mixer,
+            WorkspaceView::Perform,
+        ] {
+            app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(app.workspace_view(), expected);
+        }
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Mixer);
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Sample);
     }
 }
 
@@ -2960,6 +3092,7 @@ mod capture_task7_tests {
         assert_eq!(app.patterns().cursor().step(), 1);
         app.apply_key(press(KeyCode::Tab));
         app.apply_key(press(KeyCode::Tab));
+        app.apply_key(press(KeyCode::Tab));
         assert_eq!(app.workspace_view(), crate::WorkspaceView::Perform);
 
         app.apply_key(press(KeyCode::Enter));
@@ -4467,6 +4600,7 @@ pub struct App {
     pad_mixes: [PadMixSettings; PAD_VIEW_COUNT],
     master_mix: MasterMixSettings,
     patterns: PatternWorkspace,
+    mixer_cursor: MixerCursor,
     capture_session: crate::CaptureSession,
     capture_target_fence: Option<CaptureTargetFence>,
     capture_source_pcm: Option<Arc<[f32]>>,
@@ -4610,6 +4744,7 @@ impl App {
             pad_mixes: [PadMixSettings::default(); PAD_VIEW_COUNT],
             master_mix: MasterMixSettings::default(),
             patterns: PatternWorkspace::new(pattern_sample_rate),
+            mixer_cursor: MixerCursor::default(),
             capture_session: crate::CaptureSession::default(),
             capture_target_fence: None,
             capture_source_pcm: None,
@@ -7592,6 +7727,10 @@ impl App {
         self.master_mix
     }
 
+    pub const fn mixer_cursor(&self) -> &MixerCursor {
+        &self.mixer_cursor
+    }
+
     pub fn update_pad_mix(&mut self, pad: PadId, settings: PadMixSettings) -> Result<(), String> {
         settings.validate().map_err(|error| error.to_string())?;
         let offset = pad_offset(pad);
@@ -8991,6 +9130,88 @@ impl App {
                 let result = self.cancel_capture();
                 self.finish_capture_palette_command(result);
             }
+            PaletteCommand::PadLevel(value) => {
+                self.apply_palette_pad_settings(|settings| settings.gain_db = value)
+            }
+            PaletteCommand::PadPan(value) => {
+                self.apply_palette_pad_settings(|settings| settings.pan = value)
+            }
+            PaletteCommand::PadMute(value) => {
+                self.apply_palette_pad_mix(|settings| settings.muted = value)
+            }
+            PaletteCommand::PadChoke(value) => {
+                self.apply_palette_pad_settings(|settings| settings.choke_group = value)
+            }
+            PaletteCommand::DelaySend(value) => {
+                self.apply_palette_pad_mix(|settings| settings.delay_send = value)
+            }
+            PaletteCommand::ReverbSend(value) => {
+                self.apply_palette_pad_mix(|settings| settings.reverb_send = value)
+            }
+            PaletteCommand::MasterLevel(value) => {
+                self.apply_palette_master_mix(|settings| settings.gain_db = value)
+            }
+            PaletteCommand::DelayEnable(value) => {
+                self.apply_palette_master_mix(|settings| settings.delay.enabled = value)
+            }
+            PaletteCommand::DelayTime(value) => {
+                self.apply_palette_master_mix(|settings| settings.delay.time_ms = value)
+            }
+            PaletteCommand::DelayFeedback(value) => {
+                self.apply_palette_master_mix(|settings| settings.delay.feedback = value)
+            }
+            PaletteCommand::DelayReturn(value) => {
+                self.apply_palette_master_mix(|settings| settings.delay.return_db = value)
+            }
+            PaletteCommand::ReverbEnable(value) => {
+                self.apply_palette_master_mix(|settings| settings.reverb.enabled = value)
+            }
+            PaletteCommand::ReverbRoom(value) => {
+                self.apply_palette_master_mix(|settings| settings.reverb.room_size = value)
+            }
+            PaletteCommand::ReverbDamping(value) => {
+                self.apply_palette_master_mix(|settings| settings.reverb.damping = value)
+            }
+            PaletteCommand::ReverbReturn(value) => {
+                self.apply_palette_master_mix(|settings| settings.reverb.return_db = value)
+            }
+        }
+    }
+
+    fn apply_palette_pad_settings(&mut self, reduce: impl FnOnce(&mut PadSettings)) {
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let mut settings = self.pads[pad_offset(pad)].settings;
+        reduce(&mut settings);
+        let result = self.update_pad_settings(pad, settings);
+        if result.is_ok() {
+            self.sync_editor_to_selected_pad();
+        }
+        self.finish_mixer_palette_command(result);
+    }
+
+    fn apply_palette_pad_mix(&mut self, reduce: impl FnOnce(&mut PadMixSettings)) {
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let mut settings = self.pad_mixes[pad_offset(pad)];
+        reduce(&mut settings);
+        let result = self.update_pad_mix(pad, settings);
+        self.finish_mixer_palette_command(result);
+    }
+
+    fn apply_palette_master_mix(&mut self, reduce: impl FnOnce(&mut MasterMixSettings)) {
+        let mut settings = self.master_mix;
+        reduce(&mut settings);
+        let result = self.update_master_mix(settings);
+        self.finish_mixer_palette_command(result);
+    }
+
+    fn finish_mixer_palette_command(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.overlay = None,
+            Err(error) => self.palette_error = Some(error),
         }
     }
 
@@ -9104,6 +9325,7 @@ impl App {
             WorkspaceView::Perform => self.apply_perform_key(key),
             WorkspaceView::Pattern => self.apply_pattern_key(key),
             WorkspaceView::Sample => self.apply_sample_key(key),
+            WorkspaceView::Mixer => self.apply_mixer_key(key),
         }
     }
 
@@ -9193,6 +9415,66 @@ impl App {
             }
         } else if let Some(action) = map_key(key, self.keyboard_capabilities) {
             self.apply(action);
+        }
+    }
+
+    fn apply_mixer_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        let action = match (key.code, key.modifiers) {
+            (KeyCode::Char('?'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.open_help();
+                return;
+            }
+            (KeyCode::Char(':'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.open_palette();
+                return;
+            }
+            (KeyCode::Left, KeyModifiers::CONTROL) => MixerAction::PreviousSection,
+            (KeyCode::Right, KeyModifiers::CONTROL) => MixerAction::NextSection,
+            (KeyCode::Up, KeyModifiers::NONE) => MixerAction::PreviousField,
+            (KeyCode::Down, KeyModifiers::NONE) => MixerAction::NextField,
+            (KeyCode::Left, KeyModifiers::NONE) => MixerAction::Decrement,
+            (KeyCode::Right, KeyModifiers::NONE) => MixerAction::Increment,
+            (KeyCode::Enter, KeyModifiers::NONE) => MixerAction::Activate,
+            (KeyCode::Backspace, KeyModifiers::NONE) => MixerAction::Reset,
+            (KeyCode::Esc, KeyModifiers::NONE) => MixerAction::ReturnToPerform,
+            _ => return,
+        };
+        let Some(pad) = self.selected_pad_id() else {
+            return;
+        };
+        let context = MixerContext {
+            pad,
+            pad_settings: self.pads[pad_offset(pad)].settings,
+            pad_mix: self.pad_mixes[pad_offset(pad)],
+            master_mix: self.master_mix,
+        };
+        let intent = self.mixer_cursor.reduce(action, context);
+        if let Some(intent) = intent {
+            self.apply_mixer_intent(intent);
+        }
+    }
+
+    fn apply_mixer_intent(&mut self, intent: MixerIntent) {
+        let result = match intent {
+            MixerIntent::UpdatePadSettings { pad, settings } => {
+                let result = self.update_pad_settings(pad, settings);
+                if result.is_ok() {
+                    self.sync_editor_to_selected_pad();
+                }
+                result
+            }
+            MixerIntent::UpdatePadMix { pad, settings } => self.update_pad_mix(pad, settings),
+            MixerIntent::UpdateMasterMix(settings) => self.update_master_mix(settings),
+            MixerIntent::ReturnToPerform => {
+                self.patterns.set_view(WorkspaceView::Perform);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.status = error;
         }
     }
 
@@ -13725,12 +14007,16 @@ mod tests {
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
 
         app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Mixer);
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.workspace_view(), WorkspaceView::Sample);
         app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.workspace_view(), WorkspaceView::Pattern);
         app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.workspace_view(), WorkspaceView::Perform);
 
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.workspace_view(), WorkspaceView::Mixer);
         app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
         assert_eq!(app.workspace_view(), WorkspaceView::Sample);
     }

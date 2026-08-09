@@ -60,6 +60,7 @@ pub(crate) struct DelayBus {
     old_tap_frames: usize,
     new_tap_frames: usize,
     tap_crossfade_remaining: u32,
+    pending_tap_frames: Option<usize>,
     input_gain: LinearRamp,
     feedback: LinearRamp,
 }
@@ -76,6 +77,7 @@ impl DelayBus {
             old_tap_frames: tap_frames,
             new_tap_frames: tap_frames,
             tap_crossfade_remaining: 0,
+            pending_tap_frames: None,
             input_gain: LinearRamp::new(if settings.enabled { 1.0 } else { 0.0 }),
             feedback: LinearRamp::new(settings.feedback),
         })
@@ -83,10 +85,12 @@ impl DelayBus {
 
     pub(crate) fn set_settings(&mut self, settings: DelaySettings) {
         let tap_frames = delay_frames(self.sample_rate, settings.time_ms, self.left.len());
-        if tap_frames != self.new_tap_frames {
+        if self.tap_crossfade_remaining == 0 && tap_frames != self.new_tap_frames {
             self.old_tap_frames = self.new_tap_frames;
             self.new_tap_frames = tap_frames;
             self.tap_crossfade_remaining = TAP_CROSSFADE_FRAMES;
+        } else if self.tap_crossfade_remaining != 0 {
+            self.pending_tap_frames = (tap_frames != self.new_tap_frames).then_some(tap_frames);
         }
         self.input_gain
             .set_target(if settings.enabled { 1.0 } else { 0.0 });
@@ -104,6 +108,12 @@ impl DelayBus {
             self.tap_crossfade_remaining -= 1;
             if self.tap_crossfade_remaining == 0 {
                 self.old_tap_frames = self.new_tap_frames;
+                if let Some(pending_tap_frames) = self.pending_tap_frames.take()
+                    && pending_tap_frames != self.new_tap_frames
+                {
+                    self.new_tap_frames = pending_tap_frames;
+                    self.tap_crossfade_remaining = TAP_CROSSFADE_FRAMES;
+                }
             }
             [
                 finite_or_zero(old[0] * (1.0 - mix) + new[0] * mix, invalid_commands),
@@ -537,6 +547,41 @@ mod tests {
         assert_eq!(frames[9], [0.921_875, 0.0]);
         assert_eq!(frames[19], [0.156_25, 0.0]);
         assert!(frames[20..].iter().all(|frame| *frame == [0.0; 2]));
+    }
+
+    #[test]
+    fn delay_time_crossfade_remains_active_through_frame_128() {
+        let mut rack = FxRack::new(1_000, enabled_delay(10, 0.0, 0.0)).unwrap();
+        let mut invalid_commands = 0;
+        let _ = rack.process([0.0; 2], [1.0, 0.0], [0.0; 2], &mut invalid_commands);
+        rack.set_settings(enabled_delay(20, 0.0, 0.0));
+
+        let frames: Vec<_> = (1..=128)
+            .map(|frame| {
+                let input = if frame % 3 == 0 { [1.0, 0.0] } else { [0.0; 2] };
+                rack.process([0.0; 2], input, [0.0; 2], &mut invalid_commands)
+            })
+            .collect();
+        assert_eq!(frames[126], [0.007_812_5, 0.0]);
+        assert_eq!(frames[127], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn rapid_delay_time_retarget_preserves_the_audible_crossfade() {
+        let mut rack = FxRack::new(1_000, enabled_delay(10, 0.0, 0.0)).unwrap();
+        let mut invalid_commands = 0;
+        let _ = rack.process([0.0; 2], [1.0, 0.0], [0.0; 2], &mut invalid_commands);
+        rack.set_settings(enabled_delay(20, 0.0, 0.0));
+
+        let mut frame_10 = [0.0; 2];
+        for _ in 1..=10 {
+            frame_10 = rack.process([0.0; 2], [1.0, 0.0], [0.0; 2], &mut invalid_commands);
+        }
+        assert_eq!(frame_10, [0.921_875, 0.0]);
+
+        rack.set_settings(enabled_delay(30, 0.0, 0.0));
+        let frame_11 = rack.process([0.0; 2], [0.0; 2], [0.0; 2], &mut invalid_commands);
+        assert_eq!(frame_11, [0.914_062_5, 0.0]);
     }
 
     #[test]

@@ -372,6 +372,7 @@ impl Harness {
             .apply_terminal_event(Event::Paste(command.to_owned()));
         self.key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(self.app.palette_error(), None, "{command}");
+        self.engine.render_frames(0, |_| {});
     }
 
     fn record_hit(&mut self, index: usize) {
@@ -590,11 +591,34 @@ fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     let mix_a = explicit_pad_mix();
     let mix_b = PadMixSettings::new(false, 0.625, 0.375).unwrap();
     let master_mix = explicit_master_mix();
-    source.app.update_pad_settings(pad(0), settings_a).unwrap();
+    let mut settings_a_before_palette = settings_a;
+    settings_a_before_palette.choke_group = None;
+    source
+        .app
+        .update_pad_settings(pad(0), settings_a_before_palette)
+        .unwrap();
     source.app.update_pad_settings(pad(7), settings_b).unwrap();
-    source.app.update_pad_mix(pad(0), mix_a).unwrap();
+    source.palette("select 1");
+    source.palette("pad-choke 2");
+    source.palette("pad-mute on");
+    source.palette("delay-send 0.25");
+    source.palette("reverb-send 0.75");
+    assert_eq!(source.app.pad_mix(pad(0)), mix_a);
+    assert_eq!(
+        source.app.pad(pad(0)).settings.choke_group,
+        settings_a.choke_group
+    );
     source.app.update_pad_mix(pad(7), mix_b).unwrap();
-    source.app.update_master_mix(master_mix).unwrap();
+    source.palette("master-level -6");
+    source.palette("delay-enable on");
+    source.palette("delay-time 320");
+    source.palette("delay-feedback 0.5");
+    source.palette("delay-return -9");
+    source.palette("reverb-enable on");
+    source.palette("reverb-room 0.75");
+    source.palette("reverb-damping 0.25");
+    source.palette("reverb-return -8");
+    assert_eq!(source.app.master_mix(), master_mix);
     source.palette("pattern 1");
     source.palette("tempo 137");
     source.palette("swing 63");

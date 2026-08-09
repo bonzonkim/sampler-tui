@@ -19,8 +19,9 @@ use sampler_audio::{
     capture_channels, write_input_device,
 };
 use sampler_core::{
-    AssetDigest, BankId, EditablePattern, EventId, Meter, PadId, PadSettings, PatternEvent,
-    PatternSlotId, PatternSnapshot, PlaybackMode, Resolution, SampleEditRecipe, Tempo, Transport,
+    AssetDigest, BankId, DelaySettings, EditablePattern, EventId, MasterMixSettings, Meter, PadId,
+    PadMixSettings, PadSettings, PatternEvent, PatternSlotId, PatternSnapshot, PlaybackMode,
+    Resolution, ReverbSettings, SampleEditRecipe, Tempo, Transport,
 };
 use sampler_tui::audio::CaptureCommandFailure;
 use sampler_tui::{
@@ -659,6 +660,18 @@ fn mixed_resample_save_move_and_fresh_open_preserve_exact_tuple_and_nonzero_rend
         .update_pad_settings(pattern_pad, looping)
         .unwrap();
     source.app.update_pad_settings(live_pad, looping).unwrap();
+    source.engine.render_frames(0, |_| {});
+    let wet_pad_mix = PadMixSettings::new(false, 1.0, 1.0).unwrap();
+    source.app.update_pad_mix(pattern_pad, wet_pad_mix).unwrap();
+    source.app.update_pad_mix(live_pad, wet_pad_mix).unwrap();
+    source.engine.render_frames(0, |_| {});
+    let wet_master = MasterMixSettings::new(
+        -3.0,
+        DelaySettings::new(true, 10, 0.35, -6.0).unwrap(),
+        ReverbSettings::new(true, 0.8, 0.25, -3.0).unwrap(),
+    )
+    .unwrap();
+    source.app.update_master_mix(wet_master).unwrap();
     let captured_settings = PadSettings::new(PlaybackMode::Gate, -3.0, 0.25, 2.0, None).unwrap();
     source
         .app
@@ -767,6 +780,9 @@ fn mixed_resample_save_move_and_fresh_open_preserve_exact_tuple_and_nonzero_rend
     let recipe = source.app.committed_sample_recipe(target).unwrap();
     assert_eq!(recipe, SampleEditRecipe::identity());
     assert_eq!(source.app.pad(target).settings, captured_settings);
+    assert_eq!(source.app.pad_mix(pattern_pad), wet_pad_mix);
+    assert_eq!(source.app.pad_mix(live_pad), wet_pad_mix);
+    assert_eq!(source.app.master_mix(), wet_master);
     let before_save = source.app.project_snapshot().unwrap();
     let captured_pad = before_save
         .pads
@@ -839,6 +855,9 @@ fn mixed_resample_save_move_and_fresh_open_preserve_exact_tuple_and_nonzero_rend
         expected_pcm
     );
     assert_eq!(reopened.app.pad(target).preview, preview);
+    assert_eq!(reopened.app.pad_mix(pattern_pad), wet_pad_mix);
+    assert_eq!(reopened.app.pad_mix(live_pad), wet_pad_mix);
+    assert_eq!(reopened.app.master_mix(), wet_master);
 
     let triggers = reopened.engine.executed_triggers();
     reopened.app.apply(InputAction::PadPress(0));

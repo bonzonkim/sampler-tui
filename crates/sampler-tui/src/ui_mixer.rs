@@ -137,7 +137,7 @@ fn render_pad_header(frame: &mut Frame, area: Rect, app: &App) {
             break;
         }
         frame.render_widget(
-            Paragraph::new(truncate(&line, usize::from(area.width))),
+            Paragraph::new(fit_child_line(&line, usize::from(area.width))),
             Rect::new(area.x, y, area.width, 1),
         );
     }
@@ -340,16 +340,8 @@ fn render_pairs(frame: &mut Frame, area: Rect, rows: &[(String, String)]) {
         if y >= area.bottom() {
             break;
         }
-        let line = format!(
-            "{:<width$}{}",
-            truncate(left, column_width),
-            truncate(right, usize::from(area.width).saturating_sub(column_width)),
-            width = column_width
-        );
-        frame.render_widget(
-            Paragraph::new(truncate(&line, usize::from(area.width))),
-            Rect::new(area.x, y, area.width, 1),
-        );
+        let line = fit_child_pair(left, right, column_width, usize::from(area.width));
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
     }
 }
 
@@ -360,10 +352,30 @@ fn render_lines(frame: &mut Frame, area: Rect, rows: &[String]) {
             break;
         }
         frame.render_widget(
-            Paragraph::new(truncate(row, usize::from(area.width))),
+            Paragraph::new(fit_child_line(row, usize::from(area.width))),
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn fit_child_pair(left: &str, right: &str, left_width: usize, total_width: usize) -> String {
+    let left = fit_child_line(left, left_width);
+    let right = fit_child_line(right, total_width.saturating_sub(left_width));
+    let padding = left_width.saturating_sub(display_width(&left));
+    fit_child_line(
+        &format!("{left}{}{right}", " ".repeat(padding)),
+        total_width,
+    )
+}
+
+fn fit_child_line(value: &str, width: usize) -> String {
+    let fitted = truncate(value, width);
+    debug_assert!(display_width(&fitted) <= width);
+    fitted
+}
+
+fn display_width(value: &str) -> usize {
+    Line::from(value).width()
 }
 
 fn db(value: f32) -> String {
@@ -586,6 +598,27 @@ mod tests {
                 "row {row} exceeds {width} columns: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn unicode_content_is_fitted_against_each_mixer_child_area_before_rendering() {
+        // At 80x24 the bordered pad row and the three bordered FX children have these inner
+        // widths. Exercise the fitting boundary itself so backend clipping cannot hide overflow.
+        for child_width in [76, 24, 24, 23, 78] {
+            let fitted = super::fit_child_line(
+                " 샘플 이름이 아주 긴 킥 · 피드백 95% · 리버브 100%",
+                child_width,
+            );
+            assert!(
+                display_width(&fitted) <= child_width,
+                "content overflowed a {child_width}-column mixer child: {fitted:?}"
+            );
+        }
+
+        let pair = super::fit_child_pair(" 한글 패드 이름", " 리버브 100%", 12, 24);
+        let right = pair.find(" 리버브").expect("right child remains visible");
+        assert_eq!(display_width(&pair[..right]), 12);
+        assert!(display_width(&pair) <= 24);
     }
 
     fn load_selected_pad(app: &mut App) {

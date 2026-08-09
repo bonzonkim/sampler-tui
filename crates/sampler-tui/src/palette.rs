@@ -299,11 +299,21 @@ fn parse_resolution(input: &str) -> Result<Resolution, String> {
 }
 
 fn parse_finite_range(input: &str, minimum: f64, maximum: f64, error: &str) -> Result<f64, String> {
-    single_token(input, error)?
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite() && (minimum..=maximum).contains(value))
-        .ok_or_else(|| error.to_owned())
+    let token = single_token(input, error)?;
+    let value = token.parse::<f64>().map_err(|_| error.to_owned())?;
+    let negative_underflow = minimum >= 0.0
+        && value == 0.0
+        && token.starts_with('-')
+        && token.split(['e', 'E']).next().is_some_and(|significand| {
+            significand
+                .bytes()
+                .any(|digit| matches!(digit, b'1'..=b'9'))
+        });
+    if value.is_finite() && (minimum..=maximum).contains(&value) && !negative_underflow {
+        Ok(value)
+    } else {
+        Err(error.to_owned())
+    }
 }
 
 fn single_token<'a>(input: &'a str, error: &str) -> Result<&'a str, String> {

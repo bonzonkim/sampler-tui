@@ -5519,11 +5519,20 @@ mod tests {
     }
 
     #[test]
-    fn route_ramp_advances_once_per_frame_and_catches_up_while_silent() {
-        let (mut controller, mut engine) = harness();
+    fn active_same_pad_polyphony_advances_one_shared_route_ramp_per_frame() {
+        let (mut doubled_controller, mut doubled_engine) = harness();
+        let (mut reference_controller, mut reference_engine) = harness();
         let pad = PadId::first();
         let looping = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
-        controller
+        doubled_controller
+            .install(
+                pad,
+                constant_sample(256, 0.5),
+                looping,
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        reference_controller
             .install(
                 pad,
                 constant_sample(256, 1.0),
@@ -5531,20 +5540,31 @@ mod tests {
                 PadMixSettings::default(),
             )
             .unwrap();
-        controller
-            .update_pad(
-                pad,
-                PadSettings::new(PlaybackMode::Loop, -60.0, -1.0, 0.0, None).unwrap(),
-            )
-            .unwrap();
-        engine.render_frames(64, |_| {});
-        controller.trigger(pad, 64, 1.0).unwrap();
-        controller.trigger(pad, 64, 1.0).unwrap();
+        doubled_controller.trigger(pad, 0, 1.0).unwrap();
+        doubled_controller.trigger(pad, 0, 1.0).unwrap();
+        reference_controller.trigger(pad, 0, 1.0).unwrap();
+        let mut doubled_before = [0.0; 2];
+        let mut reference_before = [0.0; 2];
+        doubled_engine.render_frames(1, |frame| doubled_before = frame);
+        reference_engine.render_frames(1, |frame| reference_before = frame);
+        assert_eq!(doubled_before, reference_before);
+        assert_eq!(doubled_engine.voices_for_pad(pad), 2);
 
-        let mut frame = [0.0; 2];
-        engine.render_frames(1, |rendered| frame = rendered);
-        let raw = frame[0] / (1.0 - frame[0]);
-        assert!((raw - 0.000_062_5).abs() < 1.0e-8);
+        let quiet = PadSettings::new(PlaybackMode::Loop, -60.0, -1.0, 0.0, None).unwrap();
+        doubled_controller.update_pad(pad, quiet).unwrap();
+        reference_controller.update_pad(pad, quiet).unwrap();
+
+        let mut doubled = Vec::new();
+        let mut reference = Vec::new();
+        doubled_engine.render_frames(64, |frame| doubled.push(frame));
+        reference_engine.render_frames(64, |frame| reference.push(frame));
+        for frame in [0, 15, 31, 62, 63] {
+            assert_eq!(
+                doubled[frame], reference[frame],
+                "two active voices advanced the route more than once at ramp frame {frame}"
+            );
+        }
+        assert_eq!(doubled_engine.voices_for_pad(pad), 2);
     }
 
     #[test]

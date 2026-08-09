@@ -83,7 +83,8 @@ mod capture_task7_tests {
     use crate::input::InputAction;
     use crate::loader::{
         CaptureFinalizeError, FinalizeCaptureRequest, LoadPurpose, LoadedSample,
-        ProjectSaveWorkerRequest, WorkerRequest, WorkerResult, WorkerSendError,
+        ProjectSaveWorkerRequest, WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult,
+        WorkerSendError,
     };
     use crate::project_session::ProjectSnapshotError;
     use crate::project_store::{ProjectAssetMapping, SaveKind, SaveReceipt, SourceFingerprint};
@@ -1743,11 +1744,26 @@ mod capture_task7_tests {
             Ok(managed_capture(304, 48_000, b"device-loss-discard")),
         )));
         assert!(app.maintain_capture());
-        assert_matrix_action_continued(&app, ProjectAction::Open);
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
         assert!(
             app.pending_managed_releases
                 .contains(&ManagedCaptureId::new(304))
         );
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(304),
+            }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(304),
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_matrix_action_continued(&app, ProjectAction::Open);
     }
 
     #[test]
@@ -1790,6 +1806,172 @@ mod capture_task7_tests {
 
         app.apply_key(press(KeyCode::Backspace));
         assert_matrix_action_continued(&app, ProjectAction::Quit);
+    }
+
+    #[test]
+    fn capture_discard_waits_for_exact_managed_release_success_before_open_continues() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let finalize = take_finalize(&mut app);
+        app.request_open_project_interactive("after-exact-discard-release");
+        app.apply_key(press(KeyCode::Backspace));
+
+        for index in 0..WORKER_CHANNEL_CAPACITY {
+            app.pending_worker_requests
+                .push(WorkerRequest::ReleaseManagedCapture {
+                    id: ManagedCaptureId::new(700 + index as u64),
+                });
+        }
+        let discard_id = ManagedCaptureId::new(601);
+        assert!(app.apply_worker_result(finalized(
+            &finalize,
+            Ok(managed_capture(601, 48_000, b"discard-release-fence")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert!(!app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+
+        app.pending_worker_requests.clear();
+        assert!(app.maintain_capture());
+        let [release] = app.take_worker_requests().try_into().unwrap();
+        assert_eq!(
+            release,
+            WorkerRequest::ReleaseManagedCapture { id: discard_id }
+        );
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(999),
+                result: Ok(()),
+            })
+        );
+        assert!(!app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), Some(discard_id));
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: discard_id,
+                result: Err(crate::capture_store::CaptureStoreError::NotLive { id: discard_id }),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), None);
+
+        assert!(app.maintain_capture());
+        let [release] = app.take_worker_requests().try_into().unwrap();
+        assert_eq!(
+            release,
+            WorkerRequest::ReleaseManagedCapture { id: discard_id }
+        );
+        assert!(app.apply_worker_send_error(release, WorkerSendError::WorkerBusy));
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), None);
+
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: discard_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: discard_id,
+                result: Ok(()),
+            })
+        );
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.managed_release_in_flight(), Some(discard_id));
+        assert!(app.maintain_capture());
+        assert_matrix_action_continued(&app, ProjectAction::Open);
+    }
+
+    fn app_waiting_for_exact_discard_release(id: u64) -> App {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let finalize = take_finalize(&mut app);
+        app.cancel_capture().unwrap();
+        assert!(app.apply_worker_result(finalized(
+            &finalize,
+            Ok(managed_capture(id, 48_000, b"late-release-fence")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), None);
+        app
+    }
+
+    #[test]
+    fn late_quit_and_open_wait_for_the_existing_exact_discard_release() {
+        for (index, action) in [ProjectAction::Quit, ProjectAction::Open]
+            .into_iter()
+            .enumerate()
+        {
+            let discard_id = ManagedCaptureId::new(602 + index as u64);
+            let mut app = app_waiting_for_exact_discard_release(discard_id.get());
+
+            match action {
+                ProjectAction::Quit => app.apply(InputAction::Quit),
+                ProjectAction::Open => app.request_open_project_interactive("late-open"),
+            }
+
+            assert_matrix_action_waiting(&app, action);
+            assert!(matches!(
+                app.overlay(),
+                Some(super::Overlay::CaptureProgress {
+                    action: Some(shown),
+                    discarding: true,
+                }) if *shown == action
+            ));
+            assert!(app.maintain_capture());
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: discard_id }]
+            );
+            assert!(
+                app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                    id: discard_id,
+                    result: Ok(()),
+                })
+            );
+            assert_matrix_action_waiting(&app, action);
+            assert!(app.maintain_capture());
+            assert_matrix_action_continued(&app, action);
+        }
+    }
+
+    #[test]
+    fn new_capture_is_rejected_while_exact_discard_release_is_pending() {
+        let mut app = app_waiting_for_exact_discard_release(604);
+
+        assert!(matches!(
+            app.request_capture_with_limit_for_test(CaptureSource::Input, 8),
+            Err(CaptureError::AlreadyActive)
+        ));
+        assert_eq!(app.capture_session().phase(), None);
+        assert!(
+            app.pending_managed_releases
+                .contains(&ManagedCaptureId::new(604))
+        );
     }
 
     #[test]
@@ -1977,12 +2159,27 @@ mod capture_task7_tests {
         )));
         assert!(worker.maintain_capture());
         assert_eq!(worker.capture_session().phase(), None);
-        assert!(worker.project_open_stage().is_some());
+        assert!(worker.project_open_stage().is_none());
         assert!(
             worker
                 .pending_managed_releases
                 .contains(&ManagedCaptureId::new(92))
         );
+        assert!(worker.maintain_capture());
+        assert_eq!(
+            worker.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture {
+                id: ManagedCaptureId::new(92),
+            }]
+        );
+        assert!(
+            worker.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(92),
+                result: Ok(()),
+            })
+        );
+        assert!(worker.maintain_capture());
+        assert!(worker.project_open_stage().is_some());
     }
 
     #[test]
@@ -2480,6 +2677,7 @@ pub struct App {
     capture_worker_results: VecDeque<WorkerResult>,
     pending_managed_releases: VecDeque<ManagedCaptureId>,
     managed_release_in_flight: Option<ManagedCaptureId>,
+    capture_discard_release_pending: Option<ManagedCaptureId>,
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
@@ -2560,6 +2758,7 @@ impl App {
             capture_worker_results: VecDeque::new(),
             pending_managed_releases: VecDeque::new(),
             managed_release_in_flight: None,
+            capture_discard_release_pending: None,
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
@@ -2673,7 +2872,8 @@ impl App {
         source: CaptureSource,
         max_frames: usize,
     ) -> Result<(), CaptureError> {
-        if self.capture_session.phase().is_some() {
+        if self.capture_session.phase().is_some() || self.capture_discard_release_pending.is_some()
+        {
             return Err(CaptureError::AlreadyActive);
         }
         if self.editor.is_dirty() {
@@ -3092,7 +3292,13 @@ impl App {
                 }
                 self.managed_release_in_flight = None;
                 match result {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        if self.capture_discard_release_pending == Some(id) {
+                            self.capture_discard_release_pending = None;
+                            self.complete_capture_discard();
+                        }
+                        true
+                    }
                     Err(error) => {
                         self.pending_managed_releases.push_front(id);
                         self.status = error.to_string();
@@ -3129,10 +3335,12 @@ impl App {
                 }
                 self.capture_worker_request = None;
                 if self.capture_discard_pending {
-                    if let Ok(candidate) = result {
-                        self.queue_managed_release(candidate.id);
+                    match result {
+                        Ok(candidate) => {
+                            self.wait_for_capture_discard_release(candidate.id);
+                        }
+                        Err(_) => self.finish_capture_discard(),
                     }
-                    self.finish_capture_discard();
                     return true;
                 }
                 if self.capture_session.phase() == Some(CapturePhase::Failed) {
@@ -3354,7 +3562,24 @@ impl App {
     }
 
     fn finish_capture_discard(&mut self) {
+        debug_assert!(self.capture_discard_release_pending.is_none());
         self.discard_capture_transaction();
+        self.complete_capture_discard();
+    }
+
+    fn wait_for_capture_discard_release(&mut self, id: ManagedCaptureId) {
+        debug_assert!(self.capture_discard_release_pending.is_none());
+        self.discard_capture_transaction();
+        self.capture_discard_release_pending = Some(id);
+        self.queue_managed_release(id);
+        self.overlay = Some(Overlay::CaptureProgress {
+            action: self.pending_capture_project_action(),
+            discarding: true,
+        });
+        self.status = "Discarding capture and releasing exact worker artifact…".to_owned();
+    }
+
+    fn complete_capture_discard(&mut self) {
         self.overlay = None;
         self.status = "Capture discarded; prior pad unchanged".to_owned();
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureDiscard) {
@@ -3829,6 +4054,15 @@ impl App {
             return;
         };
         let label = action.label();
+        if self.capture_discard_release_pending.is_some() {
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
+            self.overlay = Some(Overlay::CaptureProgress {
+                action: Some(label),
+                discarding: true,
+            });
+            self.status = "Discarding capture and releasing exact worker artifact…".to_owned();
+            return;
+        }
         if self.capture_session.phase().is_some() {
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingCapture);
             self.present_capture_resolution_choice();

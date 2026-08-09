@@ -236,6 +236,13 @@ impl CaptureShared {
     }
 
     fn progress(&self) -> Option<CaptureProgressSnapshot> {
+        self.progress_with_validation_hook(|| {})
+    }
+
+    fn progress_with_validation_hook(
+        &self,
+        mut before_validation: impl FnMut(),
+    ) -> Option<CaptureProgressSnapshot> {
         for _ in 0..PROGRESS_SNAPSHOT_ATTEMPTS {
             let before = self.progress_sequence.load(Ordering::Acquire);
             if before & 1 != 0 {
@@ -247,6 +254,12 @@ impl CaptureShared {
             let frames = self.frames.load(Ordering::Relaxed);
             let peak = f32::from_bits(self.peak_bits.load(Ordering::Relaxed));
             let hard_limit = self.hard_limit.load(Ordering::Relaxed);
+            // This full fence keeps every relaxed payload read before the final
+            // sequence observation. Together with the writer's Release publication
+            // and both Acquire sequence loads, an equal even sequence brackets one
+            // coherent payload rather than admitting fields from another publication.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            before_validation();
             let after = self.progress_sequence.load(Ordering::Acquire);
             if before == after {
                 return published.then_some(CaptureProgressSnapshot {
@@ -920,5 +933,29 @@ mod tests {
             .store(1, Ordering::Release);
 
         assert_eq!(controller.progress(), None);
+    }
+
+    #[test]
+    fn controller_progress_retries_when_publication_lands_before_final_validation() {
+        let (controller, _core) = capture_channels(1, 1);
+        controller.shared.publish_progress(81, 1, 0.5, false);
+        let mut publish_during_first_validation = true;
+
+        let snapshot = controller.shared.progress_with_validation_hook(|| {
+            if publish_during_first_validation {
+                publish_during_first_validation = false;
+                controller.shared.publish_progress(82, 2, 1.25, true);
+            }
+        });
+
+        assert_eq!(
+            snapshot,
+            Some(CaptureProgressSnapshot {
+                token: 82,
+                frames: 2,
+                peak: 1.25,
+                hard_limit: true,
+            })
+        );
     }
 }

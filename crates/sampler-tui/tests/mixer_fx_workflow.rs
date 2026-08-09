@@ -2,8 +2,8 @@
 //! this target so the final slice proves one continuous public surface: engine/controller capture,
 //! App/worker persistence, project-store migration, and command-palette validation.
 
-#[path = "project_persistence_workflow.rs"]
-mod project_persistence_workflow;
+#[path = "support/mixer_harness.rs"]
+mod mixer_harness;
 
 use std::fs;
 use std::sync::Arc;
@@ -16,9 +16,11 @@ use sampler_core::{
     BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
     PlaybackMode, ReverbSettings,
 };
-use sampler_tui::{App, AudioPort, CaptureSupport, InputAction, RecoveryChoice, parse_palette};
+use sampler_tui::{
+    App, AudioPort, CaptureSupport, InputAction, ProjectStore, RecoveryChoice, parse_palette,
+};
 
-use project_persistence_workflow::{FixtureTree, Harness};
+use mixer_harness::{FixtureTree, Harness};
 
 struct RejectingAudio(&'static str);
 
@@ -227,6 +229,77 @@ fn app_mixer_tuple(app: &App) -> (Vec<(PadSettings, PadMixSettings)>, MasterMixS
     (pads, app.master_mix(), app.project_revision())
 }
 
+fn render_app_hit_bits(harness: &mut Harness, index: usize, frames: usize) -> Vec<[u32; 2]> {
+    harness.app.apply(InputAction::PadPress(index));
+    let mut rendered = Vec::with_capacity(frames);
+    harness.engine.render_frames(frames, |frame| {
+        rendered.push([frame[0].to_bits(), frame[1].to_bits()]);
+    });
+    rendered
+}
+
+#[test]
+fn owned_schema_v2_fixture_defaults_bitwise_to_an_explicit_dry_v3_mix() {
+    let fixture = FixtureTree::new();
+    let source_path = fixture.write_wav("schema-v2-source.wav");
+    let project = fixture.path("schema-v2-project");
+    let now = Instant::now();
+
+    let mut explicit_v3 = Harness::new();
+    explicit_v3.load(pad(0), &source_path);
+    let dry_v3_bits = render_app_hit_bits(&mut explicit_v3, 0, 65);
+    explicit_v3.save_as(&project, now);
+    let saved = ProjectStore
+        .probe(&project)
+        .unwrap()
+        .explicit
+        .unwrap()
+        .unwrap();
+    let saved_pad = &saved.pads[0];
+    let literal_v2 = format!(
+        r#"schema_version = 2
+project_id = "{}"
+name = "owned schema v2"
+revision = 29
+patterns = []
+
+[[pads]]
+audio_path = "{}"
+asset_digest = "{}"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false
+"#,
+        saved.project_id, saved_pad.audio_path, saved_pad.asset_digest
+    );
+    fs::write(project.join("project.toml"), &literal_v2).unwrap();
+    drop(explicit_v3);
+
+    let mut migrated = Harness::new();
+    migrated.open(&project, None, now);
+    assert_eq!(migrated.app.pad_mix(pad(0)), PadMixSettings::default());
+    assert_eq!(migrated.app.master_mix(), MasterMixSettings::default());
+    assert_eq!(migrated.app.project_revision(), 29);
+    assert_eq!(render_app_hit_bits(&mut migrated, 0, 65), dry_v3_bits);
+    assert_eq!(
+        fs::read_to_string(project.join("project.toml")).unwrap(),
+        literal_v2
+    );
+}
+
 #[test]
 fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_device_retry() {
     let fixture = FixtureTree::new();
@@ -351,6 +424,11 @@ fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_
         restored.app.pad(pad(2)).sample.as_ref().unwrap().data(),
         recovery_pcm
     );
+    assert!(restored.retry_fresh_audio());
+    let reference_tuple = app_mixer_tuple(&restored.app);
+    let reference_bits = render_app_hit_bits(&mut restored, 2, 1_100);
+    assert!(reference_bits.iter().any(|frame| *frame != [0, 0]));
+    assert!(restored.retry_fresh_audio());
 
     fs::create_dir(&corrupt).unwrap();
     fs::write(corrupt.join("project.toml"), "not = [valid").unwrap();
@@ -393,19 +471,24 @@ fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_
     assert_eq!(app_mixer_tuple(&restored.app), before_failure);
     assert!(restored.retry_fresh_audio());
     assert_eq!(app_mixer_tuple(&restored.app), before_failure);
+    assert_eq!(app_mixer_tuple(&restored.app), reference_tuple);
+    assert_eq!(restored.app.master_mix(), recovery_tuple.1);
+    for index in 0..16 {
+        assert_eq!(
+            restored.app.pad(pad(index as u8)).settings,
+            recovery_tuple.0[index].0
+        );
+        assert_eq!(
+            restored.app.pad_mix(pad(index as u8)),
+            recovery_tuple.0[index].1
+        );
+    }
     assert_eq!(
         restored.app.pad(pad(2)).sample.as_ref().unwrap().data(),
         recovery_pcm
     );
-    restored.app.apply(InputAction::PadPress(2));
-    let mut peak = 0.0_f32;
-    restored.engine.render_frames(1_100, |frame| {
-        peak = peak.max(frame[0].abs()).max(frame[1].abs());
-    });
-    assert!(
-        peak > 1.0e-4,
-        "retry must reconstruct installed render state"
-    );
+    let replacement_bits = render_app_hit_bits(&mut restored, 2, 1_100);
+    assert_eq!(replacement_bits, reference_bits);
 }
 
 #[test]

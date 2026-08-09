@@ -13,8 +13,8 @@ use sampler_audio::{
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, MasterMixSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PlaybackMode,
-    ProjectDocument, ProjectId, SampleEditRecipe,
+    BankId, MasterMixSettings, MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId,
+    PlaybackMode, ProjectDocument, ProjectId, SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -28,6 +28,7 @@ use crate::loader::{
     ProjectSaveWorkerRequest, ProjectToken, RenderedSample, StageProjectSampleRequest,
     WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
+use crate::midi::MidiEvent;
 use crate::mixer::{MixerAction, MixerContext, MixerCursor, MixerIntent};
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
@@ -48,6 +49,8 @@ pub const PAD_VIEW_COUNT: usize = 160;
 pub const EDIT_PREVIEW_COLUMNS: usize = 1_024;
 pub const PREVIEW_COLUMNS: usize = 64;
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+const MIDI_OWNERSHIP_COUNT: usize = 16 * 128;
+const MIDI_RECORDING_KEY_OFFSET: usize = PADS_PER_BANK as usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSaveError {
@@ -4620,6 +4623,8 @@ pub struct App {
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
+    midi_settings: MidiSettings,
+    midi_owned_pads: Box<[Option<PadId>; MIDI_OWNERSHIP_COUNT]>,
     overlay: Option<Overlay>,
     palette: LineEditor,
     palette_error: Option<String>,
@@ -4764,6 +4769,8 @@ impl App {
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
+            midi_settings: MidiSettings::default(),
+            midi_owned_pads: Box::new([None; MIDI_OWNERSHIP_COUNT]),
             overlay,
             palette: LineEditor::default(),
             palette_error: None,
@@ -5754,6 +5761,95 @@ impl App {
         }
     }
 
+    fn blocking_pad_overlay(&self) -> bool {
+        matches!(
+            self.overlay,
+            Some(
+                Overlay::Palette
+                    | Overlay::ProjectOpenProgress
+                    | Overlay::ResolveSampleDraft { .. }
+                    | Overlay::UnsavedProject { .. }
+                    | Overlay::ProjectLifecycleProgress { .. }
+                    | Overlay::ProjectSaveProgress
+                    | Overlay::ProjectError { .. }
+                    | Overlay::CaptureConfirm
+                    | Overlay::CaptureDiscard
+                    | Overlay::ResolveCapture { .. }
+                    | Overlay::CaptureProgress { .. }
+                    | Overlay::CaptureFailed { .. }
+            )
+        )
+    }
+
+    fn midi_trigger_is_fenced(&self) -> bool {
+        self.should_quit || self.project_open_is_admitting() || self.blocking_pad_overlay()
+    }
+
+    pub fn apply_midi_event(&mut self, event: MidiEvent) {
+        match event {
+            MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity: 0,
+            }
+            | MidiEvent::NoteOff { channel, note } => {
+                let owner = midi_owner_index(channel.get(), note.get());
+                let _ = self.release_midi_owner(owner);
+            }
+            MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => {
+                if self.midi_trigger_is_fenced() || !self.midi_settings.channel().accepts(channel) {
+                    return;
+                }
+                let Some(pad_index) = self.midi_settings.bank(self.active_bank).owner(note) else {
+                    return;
+                };
+                let owner = midi_owner_index(channel.get(), note.get());
+                if self.midi_owned_pads[owner].is_some() && !self.release_midi_owner(owner) {
+                    return;
+                }
+                let pad = PadId::new(self.active_bank, pad_index)
+                    .expect("MIDI map contains a valid pad index");
+                let _ = self.select_pad(usize::from(pad_index));
+                if self.patterns.view() == WorkspaceView::Pattern {
+                    let step = self.patterns.cursor().step();
+                    self.patterns.move_cursor_to(pad, step);
+                }
+                let Some(audio) = self.audio.as_mut() else {
+                    self.report_audio_unavailable();
+                    return;
+                };
+                let recording = self.patterns.is_recording();
+                let velocity = f32::from(velocity) / 127.0;
+                let result = if recording {
+                    audio.trigger_live_tracked(pad, velocity).map(Some)
+                } else {
+                    audio.trigger_live(pad, velocity).map(|()| None)
+                };
+                match result {
+                    Ok(command) => {
+                        self.midi_owned_pads[owner] = Some(pad);
+                        if let Some(command) = command {
+                            let records_duration =
+                                self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot;
+                            self.patterns.note_live_trigger_with_duration(
+                                MIDI_RECORDING_KEY_OFFSET + owner,
+                                command,
+                                pad,
+                                velocity,
+                                records_duration,
+                            );
+                        }
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+        }
+    }
+
     pub fn apply_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Repeat {
             return;
@@ -5775,23 +5871,7 @@ impl App {
             return;
         }
         if let Some(action) = map_key(key, self.keyboard_capabilities) {
-            let captures_pad_keys = matches!(
-                self.overlay,
-                Some(
-                    Overlay::Palette
-                        | Overlay::ProjectOpenProgress
-                        | Overlay::ResolveSampleDraft { .. }
-                        | Overlay::UnsavedProject { .. }
-                        | Overlay::ProjectLifecycleProgress { .. }
-                        | Overlay::ProjectSaveProgress
-                        | Overlay::ProjectError { .. }
-                        | Overlay::CaptureConfirm
-                        | Overlay::CaptureDiscard
-                        | Overlay::ResolveCapture { .. }
-                        | Overlay::CaptureProgress { .. }
-                        | Overlay::CaptureFailed { .. }
-                )
-            );
+            let captures_pad_keys = self.blocking_pad_overlay();
             match action {
                 InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
                     self.apply(action);
@@ -6638,6 +6718,7 @@ impl App {
                                 candidate.progress.admitted_actions = 1;
                                 candidate.admission = ProjectAdmission::Master;
                                 self.held_pad_by_key.fill(None);
+                                self.midi_owned_pads.fill(None);
                                 changed = true;
                             }
                             Err(error) => self.status = error,
@@ -10154,6 +10235,36 @@ impl App {
         }
     }
 
+    fn release_midi_owner(&mut self, owner: usize) -> bool {
+        let Some(pad) = self.midi_owned_pads[owner] else {
+            return true;
+        };
+        let Some(audio) = self.audio.as_mut() else {
+            self.report_audio_unavailable();
+            return false;
+        };
+        let recording = self.patterns.is_recording();
+        let result = if recording {
+            audio.release_live_tracked(pad).map(Some)
+        } else {
+            audio.release_live(pad).map(|()| None)
+        };
+        match result {
+            Ok(command) => {
+                self.midi_owned_pads[owner] = None;
+                if let Some(command) = command {
+                    self.patterns
+                        .note_live_release(MIDI_RECORDING_KEY_OFFSET + owner, command);
+                }
+                true
+            }
+            Err(error) => {
+                self.status = error;
+                false
+            }
+        }
+    }
+
     fn stop_pad(&mut self, index: usize) {
         let Some(pad) = self.pad_in_active_bank(index) else {
             return;
@@ -10180,6 +10291,7 @@ impl App {
         match audio.stop_all() {
             Ok(()) => {
                 self.held_pad_by_key.fill(None);
+                self.midi_owned_pads.fill(None);
                 self.patterns.stop_recording();
                 self.note_pattern_transport_intent(false);
             }
@@ -10862,6 +10974,10 @@ fn pad_offset(pad: PadId) -> usize {
     usize::from(u8::from(pad.bank())) * usize::from(PADS_PER_BANK) + usize::from(pad.index())
 }
 
+fn midi_owner_index(channel: u8, note: u8) -> usize {
+    usize::from(channel - 1) * 128 + usize::from(note)
+}
+
 fn pad_from_offset(offset: usize) -> PadId {
     let bank =
         u8::try_from(offset / usize::from(PADS_PER_BANK)).expect("bounded pad bank fits in u8");
@@ -10920,17 +11036,19 @@ mod tests {
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use sampler_audio::{
-        AudioController, EnginePorts, Frame, LiveAck, LiveAckKind, LiveCommandId,
+        AudioController, AudioEngine, EnginePorts, Frame, LiveAck, LiveAckKind, LiveCommandId,
         PatternSnapshotSlot, PatternSwitch, SampleBuffer, SampleSlot, Telemetry, TransportStamp,
         audio_channels, audio_channels_with_test_capacities,
     };
     use sampler_core::{
-        BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SampleEditRecipe,
+        BankId, MidiChannel, MidiChannelFilter, MidiNote, MidiSettings, PadId, PadSettings,
+        PatternSlotId, PatternSnapshot, PlaybackMode, SampleEditRecipe,
     };
 
     use crate::audio::{AudioPort, CaptureSupport};
     use crate::capture_store::{CaptureStoreError, ManagedCaptureId};
     use crate::input::InputAction;
+    use crate::midi::MidiEvent;
 
     use crate::DirectoryScan;
     use crate::loader::{
@@ -10954,7 +11072,7 @@ mod tests {
         Release(PadId, Frame),
         StopPad(PadId),
         StopAll,
-        TrackedTrigger(PadId),
+        TrackedTrigger(PadId, f32),
         TrackedRelease(PadId),
         InstallPattern,
         SelectPattern(PatternSlotId, PatternSwitch),
@@ -11205,16 +11323,22 @@ mod tests {
         fn trigger_live_tracked(
             &mut self,
             pad: PadId,
-            _velocity: f32,
+            velocity: f32,
         ) -> Result<LiveCommandId, String> {
+            if let Some(error) = &self.trigger_error {
+                return Err(error.clone());
+            }
             self.calls
                 .0
                 .borrow_mut()
-                .push(AudioCall::TrackedTrigger(pad));
+                .push(AudioCall::TrackedTrigger(pad, velocity));
             Ok(LiveCommandId::FIRST)
         }
 
         fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, String> {
+            if let Some(error) = self.release_error.take() {
+                return Err(error);
+            }
             self.calls
                 .0
                 .borrow_mut()
@@ -11354,6 +11478,213 @@ mod tests {
         fn poll_runtime_error(&mut self) -> Option<String> {
             self.maintenance.borrow_mut().push("poll");
             self.runtime_error.take()
+        }
+    }
+
+    struct EngineAudio {
+        controller: Rc<RefCell<AudioController>>,
+        sample_rate: u32,
+    }
+
+    impl EngineAudio {
+        fn harness(sample_rate: u32) -> (Self, Rc<RefCell<AudioController>>, AudioEngine) {
+            let (controller, ports) = audio_channels();
+            let controller = Rc::new(RefCell::new(controller));
+            let engine = AudioEngine::new(sample_rate, ports).unwrap();
+            (
+                Self {
+                    controller: Rc::clone(&controller),
+                    sample_rate,
+                },
+                controller,
+                engine,
+            )
+        }
+    }
+
+    impl AudioPort for EngineAudio {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+
+        fn render_horizon(&self) -> Frame {
+            self.controller.borrow().render_horizon()
+        }
+
+        fn install(
+            &mut self,
+            pad: PadId,
+            sample: Arc<SampleBuffer>,
+            settings: PadSettings,
+            mix: sampler_core::PadMixSettings,
+        ) -> Result<SampleSlot, String> {
+            self.controller
+                .borrow_mut()
+                .install(pad, sample, settings, mix)
+                .map_err(|error| error.to_string())
+        }
+
+        fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .trigger(pad, at, velocity)
+                .map_err(|error| error.to_string())
+        }
+
+        fn release(&mut self, pad: PadId, at: Frame) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .release(pad, at)
+                .map_err(|error| error.to_string())
+        }
+
+        fn trigger_live_tracked(
+            &mut self,
+            pad: PadId,
+            velocity: f32,
+        ) -> Result<LiveCommandId, String> {
+            self.controller
+                .borrow_mut()
+                .trigger_live_tracked(pad, velocity)
+                .map_err(|error| error.to_string())
+        }
+
+        fn release_live_tracked(&mut self, pad: PadId) -> Result<LiveCommandId, String> {
+            self.controller
+                .borrow_mut()
+                .release_live_tracked(pad)
+                .map_err(|error| error.to_string())
+        }
+
+        fn install_pattern(
+            &mut self,
+            snapshot: Arc<PatternSnapshot>,
+        ) -> Result<PatternSnapshotSlot, String> {
+            self.controller
+                .borrow_mut()
+                .install_pattern(snapshot)
+                .map_err(|error| error.to_string())
+        }
+
+        fn select_pattern(
+            &mut self,
+            slot: PatternSlotId,
+            switch: PatternSwitch,
+        ) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .select_pattern(slot, switch)
+                .map_err(|error| error.to_string())
+        }
+
+        fn play_pattern(&mut self) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .play_pattern()
+                .map_err(|error| error.to_string())
+        }
+
+        fn stop_pattern(&mut self) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .stop_pattern()
+                .map_err(|error| error.to_string())
+        }
+
+        fn set_record_capture(
+            &mut self,
+            capture: Option<(PatternSlotId, u64)>,
+        ) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .set_record_capture(capture)
+                .map_err(|error| error.to_string())
+        }
+
+        fn drain_live_acks(&mut self, output: &mut [LiveAck]) -> usize {
+            self.controller.borrow_mut().drain_live_acks(output)
+        }
+
+        fn reclaim_retired_patterns(&mut self) -> usize {
+            let mut reclaimed = 0;
+            while self
+                .controller
+                .borrow_mut()
+                .reclaim_retired_pattern()
+                .is_some()
+            {
+                reclaimed += 1;
+            }
+            reclaimed
+        }
+
+        fn remove_sample(&mut self, pad: PadId) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .remove_sample(pad)
+                .map_err(|error| error.to_string())
+        }
+
+        fn stop_pad(&mut self, pad: PadId) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .stop_pad(pad)
+                .map_err(|error| error.to_string())
+        }
+
+        fn stop_all(&mut self) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .stop_all()
+                .map_err(|error| error.to_string())
+        }
+
+        fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .update_pad(pad, settings)
+                .map_err(|error| error.to_string())
+        }
+
+        fn update_pad_mix(
+            &mut self,
+            pad: PadId,
+            settings: sampler_core::PadMixSettings,
+        ) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .update_pad_mix(pad, settings)
+                .map_err(|error| error.to_string())
+        }
+
+        fn update_master_mix(
+            &mut self,
+            settings: sampler_core::MasterMixSettings,
+        ) -> Result<(), String> {
+            self.controller
+                .borrow_mut()
+                .update_master_mix(settings)
+                .map_err(|error| error.to_string())
+        }
+
+        fn reclaim_retired(&mut self) -> usize {
+            self.controller.borrow_mut().reclaim_retired()
+        }
+
+        fn latest_telemetry(&mut self) -> Option<Telemetry> {
+            self.controller.borrow_mut().latest_telemetry()
+        }
+
+        fn poll_runtime_error(&mut self) -> Option<String> {
+            None
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::Unsupported
         }
     }
 
@@ -13299,7 +13630,7 @@ mod tests {
                 AudioCall::SelectPattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate,),
                 AudioCall::PlayPattern,
                 AudioCall::SetRecordCapture(Some((PatternSlotId::new(0).unwrap(), 0))),
-                AudioCall::TrackedTrigger(pad(0, 0)),
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
             ]
         );
     }
@@ -17469,5 +17800,350 @@ mod tests {
             app.request_save(),
             Err(super::ProjectSaveError::OperationPending)
         );
+    }
+
+    fn midi_channel(value: u8) -> MidiChannel {
+        MidiChannel::new(value).expect("test MIDI channel is valid")
+    }
+
+    fn midi_note(value: u8) -> MidiNote {
+        MidiNote::new(value).expect("test MIDI note is valid")
+    }
+
+    fn midi_on(channel: u8, note: u8, velocity: u8) -> MidiEvent {
+        MidiEvent::NoteOn {
+            channel: midi_channel(channel),
+            note: midi_note(note),
+            velocity,
+        }
+    }
+
+    fn midi_off(channel: u8, note: u8) -> MidiEvent {
+        MidiEvent::NoteOff {
+            channel: midi_channel(channel),
+            note: midi_note(note),
+        }
+    }
+
+    fn midi_owner_index(channel: u8, note: u8) -> usize {
+        usize::from(channel - 1) * 128 + usize::from(note)
+    }
+
+    #[test]
+    fn midi_task5_default_mapping_preserves_velocity_and_latches_bank_for_release() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+
+        app.apply_midi_event(midi_on(1, 36, 64));
+        app.apply_midi_event(midi_on(1, 36, 0));
+        app.apply_midi_event(midi_off(1, 99));
+        app.apply(InputAction::BankDelta(1));
+        app.apply_midi_event(midi_on(1, 37, 127));
+        app.apply(InputAction::BankDelta(1));
+        app.apply_midi_event(midi_off(1, 37));
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, f32::from(64_u8) / 127.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::Trigger(pad(1, 1), 64, 1.0),
+                AudioCall::Release(pad(1, 1), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn midi_task5_numbered_filter_and_omni_channel_ownership_are_independent() {
+        let filtered_audio = FakeAudio::ready(48_000, 2);
+        let filtered_calls = filtered_audio.call_log();
+        let mut filtered = App::with_audio(Box::new(filtered_audio));
+        filtered.midi_settings =
+            MidiSettings::default().with_channel(MidiChannelFilter::Channel(midi_channel(2)));
+
+        filtered.apply_midi_event(midi_on(1, 36, 127));
+        filtered.apply_midi_event(midi_on(2, 36, 127));
+        assert_eq!(
+            filtered_calls.snapshot(),
+            vec![AudioCall::Trigger(pad(0, 0), 64, 1.0)]
+        );
+
+        let omni_audio = FakeAudio::ready(48_000, 2);
+        let omni_calls = omni_audio.call_log();
+        let mut omni = App::with_audio(Box::new(omni_audio));
+        omni.apply_midi_event(midi_on(1, 36, 127));
+        omni.apply_midi_event(midi_on(2, 36, 127));
+        omni.apply_midi_event(midi_off(1, 36));
+        assert_eq!(
+            omni.midi_owned_pads[midi_owner_index(2, 36)],
+            Some(pad(0, 0))
+        );
+        omni.apply_midi_event(midi_off(2, 36));
+
+        assert_eq!(
+            omni_calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn midi_task5_repeated_note_releases_old_owner_before_remapped_trigger() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.midi_settings = app
+            .midi_settings
+            .learn_swap(BankId::new(0).unwrap(), 1, midi_note(36))
+            .unwrap();
+
+        app.apply_midi_event(midi_on(1, 36, 32));
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::Trigger(pad(0, 1), 64, f32::from(32_u8) / 127.0),
+            ]
+        );
+        assert_eq!(
+            app.midi_owned_pads[midi_owner_index(1, 36)],
+            Some(pad(0, 1))
+        );
+    }
+
+    #[test]
+    fn midi_task5_failed_repeated_release_retains_old_owner_and_aborts_trigger() {
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.midi_settings = app
+            .midi_settings
+            .learn_swap(BankId::new(0).unwrap(), 1, midi_note(36))
+            .unwrap();
+
+        app.apply_midi_event(midi_on(1, 36, 64));
+        assert_eq!(
+            app.midi_owned_pads[midi_owner_index(1, 36)],
+            Some(pad(0, 0))
+        );
+        app.apply_midi_event(midi_off(1, 36));
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+        assert_eq!(app.midi_owned_pads[midi_owner_index(1, 36)], None);
+    }
+
+    #[test]
+    fn midi_task5_trigger_and_noteoff_failures_preserve_exact_ownership() {
+        let trigger_audio = FakeAudio::ready(48_000, 2).failing_trigger("trigger queue full");
+        let mut trigger_app = App::with_audio(Box::new(trigger_audio));
+        trigger_app.apply_midi_event(midi_on(1, 36, 127));
+        trigger_app.apply_midi_event(midi_off(1, 36));
+        assert_eq!(trigger_app.midi_owned_pads[midi_owner_index(1, 36)], None);
+
+        let release_audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let release_calls = release_audio.call_log();
+        let mut release_app = App::with_audio(Box::new(release_audio));
+        release_app.apply_midi_event(midi_on(1, 36, 127));
+        release_app.apply_midi_event(midi_off(1, 36));
+        assert_eq!(
+            release_app.midi_owned_pads[midi_owner_index(1, 36)],
+            Some(pad(0, 0))
+        );
+        release_app.apply_midi_event(midi_off(1, 36));
+        assert_eq!(release_app.midi_owned_pads[midi_owner_index(1, 36)], None);
+        assert_eq!(
+            release_calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn midi_task5_stop_all_clears_owners_only_after_audio_admission() {
+        let audio = FakeAudio::ready(48_000, 2).failing_stop_all_once("stop queue full");
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(1, 36, 127));
+
+        app.apply(InputAction::StopAll);
+        assert_eq!(
+            app.midi_owned_pads[midi_owner_index(1, 36)],
+            Some(pad(0, 0))
+        );
+        app.apply(InputAction::StopAll);
+        assert_eq!(app.midi_owned_pads[midi_owner_index(1, 36)], None);
+    }
+
+    #[test]
+    fn midi_task5_trigger_fences_allow_releases_and_ordinary_overlays_remain_playable() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.should_quit = true;
+        app.apply_midi_event(midi_on(1, 37, 127));
+        app.apply_midi_event(midi_off(1, 36));
+        app.should_quit = false;
+
+        app.overlay = Some(super::Overlay::CaptureConfirm);
+        app.apply_midi_event(midi_on(1, 38, 127));
+        app.overlay = Some(super::Overlay::ProjectSaveProgress);
+        app.apply_midi_event(midi_on(1, 38, 127));
+        app.overlay = Some(super::Overlay::Help);
+        app.apply_midi_event(midi_on(1, 39, 127));
+        app.apply_midi_event(midi_on(1, 41, 127));
+        let operation = app
+            .build_project_open_candidate(
+                crate::ProjectToken::new(991),
+                PathBuf::from("midi-project"),
+                project_open_document(
+                    sampler_core::ProjectId::from_bytes([0x99; 16]),
+                    "MIDI project",
+                    0,
+                    Vec::new(),
+                ),
+                0,
+                false,
+            )
+            .unwrap();
+        let super::ProjectOpenOperation::Staging(mut candidate) = operation else {
+            panic!("project fixture must enter staging")
+        };
+        candidate.progress.phase = crate::ProjectOpenPhase::Admitting;
+        app.project_open = Some(super::ProjectOpenOperation::Staging(candidate));
+        app.apply_midi_event(midi_on(1, 40, 127));
+        app.apply_midi_event(midi_off(1, 39));
+        assert!(app.maintain_project(Instant::now()));
+        assert_eq!(app.midi_owned_pads[midi_owner_index(1, 41)], None);
+        app.project_open = None;
+
+        app.overlay = None;
+        app.capture_session
+            .begin(sampler_audio::CaptureSource::Resample, pad(0, 0), 48_000, 4)
+            .unwrap();
+        app.capture_session.mark_arming().unwrap();
+        app.capture_session.mark_recording().unwrap();
+        app.apply_midi_event(midi_on(1, 41, 127));
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::Trigger(pad(0, 3), 64, 1.0),
+                AudioCall::Trigger(pad(0, 5), 64, 1.0),
+                AudioCall::Release(pad(0, 3), 64),
+                AudioCall::StopAll,
+                AudioCall::Trigger(pad(0, 5), 64, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn midi_task5_unavailable_audio_never_creates_ownership() {
+        let mut app = App::without_audio("no output device");
+
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.apply_midi_event(midi_off(1, 36));
+
+        assert_eq!(app.midi_owned_pads[midi_owner_index(1, 36)], None);
+        assert_eq!(app.status, "no output device");
+    }
+
+    #[test]
+    fn midi_task5_real_engine_acks_record_exact_velocity_frame_and_gate_duration() {
+        let (audio, controller, mut engine) = EngineAudio::harness(100);
+        let mut app = App::with_audio(Box::new(audio));
+        let target = pad(0, 0);
+        let settings = PadSettings {
+            mode: PlaybackMode::Gate,
+            ..PadSettings::default()
+        };
+        app.pads[super::pad_offset(target)].settings = settings;
+        controller
+            .borrow_mut()
+            .install(
+                target,
+                Arc::new(SampleBuffer::new(100, [0.25, -0.25].repeat(1_000)).unwrap()),
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
+            .unwrap();
+
+        app.maintain_audio();
+        engine.render_frames(4, |_| {});
+        app.maintain_audio();
+        assert!(app.patterns.is_slot_ready(app.patterns.selected_slot()));
+        app.start_pattern_recording();
+        engine.render_frames(4, |_| {});
+        app.maintain_audio();
+        assert!(app.patterns.is_recording());
+
+        let origin = app.telemetry.pattern_origin.unwrap();
+        let trigger_absolute = engine.rendered_frame() + 64;
+        app.apply_midi_event(midi_on(1, 36, 50));
+        engine.render_frames(65, |_| {});
+        engine.render_frames(9, |_| {});
+        let release_absolute = engine.rendered_frame() + 64;
+        app.apply_midi_event(midi_off(1, 36));
+        engine.render_frames(65, |_| {});
+        app.maintain_audio();
+
+        let event = app.patterns.selected_pattern().events()[0];
+        assert_eq!(event.pad, target);
+        assert_eq!(
+            event.frame,
+            (trigger_absolute - origin) % app.patterns.selected_pattern().transport().loop_frames()
+        );
+        assert_eq!(event.velocity, f32::from(50_u8) / 127.0);
+        assert_eq!(event.duration, Some(release_absolute - trigger_absolute));
+    }
+
+    #[test]
+    fn midi_task5_real_engine_preserves_choke_group_behavior() {
+        let (audio, controller, mut engine) = EngineAudio::harness(100);
+        let mut app = App::with_audio(Box::new(audio));
+        let group = sampler_core::ChokeGroup::new(1).unwrap();
+        let settings = PadSettings {
+            choke_group: Some(group),
+            ..PadSettings::default()
+        };
+        let sample = Arc::new(SampleBuffer::new(100, [0.25, -0.25].repeat(1_000)).unwrap());
+        for target in [pad(0, 0), pad(0, 1)] {
+            controller
+                .borrow_mut()
+                .install(
+                    target,
+                    Arc::clone(&sample),
+                    settings,
+                    sampler_core::PadMixSettings::default(),
+                )
+                .unwrap();
+        }
+        engine.render_frames(0, |_| {});
+
+        app.apply_midi_event(midi_on(1, 36, 127));
+        engine.render_frames(65, |_| {});
+        assert_eq!(engine.active_voices(), 1);
+        app.apply_midi_event(midi_on(1, 37, 127));
+        engine.render_frames(129, |_| {});
+
+        assert_eq!(engine.active_voices(), 1);
     }
 }

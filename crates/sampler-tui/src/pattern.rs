@@ -406,6 +406,23 @@ mod tests {
     }
 
     #[test]
+    fn midi_task5_retrigger_keeps_retiring_ack_pair_until_duration_is_committed() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(16), command(7), pad(), 0.5);
+        workspace.note_live_release(key(16), command(8));
+        workspace.note_live_trigger(key(16), command(9), pad(), 0.75);
+
+        assert!(workspace.apply_ack(trigger_ack(7, 1_008)));
+        assert!(workspace.apply_ack(release_ack(8, 1_013)));
+        assert!(workspace.apply_ack(trigger_ack(9, 1_020)));
+
+        let events = workspace.selected_pattern().events();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].frame, events[0].duration), (8, Some(5)));
+        assert_eq!((events[1].frame, events[1].duration), (20, None));
+    }
+
+    #[test]
     fn one_shot_ack_records_no_duration_and_drops_its_release_correlation() {
         let mut workspace = recording_workspace();
         workspace.note_live_trigger_with_duration(key(0), command(7), pad(), 1.0, false);
@@ -993,6 +1010,7 @@ use sampler_core::{
 use crate::AudioPort;
 
 pub const MAX_RECORDING_KEYS: usize = 16;
+const MAX_LIVE_RECORDING_KEYS: usize = MAX_RECORDING_KEYS + 16 * 128;
 pub const MAX_ACKS_PER_MAINTENANCE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1248,6 +1266,12 @@ struct HeldRecordingKey {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum HeldRecordingLocation {
+    Active(usize),
+    Retiring(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
 struct SelectedEvent {
     slot: PatternSlotId,
     event_id: EventId,
@@ -1277,7 +1301,8 @@ pub struct PatternWorkspace {
     view: WorkspaceView,
     playing: bool,
     recording: Option<RecordingState>,
-    held_keys: [Option<HeldRecordingKey>; MAX_RECORDING_KEYS],
+    held_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
+    retiring_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
     dirty_patterns: [Option<DirtyPattern>; PATTERN_SLOT_COUNT],
     next_dirty_ticket: u64,
     pending_snapshots: [Option<PendingSnapshot>; PATTERN_SLOT_COUNT],
@@ -1318,7 +1343,8 @@ impl PatternWorkspace {
             view: WorkspaceView::Perform,
             playing: false,
             recording: None,
-            held_keys: [None; MAX_RECORDING_KEYS],
+            held_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
+            retiring_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
             dirty_patterns: array::from_fn(|_| {
                 Some(DirtyPattern {
                     generation: 0,
@@ -1393,6 +1419,7 @@ impl PatternWorkspace {
         self.playing = false;
         self.recording = None;
         self.held_keys.fill(None);
+        self.retiring_keys.fill(None);
         self.dirty_patterns = array::from_fn(|index| {
             Some(DirtyPattern {
                 generation: self.patterns[index].generation(),
@@ -1613,6 +1640,7 @@ impl PatternWorkspace {
         }
         self.recording = Some(RecordingState::Pending(RecordingIntent { stamp }));
         self.held_keys.fill(None);
+        self.retiring_keys.fill(None);
         Ok(())
     }
 
@@ -1621,6 +1649,7 @@ impl PatternWorkspace {
             .recording
             .map(|state| RecordingState::Disarming(state.intent()));
         self.held_keys.fill(None);
+        self.retiring_keys.fill(None);
     }
 
     pub fn is_recording(&self) -> bool {
@@ -1658,10 +1687,17 @@ impl PatternWorkspace {
         velocity: f32,
         record_duration: bool,
     ) {
-        let Some(entry) = self.held_keys.get_mut(key) else {
+        let Some(previous) = self.held_keys.get_mut(key).map(Option::take) else {
             return;
         };
-        *entry = Some(HeldRecordingKey {
+        if let Some(previous) = previous {
+            let Some(retiring) = self.retiring_keys.iter_mut().find(|entry| entry.is_none()) else {
+                self.held_keys[key] = Some(previous);
+                return;
+            };
+            *retiring = Some(previous);
+        }
+        self.held_keys[key] = Some(HeldRecordingKey {
             pad,
             velocity: velocity.clamp(0.0, 1.0),
             trigger_id: Some(command),
@@ -1687,10 +1723,10 @@ impl PatternWorkspace {
     }
 
     pub fn apply_ack(&mut self, ack: LiveAck) -> bool {
-        let Some(key) = self.matching_held_key(ack) else {
+        let Some(location) = self.matching_held_key(ack) else {
             return false;
         };
-        let Some(entry) = self.held_keys[key] else {
+        let Some(entry) = self.recording_key(location) else {
             return false;
         };
         let matching_trigger =
@@ -1702,12 +1738,12 @@ impl PatternWorkspace {
         }
 
         let Some(state) = self.recording else {
-            self.held_keys[key] = None;
+            self.set_recording_key(location, None);
             return false;
         };
         let intent = state.intent();
         let Some(mut stamp) = ack.transport else {
-            self.held_keys[key] = None;
+            self.set_recording_key(location, None);
             return false;
         };
         let accepted = match state {
@@ -1723,7 +1759,7 @@ impl PatternWorkspace {
             RecordingState::Disarming(_) => false,
         };
         if !state.accepts_acks() || !accepted {
-            self.held_keys[key] = None;
+            self.set_recording_key(location, None);
             return false;
         }
         if matches!(state, RecordingState::Pending(_)) && stamp != intent.stamp {
@@ -1735,7 +1771,7 @@ impl PatternWorkspace {
         match ack.kind {
             LiveAckKind::Trigger { velocity } => {
                 if ack.pad != entry.pad {
-                    self.held_keys[key] = None;
+                    self.set_recording_key(location, None);
                     return false;
                 }
                 let frame = ack.frame.wrapping_sub(stamp.origin) % stamp.loop_frames;
@@ -1751,7 +1787,7 @@ impl PatternWorkspace {
                         entry.event_id = Some(event_id);
                         entry.trigger_frame = Some(frame);
                         entry.trigger_absolute_frame = Some(ack.frame);
-                        self.held_keys[key] = entry.record_duration.then_some(entry);
+                        self.set_recording_key(location, entry.record_duration.then_some(entry));
                         if stamp.slot == self.selected_slot {
                             self.selected_event = Some(SelectedEvent {
                                 slot: stamp.slot,
@@ -1762,7 +1798,7 @@ impl PatternWorkspace {
                         true
                     }
                     Err(_) => {
-                        self.held_keys[key] = None;
+                        self.set_recording_key(location, None);
                         false
                     }
                 }
@@ -1771,7 +1807,7 @@ impl PatternWorkspace {
                 let (Some(event_id), Some(trigger_absolute_frame)) =
                     (entry.event_id, entry.trigger_absolute_frame)
                 else {
-                    self.held_keys[key] = None;
+                    self.set_recording_key(location, None);
                     return false;
                 };
                 let elapsed = ack.frame.saturating_sub(trigger_absolute_frame);
@@ -1790,19 +1826,47 @@ impl PatternWorkspace {
                     }
                     self.commit_project_pattern(index);
                 }
-                self.held_keys[key] = None;
+                self.set_recording_key(location, None);
                 committed
             }
         }
     }
 
-    fn matching_held_key(&self, ack: LiveAck) -> Option<usize> {
-        self.held_keys.iter().position(|entry| {
+    fn matching_held_key(&self, ack: LiveAck) -> Option<HeldRecordingLocation> {
+        let matches = |entry: &Option<HeldRecordingKey>| {
             entry.is_some_and(|entry| match ack.kind {
                 LiveAckKind::Trigger { .. } => entry.trigger_id == Some(ack.id),
                 LiveAckKind::Release => entry.release_id == Some(ack.id),
             })
-        })
+        };
+        self.held_keys
+            .iter()
+            .position(matches)
+            .map(HeldRecordingLocation::Active)
+            .or_else(|| {
+                self.retiring_keys
+                    .iter()
+                    .position(matches)
+                    .map(HeldRecordingLocation::Retiring)
+            })
+    }
+
+    fn recording_key(&self, location: HeldRecordingLocation) -> Option<HeldRecordingKey> {
+        match location {
+            HeldRecordingLocation::Active(index) => self.held_keys[index],
+            HeldRecordingLocation::Retiring(index) => self.retiring_keys[index],
+        }
+    }
+
+    fn set_recording_key(
+        &mut self,
+        location: HeldRecordingLocation,
+        entry: Option<HeldRecordingKey>,
+    ) {
+        match location {
+            HeldRecordingLocation::Active(index) => self.held_keys[index] = entry,
+            HeldRecordingLocation::Retiring(index) => self.retiring_keys[index] = entry,
+        }
     }
 
     fn reconcile_record_capture(&mut self, telemetry: Telemetry) {
@@ -1857,6 +1921,7 @@ impl PatternWorkspace {
         };
         if next.is_none() {
             self.held_keys.fill(None);
+            self.retiring_keys.fill(None);
         }
         self.recording = next;
     }
@@ -1923,8 +1988,8 @@ impl PatternWorkspace {
         for ack in acks.into_iter().take(result.drained_acks) {
             if result.committed_mutations < recording_mutation_budget {
                 result.committed_mutations += usize::from(self.apply_ack(ack));
-            } else if let Some(key) = self.matching_held_key(ack) {
-                self.held_keys[key] = None;
+            } else if let Some(location) = self.matching_held_key(ack) {
+                self.set_recording_key(location, None);
             }
         }
 

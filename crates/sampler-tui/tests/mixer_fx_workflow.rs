@@ -1,6 +1,6 @@
-//! Mixer/FX/choke acceptance target. The two established cross-layer harnesses are compiled into
-//! this target so the final slice proves one continuous public surface: engine/controller capture,
-//! App/worker persistence, project-store migration, and command-palette validation.
+//! Owned Mixer/FX/choke acceptance tests using isolated shared fixture/controller/App/worker
+//! support. The dedicated workflow proves the continuous public surface without importing tests
+//! from another integration target.
 
 #[path = "support/mixer_harness.rs"]
 mod mixer_harness;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use sampler_audio::{
     AudioEngine, ControlError, Frame, SampleBuffer, SampleSlot, Telemetry, audio_channels,
+    audio_channels_with_test_capacities,
 };
 use sampler_core::{
     BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
@@ -238,6 +239,40 @@ fn render_app_hit_bits(harness: &mut Harness, index: usize, frames: usize) -> Ve
     rendered
 }
 
+fn render_independent_engine_bits(
+    app: &App,
+    index: u8,
+    pad_mix_override: Option<PadMixSettings>,
+    master_override: Option<MasterMixSettings>,
+) -> Vec<[u32; 2]> {
+    let (mut controller, ports) = audio_channels_with_test_capacities(32, 256, 8);
+    let mut engine = AudioEngine::new(48_000, ports).unwrap();
+    controller
+        .update_master_mix(master_override.unwrap_or_else(|| app.master_mix()))
+        .unwrap();
+    for pad_index in 0..16 {
+        let pad_id = pad(pad_index);
+        let view = app.pad(pad_id);
+        let Some(sample) = view.sample.as_ref() else {
+            continue;
+        };
+        let mix = if pad_index == index {
+            pad_mix_override.unwrap_or_else(|| app.pad_mix(pad_id))
+        } else {
+            app.pad_mix(pad_id)
+        };
+        controller
+            .install(pad_id, Arc::clone(sample), view.settings, mix)
+            .unwrap();
+    }
+    controller.trigger_live(pad(index), 1.0).unwrap();
+    let mut rendered = Vec::with_capacity(1_100);
+    engine.render_frames(1_100, |frame| {
+        rendered.push([frame[0].to_bits(), frame[1].to_bits()]);
+    });
+    rendered
+}
+
 #[test]
 fn owned_schema_v2_fixture_defaults_bitwise_to_an_explicit_dry_v3_mix() {
     let fixture = FixtureTree::new();
@@ -424,11 +459,16 @@ fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_
         restored.app.pad(pad(2)).sample.as_ref().unwrap().data(),
         recovery_pcm
     );
-    assert!(restored.retry_fresh_audio());
     let reference_tuple = app_mixer_tuple(&restored.app);
-    let reference_bits = render_app_hit_bits(&mut restored, 2, 1_100);
+    let reference_bits = render_independent_engine_bits(&restored.app, 1, None, None);
     assert!(reference_bits.iter().any(|frame| *frame != [0, 0]));
-    assert!(restored.retry_fresh_audio());
+    let wrong_default_bits = render_independent_engine_bits(
+        &restored.app,
+        1,
+        Some(PadMixSettings::default()),
+        Some(MasterMixSettings::default()),
+    );
+    assert_ne!(wrong_default_bits, reference_bits);
 
     fs::create_dir(&corrupt).unwrap();
     fs::write(corrupt.join("project.toml"), "not = [valid").unwrap();
@@ -487,7 +527,7 @@ fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_
         restored.app.pad(pad(2)).sample.as_ref().unwrap().data(),
         recovery_pcm
     );
-    let replacement_bits = render_app_hit_bits(&mut restored, 2, 1_100);
+    let replacement_bits = render_app_hit_bits(&mut restored, 1, 1_100);
     assert_eq!(replacement_bits, reference_bits);
 }
 

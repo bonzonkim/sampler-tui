@@ -581,6 +581,116 @@ fn closing_help_reveals_a_terminal_export_outcome_without_focusing_it() {
         harness.app.export_status_view(),
         Some(ExportStatusView::Cancelled { .. })
     ));
+
+    harness.app.apply(InputAction::BankDelta(-1));
+    let newer_status = harness.app.status().to_owned();
+    harness.app.open_help();
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(harness.app.status(), newer_status);
+}
+
+#[test]
+fn suppressed_progress_restores_once_via_help_toggle_but_not_on_a_later_close() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    let token = harness.app.start_export(destination).unwrap();
+    let requests = harness.app.take_worker_requests();
+    let [WorkerRequest::Export(request)] = requests.as_slice() else {
+        panic!("expected export request")
+    };
+    let cancel = request.cancellation();
+    let operation = harness.app.export_operation().unwrap().clone();
+    harness.app.open_help();
+    assert!(
+        harness
+            .app
+            .maintain_export(Some(WorkerResult::ExportProgress {
+                token,
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 1,
+                total_units: 2,
+            }))
+    );
+
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: true, .. })
+    ));
+    assert!(harness.app.status().contains("50%"));
+
+    harness.app.open_help();
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: false, .. })
+    ));
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!cancel.is_cancelled());
+
+    assert!(
+        harness
+            .app
+            .maintain_export(Some(WorkerResult::ExportProgress {
+                token,
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 2,
+                total_units: 2,
+            }))
+    );
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: true, .. })
+    ));
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(cancel.is_cancelled());
+}
+
+#[test]
+fn clear_confirmation_restores_only_fresh_queued_or_running_export_focus() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    let token = harness.app.start_export(destination).unwrap();
+    let requests = harness.app.take_worker_requests();
+    let [WorkerRequest::Export(request)] = requests.as_slice() else {
+        panic!("expected export request")
+    };
+    let cancel = request.cancellation();
+    let operation = harness.app.export_operation().unwrap().clone();
+    harness.palette("clear-pattern");
+    assert!(
+        harness
+            .app
+            .maintain_export(Some(WorkerResult::ExportProgress {
+                token,
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 3,
+                total_units: 4,
+            }))
+    );
+
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(harness.app.overlay(), None);
+    assert!(harness.app.status().contains("75%"));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: true, .. })
+    ));
+    harness
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(cancel.is_cancelled());
 }
 
 #[test]
@@ -848,6 +958,17 @@ fn escape_cancels_only_a_focused_export_status_and_waits_for_terminal_ack() {
         focused.app.export_operation().unwrap().phase(),
         ExportPhase::Cancelling
     );
+    focused.app.open_help();
+    focused
+        .app
+        .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(
+        focused.app.export_status_view(),
+        Some(ExportStatusView::Active {
+            operation,
+            focused: false,
+        }) if operation.phase() == ExportPhase::Cancelling
+    ));
 
     assert!(
         focused
@@ -992,13 +1113,24 @@ fn completing_file_picker_selection_restores_active_export_focus() {
     let pad = PadId::new(BankId::new(0).unwrap(), 0).unwrap();
     harness.load(pad, &source);
     harness.record_hit(0);
-    harness.app.start_export(destination).unwrap();
+    let token = harness.app.start_export(destination).unwrap();
     let requests = harness.app.take_worker_requests();
     let [WorkerRequest::Export(request)] = requests.as_slice() else {
         panic!("expected export request")
     };
     let cancel = request.cancellation();
+    let operation = harness.app.export_operation().unwrap().clone();
     harness.app.open_picker_at(tree.path("."));
+    assert!(
+        harness
+            .app
+            .maintain_export(Some(WorkerResult::ExportProgress {
+                token,
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 1,
+                total_units: 4,
+            }))
+    );
     harness.dispatch_queued();
 
     harness
@@ -1014,6 +1146,32 @@ fn completing_file_picker_selection_restores_active_export_focus() {
         .app
         .apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(cancel.is_cancelled());
+}
+
+#[test]
+fn direct_open_rejects_unresolved_capture_without_cancelling_the_export() {
+    let (tree, mut harness, destination) = saved_pattern_harness();
+    harness.app.start_export(destination).unwrap();
+    let requests = harness.app.take_worker_requests();
+    let [WorkerRequest::Export(request)] = requests.as_slice() else {
+        panic!("expected export request")
+    };
+    let cancel = request.cancellation();
+    harness
+        .app
+        .request_capture_with_frame_limit(sampler_audio::CaptureSource::Resample, 64)
+        .unwrap();
+
+    assert!(matches!(
+        harness.app.request_open_project(tree.path("blocked-open")),
+        Err(ProjectOpenError::UnresolvedState(_))
+    ));
+    assert!(!cancel.is_cancelled());
+    assert_eq!(
+        harness.app.export_operation().unwrap().phase(),
+        ExportPhase::Queued
+    );
+    assert!(harness.app.project_open_stage().is_none());
 }
 
 #[test]
@@ -1121,11 +1279,6 @@ fn quit_and_open_cancel_export_then_continue_only_after_matching_cleanup_ack() {
     let cancel = request.cancellation();
     let operation = direct.app.export_operation().unwrap().clone();
     let direct_open = tree.path("direct-open");
-    direct.palette("master-level -2");
-    direct
-        .app
-        .request_capture_with_frame_limit(sampler_audio::CaptureSource::Resample, 64)
-        .unwrap();
     assert_eq!(
         direct.app.request_open_project(direct_open.clone()),
         Err(ProjectOpenError::OperationPending)
@@ -1136,6 +1289,19 @@ fn quit_and_open_cancel_export_then_continue_only_after_matching_cleanup_ack() {
         ExportPhase::Cancelling
     );
     assert!(direct.app.take_worker_requests().is_empty());
+
+    direct.app.request_save().unwrap();
+    assert!(direct.app.maintain_project(Instant::now()));
+    direct
+        .app
+        .capture_session_mut()
+        .begin(
+            sampler_audio::CaptureSource::Resample,
+            PadId::new(BankId::new(0).unwrap(), 0).unwrap(),
+            48_000,
+            64,
+        )
+        .unwrap();
 
     assert!(
         !direct
@@ -1150,7 +1316,10 @@ fn quit_and_open_cancel_export_then_continue_only_after_matching_cleanup_ack() {
             })
     );
     assert!(direct.app.project_open_stage().is_none());
-    assert!(direct.app.take_worker_requests().is_empty());
+    assert_eq!(
+        direct.app.capture_session().phase(),
+        Some(sampler_tui::CapturePhase::Confirm)
+    );
 
     let matching = WorkerResult::ExportFinished {
         token,
@@ -1161,6 +1330,14 @@ fn quit_and_open_cancel_export_then_continue_only_after_matching_cleanup_ack() {
         result: Err(OfflineExportError::Cancelled),
     };
     assert!(direct.app.apply_worker_result(matching.clone()));
+    assert!(direct.app.project_open_stage().is_none());
+    let save_requests = direct.app.take_worker_requests();
+    let [request @ WorkerRequest::SaveProject(_)] = save_requests.as_slice() else {
+        panic!("direct open must wait behind the admitted save")
+    };
+    direct.worker.try_send(request.clone()).unwrap();
+    let save_result = direct.worker.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(direct.app.apply_worker_result(save_result));
     assert_eq!(
         direct.app.project_open_stage().unwrap().directory,
         direct_open

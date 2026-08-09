@@ -4537,6 +4537,13 @@ pub enum ProjectAction {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPresentationDismissal {
+    RestoreSuppressed,
+    PreserveNewerStatus,
+    Defer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingProjectAction {
     Open(PathBuf),
@@ -4556,6 +4563,7 @@ impl PendingProjectAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectLifecycleWait {
     ExportCleanup,
+    DirectPreflight,
     ChoosingCapture,
     CaptureFinalize,
     CaptureDiscard,
@@ -4686,6 +4694,7 @@ pub struct App {
     next_export_token: u64,
     export_outcome: Option<crate::export::ExportStatusView>,
     export_status_focused: bool,
+    suppressed_export_presentation_pending: bool,
 }
 
 impl CaptureTargetFence {
@@ -4894,6 +4903,7 @@ impl App {
             next_export_token: 1,
             export_outcome: None,
             export_status_focused: false,
+            suppressed_export_presentation_pending: false,
         }
     }
 
@@ -4969,6 +4979,7 @@ impl App {
         self.export_operation = Some(operation);
         self.export_outcome = None;
         self.export_status_focused = true;
+        self.suppressed_export_presentation_pending = false;
         self.status = format!(
             "Export queued · pattern {} · revision {}",
             selected.get() + 1,
@@ -4994,6 +5005,7 @@ impl App {
     }
 
     pub fn cancel_export(&mut self) -> bool {
+        let update_status = self.export_status_has_priority();
         let Some(operation) = self.export_operation.as_mut() else {
             return false;
         };
@@ -5003,17 +5015,22 @@ impl App {
         operation.cancel.cancel();
         operation.phase = crate::ExportPhase::Cancelling;
         self.export_status_focused = false;
-        self.status = format!(
-            "Cancelling export · pattern {} · revision {}",
-            operation.slot.get() + 1,
-            operation.revision
-        );
+        if update_status {
+            self.status = format!(
+                "Cancelling export · pattern {} · revision {}",
+                operation.slot.get() + 1,
+                operation.revision
+            );
+        }
         true
     }
 
     fn export_status_has_priority(&self) -> bool {
-        self.overlay.is_none()
+        !self.should_quit
+            && self.overlay.is_none()
             && self.audio_unavailable_message.is_none()
+            && self.project_open_error.is_none()
+            && self.project_save_error.is_none()
             && self.pending_project_action.is_none()
             && self.project_lifecycle_wait.is_none()
             && self.project_open.is_none()
@@ -5024,22 +5041,27 @@ impl App {
             && self.capture_discard_release_pending.is_none()
     }
 
-    fn restore_active_export_presentation(&mut self) {
-        if !self.export_status_has_priority() {
+    fn restore_suppressed_export_presentation(&mut self) {
+        if !self.suppressed_export_presentation_pending || !self.export_status_has_priority() {
             return;
         }
+        self.suppressed_export_presentation_pending = false;
+        self.export_status_focused = false;
         if let Some(operation) = self.export_operation.as_ref() {
-            self.export_status_focused = true;
             self.status = match operation.phase {
-                crate::ExportPhase::Queued => format!(
-                    "Export queued · pattern {} · revision {}",
-                    operation.slot.get() + 1,
-                    operation.revision
-                ),
+                crate::ExportPhase::Queued => {
+                    self.export_status_focused = true;
+                    format!(
+                        "Export queued · pattern {} · revision {}",
+                        operation.slot.get() + 1,
+                        operation.revision
+                    )
+                }
                 crate::ExportPhase::Running {
                     completed_units,
                     total_units,
                 } => {
+                    self.export_status_focused = true;
                     let percent = completed_units
                         .min(total_units)
                         .saturating_mul(100)
@@ -5051,15 +5073,10 @@ impl App {
                         operation.revision
                     )
                 }
-                crate::ExportPhase::Cancelling => format!(
-                    "Cancelling export · pattern {} · revision {}",
-                    operation.slot.get() + 1,
-                    operation.revision
-                ),
+                crate::ExportPhase::Cancelling => return,
             };
             return;
         }
-        self.export_status_focused = false;
         if let Some(outcome) = self.export_outcome.as_ref() {
             self.status = match outcome {
                 crate::ExportStatusView::Completed { receipt } => format!(
@@ -5078,6 +5095,45 @@ impl App {
                 }
                 crate::ExportStatusView::Active { .. } => return,
             };
+        }
+    }
+
+    fn restore_active_export_after_audio_recovery(&mut self) {
+        if !self.export_status_has_priority() {
+            return;
+        }
+        self.suppressed_export_presentation_pending = false;
+        let Some(operation) = self.export_operation.as_ref() else {
+            return;
+        };
+        match operation.phase {
+            crate::ExportPhase::Queued => {
+                self.export_status_focused = true;
+                self.status = format!(
+                    "Export queued · pattern {} · revision {}",
+                    operation.slot.get() + 1,
+                    operation.revision
+                );
+            }
+            crate::ExportPhase::Running {
+                completed_units,
+                total_units,
+            } => {
+                let percent = completed_units
+                    .min(total_units)
+                    .saturating_mul(100)
+                    .checked_div(total_units)
+                    .unwrap_or(0);
+                self.export_status_focused = true;
+                self.status = format!(
+                    "Export pattern {} · {percent}% · revision {}",
+                    operation.slot.get() + 1,
+                    operation.revision
+                );
+            }
+            crate::ExportPhase::Cancelling => {
+                self.export_status_focused = false;
+            }
         }
     }
 
@@ -5116,11 +5172,16 @@ impl App {
             .checked_div(total_units)
             .unwrap_or(0);
         if update_status {
+            self.suppressed_export_presentation_pending = false;
+            self.export_status_focused = true;
             self.status = format!(
                 "Export pattern {} · {percent}% · revision {}",
                 operation.slot.get() + 1,
                 operation.revision
             );
+        } else {
+            self.export_status_focused = false;
+            self.suppressed_export_presentation_pending = true;
         }
         true
     }
@@ -5302,8 +5363,8 @@ impl App {
         }
         self.capture_session.mark_recording()?;
         self.capture_status = None;
-        self.overlay = None;
         self.status = "Capture recording · Enter stops · Esc reviews discard".to_owned();
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         Ok(())
     }
 
@@ -5886,7 +5947,7 @@ impl App {
         self.commit_project_mutation();
         let _ = self.capture_session.discard();
         self.clear_capture_transaction_fields();
-        self.overlay = None;
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         self.refresh_editor_for_offset(offset);
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureFinalize) {
             self.project_lifecycle_wait = None;
@@ -5940,8 +6001,8 @@ impl App {
     }
 
     fn complete_capture_discard(&mut self) {
-        self.overlay = None;
         self.status = "Capture discarded; prior pad unchanged".to_owned();
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureDiscard) {
             self.project_lifecycle_wait = None;
             self.advance_project_action();
@@ -6842,19 +6903,21 @@ impl App {
         directory: impl Into<PathBuf>,
     ) -> Result<ProjectToken, ProjectOpenError> {
         let directory = directory.into();
-        if self.export_operation.is_some() {
-            self.begin_project_action(PendingProjectAction::OpenDirect(directory));
-            return Err(ProjectOpenError::OperationPending);
-        }
         if self.project_open.is_some()
             || self.in_flight_project.is_some()
             || self.pending_explicit_save.is_some()
             || self.pending_autosave_save.is_some()
+            || self.pending_project_action.is_some()
+            || self.project_lifecycle_wait.is_some()
         {
             return Err(ProjectOpenError::OperationPending);
         }
         self.project_snapshot()
             .map_err(|error| ProjectOpenError::UnresolvedState(error.to_string()))?;
+        if self.export_operation.is_some() {
+            self.begin_project_action(PendingProjectAction::OpenDirect(directory));
+            return Err(ProjectOpenError::OperationPending);
+        }
         self.start_project_open_probe(directory)
     }
 
@@ -6916,7 +6979,7 @@ impl App {
             return;
         }
         if matches!(action, PendingProjectAction::OpenDirect(_)) {
-            self.complete_project_action();
+            self.advance_direct_project_open();
             return;
         }
         if self.capture_discard_release_pending.is_some() {
@@ -6951,6 +7014,55 @@ impl App {
         self.complete_project_action();
     }
 
+    fn advance_direct_project_open(&mut self) {
+        debug_assert!(matches!(
+            self.pending_project_action,
+            Some(PendingProjectAction::OpenDirect(_))
+        ));
+        if self.capture_discard_release_pending.is_some() {
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
+            self.overlay = Some(Overlay::CaptureProgress {
+                action: Some(ProjectAction::Open),
+                discarding: true,
+            });
+            self.status = "Discarding capture before direct project open…".to_owned();
+            return;
+        }
+        if self.capture_session.phase().is_some() {
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
+            if let Err(error) = self.cancel_capture() {
+                self.status = error.to_string();
+                self.overlay = Some(Overlay::CaptureFailed {
+                    action: Some(ProjectAction::Open),
+                });
+            }
+            return;
+        }
+        if self.project_open.is_some()
+            || self.in_flight_project.is_some()
+            || self.pending_explicit_save.is_some()
+            || self.pending_autosave_save.is_some()
+        {
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::DirectPreflight);
+            self.overlay = Some(Overlay::ProjectLifecycleProgress {
+                action: ProjectAction::Open,
+            });
+            self.status = "Waiting for project work before direct open…".to_owned();
+            return;
+        }
+        if let Err(error) = self.project_snapshot() {
+            let message = error.to_string();
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::DirectPreflight);
+            self.status = message.clone();
+            self.overlay = Some(Overlay::ProjectError {
+                title: "OPEN PROJECT ERROR".to_owned(),
+                message,
+            });
+            return;
+        }
+        self.complete_project_action();
+    }
+
     fn complete_project_action(&mut self) {
         let Some(action) = self.pending_project_action.take() else {
             return;
@@ -6958,8 +7070,8 @@ impl App {
         self.project_lifecycle_wait = None;
         match action {
             PendingProjectAction::Quit => {
-                self.overlay = None;
                 self.should_quit = true;
+                self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
             }
             PendingProjectAction::Open(directory) => {
                 if let Err(error) = self.request_open_project(directory) {
@@ -6987,8 +7099,8 @@ impl App {
     fn cancel_project_action(&mut self) {
         self.pending_project_action = None;
         self.project_lifecycle_wait = None;
-        self.overlay = None;
         self.status = "Project action cancelled".to_owned();
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
     }
 
     fn cancel_project_action_preserving_capture(&mut self) {
@@ -7066,9 +7178,9 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
-                        self.overlay = None;
                         self.status =
                             "Capture preserved · Enter stops · Esc reviews discard".to_owned();
+                        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
                     }
                     _ => {}
                 }
@@ -7354,9 +7466,18 @@ impl App {
         self.project_open = None;
         self.project_open_error = None;
         if self.overlay == Some(Overlay::ProjectOpenProgress) {
-            self.overlay = None;
+            self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         }
         self.status = "Project open cancelled".to_owned();
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
+            && matches!(
+                self.pending_project_action,
+                Some(PendingProjectAction::OpenDirect(_))
+            )
+        {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
         Ok(())
     }
 
@@ -7706,9 +7827,18 @@ impl App {
         self.pending_pattern_transport = None;
         self.editor = SampleEditor::open_empty(PadId::first(), self.pads[0].settings);
         self.sync_editor_to_selected_pad();
-        self.overlay = None;
         self.project_open_error = None;
         self.status = format!("Opened {}", self.project_session.name());
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
+            && matches!(
+                self.pending_project_action,
+                Some(PendingProjectAction::OpenDirect(_))
+            )
+        {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
     }
 
     fn apply_project_probe(
@@ -7901,8 +8031,8 @@ impl App {
         }
         match choice {
             RecoveryChoice::Cancel => {
-                self.overlay = None;
                 self.status = "Project open cancelled".to_owned();
+                self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
             }
             RecoveryChoice::Restore => {
                 let saved_revision = explicit
@@ -8120,7 +8250,7 @@ impl App {
             choice.discard_queued = false;
         } else {
             self.project_open = None;
-            self.overlay = None;
+            self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         }
         Some(true)
     }
@@ -8671,6 +8801,14 @@ impl App {
 
     pub fn close_overlay(&mut self) {
         let device_error = matches!(self.overlay, Some(Overlay::DeviceError(_)));
+        let project_error = matches!(self.overlay, Some(Overlay::ProjectError { .. }));
+        let resume_direct = project_error
+            && self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
+            && matches!(
+                self.pending_project_action,
+                Some(PendingProjectAction::OpenDirect(_))
+            )
+            && self.project_open.is_none();
         if matches!(
             self.overlay,
             Some(Overlay::ApplySample { .. } | Overlay::DiscardSample { .. })
@@ -8684,20 +8822,43 @@ impl App {
         if let Some(Overlay::DeviceError(error)) = &self.overlay {
             self.status = format!("{error} · Ctrl+R retries audio");
         }
-        self.overlay = None;
+        if resume_direct {
+            self.project_open_error = None;
+        }
+        self.dismiss_overlay(if project_error {
+            ExportPresentationDismissal::PreserveNewerStatus
+        } else {
+            ExportPresentationDismissal::RestoreSuppressed
+        });
         if device_error
             && self.pending_project_action.is_some()
             && self.project_lifecycle_wait.is_none()
         {
             self.advance_project_action();
         }
-        self.restore_active_export_presentation();
+        if resume_direct {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
     }
 
     fn dismiss_palette(&mut self) {
         if self.overlay == Some(Overlay::Palette) {
-            self.overlay = None;
-            self.restore_active_export_presentation();
+            self.dismiss_overlay(ExportPresentationDismissal::RestoreSuppressed);
+        }
+    }
+
+    fn dismiss_overlay(&mut self, presentation: ExportPresentationDismissal) {
+        self.overlay = None;
+        match presentation {
+            ExportPresentationDismissal::RestoreSuppressed => {
+                self.restore_suppressed_export_presentation();
+            }
+            ExportPresentationDismissal::PreserveNewerStatus => {
+                self.suppressed_export_presentation_pending = false;
+                self.export_status_focused = false;
+            }
+            ExportPresentationDismissal::Defer => {}
         }
     }
 
@@ -9567,7 +9728,10 @@ impl App {
         };
         self.export_outcome = Some(outcome);
         if update_status {
+            self.suppressed_export_presentation_pending = false;
             self.status = message;
+        } else {
+            self.suppressed_export_presentation_pending = true;
         }
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::ExportCleanup)
             && self.pending_project_action.is_some()
@@ -9692,17 +9856,26 @@ impl App {
         } else if kind == SaveKind::Explicit
             && matches!(self.overlay, Some(Overlay::ProjectSaveProgress))
         {
-            self.overlay = if save_succeeded {
-                None
+            if save_succeeded {
+                self.dismiss_overlay(ExportPresentationDismissal::RestoreSuppressed);
             } else {
-                Some(Overlay::ProjectError {
+                self.overlay = Some(Overlay::ProjectError {
                     title: "SAVE PROJECT ERROR".to_owned(),
                     message: self.status.clone(),
-                })
-            };
+                });
+            }
         }
         if save_succeeded {
-            self.restore_active_export_presentation();
+            self.restore_suppressed_export_presentation();
+            if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
+                && matches!(
+                    self.pending_project_action,
+                    Some(PendingProjectAction::OpenDirect(_))
+                )
+            {
+                self.project_lifecycle_wait = None;
+                self.advance_project_action();
+            }
         }
         true
     }
@@ -9909,7 +10082,7 @@ impl App {
 
     fn apply_project_error_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Press && matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-            self.overlay = None;
+            self.close_overlay();
         }
     }
 
@@ -9982,12 +10155,12 @@ impl App {
                     self.status = "Saving project…".to_owned();
                 }
                 Err(ProjectSaveError::Untitled) => {
-                    self.overlay = None;
                     self.status = "Untitled project: use save-as <directory>".to_owned();
+                    self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
                 }
                 Err(error) => {
-                    self.overlay = None;
                     self.status = error.to_string();
+                    self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
                 }
             },
             PaletteCommand::SaveAs(directory) => match self.request_save_as(directory) {
@@ -9996,8 +10169,8 @@ impl App {
                     self.status = "Saving project as a new directory…".to_owned();
                 }
                 Err(error) => {
-                    self.overlay = None;
                     self.status = error.to_string();
+                    self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
                 }
             },
             PaletteCommand::OpenProject(directory) => {
@@ -10320,7 +10493,7 @@ impl App {
             && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
             && key.code == KeyCode::Char('?')
         {
-            self.overlay = None;
+            self.close_overlay();
         }
     }
 
@@ -10729,7 +10902,7 @@ impl App {
         match self.request_sample_edit(pad, recipe) {
             Ok(()) => {
                 self.editor.observe_pending();
-                self.overlay = None;
+                self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
                 self.apply_sample_context = None;
             }
             Err(error) => {
@@ -10745,7 +10918,7 @@ impl App {
     /// not call `cancel_confirmation`: the caller's typed error must remain visible with its
     /// draft intact, while modal and token ownership always disappear together.
     fn reject_apply_confirmation(&mut self) {
-        self.overlay = None;
+        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         self.apply_sample_context = None;
     }
 
@@ -10753,7 +10926,7 @@ impl App {
         if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
             self.editor.confirm_discard();
             self.sync_editor_to_selected_pad();
-            self.overlay = None;
+            self.dismiss_overlay(ExportPresentationDismissal::RestoreSuppressed);
         }
     }
 
@@ -10794,7 +10967,7 @@ impl App {
             {
                 self.status = error;
             }
-            self.overlay = None;
+            self.dismiss_overlay(ExportPresentationDismissal::RestoreSuppressed);
         }
     }
 
@@ -11104,8 +11277,7 @@ impl App {
             self.open_picker_at(entry.path);
         } else if entry.is_selectable_file() {
             self.begin_selected_load(entry.path);
-            self.overlay = None;
-            self.restore_active_export_presentation();
+            self.dismiss_overlay(ExportPresentationDismissal::RestoreSuppressed);
         } else {
             self.status = "entry is not a supported audio file".to_owned();
         }
@@ -11378,7 +11550,7 @@ impl App {
         self.audio_format = Some((sample_rate, channels));
         self.audio_unavailable_message = None;
         self.held_pad_by_key.fill(None);
-        self.overlay = None;
+        self.dismiss_overlay(ExportPresentationDismissal::Defer);
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
         self.current_session_bound.fill(false);
@@ -11496,6 +11668,8 @@ impl App {
         if self.pending_project_action.is_some() && self.project_lifecycle_wait.is_none() {
             self.advance_project_action();
         }
+        self.restore_suppressed_export_presentation();
+        self.restore_active_export_after_audio_recovery();
     }
 
     fn pump_recovery_requests(&mut self) -> bool {
@@ -12797,23 +12971,32 @@ mod tests {
         assert_eq!(app.status(), "device disconnected");
     }
 
-    #[test]
-    fn device_failure_guidance_remains_above_an_active_export_after_dismissal() {
-        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
-        let mut app = App::with_audio(Box::new(audio));
-        app.export_operation = Some(crate::export::ExportOperation {
+    fn seed_active_export(app: &mut App, phase: crate::ExportPhase) -> crate::ExportOperation {
+        let operation = crate::export::ExportOperation {
             token: crate::ExportToken::new(7),
             project_id: app.project_session.project_id(),
             revision: app.project_revision(),
             slot: PatternSlotId::new(0).unwrap(),
             destination: "mix.wav".into(),
             cancel: crate::export::ExportCancel::default(),
-            phase: crate::ExportPhase::Running {
+            phase,
+        };
+        app.export_operation = Some(operation.clone());
+        app.export_status_focused = true;
+        operation
+    }
+
+    #[test]
+    fn device_failure_guidance_remains_above_an_active_export_after_dismissal() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(audio));
+        seed_active_export(
+            &mut app,
+            crate::ExportPhase::Running {
                 completed_units: 1,
                 total_units: 2,
             },
-        });
-        app.export_status_focused = true;
+        );
 
         assert!(app.maintain_audio());
         assert!(matches!(
@@ -12829,6 +13012,69 @@ mod tests {
             app.export_status_view(),
             Some(crate::ExportStatusView::Active { focused: false, .. })
         ));
+    }
+
+    #[test]
+    fn successful_audio_recovery_restores_running_export_focus() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(audio));
+        seed_active_export(
+            &mut app,
+            crate::ExportPhase::Running {
+                completed_units: 1,
+                total_units: 2,
+            },
+        );
+        assert!(app.maintain_audio());
+
+        assert!(app.retry_with(Box::new(FakeAudio::ready(48_000, 2))));
+
+        assert_eq!(app.overlay(), None);
+        assert_eq!(app.status(), "Export pattern 1 · 50% · revision 0");
+        assert!(matches!(
+            app.export_status_view(),
+            Some(crate::ExportStatusView::Active { focused: true, .. })
+        ));
+    }
+
+    #[test]
+    fn persistent_project_and_quit_truth_suppress_matching_export_progress() {
+        let cases = ["quit", "open-error", "save-error"];
+        for case in cases {
+            let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+            let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+            app.status = format!("newer {case}");
+            match case {
+                "quit" => app.should_quit = true,
+                "open-error" => {
+                    app.project_open_error = Some(crate::ProjectOpenError::OperationPending)
+                }
+                "save-error" => {
+                    app.project_save_error = Some(super::ProjectSaveFailure {
+                        kind: SaveKind::Explicit,
+                        error: ProjectStoreError::Filesystem {
+                            operation: "test save",
+                            path: "project".into(),
+                            kind: std::io::ErrorKind::Other,
+                        },
+                    });
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(app.maintain_export(Some(WorkerResult::ExportProgress {
+                token: operation.token(),
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 1,
+                total_units: 2,
+            })));
+
+            assert_eq!(app.status(), format!("newer {case}"));
+            assert!(matches!(
+                app.export_status_view(),
+                Some(crate::ExportStatusView::Active { focused: false, .. })
+            ));
+        }
     }
 
     #[test]
@@ -16309,6 +16555,7 @@ mod tests {
         pending_project_action: Option<super::ProjectAction>,
         project_lifecycle_wait: Option<String>,
         export_status: Option<crate::ExportStatusView>,
+        suppressed_export_presentation_pending: bool,
         worker_requests: Vec<WorkerRequest>,
     }
 
@@ -16352,6 +16599,7 @@ mod tests {
                 .as_ref()
                 .map(|wait| format!("{wait:?}")),
             export_status: app.export_status_view(),
+            suppressed_export_presentation_pending: app.suppressed_export_presentation_pending,
             worker_requests: app.pending_worker_requests.clone(),
         }
     }
@@ -20744,6 +20992,87 @@ mod tests {
         app.midi_settings = midi;
 
         assert_eq!(app.project_snapshot().unwrap().midi, midi);
+    }
+
+    #[test]
+    fn retained_direct_open_waits_for_an_existing_open_then_probes_exactly_once() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("exact-direct-project");
+        assert_eq!(
+            app.request_open_project(exact.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        assert!(operation.cancel.is_cancelled());
+        assert!(app.take_worker_requests().is_empty());
+
+        let other = PathBuf::from("already-opening-project");
+        app.start_project_open_probe(other.clone()).unwrap();
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &other
+        ));
+        let terminal = WorkerResult::ExportFinished {
+            token: operation.token(),
+            project_id: operation.project_id(),
+            revision: operation.revision(),
+            slot: operation.slot(),
+            destination: operation.destination().to_owned(),
+            result: Err(crate::OfflineExportError::Cancelled),
+        };
+
+        assert!(app.apply_worker_result(terminal.clone()));
+        assert_eq!(app.project_open_stage().unwrap().directory, other);
+        assert!(app.take_worker_requests().is_empty());
+        assert!(!app.apply_worker_result(terminal));
+        assert!(app.take_worker_requests().is_empty());
+
+        app.cancel_project_open().unwrap();
+
+        assert_eq!(app.project_open_stage().unwrap().directory, exact);
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
+        ));
+    }
+
+    #[test]
+    fn retained_direct_open_preserves_newer_open_error_until_dismissed_then_resumes() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("exact-after-error");
+        assert_eq!(
+            app.request_open_project(exact.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        app.start_project_open_probe("failed-overlap".into())
+            .unwrap();
+        app.take_worker_requests();
+        assert!(app.apply_worker_result(WorkerResult::ExportFinished {
+            token: operation.token(),
+            project_id: operation.project_id(),
+            revision: operation.revision(),
+            slot: operation.slot(),
+            destination: operation.destination().to_owned(),
+            result: Err(crate::OfflineExportError::Cancelled),
+        }));
+        let error = crate::ProjectOpenError::Probe(ProjectStoreError::Filesystem {
+            operation: "probe",
+            path: "failed-overlap".into(),
+            kind: std::io::ErrorKind::InvalidData,
+        });
+        app.fail_project_open(error.clone());
+        assert_eq!(app.project_open_error(), Some(&error));
+        assert!(app.take_worker_requests().is_empty());
+
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.project_open_error(), None);
+        assert_eq!(app.project_open_stage().unwrap().directory, exact);
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
+        ));
     }
 
     #[test]

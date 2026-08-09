@@ -725,7 +725,8 @@ impl EditablePattern {
     }
 }
 
-fn scale_frame_phase(
+/// Scales a frame by loop phase using the same nearest-frame rounding as transport replacement.
+pub fn scale_frame_phase(
     frame: Frame,
     old_loop_frames: Frame,
     new_loop_frames: Frame,

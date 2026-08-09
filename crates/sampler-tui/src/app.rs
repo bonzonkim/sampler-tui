@@ -19,7 +19,7 @@ use sampler_core::{
 
 use crate::PatternSwitch;
 use crate::audio::{AudioPort, open_default_audio};
-use crate::capture::{CaptureError, CapturePhase};
+use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
 use crate::capture_store::{ManagedCapture, ManagedCaptureId};
 use crate::file_picker::FilePicker;
 use crate::input::{InputAction, KeyboardCapabilities, map_key};
@@ -75,7 +75,7 @@ mod capture_task7_tests {
 
     use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn};
     use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
-    use crate::capture::{CaptureError, CapturePhase};
+    use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
     use crate::loader::{
         CaptureFinalizeError, FinalizeCaptureRequest, LoadPurpose, LoadedSample,
@@ -333,11 +333,21 @@ mod capture_task7_tests {
     }
 
     fn loaded_result(target: PadId, generation: u64, source: &str) -> WorkerResult {
-        let rendered = Arc::new(SampleBuffer::new(48_000, vec![0.2, -0.2]).unwrap());
+        loaded_result_with_purpose(target, generation, LoadPurpose::User, source, 48_000)
+    }
+
+    fn loaded_result_with_purpose(
+        target: PadId,
+        generation: u64,
+        purpose: LoadPurpose,
+        source: &str,
+        engine_rate: u32,
+    ) -> WorkerResult {
+        let rendered = Arc::new(SampleBuffer::new(engine_rate, vec![0.2, -0.2]).unwrap());
         WorkerResult::Loaded {
             pad: target,
             generation,
-            purpose: LoadPurpose::User,
+            purpose,
             path: source.into(),
             result: Ok(LoadedSample {
                 fingerprint: fingerprint(source.as_bytes()),
@@ -348,9 +358,9 @@ mod capture_task7_tests {
                     [PreviewColumn { min: -3, max: 3 }; EDIT_PREVIEW_COLUMNS],
                 ),
                 recipe: SampleEditRecipe::identity(),
-                source_rate: 48_000,
+                source_rate: engine_rate,
                 source_frames: 1,
-                duration: std::time::Duration::from_secs_f64(1.0 / 48_000.0),
+                duration: std::time::Duration::from_secs_f64(1.0 / f64::from(engine_rate)),
             }),
         }
     }
@@ -698,6 +708,129 @@ mod capture_task7_tests {
     }
 
     #[test]
+    fn capture_transaction_each_stale_success_fence_preserves_the_pad_and_releases_its_exact_artifact()
+     {
+        #[derive(Debug, Clone, Copy)]
+        enum Fence {
+            Token,
+            Generation,
+            Target,
+            Source,
+            NativeRate,
+            EngineRate,
+            HardLimit,
+            SourceArc,
+        }
+
+        for (index, fence) in [
+            Fence::Token,
+            Fence::Generation,
+            Fence::Target,
+            Fence::Source,
+            Fence::NativeRate,
+            Fence::EngineRate,
+            Fence::HardLimit,
+            Fence::SourceArc,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+            let mut app = App::with_audio(Box::new(audio));
+            let target = pad(0);
+            install_imported(&mut app, target, "old-stale.wav");
+            let old_sample = Arc::clone(app.pad(target).sample.as_ref().unwrap());
+            let old_source = app.pad(target).source.clone();
+            let old_settings = app.pad(target).settings;
+            let old_generation = app.pad(target).generation;
+            let old_revision = app.project_revision();
+            let old_fingerprint = app.sample_editor.commits[0].fingerprint;
+            let old_recipe = app.sample_editor.commits[0].recipe;
+
+            start_capture(&mut app, CaptureSource::Input, 4);
+            probe.complete(completion(
+                &app,
+                CaptureSource::Input,
+                vec![0.3, -0.3],
+                false,
+            ));
+            assert!(app.maintain_capture());
+            assert!(app.maintain_capture());
+            let request = take_finalize(&mut app);
+            let artifact_id = ManagedCaptureId::new(100 + index as u64);
+            let mut token = request.token;
+            let mut generation = request.generation;
+            let mut stale_target = request.target;
+            let mut source = request.source;
+            let mut source_rate = request.source_rate;
+            let mut engine_rate = request.engine_rate;
+            let mut stereo = Arc::clone(&request.stereo);
+            let mut hard_limit = request.hard_limit;
+            match fence {
+                Fence::Token => token += 1,
+                Fence::Generation => generation += 1,
+                Fence::Target => stale_target = pad(1),
+                Fence::Source => source = CaptureSource::Resample,
+                Fence::NativeRate => source_rate += 1,
+                Fence::EngineRate => engine_rate += 1,
+                Fence::HardLimit => hard_limit = !hard_limit,
+                Fence::SourceArc => stereo = Arc::from(request.stereo.as_ref()),
+            }
+            let stale = WorkerResult::CaptureFinalized {
+                token,
+                generation,
+                target: stale_target,
+                source,
+                source_rate,
+                engine_rate,
+                stereo,
+                hard_limit,
+                result: Ok(managed_capture(
+                    artifact_id.get(),
+                    request.engine_rate,
+                    format!("stale-{index}").as_bytes(),
+                )),
+            };
+
+            assert!(app.apply_worker_result(stale), "fence {fence:?}");
+            assert!(!app.maintain_capture(), "fence {fence:?}");
+            assert_eq!(
+                app.capture_session().phase(),
+                Some(CapturePhase::Finalizing),
+                "fence {fence:?}"
+            );
+            assert_eq!(app.project_revision(), old_revision, "fence {fence:?}");
+            assert_eq!(app.pad(target).source, old_source, "fence {fence:?}");
+            assert_eq!(app.pad(target).settings, old_settings, "fence {fence:?}");
+            assert_eq!(
+                app.pad(target).generation,
+                old_generation,
+                "fence {fence:?}"
+            );
+            assert!(
+                Arc::ptr_eq(app.pad(target).sample.as_ref().unwrap(), &old_sample),
+                "fence {fence:?}"
+            );
+            assert_eq!(
+                app.sample_editor.commits[0].fingerprint, old_fingerprint,
+                "fence {fence:?}"
+            );
+            assert_eq!(
+                app.sample_editor.commits[0].recipe, old_recipe,
+                "fence {fence:?}"
+            );
+
+            app.cancel_capture().unwrap();
+            assert!(app.maintain_capture(), "fence {fence:?}");
+            assert_eq!(
+                app.take_worker_requests(),
+                [WorkerRequest::ReleaseManagedCapture { id: artifact_id }],
+                "fence {fence:?}"
+            );
+        }
+    }
+
+    #[test]
     fn capture_transaction_changed_output_rate_refinalizes_only_input_and_device_loss_never_resumes()
      {
         let (audio, probe) = CaptureAudio::new(48_000, 44_100);
@@ -747,6 +880,143 @@ mod capture_task7_tests {
         assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
         assert!(replacement_probe.calls().is_empty());
         assert_eq!(probe.calls().len(), calls);
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &rerender.stereo
+        ));
+        assert_eq!(
+            app.capture_session().failure_cause(),
+            Some(CaptureFailureCause::DeviceRuntime)
+        );
+        assert_eq!(
+            app.retry_capture_finalization(),
+            Err(CaptureError::RetryNotAllowed(
+                CaptureFailureCause::DeviceRuntime
+            ))
+        );
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &rerender.stereo
+        ));
+
+        app.cancel_capture().unwrap();
+        assert!(app.capture_source_pcm.is_none());
+        assert_eq!(app.capture_session().phase(), None);
+        let recovery = app.take_worker_requests();
+        let [
+            WorkerRequest::LoadSample {
+                pad: recovery_pad,
+                generation,
+                purpose,
+                path,
+                engine_rate,
+                ..
+            },
+        ] = recovery.as_slice()
+        else {
+            panic!("expected the old pad recovery request, got {recovery:?}")
+        };
+        assert!(app.apply_worker_result(loaded_result_with_purpose(
+            *recovery_pad,
+            *generation,
+            *purpose,
+            path.to_str().unwrap(),
+            *engine_rate,
+        )));
+        assert!(app.maintain_audio());
+        assert!(app.select_pad(1));
+        start_capture(&mut app, CaptureSource::Input, 4);
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
+        let fresh_token = app.capture_session().token().unwrap();
+        assert!(replacement_probe.calls().ends_with(&[
+            CaptureCall::Begin {
+                token: fresh_token,
+                target: pad(1),
+                source: CaptureSource::Input,
+                rate: 44_100,
+                max_frames: 4,
+            },
+            CaptureCall::Start(CaptureSource::Input, fresh_token),
+        ]));
+    }
+
+    #[test]
+    fn capture_transaction_output_runtime_loss_is_terminal_for_the_retained_take() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.2, -0.2],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+
+        probe.fail_device(CaptureSource::Resample, "output capture disconnected");
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.capture_session().failure_cause(),
+            Some(CaptureFailureCause::DeviceRuntime)
+        );
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &request.stereo
+        ));
+
+        let (replacement, _) = CaptureAudio::new(48_000, 44_100);
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+        assert_eq!(
+            app.retry_capture_finalization(),
+            Err(CaptureError::RetryNotAllowed(
+                CaptureFailureCause::DeviceRuntime
+            ))
+        );
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &request.stereo
+        ));
+    }
+
+    #[test]
+    fn capture_transaction_worker_error_is_retryable_but_explicit_discard_releases_the_source() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Input, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Input,
+            vec![0.4, -0.4],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Err(CaptureFinalizeError::Prepare("encode failed".to_owned())),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.capture_session().failure_cause(),
+            Some(CaptureFailureCause::WorkerFinalization)
+        );
+        assert!(app.capture_session().failure_is_retryable());
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &request.stereo
+        ));
+
+        app.cancel_capture().unwrap();
+        assert_eq!(app.capture_session().phase(), None);
+        assert!(app.capture_source_pcm.is_none());
+        assert!(app.capture_ready.is_none());
+        assert!(app.pending_managed_releases.is_empty());
+
+        start_capture(&mut app, CaptureSource::Input, 4);
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Recording));
     }
 
     #[test]
@@ -757,6 +1027,15 @@ mod capture_task7_tests {
         let old_sample = Arc::clone(app.pad(pad(0)).sample.as_ref().unwrap());
         let old_revision = app.project_revision();
         start_capture(&mut app, CaptureSource::Resample, 4);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.2, -0.2],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
 
         probe.fail_output_session("output disconnected");
         assert!(app.maintain_audio());
@@ -768,6 +1047,27 @@ mod capture_task7_tests {
             &old_sample
         ));
         assert_eq!(app.project_revision(), old_revision);
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &request.stereo
+        ));
+
+        let (replacement, _) = CaptureAudio::new(48_000, 44_100);
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+        assert_eq!(
+            app.capture_session().failure_cause(),
+            Some(CaptureFailureCause::DeviceRuntime)
+        );
+        assert_eq!(
+            app.retry_capture_finalization(),
+            Err(CaptureError::RetryNotAllowed(
+                CaptureFailureCause::DeviceRuntime
+            ))
+        );
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &request.stereo
+        ));
     }
 
     #[test]
@@ -866,6 +1166,8 @@ mod capture_task7_tests {
         );
         assert_eq!(snapshot.pads[0].fingerprint, fingerprint(b"captured"));
         assert_eq!(snapshot.pads[0].recipe, SampleEditRecipe::identity());
+        let capture_generation = snapshot.pads[0].source_generation;
+        assert_eq!(capture_generation, app.pad(target).generation);
 
         app.project_session = crate::ProjectSession::new(
             ProjectId::from_bytes([0x21; 16]),
@@ -873,14 +1175,11 @@ mod capture_task7_tests {
             "Named",
             app.project_revision(),
         );
-        app.update_pad_settings(
-            target,
-            PadSettings {
-                gain_db: -1.0,
-                ..PadSettings::default()
-            },
-        )
-        .unwrap();
+        let changed_settings = PadSettings {
+            gain_db: -1.0,
+            ..PadSettings::default()
+        };
+        app.update_pad_settings(target, changed_settings).unwrap();
         assert!(app.maintain_project(Instant::now() + Duration::from_secs(3)));
         let autosave_requests = app.take_worker_requests();
         let [WorkerRequest::SaveProject(autosave)] = autosave_requests.as_slice() else {
@@ -894,6 +1193,15 @@ mod capture_task7_tests {
         assert_eq!(
             autosave.request.snapshot.pads[0].fingerprint,
             fingerprint(b"captured")
+        );
+        assert_eq!(
+            autosave.request.snapshot.pads[0].recipe,
+            SampleEditRecipe::identity()
+        );
+        assert_eq!(autosave.request.snapshot.pads[0].settings, changed_settings);
+        assert_eq!(
+            autosave.request.snapshot.pads[0].source_generation,
+            capture_generation
         );
         assert!(app.apply_worker_result(save_result(autosave, Vec::new())));
 
@@ -1732,7 +2040,7 @@ impl App {
     }
 
     pub fn retry_capture_finalization(&mut self) -> Result<(), CaptureError> {
-        if self.capture_source_pcm.is_none() {
+        if self.capture_session.failure_is_retryable() && self.capture_source_pcm.is_none() {
             return Err(CaptureError::RetryCompletionMissing);
         }
         self.capture_session
@@ -1784,7 +2092,9 @@ impl App {
             return false;
         };
         let message = error.to_string();
-        let _ = self.capture_session.mark_failed(message.clone());
+        let _ = self
+            .capture_session
+            .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, message.clone());
         self.capture_worker_queued = false;
         self.capture_engine_rate_in_flight = None;
         self.fail_audio(message);
@@ -1799,7 +2109,9 @@ impl App {
         };
         if let Some(error) = maintenance.runtime_error(source).cloned() {
             let message = error.to_string();
-            let _ = self.capture_session.mark_failed(message.clone());
+            let _ = self
+                .capture_session
+                .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, message.clone());
             self.fail_audio(message);
             return true;
         }
@@ -1863,9 +2175,10 @@ impl App {
             return true;
         };
         let Some(engine_rate) = self.audio.as_ref().map(|audio| audio.sample_rate()) else {
-            let _ = self
-                .capture_session
-                .mark_failed(CaptureError::AudioUnavailable.to_string());
+            let _ = self.capture_session.mark_failed_with_cause(
+                CaptureFailureCause::DeviceRuntime,
+                CaptureError::AudioUnavailable.to_string(),
+            );
             return true;
         };
         self.pending_worker_requests
@@ -1957,7 +2270,14 @@ impl App {
                     } else {
                         CaptureError::AudioUnavailable.to_string()
                     };
-                    let _ = self.capture_session.mark_failed(message.clone());
+                    let cause = if current_rate.is_none() {
+                        CaptureFailureCause::DeviceRuntime
+                    } else {
+                        CaptureFailureCause::InvalidCapture
+                    };
+                    let _ = self
+                        .capture_session
+                        .mark_failed_with_cause(cause, message.clone());
                     self.status = message;
                     return true;
                 }
@@ -1975,7 +2295,10 @@ impl App {
                 match result {
                     Err(error) => {
                         let message = error.to_string();
-                        let _ = self.capture_session.mark_failed(message.clone());
+                        let _ = self.capture_session.mark_failed_with_cause(
+                            CaptureFailureCause::WorkerFinalization,
+                            message.clone(),
+                        );
                         self.status = message;
                         true
                     }
@@ -6155,10 +6478,10 @@ impl App {
     }
 
     fn fail_audio(&mut self, error: String) {
-        if self.capture_session.phase().is_some()
-            && self.capture_session.phase() != Some(CapturePhase::Failed)
-        {
-            let _ = self.capture_session.mark_failed(error.clone());
+        if self.capture_session.phase().is_some() {
+            let _ = self
+                .capture_session
+                .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, error.clone());
         }
         self.capture_worker_queued = false;
         self.capture_engine_rate_in_flight = None;
@@ -6715,12 +7038,13 @@ mod tests {
     };
 
     use crate::audio::{AudioPort, CaptureSupport};
+    use crate::capture_store::{CaptureStoreError, ManagedCaptureId};
     use crate::input::InputAction;
 
     use crate::DirectoryScan;
     use crate::loader::{
         LoadPurpose, LoadSampleError, LoadedSample, ProjectSaveWorkerRequest, RenderedSample,
-        WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError,
+        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError,
     };
 
     use super::{
@@ -12434,6 +12758,82 @@ mod tests {
         assert_eq!(app.pad(pad(0, 1)).settings, settings);
         assert_eq!(app.pad(pad(0, 1)).state, PadLoadState::Ready);
         assert_eq!(app.pad(pad(0, 0)).state, PadLoadState::Empty);
+    }
+
+    #[test]
+    fn project_open_replacement_releases_the_exact_managed_id_through_all_backpressure_and_result_paths()
+     {
+        let mut app = project_app();
+        let managed_id = ManagedCaptureId::new(701);
+        app.sample_editor.commits[0].managed_capture = Some(managed_id);
+        let replacement = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x7d; 16]),
+            "Replacement",
+            8,
+            Vec::new(),
+        );
+        stage_project_open(&mut app, "replacement-project", replacement);
+        while app.project_open_stage().is_some() {
+            assert!(app.maintain_project(Instant::now()));
+        }
+
+        for index in 0..WORKER_CHANNEL_CAPACITY {
+            app.pending_worker_requests
+                .push(WorkerRequest::ReleaseManagedCapture {
+                    id: ManagedCaptureId::new(800 + index as u64),
+                });
+        }
+        assert!(!app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), None);
+        app.pending_worker_requests.clear();
+
+        assert!(app.maintain_capture());
+        let [release] = app.take_worker_requests().try_into().unwrap();
+        let WorkerRequest::ReleaseManagedCapture { id } = release else {
+            panic!("expected managed release request")
+        };
+        assert_eq!(id, managed_id);
+        let release = WorkerRequest::ReleaseManagedCapture { id };
+        assert!(app.apply_worker_send_error(release, WorkerSendError::WorkerBusy));
+        assert_eq!(app.managed_release_in_flight(), None);
+
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: ManagedCaptureId::new(999),
+                result: Ok(()),
+            })
+        );
+        assert!(!app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), Some(managed_id));
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: managed_id,
+                result: Err(CaptureStoreError::NotLive { id: managed_id }),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), None);
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id: managed_id }]
+        );
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id: managed_id,
+                result: Ok(()),
+            })
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(app.managed_release_in_flight(), None);
+        assert!(app.pending_managed_releases.is_empty());
     }
 
     #[test]

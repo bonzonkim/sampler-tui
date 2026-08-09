@@ -15,6 +15,19 @@ pub enum CapturePhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFailureCause {
+    WorkerFinalization,
+    DeviceRuntime,
+    InvalidCapture,
+}
+
+impl CaptureFailureCause {
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::WorkerFinalization)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
     Unsupported,
@@ -50,6 +63,7 @@ pub enum CaptureError {
     CompletionSourceMismatch,
     CompletionRateMismatch,
     RetryCompletionMissing,
+    RetryNotAllowed(CaptureFailureCause),
     Command(sampler_audio::CaptureError),
     InputOpen(String),
     OutputRuntime(String),
@@ -112,6 +126,9 @@ impl fmt::Display for CaptureError {
             Self::RetryCompletionMissing => {
                 formatter.write_str("failed capture has no completion to retry")
             }
+            Self::RetryNotAllowed(cause) => {
+                write!(formatter, "capture failure {cause:?} requires a fresh take")
+            }
             Self::Command(error) => error.fmt(formatter),
             Self::InputOpen(error) => write!(formatter, "could not open input capture: {error}"),
             Self::OutputRuntime(error) => write!(formatter, "output capture failed: {error}"),
@@ -157,8 +174,13 @@ struct ActiveCapture {
     max_frames: usize,
     phase: CapturePhase,
     completion: Option<CaptureCompletion>,
-    failure: Option<String>,
+    failure: Option<CaptureFailure>,
     managed_capture_id: Option<ManagedCaptureId>,
+}
+
+struct CaptureFailure {
+    cause: CaptureFailureCause,
+    message: String,
 }
 
 #[derive(Default)]
@@ -271,9 +293,20 @@ impl CaptureSession {
     }
 
     pub fn mark_failed(&mut self, message: impl Into<String>) -> Result<(), CaptureError> {
+        self.mark_failed_with_cause(CaptureFailureCause::InvalidCapture, message)
+    }
+
+    pub(crate) fn mark_failed_with_cause(
+        &mut self,
+        cause: CaptureFailureCause,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureError> {
         let active = self.active.as_mut().ok_or(CaptureError::NoActiveCapture)?;
         active.phase = CapturePhase::Failed;
-        active.failure = Some(message.into());
+        active.failure = Some(CaptureFailure {
+            cause,
+            message: message.into(),
+        });
         Ok(())
     }
 
@@ -284,6 +317,13 @@ impl CaptureSession {
                 from: active.phase,
                 to: CapturePhase::Finalizing,
             });
+        }
+        let cause = active
+            .failure
+            .as_ref()
+            .map_or(CaptureFailureCause::InvalidCapture, |failure| failure.cause);
+        if !cause.is_retryable() {
+            return Err(CaptureError::RetryNotAllowed(cause));
         }
         if active.completion.is_none() {
             return Err(CaptureError::RetryCompletionMissing);
@@ -381,7 +421,20 @@ impl CaptureSession {
     pub fn failure(&self) -> Option<&str> {
         self.active
             .as_ref()
-            .and_then(|active| active.failure.as_deref())
+            .and_then(|active| active.failure.as_ref())
+            .map(|failure| failure.message.as_str())
+    }
+
+    pub fn failure_cause(&self) -> Option<CaptureFailureCause> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.failure.as_ref())
+            .map(|failure| failure.cause)
+    }
+
+    pub fn failure_is_retryable(&self) -> bool {
+        self.failure_cause()
+            .is_some_and(CaptureFailureCause::is_retryable)
     }
 
     pub fn managed_capture_id(&self) -> Option<ManagedCaptureId> {
@@ -426,7 +479,7 @@ mod tests {
     use sampler_audio::{CaptureCompletion, CaptureSource};
     use sampler_core::{BankId, PadId};
 
-    use super::{CaptureError, CapturePhase, CaptureSession};
+    use super::{CaptureError, CaptureFailureCause, CapturePhase, CaptureSession};
 
     fn completion(session: &CaptureSession, source: CaptureSource) -> CaptureCompletion {
         CaptureCompletion {
@@ -621,7 +674,9 @@ mod tests {
         session
             .accept_completion(completion(&session, CaptureSource::Input))
             .unwrap();
-        session.mark_failed("encode failed").unwrap();
+        session
+            .mark_failed_with_cause(CaptureFailureCause::WorkerFinalization, "encode failed")
+            .unwrap();
         assert_eq!(session.retry_finalization_with_next_generation(), Ok(8));
         assert_eq!(
             (session.generation(), session.phase(), session.failure()),
@@ -632,10 +687,14 @@ mod tests {
         without_completion
             .begin(CaptureSource::Input, PadId::first(), 44_100, 16)
             .unwrap();
-        without_completion.mark_failed("device lost").unwrap();
+        without_completion
+            .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, "device lost")
+            .unwrap();
         assert_eq!(
             without_completion.retry_finalization_with_next_generation(),
-            Err(CaptureError::RetryCompletionMissing)
+            Err(CaptureError::RetryNotAllowed(
+                CaptureFailureCause::DeviceRuntime
+            ))
         );
         assert_eq!(
             (
@@ -658,7 +717,9 @@ mod tests {
         session
             .accept_completion(completion(&session, CaptureSource::Input))
             .unwrap();
-        session.mark_failed("retryable").unwrap();
+        session
+            .mark_failed_with_cause(CaptureFailureCause::WorkerFinalization, "retryable")
+            .unwrap();
         let completion_pointer = session.completion().unwrap().stereo.as_ptr();
 
         assert_eq!(

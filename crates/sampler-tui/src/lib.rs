@@ -23,7 +23,7 @@ pub use app::{
     SampleEditStatus,
 };
 pub use audio::{AudioPort, CaptureSupport};
-pub use capture::{CaptureError, CapturePhase, CaptureSession};
+pub use capture::{CaptureError, CaptureFailureCause, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};

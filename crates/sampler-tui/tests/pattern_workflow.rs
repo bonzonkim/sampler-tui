@@ -462,7 +462,7 @@ fn recording_rebinds_to_the_admitted_generation_after_each_overdub_snapshot() {
     harness.ui_iteration();
     assert_eq!(
         harness.app.patterns().record_capture(),
-        Some((PatternSlotId::new(0).unwrap(), 2)),
+        Some((PatternSlotId::new(0).unwrap(), 1)),
         "workspace rebinding follows the admitted snapshot"
     );
 

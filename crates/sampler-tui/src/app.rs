@@ -15441,7 +15441,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_record_trigger_and_release_each_advance_one_revision() {
+    fn accepted_gate_record_advances_once_when_release_commits_complete_note() {
         let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
         let pad = pad(0, 0);
         let stamp = TransportStamp {
@@ -15464,7 +15464,12 @@ mod tests {
         ])));
         let before_trigger = app.project_revision();
         assert!(app.maintain_audio());
-        assert_eq!(app.project_revision(), before_trigger + 1);
+        assert_eq!(app.project_revision(), before_trigger);
+        assert!(
+            app.project_snapshot().unwrap().patterns[0]
+                .events
+                .is_empty()
+        );
 
         app.patterns.note_live_release(0, LiveCommandId::FIRST);
         app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
@@ -15489,10 +15494,10 @@ mod tests {
     }
 
     #[test]
-    fn overflow_cleanup_marks_saved_project_dirty_and_schedules_exact_recovery() {
-        let now = Instant::now();
+    fn gate_overflow_at_zero_revision_budget_is_failure_atomic_and_future_recording_is_explicit() {
         let mut app = project_app();
-        name_project(&mut app, "overflow-accounting", now);
+        app.project_session
+            .set_current_revision_for_test(crate::MAX_PROJECT_REVISION - 1);
         let target = pad(0, 0);
         let stamp = TransportStamp {
             slot: PatternSlotId::new(0).unwrap(),
@@ -15512,42 +15517,55 @@ mod tests {
                 transport: Some(stamp),
             },
         ])));
-        assert!(app.maintain_audio());
-        assert_eq!(app.project_snapshot().unwrap().patterns[0].events.len(), 1);
+        app.maintain_audio();
 
-        let clean_revision = app.project_revision();
-        app.project_session.mark_explicit_saved(clean_revision);
-        app.project_session.mark_autosaved(clean_revision);
+        app.project_session
+            .set_current_revision_for_test(crate::MAX_PROJECT_REVISION);
+        app.project_session
+            .mark_explicit_saved(crate::MAX_PROJECT_REVISION);
+        app.project_session
+            .mark_autosaved(crate::MAX_PROJECT_REVISION);
+        let clean = app.project_snapshot().unwrap();
+        app.patterns.note_live_release(0, midi_command(2));
+        app.telemetry.live_ack_overflows = 1;
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.maintain_audio();
+
+        assert_eq!(app.project_snapshot().unwrap(), clean);
+        assert_eq!(app.project_revision(), crate::MAX_PROJECT_REVISION);
         assert_eq!(
             app.project_session.status(),
             crate::project_session::ProjectStatus::Clean
         );
 
-        app.patterns.note_live_release(0, midi_command(2));
-        app.telemetry.live_ack_overflows = 1;
-        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2)));
-        assert!(app.maintain_audio());
+        app.patterns
+            .note_live_trigger(0, midi_command(3), target, 1.0);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: midi_command(3),
+                pad: target,
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_240,
+                transport: Some(stamp),
+            },
+        ])));
+        app.maintain_audio();
+        app.patterns.note_live_release(0, midi_command(4));
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: midi_command(4),
+                pad: target,
+                kind: LiveAckKind::Release,
+                frame: 1_260,
+                transport: Some(stamp),
+            },
+        ])));
+        app.maintain_audio();
 
-        assert!(
-            app.project_snapshot().unwrap().patterns[0]
-                .events
-                .is_empty()
-        );
-        assert_eq!(app.project_revision(), clean_revision + 1);
-        assert_eq!(
-            app.project_session.status(),
-            crate::project_session::ProjectStatus::Modified
-        );
-
-        assert!(
-            app.maintain_project(
-                Instant::now() + super::AUTOSAVE_DEBOUNCE + Duration::from_secs(1)
-            )
-        );
-        let recovery = take_project_save(&mut app);
-        assert_eq!(recovery.request.kind, SaveKind::Recovery);
-        assert_eq!(recovery.request.snapshot.revision, clean_revision + 1);
-        assert!(recovery.request.snapshot.patterns[0].events.is_empty());
+        assert_eq!(app.project_snapshot().unwrap(), clean);
+        assert_eq!(app.patterns.pending_trigger_id(0), None);
+        assert_eq!(app.project_revision(), crate::MAX_PROJECT_REVISION);
     }
 
     #[test]
@@ -15817,7 +15835,7 @@ mod tests {
         assert_eq!(app.project_revision(), saved_revision);
     }
 
-    fn queue_record_trigger_ack(app: &mut App) -> TransportStamp {
+    fn queue_record_ack(app: &mut App, complete_gate: bool) -> TransportStamp {
         let pad = pad(0, 0);
         let stamp = TransportStamp {
             slot: PatternSlotId::new(0).unwrap(),
@@ -15828,15 +15846,24 @@ mod tests {
         app.patterns.start_recording(stamp).unwrap();
         app.patterns
             .note_live_trigger(0, LiveCommandId::FIRST, pad, 1.0);
-        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
-            LiveAck {
-                id: LiveCommandId::FIRST,
+        let mut acks = vec![LiveAck {
+            id: LiveCommandId::FIRST,
+            pad,
+            kind: LiveAckKind::Trigger { velocity: 1.0 },
+            frame: 1_120,
+            transport: Some(stamp),
+        }];
+        if complete_gate {
+            app.patterns.note_live_release(0, midi_command(2));
+            acks.push(LiveAck {
+                id: midi_command(2),
                 pad,
-                kind: LiveAckKind::Trigger { velocity: 1.0 },
-                frame: 1_120,
+                kind: LiveAckKind::Release,
+                frame: 1_240,
                 transport: Some(stamp),
-            },
-        ])));
+            });
+        }
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks(acks)));
         stamp
     }
 
@@ -15845,7 +15872,7 @@ mod tests {
         let now = Instant::now();
         let mut app = project_app();
         name_project(&mut app, "named", now);
-        queue_record_trigger_ack(&mut app);
+        queue_record_ack(&mut app, true);
         app.apply_key(key('q', KeyModifiers::CONTROL, KeyEventKind::Press));
         app.apply_key(key('y', KeyModifiers::NONE, KeyEventKind::Press));
         assert!(app.maintain_project(now));
@@ -15950,15 +15977,15 @@ mod tests {
     fn discard_before_quit_reconfirms_if_release_ack_advances_past_the_action_revision() {
         let now = Instant::now();
         let mut app = project_app();
-        let stamp = queue_record_trigger_ack(&mut app);
+        let stamp = queue_record_ack(&mut app, false);
         assert!(app.maintain_audio());
         let project_id = name_project(&mut app, "named", now);
         let action_revision = app.project_revision();
         app.project_session.mark_autosaved(action_revision);
-        app.patterns.note_live_release(0, LiveCommandId::FIRST);
+        app.patterns.note_live_release(0, midi_command(2));
         app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
             LiveAck {
-                id: LiveCommandId::FIRST,
+                id: midi_command(2),
                 pad: pad(0, 0),
                 kind: LiveAckKind::Release,
                 frame: 1_240,

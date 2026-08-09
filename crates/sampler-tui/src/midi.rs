@@ -290,27 +290,38 @@ mod tests {
     }
 
     #[test]
-    fn overflow_racing_a_take_is_accounted_on_exactly_one_side_of_the_interval_boundary() {
+    fn producer_overflow_is_forced_onto_both_sides_of_the_taken_interval_boundary() {
+        const BEFORE_BOUNDARY: usize = 20_000;
+        const AFTER_BOUNDARY: usize = 30_000;
         const ATTEMPTED_OVERFLOWS: usize = 50_000;
 
         let (mut producer, consumer) = midi_ingress();
         for _ in 0..MIDI_INGRESS_CAPACITY {
             producer.try_push_message(&[0x90, 60, 100]);
         }
-        let start = Arc::new(Barrier::new(2));
-        let producer_start = Arc::clone(&start);
+        let boundary = Arc::new(Barrier::new(2));
+        let producer_boundary = Arc::clone(&boundary);
         let worker = thread::spawn(move || {
-            producer_start.wait();
-            for _ in 0..ATTEMPTED_OVERFLOWS {
+            for _ in 0..BEFORE_BOUNDARY {
+                producer.try_push_message(&[0x90, 60, 100]);
+            }
+            producer_boundary.wait();
+            producer_boundary.wait();
+            for _ in 0..AFTER_BOUNDARY {
                 producer.try_push_message(&[0x90, 60, 100]);
             }
         });
 
-        start.wait();
+        boundary.wait();
         let before_boundary = consumer.take_lost_count();
+        boundary.wait();
         worker.join().unwrap();
         let after_boundary = consumer.take_lost_count();
 
+        assert!(before_boundary > 0);
+        assert!(after_boundary > 0);
+        assert_eq!(before_boundary, BEFORE_BOUNDARY);
+        assert_eq!(after_boundary, AFTER_BOUNDARY);
         assert_eq!(before_boundary + after_boundary, ATTEMPTED_OVERFLOWS);
         assert_eq!(consumer.take_lost_count(), 0);
     }

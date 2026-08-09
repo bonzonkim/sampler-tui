@@ -393,8 +393,9 @@ fn increment_lost(lost: &AtomicUsize) {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::sync::{Arc, Barrier, Mutex};
-    use std::thread;
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use sampler_core::{MidiChannel, MidiNote};
@@ -513,6 +514,125 @@ mod tests {
         }));
         let service = MidiService::new(Box::new(FakeBackend::new(Arc::clone(&state))));
         (service, state)
+    }
+
+    type LifecycleTrace = Arc<Mutex<Vec<&'static str>>>;
+
+    struct CallbackDataSentinel {
+        trace: LifecycleTrace,
+    }
+
+    impl CallbackDataSentinel {
+        fn invoke(&mut self, producer: &mut super::MidiIngressProducer) {
+            self.trace.lock().unwrap().push("callback");
+            producer.try_push_message(&[0x90, 64, 96]);
+        }
+    }
+
+    impl Drop for CallbackDataSentinel {
+        fn drop(&mut self) {
+            self.trace.lock().unwrap().push("callback-data-drop");
+        }
+    }
+
+    struct AppAudioDependentSentinel {
+        trace: LifecycleTrace,
+    }
+
+    impl AppAudioDependentSentinel {
+        fn new(trace: LifecycleTrace) -> Self {
+            Self { trace }
+        }
+    }
+
+    impl Drop for AppAudioDependentSentinel {
+        fn drop(&mut self) {
+            self.trace.lock().unwrap().push("dependent-drop");
+        }
+    }
+
+    struct ThreadedConnection {
+        trace: LifecycleTrace,
+        stop: Option<SyncSender<()>>,
+        worker: Option<JoinHandle<(super::MidiIngressProducer, CallbackDataSentinel)>>,
+    }
+
+    impl ThreadedConnection {
+        fn quiesce(&mut self) {
+            let Some(stop) = self.stop.take() else {
+                return;
+            };
+            self.trace.lock().unwrap().push("close-request");
+            stop.send(()).unwrap();
+            let (producer, callback_data) = self.worker.take().unwrap().join().unwrap();
+            self.trace.lock().unwrap().push("callback-thread-joined");
+            drop(producer);
+            drop(callback_data);
+        }
+    }
+
+    impl MidiConnection for ThreadedConnection {
+        fn close(mut self: Box<Self>) {
+            self.quiesce();
+            self.trace.lock().unwrap().push("connection-close");
+        }
+    }
+
+    impl Drop for ThreadedConnection {
+        fn drop(&mut self) {
+            self.quiesce();
+        }
+    }
+
+    struct ThreadedBackend {
+        trace: LifecycleTrace,
+    }
+
+    impl ThreadedBackend {
+        fn new(trace: LifecycleTrace) -> Self {
+            Self { trace }
+        }
+    }
+
+    impl MidiBackend for ThreadedBackend {
+        fn list_ports(&mut self) -> Result<Vec<MidiBackendPort>, MidiServiceError> {
+            self.trace.lock().unwrap().push("backend-list");
+            Ok(vec![backend_port("threaded", "Threaded")])
+        }
+
+        fn connect(
+            &mut self,
+            _port: &MidiBackendPort,
+            producer: super::MidiIngressProducer,
+        ) -> Result<Box<dyn MidiConnection>, MidiServiceError> {
+            self.trace.lock().unwrap().push("connect");
+            let trace = Arc::clone(&self.trace);
+            let (ready_tx, ready_rx) = sync_channel(0);
+            let (stop_tx, stop_rx) = sync_channel(0);
+            let worker = thread::spawn(move || {
+                let mut producer = producer;
+                let mut callback_data = CallbackDataSentinel {
+                    trace: Arc::clone(&trace),
+                };
+                callback_data.invoke(&mut producer);
+                ready_tx.send(()).unwrap();
+                stop_rx.recv().unwrap();
+                trace.lock().unwrap().push("callback-thread-stop");
+                (producer, callback_data)
+            });
+            ready_rx.recv().unwrap();
+            Ok(Box::new(ThreadedConnection {
+                trace: Arc::clone(&self.trace),
+                stop: Some(stop_tx),
+                worker: Some(worker),
+            }))
+        }
+    }
+
+    impl Drop for ThreadedBackend {
+        fn drop(&mut self) {
+            self.trace.lock().unwrap().push("backend-drop");
+        }
     }
 
     fn note(value: u8) -> MidiNote {
@@ -988,6 +1108,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn threaded_callback_quiesces_before_callback_data_and_dependent_state_drop() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let dependent = AppAudioDependentSentinel::new(Arc::clone(&trace));
+        let mut service = MidiService::new(Box::new(ThreadedBackend::new(Arc::clone(&trace))));
+        service.startup(Instant::now()).unwrap();
+
+        let sentinel = MidiEvent::NoteOff {
+            channel: channel(16),
+            note: note(127),
+        };
+        let mut events = [sentinel; 1];
+        assert_eq!(service.drain_events(&mut events), 1);
+        assert_eq!(
+            events[0],
+            MidiEvent::NoteOn {
+                channel: channel(1),
+                note: note(64),
+                velocity: 96,
+            }
+        );
+
+        drop(service);
+        drop(dependent);
+        let trace = trace.lock().unwrap();
+        assert_eq!(
+            trace.as_slice(),
+            [
+                "backend-list",
+                "connect",
+                "callback",
+                "close-request",
+                "callback-thread-stop",
+                "callback-thread-joined",
+                "callback-data-drop",
+                "connection-close",
+                "backend-drop",
+                "dependent-drop",
+            ]
+        );
+        let stopped = trace
+            .iter()
+            .position(|event| *event == "callback-thread-stop")
+            .unwrap();
+        assert!(!trace[stopped + 1..].contains(&"callback"));
     }
 
     #[test]

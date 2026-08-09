@@ -15,6 +15,7 @@ pub mod project_store;
 pub mod sample_editor;
 pub mod terminal;
 pub mod ui;
+mod ui_mixer;
 mod ui_pattern;
 mod ui_sample;
 

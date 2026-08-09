@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use crate::input::PAD_KEYS;
 use crate::pattern::WorkspaceView;
+use crate::ui_mixer::render_mixer;
 use crate::ui_pattern::{live_identity, live_pattern, render_pattern, transport_bar_index};
 use crate::ui_sample::render_sample as render_sample_workspace;
 use crate::{
@@ -19,17 +20,17 @@ const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const HELP_LINES: [&str; 20] = [
     "GLOBAL: Ctrl+R retries audio first when the device is unavailable",
-    "Tab / Shift+Tab: cycle Perform / Pattern / Sample",
-    "Space: play / stop selected pattern",
-    "Ctrl+R: overdub record selected pattern",
-    ", / .: previous / next pattern (1..16)",
-    "PATTERN",
+    "Tab / Shift+Tab: cycle Perform / Pattern / Sample / Mixer",
+    "PATTERN: Space play/stop · Ctrl+R overdub · ,/. previous/next",
     "Arrows / PgUp / PgDn: cursor / visible bar",
     "Enter / Delete: toggle / remove event",
     "+ / - / u / Ctrl+Delete: velocity / undo / clear",
     "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
     "Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
     "plain z remains pad 13; Apply is in-memory only; Source file unchanged",
+    "MIXER: Ctrl+Left/Right section · Up/Down field · Left/Right edit",
+    "Enter toggle · Backspace reset · Esc Perform",
+    "unsupported edits: use : command palette",
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
     "CAPTURE: resample · record-input · capture-stop · capture-cancel",
@@ -76,6 +77,10 @@ fn render_base(frame: &mut Frame, area: Rect, app: &App) {
     }
     if app.workspace_view() == WorkspaceView::Sample {
         render_sample_workspace(frame, area, app);
+        return;
+    }
+    if app.workspace_view() == WorkspaceView::Mixer {
+        render_mixer(frame, area, app);
         return;
     }
     let bank = char::from(b'A'.saturating_add(u8::from(app.active_bank())));
@@ -364,7 +369,7 @@ fn perform_pattern_summary(app: &App) -> String {
     )
 }
 
-fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+pub(crate) fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
@@ -951,7 +956,7 @@ fn centered_rect(area: Rect, requested_width: u16, requested_height: u16) -> Rec
     )
 }
 
-fn pad_label(pad: &PadView, display_source: Option<&Path>) -> String {
+pub(crate) fn pad_label(pad: &PadView, display_source: Option<&Path>) -> String {
     if !pad.label.trim().is_empty() {
         return Path::new(pad.label.trim())
             .file_stem()
@@ -983,7 +988,7 @@ fn selected_sample_label(pad: &PadView, display_source: Option<&Path>) -> String
     label.to_uppercase()
 }
 
-fn load_state_name(state: &PadLoadState) -> &'static str {
+pub(crate) fn load_state_name(state: &PadLoadState) -> &'static str {
     match state {
         PadLoadState::Empty => "EMPTY",
         PadLoadState::WaitingForDevice => "WAITING FOR DEVICE",
@@ -993,7 +998,7 @@ fn load_state_name(state: &PadLoadState) -> &'static str {
     }
 }
 
-fn safe_meter_ratio(value: f32) -> f64 {
+pub(crate) fn safe_meter_ratio(value: f32) -> f64 {
     if value.is_finite() {
         f64::from(value.clamp(0.0, 1.0))
     } else {
@@ -1008,7 +1013,7 @@ fn fit(value: &str, width: usize) -> String {
     fitted
 }
 
-fn truncate(value: &str, width: usize) -> String {
+pub(crate) fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

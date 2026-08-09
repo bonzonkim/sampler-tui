@@ -14351,7 +14351,7 @@ mod tests {
         revision: u64,
         pads: Vec<sampler_core::ProjectPad>,
     ) -> sampler_core::ProjectDocument {
-        sampler_core::ProjectDocument::new_v2(
+        sampler_core::ProjectDocument::new_v3(
             project_id,
             name,
             revision,
@@ -14359,6 +14359,7 @@ mod tests {
             PatternWorkspace::new(48_000)
                 .export_project_patterns()
                 .unwrap(),
+            sampler_core::MasterMixSettings::default(),
         )
         .unwrap()
     }
@@ -14371,6 +14372,7 @@ mod tests {
             format!("audio/{}.wav", fingerprint.digest),
             fingerprint.digest,
             settings,
+            sampler_core::PadMixSettings::default(),
             SampleEditRecipe::identity(),
         )
         .unwrap()

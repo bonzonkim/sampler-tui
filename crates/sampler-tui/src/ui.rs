@@ -1872,7 +1872,7 @@ mod tests {
         let directory = std::path::PathBuf::from("/projects/a project with a very long name");
         let token = app.request_open_project(&directory).unwrap();
         let project_id = ProjectId::from_bytes([0x51; 16]);
-        let explicit = ProjectDocument::new_v2(
+        let explicit = ProjectDocument::new_v3(
             project_id,
             "Explicit",
             i64::MAX as u64 - 1,
@@ -1880,9 +1880,10 @@ mod tests {
             PatternWorkspace::new(48_000)
                 .export_project_patterns()
                 .unwrap(),
+            sampler_core::MasterMixSettings::default(),
         )
         .unwrap();
-        let recovery = ProjectDocument::new_v2(
+        let recovery = ProjectDocument::new_v3(
             project_id,
             "Recovery",
             i64::MAX as u64,
@@ -1890,6 +1891,7 @@ mod tests {
             PatternWorkspace::new(48_000)
                 .export_project_patterns()
                 .unwrap(),
+            sampler_core::MasterMixSettings::default(),
         )
         .unwrap();
         assert!(app.apply_worker_result(WorkerResult::ProjectProbed {

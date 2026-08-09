@@ -5,12 +5,13 @@ use std::{collections::HashSet, fmt, path::Component, path::Path, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BankId, ChokeGroup, EditablePattern, EventId, MAX_PATTERN_EVENTS, Meter, ModelError,
-    PATTERN_SLOT_COUNT, PadId, PadSettings, PatternEditError, PatternEvent, PatternSlotId,
-    PlaybackMode, Resolution, SampleEditError, SampleEditRecipe, Tempo, Transport,
+    BankId, ChokeGroup, DelaySettings, EditablePattern, EventId, MAX_PATTERN_EVENTS,
+    MasterMixSettings, Meter, ModelError, PATTERN_SLOT_COUNT, PadId, PadMixSettings, PadSettings,
+    PatternEditError, PatternEvent, PatternSlotId, PlaybackMode, Resolution, ReverbSettings,
+    SampleEditError, SampleEditRecipe, Tempo, Transport,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProjectId([u8; 16]);
@@ -270,6 +271,65 @@ struct WireV2PatternEvent {
     original_offset: Option<i64>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireV3ProjectDocument {
+    schema_version: u32,
+    project_id: String,
+    name: String,
+    revision: u64,
+    #[serde(default)]
+    pads: Vec<WireV3ProjectPad>,
+    #[serde(default)]
+    patterns: Vec<WireV2ProjectPattern>,
+    master_mix: WireMasterMixSettings,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireV3ProjectPad {
+    pad: WirePadId,
+    audio_path: String,
+    asset_digest: String,
+    settings: WirePadSettings,
+    mix: WirePadMixSettings,
+    recipe: WireRecipe,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WirePadMixSettings {
+    muted: bool,
+    delay_send: f32,
+    reverb_send: f32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireMasterMixSettings {
+    gain_db: f32,
+    delay: WireDelaySettings,
+    reverb: WireReverbSettings,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireDelaySettings {
+    enabled: bool,
+    time_ms: u16,
+    feedback: f32,
+    return_db: f32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireReverbSettings {
+    enabled: bool,
+    room_size: f32,
+    damping: f32,
+    return_db: f32,
+}
+
 impl TryFrom<WirePadId> for PadId {
     type Error = ProjectError;
 
@@ -299,6 +359,98 @@ impl TryFrom<WirePadSettings> for PadSettings {
     }
 }
 
+impl TryFrom<WirePadMixSettings> for PadMixSettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WirePadMixSettings) -> Result<Self, Self::Error> {
+        PadMixSettings::new(value.muted, value.delay_send, value.reverb_send)
+            .map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<PadMixSettings> for WirePadMixSettings {
+    fn from(value: PadMixSettings) -> Self {
+        Self {
+            muted: value.muted,
+            delay_send: value.delay_send,
+            reverb_send: value.reverb_send,
+        }
+    }
+}
+
+impl TryFrom<WireDelaySettings> for DelaySettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WireDelaySettings) -> Result<Self, Self::Error> {
+        DelaySettings::new(
+            value.enabled,
+            value.time_ms,
+            value.feedback,
+            value.return_db,
+        )
+        .map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<DelaySettings> for WireDelaySettings {
+    fn from(value: DelaySettings) -> Self {
+        Self {
+            enabled: value.enabled,
+            time_ms: value.time_ms,
+            feedback: value.feedback,
+            return_db: value.return_db,
+        }
+    }
+}
+
+impl TryFrom<WireReverbSettings> for ReverbSettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WireReverbSettings) -> Result<Self, Self::Error> {
+        ReverbSettings::new(
+            value.enabled,
+            value.room_size,
+            value.damping,
+            value.return_db,
+        )
+        .map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<ReverbSettings> for WireReverbSettings {
+    fn from(value: ReverbSettings) -> Self {
+        Self {
+            enabled: value.enabled,
+            room_size: value.room_size,
+            damping: value.damping,
+            return_db: value.return_db,
+        }
+    }
+}
+
+impl TryFrom<WireMasterMixSettings> for MasterMixSettings {
+    type Error = ProjectError;
+
+    fn try_from(value: WireMasterMixSettings) -> Result<Self, Self::Error> {
+        MasterMixSettings::new(
+            value.gain_db,
+            value.delay.try_into()?,
+            value.reverb.try_into()?,
+        )
+        .map_err(ProjectError::InvalidModel)
+    }
+}
+
+impl From<MasterMixSettings> for WireMasterMixSettings {
+    fn from(value: MasterMixSettings) -> Self {
+        Self {
+            gain_db: value.gain_db,
+            delay: value.delay.into(),
+            reverb: value.reverb.into(),
+        }
+    }
+}
+
 impl TryFrom<WirePatternEvent> for PatternEvent {
     type Error = ProjectError;
 
@@ -324,15 +476,17 @@ pub struct ProjectDocument {
     pub revision: u64,
     pub pads: Vec<ProjectPad>,
     pub patterns: Vec<ProjectPattern>,
+    pub master_mix: MasterMixSettings,
 }
 
 impl ProjectDocument {
-    pub fn new_v2(
+    pub fn new_v3(
         project_id: ProjectId,
         name: impl Into<String>,
         revision: u64,
         pads: Vec<ProjectPad>,
         patterns: Vec<ProjectPattern>,
+        master_mix: MasterMixSettings,
     ) -> Result<Self, ProjectError> {
         let patterns = complete_sparse_patterns(patterns)?;
         let project = Self {
@@ -342,6 +496,7 @@ impl ProjectDocument {
             revision,
             pads,
             patterns,
+            master_mix,
         };
         project.validate()?;
         Ok(project)
@@ -349,7 +504,7 @@ impl ProjectDocument {
 
     pub fn to_toml(&self) -> Result<String, ProjectError> {
         self.validate()?;
-        let wire = WireV2ProjectDocument::try_from(self)?;
+        let wire = WireV3ProjectDocument::try_from(self)?;
         toml::to_string_pretty(&wire).map_err(|error| ProjectError::TomlEncode(error.to_string()))
     }
 
@@ -362,16 +517,11 @@ impl ProjectDocument {
         let header: Header =
             toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
         match header.schema_version {
-            1 => {
-                let wire: WireV1ProjectDocument = toml::from_str(source)
-                    .map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
-                LegacyProjectDocument::try_from(wire).map(ParsedProjectDocument::Legacy)
-            }
-            CURRENT_SCHEMA_VERSION => {
-                let wire: WireV2ProjectDocument = toml::from_str(source)
-                    .map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
-                ProjectDocument::try_from(wire).map(ParsedProjectDocument::Current)
-            }
+            1 => parse_v1_legacy(source),
+            2 => parse_v2(source)
+                .and_then(migrate_v2_to_v3)
+                .map(ParsedProjectDocument::Current),
+            3 => parse_v3_current(source).map(ParsedProjectDocument::Current),
             found if found > CURRENT_SCHEMA_VERSION => Err(ProjectError::NewerSchema {
                 found,
                 supported: CURRENT_SCHEMA_VERSION,
@@ -409,8 +559,27 @@ impl ProjectDocument {
                 return Err(ProjectError::DuplicatePatternSlot(pattern.slot));
             }
         }
+        self.master_mix
+            .validate()
+            .map_err(ProjectError::InvalidModel)?;
         Ok(())
     }
+}
+
+fn parse_v1_legacy(source: &str) -> Result<ParsedProjectDocument, ProjectError> {
+    let wire: WireV1ProjectDocument =
+        toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
+    LegacyProjectDocument::try_from(wire).map(ParsedProjectDocument::Legacy)
+}
+
+fn parse_v2(source: &str) -> Result<WireV2ProjectDocument, ProjectError> {
+    toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))
+}
+
+fn parse_v3_current(source: &str) -> Result<ProjectDocument, ProjectError> {
+    let wire: WireV3ProjectDocument =
+        toml::from_str(source).map_err(|error| ProjectError::TomlSyntax(error.to_string()))?;
+    ProjectDocument::try_from(wire)
 }
 
 fn complete_sparse_patterns(
@@ -457,6 +626,7 @@ pub struct ProjectPad {
     pub audio_path: String,
     pub asset_digest: AssetDigest,
     pub settings: PadSettings,
+    pub mix: PadMixSettings,
     pub recipe: SampleEditRecipe,
 }
 
@@ -466,6 +636,7 @@ impl ProjectPad {
         audio_path: impl Into<String>,
         asset_digest: AssetDigest,
         settings: PadSettings,
+        mix: PadMixSettings,
         recipe: SampleEditRecipe,
     ) -> Result<Self, ProjectError> {
         let value = Self {
@@ -473,6 +644,7 @@ impl ProjectPad {
             audio_path: audio_path.into(),
             asset_digest,
             settings,
+            mix,
             recipe,
         };
         value.validate()?;
@@ -489,6 +661,7 @@ impl ProjectPad {
             self.settings.choke_group,
         )
         .map_err(ProjectError::InvalidModel)?;
+        self.mix.validate().map_err(ProjectError::InvalidModel)?;
         self.recipe
             .validate()
             .map_err(ProjectError::InvalidRecipe)?;
@@ -852,6 +1025,25 @@ impl TryFrom<WireV2ProjectPad> for ProjectPad {
             value.audio_path,
             digest,
             value.settings.try_into()?,
+            PadMixSettings::default(),
+            value.recipe.try_into()?,
+        )
+    }
+}
+
+impl TryFrom<WireV3ProjectPad> for ProjectPad {
+    type Error = ProjectError;
+
+    fn try_from(value: WireV3ProjectPad) -> Result<Self, Self::Error> {
+        let digest = decode_hex(&value.asset_digest)
+            .map(AssetDigest::from_bytes)
+            .ok_or(ProjectError::InvalidAssetDigest)?;
+        ProjectPad::new(
+            value.pad.try_into()?,
+            value.audio_path,
+            digest,
+            value.settings.try_into()?,
+            value.mix.try_into()?,
             value.recipe.try_into()?,
         )
     }
@@ -883,17 +1075,42 @@ impl TryFrom<WireV2ProjectPattern> for ProjectPattern {
     }
 }
 
-impl TryFrom<WireV2ProjectDocument> for ProjectDocument {
+fn migrate_v2_to_v3(value: WireV2ProjectDocument) -> Result<ProjectDocument, ProjectError> {
+    if value.schema_version != 2 {
+        return Err(ProjectError::UnsupportedSchema(value.schema_version));
+    }
+    let project_id = decode_hex(&value.project_id)
+        .map(ProjectId::from_bytes)
+        .ok_or(ProjectError::InvalidProjectId)?;
+    ProjectDocument::new_v3(
+        project_id,
+        value.name,
+        value.revision,
+        value
+            .pads
+            .into_iter()
+            .map(ProjectPad::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        value
+            .patterns
+            .into_iter()
+            .map(ProjectPattern::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        MasterMixSettings::default(),
+    )
+}
+
+impl TryFrom<WireV3ProjectDocument> for ProjectDocument {
     type Error = ProjectError;
 
-    fn try_from(value: WireV2ProjectDocument) -> Result<Self, Self::Error> {
+    fn try_from(value: WireV3ProjectDocument) -> Result<Self, Self::Error> {
         if value.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(ProjectError::UnsupportedSchema(value.schema_version));
         }
         let project_id = decode_hex(&value.project_id)
             .map(ProjectId::from_bytes)
             .ok_or(ProjectError::InvalidProjectId)?;
-        Self::new_v2(
+        Self::new_v3(
             project_id,
             value.name,
             value.revision,
@@ -907,11 +1124,12 @@ impl TryFrom<WireV2ProjectDocument> for ProjectDocument {
                 .into_iter()
                 .map(ProjectPattern::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            value.master_mix.try_into()?,
         )
     }
 }
 
-impl TryFrom<&ProjectDocument> for WireV2ProjectDocument {
+impl TryFrom<&ProjectDocument> for WireV3ProjectDocument {
     type Error = ProjectError;
 
     fn try_from(value: &ProjectDocument) -> Result<Self, Self::Error> {
@@ -924,11 +1142,12 @@ impl TryFrom<&ProjectDocument> for WireV2ProjectDocument {
             pads: value
                 .pads
                 .iter()
-                .map(|pad| WireV2ProjectPad {
+                .map(|pad| WireV3ProjectPad {
                     pad: pad.pad.into(),
                     audio_path: pad.audio_path.clone(),
                     asset_digest: encode_hex(pad.asset_digest.as_bytes()),
                     settings: pad.settings.into(),
+                    mix: pad.mix.into(),
                     recipe: pad.recipe.into(),
                 })
                 .collect(),
@@ -951,6 +1170,7 @@ impl TryFrom<&ProjectDocument> for WireV2ProjectDocument {
                     events: pattern.events.iter().copied().map(Into::into).collect(),
                 })
                 .collect(),
+            master_mix: value.master_mix.into(),
         })
     }
 }
@@ -1079,8 +1299,8 @@ fn validate_current_audio_path(
 mod tests {
     use super::*;
     use crate::{
-        BankId, EditablePattern, PadId, PadSettings, PatternSlotId, SAMPLE_PHASE_SCALE,
-        SampleEditRecipe,
+        BankId, DelaySettings, EditablePattern, MasterMixSettings, PadId, PadMixSettings,
+        PadSettings, PatternSlotId, ReverbSettings, SAMPLE_PHASE_SCALE, SampleEditRecipe,
     };
 
     fn digest(byte: u8) -> AssetDigest {
@@ -1092,12 +1312,13 @@ mod tests {
     }
 
     fn empty_project(name: &str) -> ProjectDocument {
-        ProjectDocument::new_v2(
+        ProjectDocument::new_v3(
             ProjectId::from_bytes([0x10; 16]),
             name,
             0,
             Vec::new(),
             Vec::new(),
+            MasterMixSettings::default(),
         )
         .unwrap()
     }
@@ -1142,12 +1363,13 @@ index = {index}
                 current_audio_path(0x11, "wav"),
                 digest(0x11),
                 PadSettings::default(),
+                PadMixSettings::default(),
                 SampleEditRecipe::identity(),
             )
             .unwrap(),
         );
         let encoded = project.to_toml().unwrap();
-        assert!(encoded.contains("schema_version = 2"));
+        assert!(encoded.contains("schema_version = 3"));
         assert_eq!(
             ProjectDocument::from_toml(&encoded).unwrap(),
             ParsedProjectDocument::Current(project)
@@ -1175,6 +1397,7 @@ index = {index}
                     path,
                     digest(0x22),
                     PadSettings::default(),
+                    PadMixSettings::default(),
                     SampleEditRecipe::identity(),
                 )
                 .is_err()
@@ -1186,6 +1409,7 @@ index = {index}
                 current_audio_path(0x22, "wav"),
                 digest(0x22),
                 PadSettings::default(),
+                PadMixSettings::default(),
                 SampleEditRecipe::identity(),
             )
             .is_ok()
@@ -1200,6 +1424,7 @@ index = {index}
             current_audio_path(0x33, "flac"),
             digest(0x33),
             PadSettings::default(),
+            PadMixSettings::default(),
             SampleEditRecipe::identity(),
         )
         .unwrap();
@@ -1352,6 +1577,108 @@ bank = 0
 index = 0
 "#;
 
+    const SCHEMA_V2_LITERAL: &str = r#"
+schema_version = 2
+project_id = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+name = "literal-v2"
+revision = 41
+
+[[pads]]
+audio_path = "audio/6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d.wav"
+asset_digest = "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d"
+
+[pads.pad]
+bank = 2
+index = 3
+
+[pads.settings]
+mode = "Gate"
+gain_db = -3.0
+pan = 0.25
+pitch_semitones = 2.0
+choke_group = 4
+
+[pads.recipe]
+start_phase = 1
+end_phase = 4294967296
+reversed = true
+normalize = true
+
+[[patterns]]
+slot = 7
+name = "literal pattern"
+sample_rate = 48000
+tempo = 123.0
+bars = 2
+resolution = "eighth"
+swing = 0.6
+quantize_strength = 0.75
+
+[patterns.meter]
+numerator = 3
+denominator = 4
+
+[[patterns.events]]
+id = 9
+frame = 0
+raw_frame = 0
+velocity = 0.75
+duration = 2400
+original_offset = 0
+
+[patterns.events.pad]
+bank = 2
+index = 3
+"#;
+
+    const SCHEMA_V3_LITERAL: &str = r#"
+schema_version = 3
+project_id = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+name = "literal-v3"
+revision = 42
+patterns = []
+
+[master_mix]
+gain_db = -6.0
+
+[master_mix.delay]
+enabled = true
+time_ms = 640
+feedback = 0.625
+return_db = -9.0
+
+[master_mix.reverb]
+enabled = true
+room_size = 0.8
+damping = 0.2
+return_db = -7.0
+
+[[pads]]
+audio_path = "audio/5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c.wav"
+asset_digest = "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[pads.mix]
+muted = true
+delay_send = 0.25
+reverb_send = 0.75
+
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false
+"#;
+
     fn quantized_pattern(slot: PatternSlotId) -> EditablePattern {
         let transport = Transport::new(
             48_000,
@@ -1375,6 +1702,7 @@ index = 0
             "audio/5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c.wav",
             digest,
             PadSettings::default(),
+            PadMixSettings::default(),
             SampleEditRecipe::new(1, SAMPLE_PHASE_SCALE, true, true).unwrap(),
         )
         .unwrap()
@@ -1383,7 +1711,7 @@ index = 0
     fn current_document() -> ProjectDocument {
         let id = ProjectId::from_bytes([0x2a; 16]);
         let digest = AssetDigest::from_bytes([0x5c; 32]);
-        ProjectDocument::new_v2(
+        ProjectDocument::new_v3(
             id,
             "beat",
             41,
@@ -1392,12 +1720,217 @@ index = 0
                 ProjectPattern::from_editable(&quantized_pattern(PatternSlotId::new(7).unwrap()))
                     .unwrap(),
             ],
+            MasterMixSettings::default(),
+        )
+        .unwrap()
+    }
+
+    fn mixer_document_fixture() -> ProjectDocument {
+        let pad_mix = PadMixSettings::new(true, 0.25, 0.75).unwrap();
+        let master_mix = MasterMixSettings::new(
+            -6.0,
+            DelaySettings::new(true, 640, 0.625, -9.0).unwrap(),
+            ReverbSettings::new(true, 0.8, 0.2, -7.0).unwrap(),
+        )
+        .unwrap();
+        ProjectDocument::new_v3(
+            ProjectId::from_bytes([0x2a; 16]),
+            "mixer round trip",
+            42,
+            vec![
+                ProjectPad::new(
+                    PadId::first(),
+                    current_audio_path(0x5c, "wav"),
+                    digest(0x5c),
+                    PadSettings::default(),
+                    pad_mix,
+                    SampleEditRecipe::identity(),
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+            master_mix,
         )
         .unwrap()
     }
 
     #[test]
-    fn schema_v2_round_trip_preserves_id_revision_recipe_slot_and_raw_quantize_state() {
+    fn schema_v2_migrates_to_current_dry_mixer_defaults() {
+        let ParsedProjectDocument::Current(project) =
+            ProjectDocument::from_toml(SCHEMA_V2_LITERAL).unwrap()
+        else {
+            panic!("v2 must migrate directly to current")
+        };
+
+        assert_eq!(project.schema_version, 3);
+        assert_eq!(project.project_id, ProjectId::from_bytes([0x2a; 16]));
+        assert_eq!(project.name, "literal-v2");
+        assert_eq!(project.revision, 41);
+        assert_eq!(project.master_mix, MasterMixSettings::default());
+        assert_eq!(project.pads.len(), 1);
+        let pad = &project.pads[0];
+        assert_eq!(pad.pad, PadId::new(BankId::new(2).unwrap(), 3).unwrap());
+        assert_eq!(pad.audio_path, current_audio_path(0x6d, "wav"));
+        assert_eq!(pad.asset_digest, digest(0x6d));
+        assert_eq!(pad.settings.mode, PlaybackMode::Gate);
+        assert_eq!(pad.settings.gain_db, -3.0);
+        assert_eq!(pad.settings.pan, 0.25);
+        assert_eq!(pad.settings.pitch_semitones, 2.0);
+        assert_eq!(pad.settings.choke_group, Some(ChokeGroup::new(4).unwrap()));
+        assert_eq!(pad.recipe.start_phase, 1);
+        assert_eq!(pad.recipe.end_phase, SAMPLE_PHASE_SCALE);
+        assert!(pad.recipe.reversed);
+        assert!(pad.recipe.normalize);
+        assert_eq!(pad.mix, PadMixSettings::default());
+
+        assert_eq!(project.patterns.len(), PATTERN_SLOT_COUNT);
+        let pattern = &project.patterns[0];
+        assert_eq!(pattern.slot, PatternSlotId::new(7).unwrap());
+        assert_eq!(pattern.name, "literal pattern");
+        assert_eq!(pattern.sample_rate, 48_000);
+        assert_eq!(pattern.tempo, Tempo::new(123.0).unwrap());
+        assert_eq!(pattern.meter, Meter::new(3, 4).unwrap());
+        assert_eq!(pattern.bars, 2);
+        assert_eq!(pattern.resolution, Resolution::Eighth);
+        assert_eq!(pattern.swing, 0.6);
+        assert_eq!(pattern.quantize_strength, 0.75);
+        assert_eq!(pattern.events.len(), 1);
+        assert_eq!(pattern.events[0].event.id, EventId(9));
+        assert_eq!(pattern.events[0].event.pad, pad.pad);
+        assert_eq!(pattern.events[0].event.frame, 0);
+        assert_eq!(pattern.events[0].raw_frame, 0);
+        assert_eq!(pattern.events[0].event.velocity, 0.75);
+        assert_eq!(pattern.events[0].event.duration, Some(2_400));
+        assert_eq!(pattern.events[0].event.original_offset, Some(0));
+    }
+
+    #[test]
+    fn schema_v3_round_trip_preserves_every_mixer_field() {
+        let document = mixer_document_fixture();
+        let encoded = document.to_toml().unwrap();
+        assert!(encoded.contains("schema_version = 3"));
+        assert_eq!(
+            ProjectDocument::from_toml(&encoded).unwrap(),
+            ParsedProjectDocument::Current(document)
+        );
+    }
+
+    #[test]
+    fn schema_v3_literal_preserves_every_mixer_field() {
+        let ParsedProjectDocument::Current(project) =
+            ProjectDocument::from_toml(SCHEMA_V3_LITERAL).unwrap()
+        else {
+            panic!("v3 must parse as current")
+        };
+        assert_eq!(
+            project.pads[0].mix,
+            PadMixSettings::new(true, 0.25, 0.75).unwrap()
+        );
+        assert_eq!(
+            project.master_mix,
+            MasterMixSettings::new(
+                -6.0,
+                DelaySettings::new(true, 640, 0.625, -9.0).unwrap(),
+                ReverbSettings::new(true, 0.8, 0.2, -7.0).unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_v3_rejects_nonfinite_and_out_of_range_mixer_values() {
+        let invalid_sources = [
+            SCHEMA_V3_LITERAL.replace("delay_send = 0.25", "delay_send = nan"),
+            SCHEMA_V3_LITERAL.replace("reverb_send = 0.75", "reverb_send = +inf"),
+            SCHEMA_V3_LITERAL.replace("gain_db = -6.0", "gain_db = -inf"),
+            SCHEMA_V3_LITERAL.replace("delay_send = 0.25", "delay_send = 1.01"),
+            SCHEMA_V3_LITERAL.replace("reverb_send = 0.75", "reverb_send = -0.01"),
+            SCHEMA_V3_LITERAL.replace("gain_db = -6.0", "gain_db = 6.01"),
+            SCHEMA_V3_LITERAL.replace("time_ms = 640", "time_ms = 9"),
+            SCHEMA_V3_LITERAL.replace("feedback = 0.625", "feedback = 0.951"),
+            SCHEMA_V3_LITERAL.replacen("return_db = -9.0", "return_db = -60.01", 1),
+            SCHEMA_V3_LITERAL.replace("room_size = 0.8", "room_size = 1.01"),
+            SCHEMA_V3_LITERAL.replace("damping = 0.2", "damping = -0.01"),
+            SCHEMA_V3_LITERAL.replace("return_db = -7.0", "return_db = 6.01"),
+        ];
+        for invalid in invalid_sources {
+            assert!(
+                ProjectDocument::from_toml(&invalid).is_err(),
+                "accepted invalid mixer wire value: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v3_rejects_unknown_fields_in_every_mixer_table() {
+        let invalid_sources = [
+            SCHEMA_V3_LITERAL.replace("muted = true", "muted = true\nunknown_pad_mix = 1"),
+            SCHEMA_V3_LITERAL.replace("gain_db = -6.0", "gain_db = -6.0\nunknown_master = 1"),
+            SCHEMA_V3_LITERAL.replacen("enabled = true", "enabled = true\nunknown_delay = 1", 1),
+            SCHEMA_V3_LITERAL.replace("room_size = 0.8", "room_size = 0.8\nunknown_reverb = 1"),
+        ];
+        for invalid in invalid_sources {
+            assert!(
+                matches!(
+                    ProjectDocument::from_toml(&invalid),
+                    Err(ProjectError::TomlSyntax(_))
+                ),
+                "accepted unknown mixer field: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v3_rejects_duplicate_pads_from_literal_wire_data() {
+        let duplicate = format!(
+            "{SCHEMA_V3_LITERAL}\n{}",
+            r#"
+[[pads]]
+audio_path = "audio/6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d.wav"
+asset_digest = "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[pads.mix]
+muted = false
+delay_send = 0.0
+reverb_send = 0.0
+
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false
+"#
+        );
+        assert_eq!(
+            ProjectDocument::from_toml(&duplicate),
+            Err(ProjectError::DuplicatePad(PadId::first()))
+        );
+    }
+
+    #[test]
+    fn schema_four_is_rejected_as_newer_than_schema_three() {
+        let schema_four = SCHEMA_V3_LITERAL.replacen("schema_version = 3", "schema_version = 4", 1);
+        assert_eq!(
+            ProjectDocument::from_toml(&schema_four),
+            Err(ProjectError::NewerSchema {
+                found: 4,
+                supported: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn schema_v3_round_trip_preserves_id_revision_recipe_slot_and_raw_quantize_state() {
         let document = current_document();
         let encoded = document.to_toml().unwrap();
         assert!(encoded.contains("raw_frame = 6800"));
@@ -1422,16 +1955,17 @@ index = 0
     }
 
     #[test]
-    fn schema_v2_completes_sparse_patterns_without_reordering_existing_slots() {
+    fn schema_v3_completes_sparse_patterns_without_reordering_existing_slots() {
         let existing =
             ProjectPattern::from_editable(&quantized_pattern(PatternSlotId::new(7).unwrap()))
                 .unwrap();
-        let project = ProjectDocument::new_v2(
+        let project = ProjectDocument::new_v3(
             ProjectId::from_bytes([0x4d; 16]),
             "sparse",
             1,
             Vec::new(),
             vec![existing.clone()],
+            MasterMixSettings::default(),
         )
         .unwrap();
 
@@ -1502,7 +2036,7 @@ index = 0
     }
 
     #[test]
-    fn schema_v2_rejects_noncanonical_or_mismatched_asset_names() {
+    fn schema_v3_rejects_noncanonical_or_mismatched_asset_names() {
         let encoded = current_document().to_toml().unwrap();
         let digest = "5c".repeat(32);
         for invalid in [
@@ -1531,7 +2065,7 @@ index = 0
     }
 
     #[test]
-    fn schema_v2_rejects_duplicate_slots_but_allows_duplicate_names_in_distinct_slots() {
+    fn schema_v3_rejects_duplicate_slots_but_allows_duplicate_names_in_distinct_slots() {
         let first = quantized_pattern(PatternSlotId::new(1).unwrap());
         let second = quantized_pattern(PatternSlotId::new(2).unwrap());
         let patterns = vec![
@@ -1539,24 +2073,26 @@ index = 0
             ProjectPattern::from_editable(&second).unwrap(),
         ];
         assert!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 ProjectId::from_bytes([1; 16]),
                 "same names are fine",
                 0,
                 Vec::new(),
                 patterns,
+                MasterMixSettings::default(),
             )
             .is_ok()
         );
 
         let duplicate = ProjectPattern::from_editable(&first).unwrap();
         assert_eq!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 ProjectId::from_bytes([1; 16]),
                 "duplicate slot",
                 0,
                 Vec::new(),
                 vec![duplicate.clone(), duplicate],
+                MasterMixSettings::default(),
             ),
             Err(ProjectError::DuplicatePatternSlot(
                 PatternSlotId::new(1).unwrap()
@@ -1565,14 +2101,15 @@ index = 0
     }
 
     #[test]
-    fn schema_v2_rejects_revision_recipe_offsets_max_event_unknown_fields_and_future_schema() {
+    fn schema_v3_rejects_revision_recipe_offsets_max_event_unknown_fields_and_future_schema() {
         assert_eq!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 ProjectId::from_bytes([1; 16]),
                 "revision",
                 i64::MAX as u64 + 1,
                 Vec::new(),
                 Vec::new(),
+                MasterMixSettings::default(),
             ),
             Err(ProjectError::InvalidRevision(i64::MAX as u64 + 1))
         );
@@ -1597,29 +2134,30 @@ index = 0
             );
         }
 
-        let future = encoded.replacen("schema_version = 2", "schema_version = 3", 1);
+        let future = encoded.replacen("schema_version = 3", "schema_version = 4", 1);
         assert_eq!(
             ProjectDocument::from_toml(&future),
             Err(ProjectError::NewerSchema {
-                found: 3,
+                found: 4,
                 supported: CURRENT_SCHEMA_VERSION,
             })
         );
     }
 
     #[test]
-    fn schema_v2_nested_validation_rejects_candidates_without_partial_documents() {
+    fn schema_v3_nested_validation_rejects_candidates_without_partial_documents() {
         let base = current_document();
 
         let mut duplicate_pad = base.clone();
         duplicate_pad.pads.push(duplicate_pad.pads[0].clone());
         assert!(matches!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 duplicate_pad.project_id,
                 duplicate_pad.name,
                 duplicate_pad.revision,
                 duplicate_pad.pads,
                 duplicate_pad.patterns,
+                duplicate_pad.master_mix,
             ),
             Err(ProjectError::DuplicatePad(_))
         ));
@@ -1627,12 +2165,13 @@ index = 0
         let mut invalid_settings = base.clone();
         invalid_settings.pads[0].settings.pan = 2.0;
         assert_eq!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 invalid_settings.project_id,
                 invalid_settings.name,
                 invalid_settings.revision,
                 invalid_settings.pads,
                 invalid_settings.patterns,
+                invalid_settings.master_mix,
             ),
             Err(ProjectError::InvalidModel(ModelError::PanOutOfRange))
         );
@@ -1641,12 +2180,13 @@ index = 0
         let event = duplicate_event.patterns[0].events[0];
         duplicate_event.patterns[0].events.push(event);
         assert_eq!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 duplicate_event.project_id,
                 duplicate_event.name,
                 duplicate_event.revision,
                 duplicate_event.pads,
                 duplicate_event.patterns,
+                duplicate_event.master_mix,
             ),
             Err(ProjectError::InvalidModel(ModelError::DuplicateEvent))
         );
@@ -1658,12 +2198,13 @@ index = 0
             .transport()
             .loop_frames();
         assert_eq!(
-            ProjectDocument::new_v2(
+            ProjectDocument::new_v3(
                 invalid_raw.project_id,
                 invalid_raw.name,
                 invalid_raw.revision,
                 invalid_raw.pads,
                 invalid_raw.patterns,
+                invalid_raw.master_mix,
             ),
             Err(ProjectError::InvalidModel(ModelError::InvalidEvent))
         );

@@ -950,6 +950,7 @@ impl ProjectStore {
                 relative_path,
                 pad.fingerprint.digest,
                 pad.settings,
+                sampler_core::PadMixSettings::default(),
                 pad.recipe,
             )?);
             mappings.push(ProjectAssetMapping {
@@ -960,12 +961,13 @@ impl ProjectStore {
             });
         }
 
-        let document = ProjectDocument::new_v2(
+        let document = ProjectDocument::new_v3(
             request.snapshot.project_id,
             request.snapshot.name,
             request.snapshot.revision,
             document_pads,
             request.snapshot.patterns,
+            sampler_core::MasterMixSettings::default(),
         )?;
         let canonical_toml = document.to_toml()?;
         let destination = directory.join(match request.kind {
@@ -1087,6 +1089,7 @@ fn migrate_legacy(
             relative,
             fingerprint.digest,
             pad.settings(),
+            sampler_core::PadMixSettings::default(),
             pad.recipe(),
         )?);
     }
@@ -1104,12 +1107,13 @@ fn migrate_legacy(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    ProjectDocument::new_v2(
+    ProjectDocument::new_v3(
         ProjectId::from_bytes(project_id),
         legacy.name(),
         legacy.revision(),
         pads,
         patterns,
+        sampler_core::MasterMixSettings::default(),
     )
     .map_err(ProjectStoreError::from)
 }
@@ -2142,12 +2146,13 @@ mod tests {
             .save(fixture.request(1, SaveKind::Explicit))
             .unwrap();
         let before = read(&fixture.directory.join("project.toml"));
-        let foreign = ProjectDocument::new_v2(
+        let foreign = ProjectDocument::new_v3(
             ProjectId::from_bytes([0x7f; 16]),
             "foreign temp",
             90,
             Vec::new(),
             Vec::new(),
+            sampler_core::MasterMixSettings::default(),
         )
         .unwrap()
         .to_toml()
@@ -3015,12 +3020,13 @@ pitch_semitones = 0.0
         request.directory = target.clone();
         request.save_as = true;
         request.snapshot.project_id = ProjectId::from_bytes([0x71; 16]);
-        let foreign = ProjectDocument::new_v2(
+        let foreign = ProjectDocument::new_v3(
             ProjectId::from_bytes([0x72; 16]),
             "foreign",
             99,
             Vec::new(),
             Vec::new(),
+            sampler_core::MasterMixSettings::default(),
         )
         .unwrap()
         .to_toml()

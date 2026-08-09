@@ -20,7 +20,7 @@ use crate::input::KeyboardCapabilities;
 use crate::loader::{
     WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError, WorkerSendFailure,
 };
-use crate::{App, ui};
+use crate::{App, MidiService, MidirBackend, ui};
 
 pub const MAX_EVENTS_PER_ITERATION: usize = 64;
 const MAX_WORKER_RESULTS_PER_ITERATION: usize = 8;
@@ -197,6 +197,12 @@ impl<O: KeyboardEnhancementOps> Drop for KeyboardEnhancementGuard<O> {
 trait EventLoopApp {
     fn should_quit(&self) -> bool;
     fn maintain_audio(&mut self) -> bool;
+    fn maintain_midi(&mut self, _now: Instant) -> bool {
+        false
+    }
+    fn midi_connected(&self) -> bool {
+        false
+    }
     fn maintain_capture(&mut self) -> bool;
     fn maintain_project(&mut self, now: Instant) -> bool;
     fn apply_worker_result(&mut self, result: WorkerResult) -> bool;
@@ -215,6 +221,14 @@ impl EventLoopApp for App {
 
     fn maintain_audio(&mut self) -> bool {
         App::maintain_audio(self)
+    }
+
+    fn maintain_midi(&mut self, now: Instant) -> bool {
+        App::maintain_midi(self, now)
+    }
+
+    fn midi_connected(&self) -> bool {
+        App::midi_connected(self)
     }
 
     fn maintain_capture(&mut self) -> bool {
@@ -343,13 +357,18 @@ where
 
     state.dirty |= app.maintain_project(now);
 
+    state.dirty |= app.maintain_midi(now);
+
     let mut events_applied = 0;
     for event_index in 0..MAX_EVENTS_PER_ITERATION {
-        let timeout = if event_index == 0 {
+        let mut timeout = if event_index == 0 {
             state.next_tick.saturating_duration_since(now)
         } else {
             Duration::ZERO
         };
+        if event_index == 0 && app.midi_connected() {
+            timeout = timeout.min(Duration::from_millis(2));
+        }
         if !events.poll(timeout)? {
             break;
         }
@@ -724,11 +743,16 @@ where
 pub trait AudioShutdown {
     type Error;
 
+    fn shutdown_midi(&mut self) -> Result<(), Self::Error>;
     fn shutdown_audio(&mut self) -> Result<(), Self::Error>;
 }
 
 impl AudioShutdown for App {
     type Error = DynError;
+
+    fn shutdown_midi(&mut self) -> Result<(), Self::Error> {
+        App::shutdown_midi(self).map_err(|error| Box::new(io::Error::other(error)) as DynError)
+    }
 
     fn shutdown_audio(&mut self) -> Result<(), Self::Error> {
         App::shutdown_audio(self).map_err(|error| Box::new(io::Error::other(error)) as DynError)
@@ -751,7 +775,9 @@ impl<'a, A: AudioShutdown> AudioShutdownGuard<'a, A> {
 
     fn shutdown(&mut self) -> Result<(), A::Error> {
         self.active = false;
-        self.app.shutdown_audio()
+        let midi = self.app.shutdown_midi();
+        let audio = self.app.shutdown_audio();
+        preserve_primary(midi, audio)
     }
 }
 
@@ -759,6 +785,7 @@ impl<A: AudioShutdown> Drop for AudioShutdownGuard<'_, A> {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
+            let _ = self.app.shutdown_midi();
             let _ = self.app.shutdown_audio();
         }
     }
@@ -792,6 +819,7 @@ fn app_with_default_audio_and_project(
 
 pub fn run_tui(initial_project: Option<std::path::PathBuf>) -> Result<(), DynError> {
     let mut app = app_with_default_audio_and_project(open_default_audio, initial_project);
+    app.install_midi_service(MidiService::new(Box::new(MidirBackend)), Instant::now());
     let mut events = CrosstermEventSource;
     let mut worker = WorkerHandle::spawn();
     let mut lifecycle = RatatuiTerminalLifecycle::default();
@@ -862,6 +890,11 @@ mod tests {
         should_quit: bool,
         quit_on_worker_result: bool,
         maintenance_calls: usize,
+        capture_maintenance_calls: usize,
+        midi_maintenance_calls: usize,
+        midi_connected: bool,
+        midi_events_remaining: usize,
+        midi_events_applied: usize,
         project_maintenance_times: Vec<Instant>,
         worker_results: usize,
         events_applied: usize,
@@ -882,7 +915,20 @@ mod tests {
             false
         }
 
+        fn maintain_midi(&mut self, _now: Instant) -> bool {
+            self.midi_maintenance_calls += 1;
+            let drained = self.midi_events_remaining.min(crate::MAX_MIDI_DRAIN);
+            self.midi_events_remaining -= drained;
+            self.midi_events_applied += drained;
+            drained > 0
+        }
+
+        fn midi_connected(&self) -> bool {
+            self.midi_connected
+        }
+
         fn maintain_capture(&mut self) -> bool {
+            self.capture_maintenance_calls += 1;
             false
         }
 
@@ -1003,7 +1049,90 @@ mod tests {
 
         assert_eq!(app.events_applied, MAX_EVENTS_PER_ITERATION);
         assert_eq!(app.maintenance_calls, 1);
+        assert_eq!(app.midi_maintenance_calls, 1);
         assert_eq!(events.events.len(), 500 - MAX_EVENTS_PER_ITERATION);
+    }
+
+    #[test]
+    fn saturated_midi_and_terminal_input_do_not_starve_any_iteration_consumer() {
+        let now = Instant::now();
+        let mut events = FakeEvents::with_events((0..500).map(|_| pad_press('1')));
+        let mut app = FakeApp {
+            midi_events_remaining: 500,
+            ..FakeApp::default()
+        };
+        let mut worker = FakeWorker {
+            results: (0..20).map(|_| failed_scan()).collect(),
+            ..FakeWorker::default()
+        };
+        let mut drawer = FakeDrawer::default();
+        let mut state = LoopState::new(now);
+
+        iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.midi_events_applied, crate::MAX_MIDI_DRAIN);
+        assert_eq!(app.worker_results, MAX_WORKER_RESULTS_PER_ITERATION);
+        assert_eq!(app.capture_maintenance_calls, 1);
+        assert_eq!(app.project_maintenance_times, [now]);
+        assert_eq!(app.events_applied, MAX_EVENTS_PER_ITERATION);
+        assert_eq!(app.ticks, 1);
+        assert_eq!(drawer.draws, 1);
+    }
+
+    #[test]
+    fn connected_midi_caps_the_first_poll_timeout_at_two_milliseconds() {
+        let now = Instant::now();
+        let mut app = FakeApp {
+            midi_connected: true,
+            ..FakeApp::default()
+        };
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker::default();
+        let mut drawer = FakeDrawer::default();
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(events.poll_timeouts, [Duration::from_millis(2)]);
+        assert_eq!(app.midi_maintenance_calls, 1);
+    }
+
+    #[test]
+    fn disconnected_midi_keeps_the_existing_tick_poll_cadence() {
+        let now = Instant::now();
+        let mut app = FakeApp::default();
+        let mut events = FakeEvents::default();
+        let mut worker = FakeWorker::default();
+        let mut drawer = FakeDrawer::default();
+        let mut state = LoopState::new(now + TICK_INTERVAL);
+
+        iteration(
+            &mut app,
+            &mut events,
+            &mut worker,
+            &mut drawer,
+            now,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(events.poll_timeouts, [TICK_INTERVAL]);
     }
 
     #[test]
@@ -1047,6 +1176,10 @@ mod tests {
             }
             fn maintain_project(&mut self, _now: Instant) -> bool {
                 self.0.lock().unwrap().push("project");
+                true
+            }
+            fn maintain_midi(&mut self, _now: Instant) -> bool {
+                self.0.lock().unwrap().push("midi");
                 true
             }
             fn apply_worker_result(&mut self, _result: WorkerResult) -> bool {
@@ -1128,6 +1261,7 @@ mod tests {
                 "worker-result",
                 "capture",
                 "project",
+                "midi",
                 "poll",
                 "event",
                 "poll",
@@ -1765,6 +1899,7 @@ mod tests {
             [
                 "init",
                 "loop",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "request",
@@ -1810,6 +1945,11 @@ mod tests {
 
     impl AudioShutdown for FakeShutdownApp {
         type Error = io::Error;
+
+        fn shutdown_midi(&mut self) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("close-midi");
+            Ok(())
+        }
 
         fn shutdown_audio(&mut self) -> Result<(), Self::Error> {
             self.calls.lock().unwrap().push("stop-all");
@@ -1909,6 +2049,7 @@ mod tests {
             *calls.lock().unwrap(),
             [
                 "init-partial",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "request",
@@ -1960,6 +2101,7 @@ mod tests {
             [
                 "init",
                 "query",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "request",
@@ -2013,6 +2155,7 @@ mod tests {
                 "init",
                 "query",
                 "push",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "request",
@@ -2063,6 +2206,7 @@ mod tests {
                 "query",
                 "push",
                 "loop",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "pop",
@@ -2119,6 +2263,7 @@ mod tests {
                 "query",
                 "push",
                 "loop",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "pop",
@@ -2165,6 +2310,7 @@ mod tests {
             [
                 "init",
                 "loop",
+                "close-midi",
                 "stop-all",
                 "drop-audio",
                 "request",

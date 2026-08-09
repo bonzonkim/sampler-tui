@@ -377,12 +377,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::new().borders(Borders::TOP).title(" STATUS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let primary = app.display_status_text();
     let rows = [
-        if app.status().is_empty() {
-            "Ready"
-        } else {
-            app.status()
-        },
+        primary.as_str(),
         "Enter trigger · Shift+pad stop · Shift+Esc stop all",
         "l load · [/] bank · ? help · : cmd · Ctrl+Q quit",
     ];
@@ -1041,10 +1038,10 @@ fn display_width(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -1060,8 +1057,9 @@ mod tests {
     use crate::input::InputAction;
     use crate::loader::{LoadPurpose, LoadSampleError, LoadedSample, WorkerResult};
     use crate::{
-        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, Overlay, PatternWorkspace,
-        PreviewColumn,
+        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, MidiBackend,
+        MidiBackendPort, MidiConnection, MidiIngressProducer, MidiService, MidiServiceError,
+        Overlay, PatternWorkspace, PreviewColumn,
     };
 
     use super::{render, transport_bar_index};
@@ -1275,6 +1273,90 @@ mod tests {
         App::with_audio(Box::new(FakeAudio::ready()))
     }
 
+    struct StaticMidi(Vec<MidiBackendPort>);
+    struct NullMidiConnection;
+
+    impl MidiConnection for NullMidiConnection {
+        fn close(self: Box<Self>) {}
+    }
+
+    impl MidiBackend for StaticMidi {
+        fn list_ports(&mut self) -> Result<Vec<MidiBackendPort>, MidiServiceError> {
+            Ok(self.0.clone())
+        }
+
+        fn connect(
+            &mut self,
+            _port: &MidiBackendPort,
+            _producer: MidiIngressProducer,
+        ) -> Result<Box<dyn MidiConnection>, MidiServiceError> {
+            Ok(Box::new(NullMidiConnection))
+        }
+    }
+
+    fn midi_app(ports: &[(&str, &str)]) -> App {
+        let mut app = ready_app();
+        let backend = StaticMidi(
+            ports
+                .iter()
+                .map(|(backend_id, name)| MidiBackendPort {
+                    backend_id: (*backend_id).to_owned(),
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+        );
+        app.install_midi_service(MidiService::new(Box::new(backend)), Instant::now());
+        app
+    }
+
+    struct MutableMidi {
+        ports: Rc<RefCell<Vec<MidiBackendPort>>>,
+        producer: Rc<RefCell<Option<MidiIngressProducer>>>,
+    }
+
+    impl MidiBackend for MutableMidi {
+        fn list_ports(&mut self) -> Result<Vec<MidiBackendPort>, MidiServiceError> {
+            Ok(self.ports.borrow().clone())
+        }
+
+        fn connect(
+            &mut self,
+            _port: &MidiBackendPort,
+            producer: MidiIngressProducer,
+        ) -> Result<Box<dyn MidiConnection>, MidiServiceError> {
+            *self.producer.borrow_mut() = Some(producer);
+            Ok(Box::new(NullMidiConnection))
+        }
+    }
+
+    struct MutableMidiFixture {
+        app: App,
+        ports: Rc<RefCell<Vec<MidiBackendPort>>>,
+        producer: Rc<RefCell<Option<MidiIngressProducer>>>,
+        now: Instant,
+    }
+
+    fn mutable_midi_app() -> MutableMidiFixture {
+        let now = Instant::now();
+        let ports = Rc::new(RefCell::new(vec![MidiBackendPort {
+            backend_id: "keys".to_owned(),
+            name: "Stage Keys".to_owned(),
+        }]));
+        let producer = Rc::new(RefCell::new(None));
+        let backend = MutableMidi {
+            ports: Rc::clone(&ports),
+            producer: Rc::clone(&producer),
+        };
+        let mut app = ready_app();
+        app.install_midi_service(MidiService::new(Box::new(backend)), now);
+        MutableMidiFixture {
+            app,
+            ports,
+            producer,
+            now,
+        }
+    }
+
     fn populated_app() -> App {
         populated_app_with_audio(FakeAudio::ready().with_stop_error("Overflow 3"))
     }
@@ -1440,6 +1522,78 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("Required: 80x24")));
         assert!(!lines.iter().any(|line| line.contains("PADS")));
+    }
+
+    #[test]
+    fn midi_statuses_fit_minimum_and_wide_layouts_without_displacing_help() {
+        let auto = midi_app(&[("keys", "Stage Keys")]);
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &auto).join("\n");
+            assert!(screen.contains("MIDI AUTO #0 Stage Keys · Omni"));
+            assert!(screen.contains("? help"));
+        }
+
+        let off = midi_app(&[("a", "Keys"), ("b", "Pads")]);
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &off).join("\n");
+            assert!(screen.contains("MIDI OFF · 2 ports · : midi-connect <index>"));
+        }
+
+        let mut learn = auto;
+        learn.arm_midi_learn();
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &learn).join("\n");
+            assert!(screen.contains("MIDI LEARN · PAD A01 · play a note"));
+            assert!(screen.contains("? help"));
+        }
+    }
+
+    #[test]
+    fn midi_validation_disappearance_and_overflow_statuses_are_visible_at_minimum_size() {
+        let mut validation = midi_app(&[("a", "Keys"), ("b", "Pads")]);
+        validation.open_palette();
+        validation.apply_terminal_event(Event::Paste("midi-connect 99".to_owned()));
+        validation.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for width in [80, 120] {
+            assert!(
+                render_lines(width, 24, &validation)
+                    .join("\n")
+                    .contains("MIDI port index 99 is outside the current snapshot")
+            );
+        }
+
+        let mut disappeared = mutable_midi_app();
+        disappeared.ports.borrow_mut().clear();
+        assert!(
+            disappeared
+                .app
+                .maintain_midi(disappeared.now + Duration::from_secs(1))
+        );
+        for width in [80, 120] {
+            assert!(
+                render_lines(width, 24, &disappeared.app)
+                    .join("\n")
+                    .contains("MIDI port disappeared: Stage Keys")
+            );
+        }
+
+        let mut overflow = mutable_midi_app();
+        for _ in 0..crate::MIDI_INGRESS_CAPACITY + 5 {
+            overflow
+                .producer
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x90, 100, 127]);
+        }
+        assert!(overflow.app.maintain_midi(overflow.now));
+        for width in [80, 120] {
+            assert!(
+                render_lines(width, 24, &overflow.app)
+                    .join("\n")
+                    .contains("MIDI overflow · 5 dropped · held notes released")
+            );
+        }
     }
 
     #[test]
@@ -1859,28 +2013,30 @@ mod tests {
         let mut app = ready_app();
         app.open_help();
 
-        let screen = render_lines(80, 24, &app).join("\n");
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &app).join("\n");
 
-        for command in [
-            "midi-ports",
-            "midi-connect <index>",
-            "midi-disconnect",
-            "midi-channel <omni|1..16>",
-            "midi-learn",
-            "midi-unmap",
-            "midi-reset-bank",
-        ] {
-            assert!(screen.contains(command), "missing {command:?} from help");
+            for command in [
+                "midi-ports",
+                "midi-connect <index>",
+                "midi-disconnect",
+                "midi-channel <omni|1..16>",
+                "midi-learn",
+                "midi-unmap",
+                "midi-reset-bank",
+            ] {
+                assert!(screen.contains(command), "missing {command:?} from help");
+            }
+            assert!(screen.contains("MIDI active bank"));
+            assert!(screen.contains("linear velocity"));
+            assert!(screen.contains("Note On 0=Off"));
+            assert!(screen.contains("notes 36..51 map to pads 1..16 in every bank"));
+            assert!(screen.contains("Enter toggle · Backspace reset · Esc Perform"));
+            assert!(screen.contains("Up/Down pitch · o/g/l mode"));
+            assert!(screen.contains("Ctrl+Z undo"));
+            assert!(screen.contains("plain z remains pad 13"));
+            assert!(screen.contains("pads/pattern stay live"));
         }
-        assert!(screen.contains("MIDI active bank"));
-        assert!(screen.contains("linear velocity"));
-        assert!(screen.contains("Note On 0=Off"));
-        assert!(screen.contains("notes 36..51 map to pads 1..16 in every bank"));
-        assert!(screen.contains("Enter toggle · Backspace reset · Esc Perform"));
-        assert!(screen.contains("Up/Down pitch · o/g/l mode"));
-        assert!(screen.contains("Ctrl+Z undo"));
-        assert!(screen.contains("plain z remains pad 13"));
-        assert!(screen.contains("pads/pattern stay live"));
     }
 
     #[test]

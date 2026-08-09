@@ -13,9 +13,9 @@ use sampler_audio::{
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MasterMixSettings, MidiChannelFilter, MidiNote,
-    MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PlaybackMode, ProjectDocument,
-    ProjectId, SampleEditRecipe,
+    BankId, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MasterMixSettings, MidiChannel,
+    MidiChannelFilter, MidiNote, MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId,
+    PlaybackMode, ProjectDocument, ProjectId, SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -4634,6 +4634,9 @@ pub struct App {
     midi_settings: MidiSettings,
     midi_learn_target: Option<PadId>,
     midi_owned_pads: Box<[Option<MidiOwnedVoice>; MIDI_OWNERSHIP_COUNT]>,
+    midi_overflow_pending: usize,
+    midi_notice: Option<String>,
+    midi_deferred_events: VecDeque<MidiEvent>,
     overlay: Option<Overlay>,
     palette: LineEditor,
     palette_error: Option<String>,
@@ -4747,6 +4750,21 @@ impl App {
         app
     }
 
+    pub(crate) fn install_midi_service(
+        &mut self,
+        mut midi_service: MidiService,
+        now: Instant,
+    ) -> bool {
+        self.reset_midi_ingress_fence();
+        self.midi_service.take();
+        let startup = midi_service.startup(now);
+        self.midi_service = Some(midi_service);
+        if let Err(error) = startup {
+            self.set_midi_notice(error.to_string());
+        }
+        true
+    }
+
     fn new(mut audio: Option<Box<dyn AudioPort>>, mut audio_error: Option<String>) -> Self {
         if let Some(candidate) = audio.as_mut()
             && let Err(error) = candidate.update_master_mix(MasterMixSettings::default())
@@ -4787,6 +4805,9 @@ impl App {
             midi_settings: MidiSettings::default(),
             midi_learn_target: None,
             midi_owned_pads: Box::new([None; MIDI_OWNERSHIP_COUNT]),
+            midi_overflow_pending: 0,
+            midi_notice: None,
+            midi_deferred_events: VecDeque::with_capacity(crate::midi::MAX_MIDI_DRAIN),
             midi_service: None,
             overlay,
             palette: LineEditor::default(),
@@ -5826,39 +5847,210 @@ impl App {
         match result {
             Some(Ok(Some(MidiServiceEvent::PortDisappeared(port)))) => {
                 self.cancel_midi_learn();
-                self.status = match self.release_all_midi_owners() {
+                self.midi_deferred_events.clear();
+                self.midi_overflow_pending = 0;
+                let notice = match self.release_all_midi_owners() {
                     Ok(()) => format!("MIDI port disappeared: {}", port.name()),
                     Err(error) => format!(
                         "MIDI port disappeared: {}; held-note release failed: {error}",
                         port.name()
                     ),
                 };
+                self.set_midi_notice(notice);
                 true
             }
             Some(Err(error)) => {
-                self.status = error.to_string();
+                self.set_midi_notice(error.to_string());
                 true
             }
-            _ => false,
+            Some(Ok(None)) => {
+                let recovered = self.midi_notice.as_ref().is_some_and(|notice| {
+                    notice.starts_with("could not initialize MIDI")
+                        || notice.starts_with("could not enumerate MIDI")
+                        || notice.starts_with("could not read MIDI")
+                        || notice.starts_with("could not connect MIDI")
+                });
+                if recovered {
+                    self.clear_midi_notice();
+                }
+                recovered
+            }
+            None => false,
         }
     }
 
-    fn list_midi_ports(&mut self) -> Result<(), String> {
-        let service = self
+    pub fn maintain_midi(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        let observed_lost = self
             .midi_service
-            .as_mut()
-            .ok_or("MIDI input service is unavailable")?;
-        service.refresh_ports().map_err(|error| error.to_string())?;
-        self.status = if service.ports().is_empty() {
-            "MIDI ports: none".to_owned()
-        } else {
-            service
-                .ports()
-                .iter()
-                .map(|port| format!("#{} {}", port.index(), port.name()))
-                .collect::<Vec<_>>()
-                .join(" · ")
+            .as_ref()
+            .map_or(0, MidiService::take_lost_count);
+        self.midi_overflow_pending = self.midi_overflow_pending.saturating_add(observed_lost);
+        if self.midi_overflow_pending > 0 && !self.recover_midi_overflow() {
+            return true;
+        }
+
+        let mut applied = 0;
+        while applied < crate::midi::MAX_MIDI_DRAIN {
+            let Some(event) = self.midi_deferred_events.pop_front() else {
+                break;
+            };
+            self.apply_midi_event(event);
+            applied += 1;
+            changed = true;
+        }
+
+        let remaining = crate::midi::MAX_MIDI_DRAIN - applied;
+        if remaining > 0 {
+            let empty = MidiEvent::NoteOff {
+                channel: MidiChannel::new(1).expect("first MIDI channel is valid"),
+                note: MidiNote::new(0).expect("zero MIDI note is valid"),
+            };
+            let mut events = [empty; crate::midi::MAX_MIDI_DRAIN];
+            let drained = self
+                .midi_service
+                .as_mut()
+                .map_or(0, |service| service.drain_events(&mut events[..remaining]));
+            let lost_after_drain = self
+                .midi_service
+                .as_ref()
+                .map_or(0, MidiService::take_lost_count);
+            if lost_after_drain > 0 {
+                self.midi_overflow_pending =
+                    self.midi_overflow_pending.saturating_add(lost_after_drain);
+                self.midi_deferred_events
+                    .extend(events[..drained].iter().copied());
+                if !self.recover_midi_overflow() {
+                    return true;
+                }
+                while applied < crate::midi::MAX_MIDI_DRAIN {
+                    let Some(event) = self.midi_deferred_events.pop_front() else {
+                        break;
+                    };
+                    self.apply_midi_event(event);
+                    applied += 1;
+                    changed = true;
+                }
+            } else {
+                for event in events.into_iter().take(drained) {
+                    self.apply_midi_event(event);
+                    changed = true;
+                }
+            }
+        }
+
+        changed | self.maintain_midi_service(now)
+    }
+
+    fn recover_midi_overflow(&mut self) -> bool {
+        let dropped = self.midi_overflow_pending;
+        match self.release_all_midi_owners() {
+            Ok(()) => {
+                self.midi_overflow_pending = 0;
+                self.set_midi_notice(format!(
+                    "MIDI overflow · {dropped} dropped · held notes released"
+                ));
+                true
+            }
+            Err(error) => {
+                self.set_midi_notice(format!(
+                    "MIDI overflow · {dropped} dropped · held-note release failed: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    pub fn midi_connected(&self) -> bool {
+        self.midi_service
+            .as_ref()
+            .and_then(MidiService::connected_port)
+            .is_some()
+    }
+
+    pub fn midi_status_text(&self) -> Option<String> {
+        if let Some(target) = self.midi_learn_target {
+            let bank = char::from(b'A'.saturating_add(u8::from(target.bank())));
+            return Some(format!(
+                "MIDI LEARN · PAD {bank}{:02} · play a note",
+                target.index() + 1
+            ));
+        }
+        let service = self.midi_service.as_ref()?;
+        if let Some(notice) = &self.midi_notice {
+            return Some(notice.clone());
+        }
+        let channel = match self.midi_settings.channel() {
+            MidiChannelFilter::Omni => "Omni".to_owned(),
+            MidiChannelFilter::Channel(channel) => channel.get().to_string(),
         };
+        Some(match service.connected_port() {
+            Some(port) if service.ports().len() == 1 => {
+                format!("MIDI AUTO #{} {} · {channel}", port.index(), port.name())
+            }
+            Some(port) => format!("MIDI #{} {} · {channel}", port.index(), port.name()),
+            None => format!(
+                "MIDI OFF · {} ports · : midi-connect <index>",
+                service.ports().len()
+            ),
+        })
+    }
+
+    pub fn display_status_text(&self) -> String {
+        if self.midi_learn_target.is_some() {
+            return self
+                .midi_status_text()
+                .expect("armed MIDI Learn has presentation text");
+        }
+        if !self.status.is_empty() && self.midi_notice.as_deref() != Some(self.status.as_str()) {
+            return self.status.clone();
+        }
+        self.midi_status_text().unwrap_or_else(|| {
+            if self.status.is_empty() {
+                "Ready".to_owned()
+            } else {
+                self.status.clone()
+            }
+        })
+    }
+
+    fn set_midi_notice(&mut self, notice: String) {
+        self.status.clone_from(&notice);
+        self.midi_notice = Some(notice);
+    }
+
+    fn clear_midi_notice(&mut self) {
+        if self.midi_notice.as_deref() == Some(self.status.as_str()) {
+            self.status.clear();
+        }
+        self.midi_notice = None;
+    }
+
+    fn reset_midi_ingress_fence(&mut self) {
+        self.midi_deferred_events.clear();
+        self.midi_overflow_pending = 0;
+        self.clear_midi_notice();
+    }
+
+    fn list_midi_ports(&mut self) -> Result<(), String> {
+        let notice = {
+            let service = self
+                .midi_service
+                .as_mut()
+                .ok_or("MIDI input service is unavailable")?;
+            service.refresh_ports().map_err(|error| error.to_string())?;
+            if service.ports().is_empty() {
+                "MIDI ports: none".to_owned()
+            } else {
+                service
+                    .ports()
+                    .iter()
+                    .map(|port| format!("#{} {}", port.index(), port.name()))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            }
+        };
+        self.set_midi_notice(notice);
         Ok(())
     }
 
@@ -5883,10 +6075,10 @@ impl App {
             .as_mut()
             .expect("the MIDI service that prepared a connection still exists");
         service.commit_connection(prepared);
+        self.reset_midi_ingress_fence();
         if needs_reconciliation {
             self.cancel_midi_learn();
         }
-        self.status = format!("MIDI connected: #{index}");
         Ok(())
     }
 
@@ -5896,6 +6088,7 @@ impl App {
         if let Some(service) = self.midi_service.as_mut() {
             service.disconnect();
         }
+        self.reset_midi_ingress_fence();
         Ok(())
     }
 
@@ -8518,6 +8711,13 @@ impl App {
         let result = audio.stop_all();
         drop(audio);
         result
+    }
+
+    pub fn shutdown_midi(&mut self) -> Result<(), String> {
+        self.cancel_midi_learn();
+        self.reset_midi_ingress_fence();
+        self.midi_service.take();
+        Ok(())
     }
 
     fn retry_default_device_with(
@@ -11408,10 +11608,12 @@ mod tests {
     #[derive(Default)]
     struct FakeMidiState {
         ports: Vec<MidiBackendPort>,
+        list_error: Option<String>,
         connected: Vec<String>,
         connect_error_for: Option<String>,
         closed: usize,
         lifecycle: Option<Rc<RefCell<Vec<&'static str>>>>,
+        producer: Option<MidiIngressProducer>,
     }
 
     struct FakeMidiBackend(Rc<RefCell<FakeMidiState>>);
@@ -11430,18 +11632,22 @@ mod tests {
 
     impl MidiBackend for FakeMidiBackend {
         fn list_ports(&mut self) -> Result<Vec<MidiBackendPort>, MidiServiceError> {
+            if let Some(error) = self.0.borrow().list_error.clone() {
+                return Err(MidiServiceError::PortEnumeration(error));
+            }
             Ok(self.0.borrow().ports.clone())
         }
 
         fn connect(
             &mut self,
             port: &MidiBackendPort,
-            _producer: MidiIngressProducer,
+            producer: MidiIngressProducer,
         ) -> Result<Box<dyn MidiConnection>, MidiServiceError> {
             self.0.borrow_mut().connected.push(port.backend_id.clone());
             if self.0.borrow().connect_error_for.as_deref() == Some(port.backend_id.as_str()) {
                 return Err(MidiServiceError::Connect("candidate refused".to_owned()));
             }
+            self.0.borrow_mut().producer = Some(producer);
             Ok(Box::new(FakeMidiConnection(Rc::clone(&self.0))))
         }
     }
@@ -18756,6 +18962,210 @@ mod tests {
                 AudioCall::TrackedOwnedRelease(pad(1, 1), midi_command(3)),
             ]
         );
+    }
+
+    #[test]
+    fn midi_overflow_release_failure_retains_exact_interval_and_blocks_later_events_for_retry() {
+        let now = Instant::now();
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        state
+            .borrow_mut()
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_push_message(&[0x91, 36, 127]);
+        assert!(app.maintain_midi(now));
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        calls.clear();
+        for _ in 0..crate::midi::MIDI_INGRESS_CAPACITY {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x81, 90, 0]);
+        }
+        for _ in 0..7 {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x91, 37, 127]);
+        }
+
+        assert!(app.maintain_midi(now));
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        assert!(app.status().contains("7 dropped"));
+        assert!(app.status().contains("release queue full"));
+
+        assert!(app.maintain_midi(now));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1))]
+        );
+        assert!(app.midi_owned_pads.iter().all(Option::is_none));
+        assert_eq!(
+            app.status(),
+            "MIDI overflow · 7 dropped · held notes released"
+        );
+    }
+
+    #[test]
+    fn midi_maintenance_drains_at_most_one_hundred_twenty_eight_events_per_iteration() {
+        let now = Instant::now();
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        for _ in 0..129 {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x90, 36, 127]);
+        }
+
+        assert!(app.maintain_midi(now));
+        assert_eq!(calls.snapshot().len(), 128 + 127);
+        assert!(app.maintain_midi(now));
+        assert_eq!(calls.snapshot().len(), 129 + 128);
+        assert!(!app.maintain_midi(now));
+    }
+
+    #[test]
+    fn midi_notice_sequences_replace_stale_truth_and_preserve_ordinary_status() {
+        let now = Instant::now();
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2)
+            .failing_owned_release_at(2, "second overflow release rejected");
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.midi_overflow_pending = 3;
+        assert!(app.recover_midi_overflow());
+        app.apply_midi_event(midi_on(1, 36, 127));
+        app.midi_overflow_pending = 4;
+        assert!(!app.recover_midi_overflow());
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some(
+                "MIDI overflow · 4 dropped · held-note release failed: second overflow release rejected"
+            )
+        );
+
+        state.borrow_mut().ports.clear();
+        assert!(app.maintain_midi_service(now + Duration::from_secs(1)));
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI port disappeared: Keys")
+        );
+
+        app.status = "Project saved".to_owned();
+        assert_eq!(app.display_status_text(), "Project saved");
+        app.arm_midi_learn();
+        assert_eq!(
+            app.display_status_text(),
+            "MIDI LEARN · PAD A01 · play a note"
+        );
+    }
+
+    #[test]
+    fn recovered_startup_error_clears_stale_notice_to_current_off_state() {
+        let now = Instant::now();
+        let (service, state) = fake_midi_service([]);
+        state.borrow_mut().list_error = Some("backend asleep".to_owned());
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.install_midi_service(service, now);
+        state.borrow_mut().list_error = None;
+
+        assert!(app.maintain_midi_service(now));
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI OFF · 0 ports · : midi-connect <index>")
+        );
+        assert_eq!(app.status(), "");
+    }
+
+    #[test]
+    fn midi_source_boundaries_discard_deferred_old_connection_events() {
+        let now = Instant::now();
+        let (mut service, _state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
+        app.midi_overflow_pending = 2;
+        app.disconnect_midi_port().unwrap();
+        calls.clear();
+        assert!(!app.maintain_midi(now));
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert!(app.midi_deferred_events.is_empty());
+        assert_eq!(app.midi_overflow_pending, 0);
+
+        let (mut replacement, replacement_state) =
+            fake_midi_service([("a", "Keys"), ("b", "Pads")]);
+        replacement.startup(now).unwrap();
+        replacement.connect(0).unwrap();
+        app.install_midi_service(replacement, now);
+        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
+        app.midi_overflow_pending = 2;
+        app.connect_midi_port(1).unwrap();
+        calls.clear();
+        assert!(!app.maintain_midi(now));
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+
+        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
+        app.midi_overflow_pending = 2;
+        replacement_state.borrow_mut().ports.clear();
+        assert!(app.maintain_midi_service(now + Duration::from_secs(1)));
+        calls.clear();
+        assert!(!app.maintain_midi(now + Duration::from_secs(1)));
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+    }
+
+    #[test]
+    fn midi_startup_status_covers_off_auto_multiple_and_recoverable_failure() {
+        let now = Instant::now();
+
+        let (zero, _) = fake_midi_service([]);
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.install_midi_service(zero, now);
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI OFF · 0 ports · : midi-connect <index>")
+        );
+
+        let (multiple, _) = fake_midi_service([("a", "Keys"), ("b", "Pads")]);
+        app.install_midi_service(multiple, now);
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI OFF · 2 ports · : midi-connect <index>")
+        );
+
+        let (one, _) = fake_midi_service([("a", "Keys")]);
+        app.install_midi_service(one, now);
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI AUTO #0 Keys · Omni")
+        );
+
+        let (failed, state) = fake_midi_service([]);
+        state.borrow_mut().list_error = Some("backend asleep".to_owned());
+        app.install_midi_service(failed, now);
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("could not enumerate MIDI input ports: backend asleep")
+        );
+        assert!(!app.midi_connected());
     }
 
     #[test]

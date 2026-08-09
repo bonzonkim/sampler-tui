@@ -59,7 +59,12 @@ impl AudioPort for ControllerPort {
     ) -> Result<SampleSlot, String> {
         self.installed_settings.borrow_mut().push(settings);
         self.controller()
-            .install(pad, sample, settings)
+            .install(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|e| e.to_string())
     }
     fn install_recovery(
@@ -70,7 +75,12 @@ impl AudioPort for ControllerPort {
     ) -> Result<SampleSlot, String> {
         self.installed_settings.borrow_mut().push(settings);
         self.controller()
-            .install_recovery(pad, sample, settings)
+            .install_recovery(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|e| e.to_string())
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String> {
@@ -696,6 +706,7 @@ fn dense_pattern_and_ack_overflow_are_visible_without_silent_loss() {
                 pad(0),
                 Arc::new(SampleBuffer::new(48_000, vec![0.25; 1024]).unwrap()),
                 PadSettings::default(),
+                sampler_core::PadMixSettings::default(),
             )
             .unwrap();
         control.install_pattern(snapshot).unwrap();

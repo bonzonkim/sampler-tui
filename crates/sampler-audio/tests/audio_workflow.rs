@@ -4,7 +4,7 @@ use sampler_audio::{
     AudioEngine, COMMAND_CAPACITY, ControlError, PadId, PadSettings, SAMPLE_SLOT_COUNT,
     SampleBuffer, audio_channels,
 };
-use sampler_core::{BankId, PlaybackMode};
+use sampler_core::{BankId, PadMixSettings, PlaybackMode};
 
 fn constant_sample(frames: usize, value: f32) -> Arc<SampleBuffer> {
     Arc::new(SampleBuffer::new(48_000, vec![value; frames * 2]).unwrap())
@@ -19,7 +19,12 @@ fn rendered_replacement_retires_and_reuses_the_original_slot() {
     let one_shot = PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
 
     let original_slot = controller
-        .install(first_pad, constant_sample(4, 0.75), one_shot)
+        .install(
+            first_pad,
+            constant_sample(4, 0.75),
+            one_shot,
+            PadMixSettings::default(),
+        )
         .unwrap();
     controller.trigger(first_pad, 0, 1.0).unwrap();
     let mut rendered = [0.0; 16];
@@ -28,14 +33,24 @@ fn rendered_replacement_retires_and_reuses_the_original_slot() {
     assert_eq!(engine.active_voices(), 0);
 
     let replacement_slot = controller
-        .install(first_pad, constant_sample(8, 0.5), one_shot)
+        .install(
+            first_pad,
+            constant_sample(8, 0.5),
+            one_shot,
+            PadMixSettings::default(),
+        )
         .unwrap();
     assert_ne!(replacement_slot, original_slot);
     engine.render_stereo(&mut []);
     assert_eq!(controller.reclaim_retired(), 1);
 
     let reused_slot = controller
-        .install(second_pad, constant_sample(8, 0.25), one_shot)
+        .install(
+            second_pad,
+            constant_sample(8, 0.25),
+            one_shot,
+            PadMixSettings::default(),
+        )
         .unwrap();
     assert_eq!(reused_slot, original_slot);
 }
@@ -47,7 +62,12 @@ fn rapid_pressure_reports_backpressure_and_reaches_bounded_quiescence_without_tr
     let pad = PadId::first();
     let looped = PadSettings::new(PlaybackMode::Loop, -6.0, 0.0, 0.0, None).unwrap();
     controller
-        .install(pad, constant_sample(32, 0.25), looped)
+        .install(
+            pad,
+            constant_sample(32, 0.25),
+            looped,
+            PadMixSettings::default(),
+        )
         .unwrap();
     engine.render_frames(0, |_| {});
 
@@ -61,6 +81,7 @@ fn rapid_pressure_reports_backpressure_and_reaches_bounded_quiescence_without_tr
                         pad,
                         constant_sample(32, 0.25 + (submission % 4) as f32 * 0.05),
                         looped,
+                        PadMixSettings::default(),
                     )
                     .map(|_| ()),
                 false,

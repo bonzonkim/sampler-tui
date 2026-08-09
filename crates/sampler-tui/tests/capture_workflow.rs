@@ -156,7 +156,12 @@ impl AudioPort for IntegrationPort {
         self.state.borrow_mut().install_attempts += 1;
         let result = self
             .output()
-            .install(pad, sample, settings)
+            .install(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|error| error.to_string());
         if result.is_ok() {
             self.state.borrow_mut().install_successes += 1;
@@ -173,7 +178,12 @@ impl AudioPort for IntegrationPort {
         self.state.borrow_mut().install_attempts += 1;
         let result = self
             .output()
-            .install_recovery(pad, sample, settings)
+            .install_recovery(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|error| error.to_string());
         if result.is_ok() {
             self.state.borrow_mut().install_successes += 1;

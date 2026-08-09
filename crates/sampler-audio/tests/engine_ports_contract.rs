@@ -4,7 +4,9 @@ use sampler_audio::{
     AudioCommand, ControlError, PadId, PadSettings, PatternRetirement, SampleBuffer,
     audio_channels_with_test_capacities,
 };
-use sampler_core::{EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport};
+use sampler_core::{
+    EditablePattern, Meter, PadMixSettings, PatternSlotId, Resolution, Tempo, Transport,
+};
 
 fn pattern_snapshot() -> Arc<sampler_core::PatternSnapshot> {
     let transport = Transport::new(
@@ -30,7 +32,12 @@ fn public_ports_consume_both_lanes_and_release_shared_admission() {
     let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25, 0.25]).unwrap());
 
     controller
-        .install(pad, sample, PadSettings::default())
+        .install(
+            pad,
+            sample,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     controller.trigger_live(pad, 1.0).unwrap();
     controller.trigger(pad, 10, 1.0).unwrap();
@@ -41,7 +48,7 @@ fn public_ports_consume_both_lanes_and_release_shared_admission() {
 
     assert!(matches!(
         ports.immediate_commands.pop().unwrap(),
-        AudioCommand::InstallSample { .. }
+        AudioCommand::Install { .. }
     ));
     assert!(matches!(
         ports.immediate_commands.pop().unwrap(),

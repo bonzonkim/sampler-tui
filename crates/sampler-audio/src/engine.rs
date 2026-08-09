@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use rtrb::PushError;
 use sampler_core::{
-    EventId, FIRST_LOOP_VALID_MASK_WORDS, Frame, PATTERN_SLOT_COUNT, PadId, PadSettings,
-    PatternAction, PatternActionKind, PatternSlotId, PatternSnapshot, PlaybackMode, VoiceAllocator,
-    VoiceId, VoiceRequest,
+    EventId, FIRST_LOOP_VALID_MASK_WORDS, Frame, MasterMixSettings, PATTERN_SLOT_COUNT, PadId,
+    PadMixSettings, PadSettings, PatternAction, PatternActionKind, PatternSlotId, PatternSnapshot,
+    PlaybackMode, VoiceAllocator, VoiceId, VoiceRequest,
 };
 
+use crate::fx::FxRack;
 use crate::{
     AudioCommand, CaptureState, CriticalEvent, EngineError, EnginePorts, LiveAck, LiveAckKind,
     LiveCommandId, PatternRetirement, PatternSnapshotSlot, PatternSwitch, SAMPLE_SLOT_COUNT,
@@ -24,6 +25,7 @@ const PAD_COUNT: usize = 160;
 const PADS_PER_BANK: usize = 16;
 const ATTACK_FRAMES: u8 = 32;
 const RELEASE_FRAMES: u8 = 64;
+const ROUTE_RAMP_FRAMES: u32 = 64;
 
 struct SampleEntry {
     buffer: Option<Arc<SampleBuffer>>,
@@ -35,6 +37,128 @@ struct SampleEntry {
 struct PadBinding {
     slot: Option<SampleSlot>,
     settings: PadSettings,
+    mix: PadMixSettings,
+    route: PadRoute,
+}
+
+#[derive(Clone, Copy)]
+struct RouteRamp {
+    current: f32,
+    target: f32,
+    step: f32,
+    remaining: u32,
+}
+
+impl RouteRamp {
+    const fn new(value: f32) -> Self {
+        Self {
+            current: value,
+            target: value,
+            step: 0.0,
+            remaining: 0,
+        }
+    }
+
+    fn set_target(&mut self, target: f32) {
+        if self.target.to_bits() == target.to_bits() {
+            return;
+        }
+        self.target = target;
+        self.step = (target - self.current) / ROUTE_RAMP_FRAMES as f32;
+        self.remaining = ROUTE_RAMP_FRAMES;
+    }
+
+    fn advance(&mut self, frames: Frame) {
+        let steps =
+            u32::try_from(frames.min(Frame::from(self.remaining))).unwrap_or(self.remaining);
+        if steps == 0 {
+            return;
+        }
+        self.current += self.step * steps as f32;
+        self.remaining -= steps;
+        if self.remaining == 0 {
+            self.current = self.target;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PadRoute {
+    level: RouteRamp,
+    pan: RouteRamp,
+    audible: RouteRamp,
+    delay_send: RouteRamp,
+    reverb_send: RouteRamp,
+    last_frame: Option<Frame>,
+}
+
+#[derive(Clone, Copy)]
+struct PadRouteValues {
+    level: f32,
+    pan: f32,
+    audible: f32,
+    delay_send: f32,
+    reverb_send: f32,
+}
+
+impl PadRoute {
+    fn new(settings: PadSettings, mix: PadMixSettings, at_frame: Frame) -> Self {
+        Self {
+            level: RouteRamp::new(db_to_gain(settings.gain_db)),
+            pan: RouteRamp::new(settings.pan),
+            audible: RouteRamp::new(if mix.muted { 0.0 } else { 1.0 }),
+            delay_send: RouteRamp::new(mix.delay_send),
+            reverb_send: RouteRamp::new(mix.reverb_send),
+            last_frame: at_frame.checked_sub(1),
+        }
+    }
+
+    fn set_pad_settings(&mut self, settings: PadSettings, at_frame: Frame) {
+        self.advance_before(at_frame);
+        self.level.set_target(db_to_gain(settings.gain_db));
+        self.pan.set_target(settings.pan);
+    }
+
+    fn set_mix_settings(&mut self, settings: PadMixSettings, at_frame: Frame) {
+        self.advance_before(at_frame);
+        self.audible
+            .set_target(if settings.muted { 0.0 } else { 1.0 });
+        self.delay_send.set_target(settings.delay_send);
+        self.reverb_send.set_target(settings.reverb_send);
+    }
+
+    fn values_for_frame(&mut self, frame: Frame) -> PadRouteValues {
+        self.advance_through(frame);
+        PadRouteValues {
+            level: self.level.current,
+            pan: self.pan.current,
+            audible: self.audible.current,
+            delay_send: self.delay_send.current,
+            reverb_send: self.reverb_send.current,
+        }
+    }
+
+    fn advance_before(&mut self, frame: Frame) {
+        if let Some(previous) = frame.checked_sub(1) {
+            self.advance_through(previous);
+        }
+    }
+
+    fn advance_through(&mut self, frame: Frame) {
+        if self.last_frame.is_some_and(|last| last >= frame) {
+            return;
+        }
+        let elapsed = self.last_frame.map_or_else(
+            || frame.saturating_add(1),
+            |last| frame.saturating_sub(last),
+        );
+        self.level.advance(elapsed);
+        self.pan.advance(elapsed);
+        self.audible.advance(elapsed);
+        self.delay_send.advance(elapsed);
+        self.reverb_send.advance(elapsed);
+        self.last_frame = Some(frame);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -90,8 +214,7 @@ struct AudioVoice {
     pad: PadId,
     mode: PlaybackMode,
     choke_group: Option<sampler_core::ChokeGroup>,
-    left_gain: f32,
-    right_gain: f32,
+    velocity: f32,
     envelope: Envelope,
     sequence: u64,
     pattern_voice: Option<PatternVoiceId>,
@@ -669,6 +792,7 @@ impl ScheduledAction {
 pub struct AudioEngine {
     sample_rate: u32,
     ports: EnginePorts,
+    fx: FxRack,
     samples: [SampleEntry; SAMPLE_SLOT_COUNT],
     pads: [PadBinding; PAD_COUNT],
     allocator: VoiceAllocator<VOICE_COUNT>,
@@ -704,15 +828,18 @@ impl AudioEngine {
         Ok(Self {
             sample_rate,
             ports,
+            fx: FxRack::new(sample_rate, MasterMixSettings::default())?,
             samples: array::from_fn(|_| SampleEntry {
                 buffer: None,
                 pad_references: 0,
                 retiring: false,
             }),
-            pads: [PadBinding {
+            pads: array::from_fn(|_| PadBinding {
                 slot: None,
                 settings: PadSettings::default(),
-            }; PAD_COUNT],
+                mix: PadMixSettings::default(),
+                route: PadRoute::new(PadSettings::default(), PadMixSettings::default(), 0),
+            }),
             allocator: VoiceAllocator::new(),
             voices: [None; VOICE_COUNT],
             pending: [None; PENDING_COUNT],
@@ -934,12 +1061,13 @@ impl AudioEngine {
                 sequence: *sequence,
                 source: ActionSource::Live(*id),
             }),
-            Ok(AudioCommand::InstallSample {
+            Ok(AudioCommand::Install {
                 slot,
                 buffer,
                 settings,
+                mix,
                 ..
-            }) if self.install_is_invalid(*slot, buffer, *settings)
+            }) if self.install_is_invalid(*slot, buffer, *settings, *mix)
                 && self.deferred_retirement.is_some() =>
             {
                 return false;
@@ -1033,16 +1161,37 @@ impl AudioEngine {
 
     fn execute_immediate(&mut self, command: AudioCommand) {
         match command {
-            AudioCommand::InstallSample {
+            AudioCommand::Install {
                 pad,
                 slot,
                 buffer,
                 settings,
+                mix,
                 ..
-            } => self.install_sample(pad, slot, buffer, settings),
+            } => self.install_sample(pad, slot, buffer, settings, mix),
             AudioCommand::UpdatePad { pad, settings } => {
                 if settings_are_valid(settings) && self.pad_binding(pad).slot.is_some() {
-                    self.pad_binding_mut(pad).settings = settings;
+                    let frame = self.rendered_frame;
+                    let binding = self.pad_binding_mut(pad);
+                    binding.route.set_pad_settings(settings, frame);
+                    binding.settings = settings;
+                } else {
+                    self.invalid_commands = self.invalid_commands.saturating_add(1);
+                }
+            }
+            AudioCommand::UpdatePadMix { pad, settings } => {
+                if mix_settings_are_valid(settings) && self.pad_binding(pad).slot.is_some() {
+                    let frame = self.rendered_frame;
+                    let binding = self.pad_binding_mut(pad);
+                    binding.route.set_mix_settings(settings, frame);
+                    binding.mix = settings;
+                } else {
+                    self.invalid_commands = self.invalid_commands.saturating_add(1);
+                }
+            }
+            AudioCommand::UpdateMasterMix { settings } => {
+                if master_settings_are_valid(settings) {
+                    self.fx.set_settings(settings);
                 } else {
                     self.invalid_commands = self.invalid_commands.saturating_add(1);
                 }
@@ -1155,8 +1304,9 @@ impl AudioEngine {
         slot: SampleSlot,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) {
-        if self.install_is_invalid(slot, &buffer, settings) {
+        if self.install_is_invalid(slot, &buffer, settings, mix) {
             self.invalid_commands = self.invalid_commands.saturating_add(1);
             self.return_rejected_buffer(slot, buffer);
             return;
@@ -1176,6 +1326,8 @@ impl AudioEngine {
         self.pads[pad_index] = PadBinding {
             slot: Some(slot),
             settings,
+            mix,
+            route: PadRoute::new(settings, mix, self.rendered_frame),
         };
     }
 
@@ -1184,12 +1336,14 @@ impl AudioEngine {
         slot: SampleSlot,
         buffer: &SampleBuffer,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> bool {
         let entry = &self.samples[slot.index()];
         entry.buffer.is_some()
             || entry.retiring
             || buffer.sample_rate() != self.sample_rate
             || !settings_are_valid(settings)
+            || !mix_settings_are_valid(mix)
     }
 
     fn remove_needs_retirement_capacity(&self, pad: PadId) -> bool {
@@ -1617,8 +1771,6 @@ impl AudioEngine {
         }
 
         let gain = 10.0_f32.powf(binding.settings.gain_db / 20.0) * velocity;
-        let pan_angle = (binding.settings.pan + 1.0) * PI / 4.0;
-
         let advance = 2.0_f64.powf(f64::from(binding.settings.pitch_semitones) / 12.0_f64);
         let allocation = self.allocator.trigger(VoiceRequest::new(
             pad,
@@ -1635,8 +1787,7 @@ impl AudioEngine {
             pad,
             mode: binding.settings.mode,
             choke_group: binding.settings.choke_group,
-            left_gain: gain * pan_angle.cos(),
-            right_gain: gain * pan_angle.sin(),
+            velocity,
             envelope: Envelope::attack(),
             sequence,
             pattern_voice,
@@ -1722,7 +1873,9 @@ impl AudioEngine {
     }
 
     fn render_frame(&mut self) -> [f32; 2] {
-        let mut output = [0.0, 0.0];
+        let mut dry = [0.0, 0.0];
+        let mut delay_input = [0.0, 0.0];
+        let mut reverb_input = [0.0, 0.0];
         for slot in 0..VOICE_COUNT {
             let Some(mut voice) = self.voices[slot] else {
                 continue;
@@ -1739,16 +1892,39 @@ impl AudioEngine {
             };
 
             let (envelope_gain, release_finished) = voice.envelope.next_gain();
+            let rendered_frame = self.rendered_frame;
+            let route = self
+                .pad_binding_mut(voice.pad)
+                .route
+                .values_for_frame(rendered_frame);
+            let pan_angle = (route.pan + 1.0) * PI / 4.0;
+            let routed_gain = route.level * route.audible * voice.velocity * envelope_gain;
             let left = finite_or_zero(
-                sample[0] * voice.left_gain * envelope_gain,
+                sample[0] * routed_gain * pan_angle.cos(),
                 &mut self.invalid_commands,
             );
             let right = finite_or_zero(
-                sample[1] * voice.right_gain * envelope_gain,
+                sample[1] * routed_gain * pan_angle.sin(),
                 &mut self.invalid_commands,
             );
-            output[0] = finite_or_zero(output[0] + left, &mut self.invalid_commands);
-            output[1] = finite_or_zero(output[1] + right, &mut self.invalid_commands);
+            dry[0] = finite_or_zero(dry[0] + left, &mut self.invalid_commands);
+            dry[1] = finite_or_zero(dry[1] + right, &mut self.invalid_commands);
+            delay_input[0] = finite_or_zero(
+                delay_input[0] + left * route.delay_send,
+                &mut self.invalid_commands,
+            );
+            delay_input[1] = finite_or_zero(
+                delay_input[1] + right * route.delay_send,
+                &mut self.invalid_commands,
+            );
+            reverb_input[0] = finite_or_zero(
+                reverb_input[0] + left * route.reverb_send,
+                &mut self.invalid_commands,
+            );
+            reverb_input[1] = finite_or_zero(
+                reverb_input[1] + right * route.reverb_send,
+                &mut self.invalid_commands,
+            );
             voice.position += voice.advance;
 
             let sample_frames = self.samples[voice.slot.index()]
@@ -1766,9 +1942,12 @@ impl AudioEngine {
                 self.voices[slot] = Some(voice);
             }
         }
+        let master = self
+            .fx
+            .process(dry, delay_input, reverb_input, &mut self.invalid_commands);
         [
-            soft_limit(output[0], &mut self.invalid_commands),
-            soft_limit(output[1], &mut self.invalid_commands),
+            soft_limit(master[0], &mut self.invalid_commands),
+            soft_limit(master[1], &mut self.invalid_commands),
         ]
     }
 
@@ -1994,12 +2173,19 @@ fn pad_index(pad: PadId) -> usize {
 }
 
 fn settings_are_valid(settings: PadSettings) -> bool {
-    settings.gain_db.is_finite()
-        && (-60.0..=6.0).contains(&settings.gain_db)
-        && settings.pan.is_finite()
-        && (-1.0..=1.0).contains(&settings.pan)
-        && settings.pitch_semitones.is_finite()
-        && (-24.0..=24.0).contains(&settings.pitch_semitones)
+    settings.validate().is_ok()
+}
+
+fn mix_settings_are_valid(settings: PadMixSettings) -> bool {
+    settings.validate().is_ok()
+}
+
+fn master_settings_are_valid(settings: MasterMixSettings) -> bool {
+    settings.validate().is_ok()
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
 }
 
 #[cfg(test)]
@@ -2014,8 +2200,8 @@ mod tests {
         command::{RECOVERY_COMMAND_CAPACITY, audio_channels_with_capacities},
     };
     use sampler_core::{
-        BankId, ChokeGroup, EditablePattern, EventId, Meter, PatternEvent, PatternSlotId,
-        Resolution, Tempo, Transport,
+        BankId, ChokeGroup, DelaySettings, EditablePattern, EventId, MasterMixSettings, Meter,
+        PadMixSettings, PatternEvent, PatternSlotId, Resolution, ReverbSettings, Tempo, Transport,
     };
 
     fn harness() -> (AudioController, AudioEngine) {
@@ -2122,7 +2308,12 @@ mod tests {
         frames: usize,
     ) {
         controller
-            .install(pad, constant_sample_at(sample_rate, frames, 0.5), settings)
+            .install(
+                pad,
+                constant_sample_at(sample_rate, frames, 0.5),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(0, |_| {});
     }
@@ -2156,7 +2347,12 @@ mod tests {
         let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         install_ready_sample(&mut controller, &mut engine, 100, pattern_pad, looping, 128);
         controller
-            .install(live_pad, constant_sample_at(100, 128, -0.25), looping)
+            .install(
+                live_pad,
+                constant_sample_at(100, 128, -0.25),
+                looping,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller
             .install_pattern(pattern_snapshot_with_triggers(0, 100, &[(2, pattern_pad)]))
@@ -4131,6 +4327,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(1_024, 0.25),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         engine.render_frames(1, |_| {});
@@ -4159,6 +4356,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(1_024, 0.25),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         engine.render_frames(1, |_| {});
@@ -4182,7 +4380,12 @@ mod tests {
         let first = PadId::first();
         let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
         controller
-            .install(first, constant_sample(1_024, 0.25), PadSettings::default())
+            .install(
+                first,
+                constant_sample(1_024, 0.25),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(64, |_| {});
         for _ in 0..NON_LIVE_PENDING_COUNT {
@@ -4193,7 +4396,12 @@ mod tests {
 
         controller.trigger(first, 20_000, 1.0).unwrap();
         controller
-            .install(second, constant_sample(1_024, 0.5), PadSettings::default())
+            .install(
+                second,
+                constant_sample(1_024, 0.5),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         let gate = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
         controller.update_pad(second, gate).unwrap();
@@ -4218,7 +4426,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let pad = PadId::first();
         controller
-            .install(pad, constant_sample(1_024, 0.25), PadSettings::default())
+            .install(
+                pad,
+                constant_sample(1_024, 0.25),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(1, |_| {});
         let at_frame = engine.rendered_frame() + 1;
@@ -4241,7 +4454,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let pad = PadId::first();
         controller
-            .install(pad, constant_sample(1_024, 0.25), PadSettings::default())
+            .install(
+                pad,
+                constant_sample(1_024, 0.25),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(1, |_| {});
         for _ in 0..MAX_COMMANDS_PER_RENDER {
@@ -4263,7 +4481,12 @@ mod tests {
         let pad = PadId::first();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(pad, constant_sample(1_024, 0.25), settings)
+            .install(
+                pad,
+                constant_sample(1_024, 0.25),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(64, |_| {});
         for _ in 0..NON_LIVE_PENDING_COUNT {
@@ -4292,7 +4515,12 @@ mod tests {
         let pad = PadId::first();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(pad, constant_sample(1_024, 0.25), settings)
+            .install(
+                pad,
+                constant_sample(1_024, 0.25),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(65, |_| {});
 
@@ -4319,7 +4547,12 @@ mod tests {
             let bank = BankId::new((index / PADS_PER_BANK) as u8).unwrap();
             let pad = PadId::new(bank, (index % PADS_PER_BANK) as u8).unwrap();
             if controller
-                .install_recovery(pad, constant_sample(8, 0.25), PadSettings::default())
+                .install_recovery(
+                    pad,
+                    constant_sample(8, 0.25),
+                    PadSettings::default(),
+                    PadMixSettings::default(),
+                )
                 .is_ok()
             {
                 accepted_installs += 1;
@@ -4339,7 +4572,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let sample = constant_sample(8, 1.0);
         controller
-            .install(PadId::first(), sample, PadSettings::default())
+            .install(
+                PadId::first(),
+                sample,
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 3, 1.0).unwrap();
         let mut output = [0.0; 16];
@@ -4353,7 +4591,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let sample = constant_sample(2, 1.0);
         controller
-            .install(PadId::first(), sample, PadSettings::default())
+            .install(
+                PadId::first(),
+                sample,
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         let mut warmup = [0.0; 8];
         engine.render_stereo(&mut warmup);
@@ -4381,7 +4624,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(8, 0.5), settings)
+            .install(
+                PadId::first(),
+                constant_sample(8, 0.5),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         engine.render_frames(32, |_| {});
@@ -4433,7 +4681,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(256, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         controller.release(PadId::first(), 32).unwrap();
@@ -4448,7 +4701,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Gate, 0.0, -1.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(256, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         controller.release(PadId::first(), 8).unwrap();
@@ -4462,7 +4720,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(2, 0.5), settings)
+            .install(
+                PadId::first(),
+                constant_sample(2, 0.5),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let mut output = [0.0; 20];
@@ -4476,7 +4739,9 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, -12.0, None).unwrap();
         let ramp = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0, 1.0, 1.0]).unwrap());
-        controller.install(PadId::first(), ramp, settings).unwrap();
+        controller
+            .install(PadId::first(), ramp, settings, PadMixSettings::default())
+            .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let mut output = [0.0; 2 * 36];
         engine.render_stereo(&mut output);
@@ -4494,7 +4759,9 @@ mod tests {
             )
             .unwrap(),
         );
-        controller.install(PadId::first(), ramp, settings).unwrap();
+        controller
+            .install(PadId::first(), ramp, settings, PadMixSettings::default())
+            .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let mut output = [0.0; 6];
         engine.render_stereo(&mut output);
@@ -4507,7 +4774,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(8, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(8, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let mut output = [0.0; 16];
@@ -4522,10 +4794,20 @@ mod tests {
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, group).unwrap();
         let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
         controller
-            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(256, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller
-            .install(second, constant_sample(256, 0.5), settings)
+            .install(
+                second,
+                constant_sample(256, 0.5),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         controller.trigger(second, 32, 1.0).unwrap();
@@ -4540,7 +4822,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(256, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         for frame in 0..33 {
             controller
@@ -4570,7 +4857,12 @@ mod tests {
             (newcomer, normal_settings),
         ] {
             controller
-                .install(pad, constant_sample(8, 0.25), settings)
+                .install(
+                    pad,
+                    constant_sample(8, 0.25),
+                    settings,
+                    PadMixSettings::default(),
+                )
                 .unwrap();
         }
         controller.trigger(quiet_by_gain, 0, 1.0).unwrap();
@@ -4594,6 +4886,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(128, 1.0),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
@@ -4604,6 +4897,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(2, 0.5),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         let mut first = [0.0; 64];
@@ -4620,7 +4914,12 @@ mod tests {
             let (mut controller, mut engine) = harness();
             let settings = PadSettings::new(PlaybackMode::Loop, gain_db, -1.0, 0.0, None).unwrap();
             controller
-                .install(PadId::first(), constant_sample(64, 0.1), settings)
+                .install(
+                    PadId::first(),
+                    constant_sample(64, 0.1),
+                    settings,
+                    PadMixSettings::default(),
+                )
                 .unwrap();
             controller.trigger(PadId::first(), 0, 1.0).unwrap();
             let mut output = [0.0; 64];
@@ -4639,6 +4938,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(128, 1.0),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
@@ -4654,7 +4954,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(256, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(256, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let mut attack = [0.0; 64];
@@ -4674,7 +4979,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(8, 1.0), settings)
+            .install(
+                PadId::first(),
+                constant_sample(8, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         engine.render_frames(1_599, |_| {});
@@ -4699,6 +5009,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(1, 1.0),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
 
@@ -4721,7 +5032,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let pad = PadId::first();
         controller
-            .install(pad, constant_sample(4_000, 1.0), PadSettings::default())
+            .install(
+                pad,
+                constant_sample(4_000, 1.0),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(pad, 0, 1.0).unwrap();
         controller.release(pad, 1).unwrap();
@@ -4740,7 +5056,7 @@ mod tests {
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         let sample = Arc::new(SampleBuffer::new(44_101, vec![0.25; 16]).unwrap());
         controller
-            .install(PadId::first(), sample, settings)
+            .install(PadId::first(), sample, settings, PadMixSettings::default())
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
 
@@ -4756,7 +5072,12 @@ mod tests {
         let mut engine = AudioEngine::new(48_000, ports).unwrap();
         let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(8, 0.25), settings)
+            .install(
+                PadId::first(),
+                constant_sample(8, 0.25),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
 
@@ -4772,7 +5093,12 @@ mod tests {
         let (mut controller, mut engine) = harness();
         let settings = PadSettings::new(PlaybackMode::Loop, 6.0, 0.0, 0.0, None).unwrap();
         controller
-            .install(PadId::first(), constant_sample(8, f32::MAX), settings)
+            .install(
+                PadId::first(),
+                constant_sample(8, f32::MAX),
+                settings,
+                PadMixSettings::default(),
+            )
             .unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
@@ -4792,7 +5118,12 @@ mod tests {
             let sample = constant_sample(8, 0.25 + index as f32 * 0.25);
             *weak = Some(Arc::downgrade(&sample));
             controller
-                .install(PadId::first(), sample, PadSettings::default())
+                .install(
+                    PadId::first(),
+                    sample,
+                    PadSettings::default(),
+                    PadMixSettings::default(),
+                )
                 .unwrap();
             engine.render_stereo(&mut []);
         }
@@ -4801,6 +5132,7 @@ mod tests {
                 PadId::first(),
                 constant_sample(8, 0.75),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         engine.render_stereo(&mut []);
@@ -4826,7 +5158,12 @@ mod tests {
         let sample = constant_sample(128, 0.5);
         let weak = Arc::downgrade(&sample);
         controller
-            .install(pad, Arc::clone(&sample), PadSettings::default())
+            .install(
+                pad,
+                Arc::clone(&sample),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         drop(sample);
         controller.trigger(pad, 0, 1.0).unwrap();
@@ -4865,7 +5202,12 @@ mod tests {
             let settings = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
             for pad in [removed, preserved] {
                 controller
-                    .install(pad, constant_sample(256, 0.5), settings)
+                    .install(
+                        pad,
+                        constant_sample(256, 0.5),
+                        settings,
+                        PadMixSettings::default(),
+                    )
                     .unwrap();
                 controller.trigger(pad, 0, 1.0).unwrap();
             }
@@ -4893,7 +5235,12 @@ mod tests {
         let mut engine = AudioEngine::new(48_000, ports).unwrap();
         let pad = PadId::first();
         controller
-            .install(pad, constant_sample(8, 0.5), PadSettings::default())
+            .install(
+                pad,
+                constant_sample(8, 0.5),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         engine.render_frames(0, |_| {});
         engine
@@ -4937,5 +5284,351 @@ mod tests {
         assert_eq!(engine.queued_commands(), 0);
         assert_eq!(engine.invalid_commands(), invalid_before);
         assert_eq!(controller.reclaim_retired(), 1);
+    }
+
+    #[test]
+    fn default_mixer_is_bit_exact_with_the_pre_fx_dry_fixture() {
+        let (mut controller, mut engine) = harness();
+        let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(
+                PadId::first(),
+                constant_sample(16, 1.0),
+                settings,
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        controller.trigger(PadId::first(), 0, 1.0).unwrap();
+
+        let mut frames = Vec::new();
+        engine.render_frames(4, |frame| frames.push(frame));
+        assert_eq!(
+            frames,
+            vec![
+                [f32::from_bits(0x3cb1_1b16); 2],
+                [f32::from_bits(0x3d2d_5ba0); 2],
+                [f32::from_bits(0x3d7e_a5e7); 2],
+                [f32::from_bits(0x3da6_5196); 2],
+            ]
+        );
+    }
+
+    #[test]
+    fn playing_loop_ramps_current_gain_pan_and_mute_without_stopping() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        controller
+            .install(
+                pad,
+                constant_sample(256, 1.0),
+                looping,
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        controller.trigger(pad, 0, 1.0).unwrap();
+        engine.render_frames(32, |_| {});
+
+        controller
+            .update_pad(
+                pad,
+                PadSettings::new(PlaybackMode::Loop, -6.0, -1.0, 0.0, None).unwrap(),
+            )
+            .unwrap();
+        let mut routed = [0.0; 2];
+        engine.render_frames(64, |frame| routed = frame);
+        assert!((routed[0] - 0.333_860_58).abs() < 1.0e-7);
+        assert_eq!(routed[1], 0.0);
+
+        controller
+            .update_pad_mix(pad, PadMixSettings::new(true, 0.0, 0.0).unwrap())
+            .unwrap();
+        let mut muted = [1.0; 2];
+        engine.render_frames(64, |frame| muted = frame);
+        assert_eq!(muted, [0.0; 2]);
+        assert_eq!(engine.voices_for_pad(pad), 1);
+    }
+
+    #[test]
+    fn two_pads_feed_distinct_amounts_into_the_same_delay_bus() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(1_000, ports).unwrap();
+        let first = PadId::first();
+        let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        let one_shot = PadSettings::new(PlaybackMode::OneShot, 0.0, -1.0, 0.0, None).unwrap();
+        controller
+            .install(
+                first,
+                constant_sample_at(1_000, 1, 1.0),
+                one_shot,
+                PadMixSettings::new(false, 0.25, 0.0).unwrap(),
+            )
+            .unwrap();
+        controller
+            .install(
+                second,
+                constant_sample_at(1_000, 1, 1.0),
+                one_shot,
+                PadMixSettings::new(false, 0.75, 0.0).unwrap(),
+            )
+            .unwrap();
+        controller
+            .update_master_mix(
+                MasterMixSettings::new(
+                    0.0,
+                    DelaySettings::new(true, 10, 0.0, 0.0).unwrap(),
+                    ReverbSettings::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine.render_frames(128, |_| {});
+        controller.trigger(first, 128, 1.0).unwrap();
+        controller.trigger(second, 129, 1.0).unwrap();
+
+        let mut frames = Vec::new();
+        engine.render_frames(12, |frame| frames.push(frame));
+        assert!(
+            (frames[10][0] - 0.007_751_938).abs() < 1.0e-7,
+            "unexpected first delay tap: {:?}",
+            frames[10]
+        );
+        assert!(
+            (frames[11][0] - 0.022_900_764).abs() < 1.0e-7,
+            "unexpected second delay tap: {:?}",
+            frames[11]
+        );
+        assert_eq!(frames[10][1], 0.0);
+        assert_eq!(frames[11][1], 0.0);
+    }
+
+    #[test]
+    fn master_level_is_applied_before_the_existing_limiter() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(1_000, ports).unwrap();
+        let pad = PadId::first();
+        controller
+            .install(
+                pad,
+                constant_sample_at(1_000, 1, 1.0),
+                PadSettings::new(PlaybackMode::OneShot, 0.0, -1.0, 0.0, None).unwrap(),
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        controller
+            .update_master_mix(
+                MasterMixSettings::new(
+                    -6.020_600_3,
+                    DelaySettings::default(),
+                    ReverbSettings::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        controller.trigger(pad, 64, 1.0).unwrap();
+
+        let mut rendered = [0.0; 2];
+        engine.render_frames(1, |frame| rendered = frame);
+        assert!((rendered[0] - 0.015_384_615).abs() < 1.0e-7);
+        assert_eq!(rendered[1], 0.0);
+    }
+
+    #[test]
+    fn route_ramp_advances_once_per_frame_and_catches_up_while_silent() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
+        controller
+            .install(
+                pad,
+                constant_sample(256, 1.0),
+                looping,
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        controller
+            .update_pad(
+                pad,
+                PadSettings::new(PlaybackMode::Loop, -60.0, -1.0, 0.0, None).unwrap(),
+            )
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        controller.trigger(pad, 64, 1.0).unwrap();
+        controller.trigger(pad, 64, 1.0).unwrap();
+
+        let mut frame = [0.0; 2];
+        engine.render_frames(1, |rendered| frame = rendered);
+        let raw = frame[0] / (1.0 - frame[0]);
+        assert!((raw - 0.000_062_5).abs() < 1.0e-8);
+    }
+
+    #[test]
+    fn live_same_pad_and_pattern_cross_pad_triggers_use_trigger_time_choke_membership() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(100, ports).unwrap();
+        let first = PadId::first();
+        let second = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
+        let group = Some(ChokeGroup::new(1).unwrap());
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, group).unwrap();
+        for pad in [first, second] {
+            controller
+                .install(
+                    pad,
+                    constant_sample_at(100, 256, 0.5),
+                    looping,
+                    PadMixSettings::default(),
+                )
+                .unwrap();
+        }
+
+        controller.trigger_live(first, 1.0).unwrap();
+        controller.trigger_live(first, 1.0).unwrap();
+        engine.render_frames(129, |_| {});
+        assert_eq!(engine.voices_for_pad(first), 1);
+
+        controller
+            .update_pad(
+                first,
+                PadSettings::new(
+                    PlaybackMode::Loop,
+                    0.0,
+                    0.0,
+                    0.0,
+                    Some(ChokeGroup::new(2).unwrap()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        controller
+            .install_pattern(pattern_snapshot_with_triggers(0, 100, &[(0, second)]))
+            .unwrap();
+        controller
+            .select_pattern(PatternSlotId::new(0).unwrap(), PatternSwitch::Immediate)
+            .unwrap();
+        controller.play_pattern().unwrap();
+        engine.render_frames(1, |_| {});
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .any(|voice| voice.pad == first && voice.envelope.release_frame.is_some())
+        );
+        assert_eq!(engine.voices_for_pad(second), 1);
+    }
+
+    #[test]
+    fn mute_advances_loop_silently_and_stop_all_leaves_delay_tail_running() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(1_000, ports).unwrap();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, -1.0, 0.0, None).unwrap();
+        controller
+            .install(
+                pad,
+                constant_sample_at(1_000, 257, 0.5),
+                looping,
+                PadMixSettings::new(false, 1.0, 0.0).unwrap(),
+            )
+            .unwrap();
+        controller.trigger(pad, 0, 1.0).unwrap();
+        engine.render_frames(96, |_| {});
+
+        controller
+            .update_pad_mix(pad, PadMixSettings::new(true, 1.0, 0.0).unwrap())
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        let position = engine
+            .voices
+            .iter()
+            .flatten()
+            .find(|voice| voice.pad == pad)
+            .unwrap()
+            .position;
+        let mut muted = Vec::new();
+        engine.render_frames(16, |frame| muted.push(frame));
+        assert!(muted.iter().all(|frame| *frame == [0.0; 2]));
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .find(|voice| voice.pad == pad)
+                .unwrap()
+                .position
+                > position
+        );
+
+        controller
+            .update_pad_mix(pad, PadMixSettings::new(false, 1.0, 0.0).unwrap())
+            .unwrap();
+        controller
+            .update_master_mix(
+                MasterMixSettings::new(
+                    0.0,
+                    DelaySettings::new(true, 10, 0.5, 0.0).unwrap(),
+                    ReverbSettings::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine.render_frames(64, |_| {});
+        controller.stop_all().unwrap();
+        engine.render_frames(65, |_| {});
+        assert_eq!(engine.voices_for_pad(pad), 0);
+        let mut tail = Vec::new();
+        engine.render_frames(20, |frame| tail.push(frame));
+        assert!(tail.iter().any(|frame| frame[0] != 0.0 || frame[1] != 0.0));
+    }
+
+    #[test]
+    fn engine_rejects_malformed_pad_mix_without_changing_the_binding() {
+        let (mut controller, mut engine) = harness();
+        let pad = PadId::first();
+        controller
+            .install(
+                pad,
+                constant_sample(16, 0.5),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        engine.render_frames(0, |_| {});
+        let invalid_before = engine.invalid_commands();
+        engine.execute_immediate(AudioCommand::UpdatePadMix {
+            pad,
+            settings: PadMixSettings {
+                muted: false,
+                delay_send: f32::NAN,
+                reverb_send: 0.0,
+            },
+        });
+        assert_eq!(engine.pad_binding(pad).mix, PadMixSettings::default());
+        assert_eq!(engine.invalid_commands(), invalid_before + 1);
+    }
+
+    #[test]
+    fn full_queue_rejects_pad_mix_update_without_changing_the_binding() {
+        let (mut controller, ports) = audio_channels_with_capacities(1, 256, 8);
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let pad = PadId::first();
+        controller
+            .install(
+                pad,
+                constant_sample(16, 0.5),
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
+            .unwrap();
+        engine.render_frames(0, |_| {});
+
+        controller.stop_pad(pad).unwrap();
+        assert_eq!(
+            controller.update_pad_mix(pad, PadMixSettings::new(true, 0.5, 0.5).unwrap()),
+            Err(crate::ControlError::CommandQueueFull)
+        );
+        engine.render_frames(0, |_| {});
+        assert_eq!(engine.pad_binding(pad).mix, PadMixSettings::default());
     }
 }

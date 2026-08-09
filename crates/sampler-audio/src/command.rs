@@ -4,7 +4,10 @@ mod tests {
 
     use super::*;
     use crate::{CaptureBuffer, CaptureCommand, CaptureSource, PadId, PadSettings, SampleBuffer};
-    use sampler_core::{EditablePattern, Meter, PatternSlotId, Resolution, Tempo, Transport};
+    use sampler_core::{
+        EditablePattern, MasterMixSettings, Meter, PadMixSettings, PatternSlotId, Resolution,
+        Tempo, Transport,
+    };
 
     fn snapshot(slot: u8) -> Arc<sampler_core::PatternSnapshot> {
         let transport = Transport::new(
@@ -418,7 +421,12 @@ mod tests {
         let (mut controller, mut ports) = audio_channels_with_capacities(8, 256, 8);
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
         let slot = controller
-            .install(PadId::first(), sample, PadSettings::default())
+            .install(
+                PadId::first(),
+                sample,
+                PadSettings::default(),
+                PadMixSettings::default(),
+            )
             .unwrap();
         let installed = ports.immediate_commands.pop().unwrap();
         let buffer = installed.into_installed_buffer().unwrap();
@@ -438,6 +446,64 @@ mod tests {
             controller.trigger(PadId::first(), 0, f32::NAN),
             Err(ControlError::InvalidVelocity)
         );
+    }
+
+    #[test]
+    fn controller_validates_mixer_settings_before_queue_or_slot_mutation() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(8, 256, 8);
+        let pad = PadId::first();
+        let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
+        let invalid_mix = PadMixSettings {
+            muted: false,
+            delay_send: f32::NAN,
+            reverb_send: 0.0,
+        };
+        assert_eq!(
+            controller.install(
+                pad,
+                Arc::clone(&sample),
+                PadSettings::default(),
+                invalid_mix,
+            ),
+            Err(ControlError::InvalidSettings)
+        );
+        assert_eq!(controller.available_slots(), SAMPLE_SLOT_COUNT);
+        assert!(ports.immediate_commands.pop().is_err());
+
+        assert_eq!(
+            controller.update_pad_mix(pad, invalid_mix),
+            Err(ControlError::InvalidSettings)
+        );
+        let invalid_master = MasterMixSettings {
+            gain_db: f32::INFINITY,
+            ..MasterMixSettings::default()
+        };
+        assert_eq!(
+            controller.update_master_mix(invalid_master),
+            Err(ControlError::InvalidSettings)
+        );
+        assert!(ports.immediate_commands.pop().is_err());
+    }
+
+    #[test]
+    fn install_command_carries_pad_mix_atomically() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(8, 256, 8);
+        let mix = PadMixSettings::new(true, 0.25, 0.75).unwrap();
+        controller
+            .install(
+                PadId::first(),
+                Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
+                PadSettings::default(),
+                mix,
+            )
+            .unwrap();
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::Install {
+                mix: installed_mix,
+                ..
+            } if installed_mix == mix
+        ));
     }
 
     #[test]
@@ -461,7 +527,12 @@ mod tests {
         controller.trigger(PadId::first(), 0, 1.0).unwrap();
         let sample = Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap());
         assert_eq!(
-            controller.install(PadId::first(), sample, PadSettings::default()),
+            controller.install(
+                PadId::first(),
+                sample,
+                PadSettings::default(),
+                PadMixSettings::default(),
+            ),
             Err(ControlError::CommandQueueFull)
         );
         assert_eq!(controller.available_slots(), 256);
@@ -477,6 +548,7 @@ mod tests {
                     PadId::first(),
                     Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                     PadSettings::default(),
+                    PadMixSettings::default(),
                 )
                 .unwrap();
         }
@@ -485,6 +557,7 @@ mod tests {
                 PadId::first(),
                 Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                 PadSettings::default(),
+                PadMixSettings::default(),
             ),
             Err(ControlError::CommandQueueFull)
         );
@@ -493,6 +566,7 @@ mod tests {
                 PadId::first(),
                 Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
 
@@ -503,6 +577,7 @@ mod tests {
                 PadId::first(),
                 Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
     }
@@ -517,6 +592,7 @@ mod tests {
                     PadId::first(),
                     Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                     PadSettings::default(),
+                    PadMixSettings::default(),
                 ),
                 Err(ControlError::CommandQueueFull)
             );
@@ -528,6 +604,7 @@ mod tests {
                 PadId::first(),
                 Arc::new(SampleBuffer::new(48_000, vec![0.0, 0.0]).unwrap()),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
     }
@@ -602,7 +679,12 @@ mod tests {
         let pad = PadId::first();
 
         assert_eq!(
-            controller.install(pad, sample, PadSettings::default()),
+            controller.install(
+                pad,
+                sample,
+                PadSettings::default(),
+                PadMixSettings::default(),
+            ),
             Err(ControlError::ClosedSession)
         );
         assert_eq!(
@@ -685,7 +767,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, PeekError, PopError, Producer, RingBuffer};
-use sampler_core::{Frame, PadId, PadSettings, PatternSlotId, PatternSnapshot};
+use sampler_core::{
+    Frame, MasterMixSettings, PadId, PadMixSettings, PadSettings, PatternSlotId, PatternSnapshot,
+};
 
 use crate::{
     CaptureBuffer, CaptureCommand, CaptureController, CaptureCore, CaptureError, CaptureOutcome,
@@ -800,11 +884,12 @@ struct PatternSnapshotOwner {
 
 #[derive(Debug)]
 pub enum AudioCommand {
-    InstallSample {
+    Install {
         pad: PadId,
         slot: SampleSlot,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
         recovery: bool,
     },
     InstallPattern {
@@ -853,6 +938,13 @@ pub enum AudioCommand {
         pad: PadId,
         settings: PadSettings,
     },
+    UpdatePadMix {
+        pad: PadId,
+        settings: PadMixSettings,
+    },
+    UpdateMasterMix {
+        settings: MasterMixSettings,
+    },
     RemoveSample {
         pad: PadId,
     },
@@ -864,7 +956,7 @@ pub enum AudioCommand {
 impl AudioCommand {
     pub fn into_installed_buffer(self) -> Option<Arc<SampleBuffer>> {
         match self {
-            Self::InstallSample { buffer, .. } => Some(buffer),
+            Self::Install { buffer, .. } => Some(buffer),
             _ => None,
         }
     }
@@ -1018,7 +1110,7 @@ impl CommandConsumer {
     pub fn pop(&mut self) -> Result<AudioCommand, PopError> {
         let command = self.inner.pop()?;
         self.shared.complete_command();
-        if matches!(&command, AudioCommand::InstallSample { recovery: true, .. }) {
+        if matches!(&command, AudioCommand::Install { recovery: true, .. }) {
             self.shared.complete_recovery_command();
         }
         Ok(command)
@@ -1318,8 +1410,9 @@ impl AudioController {
         pad: PadId,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, ControlError> {
-        self.install_inner(pad, buffer, settings, false)
+        self.install_inner(pad, buffer, settings, mix, false)
     }
 
     pub fn install_recovery(
@@ -1327,8 +1420,9 @@ impl AudioController {
         pad: PadId,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
     ) -> Result<SampleSlot, ControlError> {
-        self.install_inner(pad, buffer, settings, true)
+        self.install_inner(pad, buffer, settings, mix, true)
     }
 
     pub fn install_pattern(
@@ -1422,9 +1516,12 @@ impl AudioController {
         pad: PadId,
         buffer: Arc<SampleBuffer>,
         settings: PadSettings,
+        mix: PadMixSettings,
         recovery: bool,
     ) -> Result<SampleSlot, ControlError> {
         self.ensure_open()?;
+        validate_settings(settings)?;
+        validate_mix_settings(mix)?;
         let Some(index) = self.free_slots.iter().position(|is_free| *is_free) else {
             return Err(ControlError::NoFreeSampleSlot);
         };
@@ -1437,11 +1534,12 @@ impl AudioController {
             return Err(ControlError::CommandQueueFull);
         }
 
-        let command = AudioCommand::InstallSample {
+        let command = AudioCommand::Install {
             pad,
             slot,
             buffer,
             settings,
+            mix,
             recovery,
         };
         if let Err(error) = self.push_immediate_command(command) {
@@ -1548,7 +1646,24 @@ impl AudioController {
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {
         self.ensure_open()?;
+        validate_settings(settings)?;
         self.push_immediate_command(AudioCommand::UpdatePad { pad, settings })
+    }
+
+    pub fn update_pad_mix(
+        &mut self,
+        pad: PadId,
+        settings: PadMixSettings,
+    ) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        validate_mix_settings(settings)?;
+        self.push_immediate_command(AudioCommand::UpdatePadMix { pad, settings })
+    }
+
+    pub fn update_master_mix(&mut self, settings: MasterMixSettings) -> Result<(), ControlError> {
+        self.ensure_open()?;
+        validate_master_settings(settings)?;
+        self.push_immediate_command(AudioCommand::UpdateMasterMix { settings })
     }
 
     pub fn remove_sample(&mut self, pad: PadId) -> Result<(), ControlError> {
@@ -1683,4 +1798,22 @@ impl AudioController {
             Ok(())
         }
     }
+}
+
+fn validate_settings(settings: PadSettings) -> Result<(), ControlError> {
+    settings
+        .validate()
+        .map_err(|_| ControlError::InvalidSettings)
+}
+
+fn validate_mix_settings(settings: PadMixSettings) -> Result<(), ControlError> {
+    settings
+        .validate()
+        .map_err(|_| ControlError::InvalidSettings)
+}
+
+fn validate_master_settings(settings: MasterMixSettings) -> Result<(), ControlError> {
+    settings
+        .validate()
+        .map_err(|_| ControlError::InvalidSettings)
 }

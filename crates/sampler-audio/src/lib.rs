@@ -6,8 +6,6 @@ mod decode;
 mod device;
 mod engine;
 mod error;
-// Task 3 builds this fixed DSP foundation before Task 4 wires it into AudioEngine.
-#[cfg_attr(not(test), allow(dead_code))]
 mod fx;
 mod input;
 mod resample;

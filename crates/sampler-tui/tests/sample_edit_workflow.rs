@@ -165,7 +165,12 @@ impl AudioPort for ControllerPort {
             return Err("test audio queue full".to_owned());
         }
         self.controller()
-            .install(pad, sample, settings)
+            .install(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -176,7 +181,12 @@ impl AudioPort for ControllerPort {
         settings: PadSettings,
     ) -> Result<SampleSlot, String> {
         self.controller()
-            .install_recovery(pad, sample, settings)
+            .install_recovery(
+                pad,
+                sample,
+                settings,
+                sampler_core::PadMixSettings::default(),
+            )
             .map_err(|error| error.to_string())
     }
 

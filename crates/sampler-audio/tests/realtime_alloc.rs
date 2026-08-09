@@ -8,8 +8,8 @@ use sampler_audio::{
     audio_channels_with_test_capacities, write_frames,
 };
 use sampler_core::{
-    BankId, EditablePattern, EventId, Meter, PatternEvent, PatternSlotId, PlaybackMode, Resolution,
-    Tempo, Transport,
+    BankId, EditablePattern, EventId, Meter, PadMixSettings, PatternEvent, PatternSlotId,
+    PlaybackMode, Resolution, Tempo, Transport,
 };
 
 struct CountingAllocator {
@@ -74,7 +74,7 @@ fn looping_harness() -> (AudioController, AudioEngine) {
     let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25; 16]).unwrap());
     let settings = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
     controller
-        .install(PadId::first(), sample, settings)
+        .install(PadId::first(), sample, settings, PadMixSettings::default())
         .unwrap();
     controller.trigger(PadId::first(), 0, 1.0).unwrap();
     (controller, engine)
@@ -173,13 +173,23 @@ fn measure_live_and_recovery_command_ingestion() {
     let mut engine = AudioEngine::new(48_000, ports).unwrap();
     let first = Arc::new(SampleBuffer::new(48_000, vec![0.25; 16]).unwrap());
     controller
-        .install(PadId::first(), first, PadSettings::default())
+        .install(
+            PadId::first(),
+            first,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     engine.render_frames(1, |_| {});
     let second_pad = PadId::new(BankId::new(0).unwrap(), 1).unwrap();
     let recovered = Arc::new(SampleBuffer::new(48_000, vec![0.5; 16]).unwrap());
     controller
-        .install_recovery(second_pad, recovered, PadSettings::default())
+        .install_recovery(
+            second_pad,
+            recovered,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     controller.trigger_live(PadId::first(), 0.75).unwrap();
     controller.release_live(PadId::first()).unwrap();
@@ -194,7 +204,12 @@ fn measure_live_and_recovery_command_ingestion() {
     let invalid = Arc::new(SampleBuffer::new(44_100, vec![0.25; 16]).unwrap());
     let keepalive = Arc::clone(&invalid);
     controller
-        .install_recovery(second_pad, invalid, PadSettings::default())
+        .install_recovery(
+            second_pad,
+            invalid,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     assert_zero_callback_activity("invalid recovery command ingestion", || {
         engine.render_frames(0, |_| {});
@@ -212,6 +227,7 @@ fn measure_single_action_store_source_quotas() {
             pad,
             Arc::new(SampleBuffer::new(48_000, vec![0.25; 2_048]).unwrap()),
             PadSettings::default(),
+            PadMixSettings::default(),
         )
         .unwrap();
     engine.render_frames(1, |_| {});
@@ -240,7 +256,12 @@ fn measure_invalid_command_handling() {
     let invalid_rate = Arc::new(SampleBuffer::new(44_100, vec![0.25; 16]).unwrap());
     let keepalive = Arc::clone(&invalid_rate);
     controller
-        .install(PadId::first(), invalid_rate, PadSettings::default())
+        .install(
+            PadId::first(),
+            invalid_rate,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
 
     assert_zero_callback_activity("invalid command handling", || {
@@ -257,7 +278,12 @@ fn measure_voice_completion_without_final_arc_drop() {
     let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25; 2]).unwrap());
     let keepalive = Arc::clone(&sample);
     controller
-        .install(PadId::first(), sample, PadSettings::default())
+        .install(
+            PadId::first(),
+            sample,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     controller.trigger(PadId::first(), 0, 1.0).unwrap();
 
@@ -275,7 +301,12 @@ fn measure_sample_remap_retirement() {
     let first = Arc::new(SampleBuffer::new(48_000, vec![0.25; 16]).unwrap());
     let first_keepalive = Arc::clone(&first);
     controller
-        .install(PadId::first(), first, PadSettings::default())
+        .install(
+            PadId::first(),
+            first,
+            PadSettings::default(),
+            PadMixSettings::default(),
+        )
         .unwrap();
     engine.render_frames(0, |_| {});
     controller
@@ -283,6 +314,7 @@ fn measure_sample_remap_retirement() {
             PadId::first(),
             Arc::new(SampleBuffer::new(48_000, vec![0.5; 16]).unwrap()),
             PadSettings::default(),
+            PadMixSettings::default(),
         )
         .unwrap();
 
@@ -302,6 +334,7 @@ fn measure_full_retirement_retry() {
                 PadId::first(),
                 Arc::new(SampleBuffer::new(48_000, vec![value; 16]).unwrap()),
                 PadSettings::default(),
+                PadMixSettings::default(),
             )
             .unwrap();
         engine.render_frames(0, |_| {});
@@ -360,6 +393,7 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
             PadId::first(),
             Arc::new(SampleBuffer::new(100, vec![0.5; 128]).unwrap()),
             PadSettings::default(),
+            PadMixSettings::default(),
         )
         .unwrap();
     engine.render_frames(0, |_| {});
@@ -415,7 +449,9 @@ fn measure_exact_duration_pattern_releases() {
         let pad = PadId::first();
         let sample = Arc::new(SampleBuffer::new(1_000, vec![0.5; 256]).unwrap());
         let settings = PadSettings::new(mode, 0.0, 0.0, 0.0, None).unwrap();
-        controller.install(pad, sample, settings).unwrap();
+        controller
+            .install(pad, sample, settings, PadMixSettings::default())
+            .unwrap();
         engine.render_frames(0, |_| {});
         controller
             .install_pattern(duration_pattern_snapshot(0, 1_000, pad, 2, 3))
@@ -445,6 +481,7 @@ fn measure_bounded_capture_ownership() {
             pattern_pad,
             Arc::new(SampleBuffer::new(100, vec![0.5; 256]).unwrap()),
             looping,
+            PadMixSettings::default(),
         )
         .unwrap();
     controller
@@ -452,6 +489,7 @@ fn measure_bounded_capture_ownership() {
             live_pad,
             Arc::new(SampleBuffer::new(100, vec![0.25; 256]).unwrap()),
             looping,
+            PadMixSettings::default(),
         )
         .unwrap();
     engine.render_frames(0, |_| {});

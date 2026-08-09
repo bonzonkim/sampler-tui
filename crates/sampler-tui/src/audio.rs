@@ -9,7 +9,7 @@ use sampler_audio::{
     InputCaptureSession, LiveAck, LiveCommandId, PATTERN_SNAPSHOT_SLOT_COUNT, PatternSnapshotSlot,
     PatternSwitch, SAMPLE_SLOT_COUNT, SampleBuffer, SampleSlot, Telemetry,
 };
-use sampler_core::{PadId, PadSettings, PatternSlotId, PatternSnapshot};
+use sampler_core::{PadId, PadMixSettings, PadSettings, PatternSlotId, PatternSnapshot};
 
 use crate::CaptureError;
 
@@ -383,7 +383,8 @@ impl SessionLike for AudioSession {
         sample: Arc<SampleBuffer>,
         settings: PadSettings,
     ) -> Result<SampleSlot, Self::CommandError> {
-        self.controller_mut().install(pad, sample, settings)
+        self.controller_mut()
+            .install(pad, sample, settings, PadMixSettings::default())
     }
 
     fn install_recovery(
@@ -393,7 +394,7 @@ impl SessionLike for AudioSession {
         settings: PadSettings,
     ) -> Result<SampleSlot, Self::CommandError> {
         self.controller_mut()
-            .install_recovery(pad, sample, settings)
+            .install_recovery(pad, sample, settings, PadMixSettings::default())
     }
 
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), Self::CommandError> {

@@ -82,6 +82,8 @@ pub enum ControlError {
     LiveCommandIdExhausted,
     #[error("trigger velocity must be finite and in 0.0..=1.0")]
     InvalidVelocity,
+    #[error("audio settings are invalid")]
+    InvalidSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

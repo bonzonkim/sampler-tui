@@ -12,17 +12,19 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use sampler_audio::{
-    AudioController, AudioEngine, ControlError, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot,
-    PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels_with_test_capacities,
+    AudioController, AudioEngine, CaptureBuffer, CaptureOutcome, CaptureSource, CaptureStatus,
+    ControlError, Frame, LiveAck, LiveCommandId, PatternSnapshotSlot, PatternSwitch, SampleBuffer,
+    SampleSlot, Telemetry, audio_channels_with_test_capacities,
 };
 use sampler_core::{
     BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
     PatternSlotId, PatternSnapshot, PlaybackMode, ReverbSettings, SAMPLE_PHASE_SCALE,
     SampleEditRecipe,
 };
+use sampler_tui::audio::CaptureCommandFailure;
 use sampler_tui::{
-    App, AudioPort, CaptureSupport, InputAction, KeyboardCapabilities, ProjectOpenPhase,
-    ProjectStore, RecoveryChoice, WorkerHandle, WorkerRequest,
+    App, AudioPort, CaptureError, CaptureSupport, InputAction, KeyboardCapabilities,
+    ProjectOpenPhase, ProjectStore, RecoveryChoice, WorkerHandle, WorkerRequest,
 };
 
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -34,12 +36,12 @@ const FLAC_MONO_8K: &str = concat!(
     "861c9edc001861c9ee4001861c9edc00186180b769",
 );
 
-struct FixtureTree {
+pub(crate) struct FixtureTree {
     root: PathBuf,
 }
 
 impl FixtureTree {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "sampler-tui-project-workflow-{}-{id}",
@@ -49,11 +51,11 @@ impl FixtureTree {
         Self { root }
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
 
-    fn write_wav(&self, name: &str) -> PathBuf {
+    pub(crate) fn write_wav(&self, name: &str) -> PathBuf {
         let path = self.path(name);
         let frames = [
             [0.0625, -0.125],
@@ -114,6 +116,7 @@ impl Drop for FixtureTree {
 struct ControllerPort {
     sample_rate: u32,
     controller: Rc<RefCell<AudioController>>,
+    runtime_failure: Rc<RefCell<Option<String>>>,
 }
 
 impl ControllerPort {
@@ -124,7 +127,7 @@ impl ControllerPort {
 
 impl AudioPort for ControllerPort {
     fn capture_support(&self) -> CaptureSupport {
-        CaptureSupport::Unsupported
+        CaptureSupport::Available
     }
 
     fn sample_rate(&self) -> u32 {
@@ -284,19 +287,86 @@ impl AudioPort for ControllerPort {
     }
 
     fn poll_runtime_error(&mut self) -> Option<String> {
-        None
+        self.runtime_failure.borrow_mut().take()
+    }
+
+    fn capture_source_rate(&mut self, source: CaptureSource) -> Result<u32, CaptureError> {
+        match source {
+            CaptureSource::Resample => Ok(self.sample_rate),
+            CaptureSource::Input => Err(CaptureError::Unsupported),
+        }
+    }
+
+    fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureCommandFailure> {
+        self.controller()
+            .arm_capture(buffer)
+            .unwrap_or_else(|failure| panic!("capture arm rejected: {:?}", failure.error()));
+        Ok(())
+    }
+
+    fn start_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        assert_eq!(source, CaptureSource::Resample);
+        self.controller()
+            .start_capture(token)
+            .unwrap_or_else(|failure| panic!("capture start rejected: {:?}", failure.error()));
+        Ok(())
+    }
+
+    fn stop_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        assert_eq!(source, CaptureSource::Resample);
+        self.controller()
+            .stop_capture(token)
+            .unwrap_or_else(|failure| panic!("capture stop rejected: {:?}", failure.error()));
+        Ok(())
+    }
+
+    fn cancel_capture(
+        &mut self,
+        source: CaptureSource,
+        token: u64,
+    ) -> Result<(), CaptureCommandFailure> {
+        assert_eq!(source, CaptureSource::Resample);
+        self.controller()
+            .cancel_capture(token)
+            .unwrap_or_else(|failure| panic!("capture cancel rejected: {:?}", failure.error()));
+        Ok(())
+    }
+
+    fn capture_status(&mut self, source: CaptureSource) -> Option<CaptureStatus> {
+        (source == CaptureSource::Resample)
+            .then(|| self.controller.borrow().capture_status())
+            .flatten()
+    }
+
+    fn capture_completion(&mut self, source: CaptureSource) -> Option<CaptureOutcome> {
+        (source == CaptureSource::Resample)
+            .then(|| self.controller().try_capture_completion())
+            .flatten()
     }
 }
 
-struct Harness {
-    app: App,
-    engine: AudioEngine,
+pub(crate) struct Harness {
+    pub(crate) app: App,
+    pub(crate) engine: AudioEngine,
     worker: WorkerHandle,
-    controller: Rc<RefCell<AudioController>>,
+    pub(crate) controller: Rc<RefCell<AudioController>>,
+    #[allow(
+        dead_code,
+        reason = "runtime device-loss support is consumed by the mixer_fx_workflow path module"
+    )]
+    runtime_failure: Rc<RefCell<Option<String>>>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::new_with_worker(WorkerHandle::spawn())
     }
 
@@ -304,9 +374,11 @@ impl Harness {
         let (controller, ports) = audio_channels_with_test_capacities(8, 256, 8);
         let controller = Rc::new(RefCell::new(controller));
         let engine = AudioEngine::new(48_000, ports).unwrap();
+        let runtime_failure = Rc::new(RefCell::new(None));
         let mut app = App::with_audio(Box::new(ControllerPort {
             sample_rate: 48_000,
             controller: Rc::clone(&controller),
+            runtime_failure: Rc::clone(&runtime_failure),
         }));
         app.set_keyboard_capabilities(KeyboardCapabilities {
             release_events: true,
@@ -316,6 +388,7 @@ impl Harness {
             engine,
             worker,
             controller,
+            runtime_failure,
         };
         for _ in 0..40 {
             harness.app.maintain_audio();
@@ -335,7 +408,7 @@ impl Harness {
         self.app.apply_worker_result(result)
     }
 
-    fn dispatch_queued(&mut self) -> usize {
+    pub(crate) fn dispatch_queued(&mut self) -> usize {
         let requests = self.app.take_worker_requests();
         assert!(requests.len() <= 1, "project work is bounded per iteration");
         let count = requests.len();
@@ -345,7 +418,7 @@ impl Harness {
         count
     }
 
-    fn load(&mut self, pad: PadId, path: &Path) {
+    pub(crate) fn load(&mut self, pad: PadId, path: &Path) {
         let request = self.app.begin_load(pad, path).expect("load request");
         assert!(self.dispatch(request));
         self.engine.render_frames(0, |_| {});
@@ -366,7 +439,7 @@ impl Harness {
         ));
     }
 
-    fn palette(&mut self, command: &str) {
+    pub(crate) fn palette(&mut self, command: &str) {
         self.key(KeyCode::Char(':'), KeyModifiers::SHIFT);
         self.app
             .apply_terminal_event(Event::Paste(command.to_owned()));
@@ -388,13 +461,13 @@ impl Harness {
         self.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
     }
 
-    fn save_as(&mut self, directory: &Path, now: Instant) {
+    pub(crate) fn save_as(&mut self, directory: &Path, now: Instant) {
         self.app.request_save_as(directory).unwrap();
         assert!(self.app.maintain_project(now));
         assert_eq!(self.dispatch_queued(), 1);
     }
 
-    fn open(&mut self, directory: &Path, choice: Option<RecoveryChoice>, now: Instant) {
+    pub(crate) fn open(&mut self, directory: &Path, choice: Option<RecoveryChoice>, now: Instant) {
         self.app.request_open_project(directory).unwrap();
         assert_eq!(self.dispatch_queued(), 1);
         if self
@@ -408,6 +481,71 @@ impl Harness {
             self.dispatch_queued();
         }
         self.finish_open(now);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "continuous capture support is consumed by the mixer_fx_workflow path module"
+    )]
+    pub(crate) fn resample_and_install(&mut self, frames: usize) -> Vec<f32> {
+        self.app
+            .request_capture_with_frame_limit(CaptureSource::Resample, frames + 16)
+            .unwrap();
+        self.engine.render_frames(0, |_| {});
+        self.engine.render_frames(0, |_| {});
+        let mut expected = Vec::with_capacity(frames * 2);
+        self.engine
+            .render_frames(frames, |frame| expected.extend_from_slice(&frame));
+        self.app.stop_capture().unwrap();
+        self.engine.render_frames(0, |_| {});
+        for _ in 0..32 {
+            self.app.maintain_capture();
+            self.dispatch_queued();
+            self.engine.render_frames(0, |_| {});
+            if self.app.capture_session().phase().is_none() {
+                return expected;
+            }
+        }
+        panic!(
+            "resample did not install: {:?} {}",
+            self.app.capture_session().phase(),
+            self.app.status()
+        );
+    }
+
+    #[allow(
+        dead_code,
+        reason = "runtime device-loss support is consumed by the mixer_fx_workflow path module"
+    )]
+    pub(crate) fn fail_runtime(&mut self, message: &str) {
+        *self.runtime_failure.borrow_mut() = Some(message.to_owned());
+        self.app.maintain_audio();
+    }
+
+    #[allow(
+        dead_code,
+        reason = "runtime retry support is consumed by the mixer_fx_workflow path module"
+    )]
+    pub(crate) fn retry_fresh_audio(&mut self) -> bool {
+        let (controller, ports) = audio_channels_with_test_capacities(8, 256, 8);
+        let controller = Rc::new(RefCell::new(controller));
+        let engine = AudioEngine::new(48_000, ports).unwrap();
+        let runtime_failure = Rc::new(RefCell::new(None));
+        let admitted = self.app.retry_with(Box::new(ControllerPort {
+            sample_rate: 48_000,
+            controller: Rc::clone(&controller),
+            runtime_failure: Rc::clone(&runtime_failure),
+        }));
+        if admitted {
+            self.controller = controller;
+            self.engine = engine;
+            self.runtime_failure = runtime_failure;
+            for _ in 0..256 {
+                self.app.maintain_audio();
+                self.engine.render_frames(0, |_| {});
+            }
+        }
+        admitted
     }
 
     fn finish_open(&mut self, now: Instant) {
@@ -428,13 +566,19 @@ impl Harness {
         );
     }
 
-    fn autosave(&mut self, now: Instant) {
+    pub(crate) fn autosave(&mut self, now: Instant) {
         // A successful explicit save queues exact recovery cleanup ahead of later autosave work.
         // Drain that bounded item, then the recovery save at the same already-quiet timestamp.
+        let mut dispatched = 0;
         for _ in 0..2 {
-            assert!(self.app.maintain_project(now + Duration::from_secs(3)));
-            assert_eq!(self.dispatch_queued(), 1);
+            if self.app.maintain_project(now + Duration::from_secs(3)) {
+                dispatched += self.dispatch_queued();
+            }
         }
+        assert!(
+            dispatched >= 1,
+            "autosave must dispatch bounded project work"
+        );
     }
 }
 

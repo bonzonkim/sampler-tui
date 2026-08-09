@@ -369,7 +369,7 @@ fn perform_pattern_summary(app: &App) -> String {
     )
 }
 
-pub(crate) fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }

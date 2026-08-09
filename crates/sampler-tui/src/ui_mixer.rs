@@ -7,7 +7,7 @@ use sampler_core::PlaybackMode;
 
 use crate::App;
 use crate::mixer::{DelayField, MixerSection, PadField, ReverbField};
-use crate::ui::{load_state_name, pad_label, render_status, safe_meter_ratio, truncate};
+use crate::ui::{load_state_name, pad_label, safe_meter_ratio, truncate};
 
 pub(crate) fn render_mixer(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
@@ -41,7 +41,76 @@ pub(crate) fn render_mixer(frame: &mut Frame, area: Rect, app: &App) {
         .split(inner);
     render_pad_header(frame, sections[0], app);
     render_sections(frame, sections[1], app);
-    render_status(frame, sections[2], app);
+    render_mixer_status(frame, sections[2], app);
+}
+
+fn render_mixer_status(frame: &mut Frame, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::new().borders(Borders::TOP).title(" STATUS ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let mut context = focused_context(app);
+    if !app.status().is_empty() {
+        context.push_str(" · ");
+        context.push_str(app.status());
+    }
+    let rows = [
+        context,
+        "Ctrl+←/→ section · ↑/↓ field · ←/→ edit".to_owned(),
+        "Enter toggle · Backspace reset · Esc perform · ? help · : cmd".to_owned(),
+    ];
+    render_lines(frame, inner, &rows);
+}
+
+fn focused_context(app: &App) -> String {
+    let selected = app.selected_pad().min(15);
+    let offset = usize::from(u8::from(app.active_bank())) * 16 + selected;
+    let pad = &app.pads()[offset];
+    let Some(pad_id) = app.selected_pad_id() else {
+        return format!("PAD {:02} · unavailable", selected + 1);
+    };
+    let mix = app.pad_mix(pad_id);
+    let master = app.master_mix();
+    let cursor = app.mixer_cursor();
+    let (section, field, value) = match cursor.section() {
+        MixerSection::Pad => match cursor.pad_field() {
+            PadField::Level => ("PAD MIX", "Level", db(pad.settings.gain_db)),
+            PadField::Pan => ("PAD MIX", "Pan", pan(pad.settings.pan)),
+            PadField::Mute => ("PAD MIX", "Mute", on_off(mix.muted).to_owned()),
+            PadField::Choke => (
+                "PAD MIX",
+                "Choke",
+                pad.settings
+                    .choke_group
+                    .map_or_else(|| "--".to_owned(), |group| group.get().to_string()),
+            ),
+            PadField::DelaySend => ("PAD MIX", "Delay", percent(mix.delay_send)),
+            PadField::ReverbSend => ("PAD MIX", "Reverb", percent(mix.reverb_send)),
+        },
+        MixerSection::Master => ("MASTER", "Level", db(master.gain_db)),
+        MixerSection::Delay => match cursor.delay_field() {
+            DelayField::Enabled => ("DELAY", "Enabled", on_off(master.delay.enabled).to_owned()),
+            DelayField::Time => ("DELAY", "Time", format!("{} ms", master.delay.time_ms)),
+            DelayField::Feedback => ("DELAY", "Feedback", percent(master.delay.feedback)),
+            DelayField::Return => ("DELAY", "Return", db(master.delay.return_db)),
+        },
+        MixerSection::Reverb => match cursor.reverb_field() {
+            ReverbField::Enabled => (
+                "REVERB",
+                "Enabled",
+                on_off(master.reverb.enabled).to_owned(),
+            ),
+            ReverbField::Room => ("REVERB", "Room", percent(master.reverb.room_size)),
+            ReverbField::Damping => ("REVERB", "Damping", percent(master.reverb.damping)),
+            ReverbField::Return => ("REVERB", "Return", db(master.reverb.return_db)),
+        },
+    };
+    format!("PAD {:02} · {section} · {field} · {value}", selected + 1)
 }
 
 fn render_pad_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -709,6 +778,33 @@ mod tests {
         assert!(screen.contains("DELAY [FOCUS]"));
         assert!(screen.contains("> Time 250 ms"));
         assert!(!screen.contains("> Level 0.0 dB"));
+    }
+
+    #[test]
+    fn default_mixer_status_names_committed_focus_and_uses_local_controls() {
+        let app = mixer_app(FakeAudio::ready());
+        let lines = render_lines(80, 24, &app);
+        let footer = lines[19..].join("\n");
+
+        assert!(footer.contains("PAD 01 · PAD MIX · Level · 0.0 dB"));
+        assert!(footer.contains("Enter toggle"));
+        assert!(footer.contains("? help · : cmd"));
+        assert!(!footer.contains("Ready"));
+        assert!(!footer.contains("Enter trigger"));
+    }
+
+    #[test]
+    fn mixer_status_reads_the_committed_value_after_a_successful_change() {
+        let mut app = mixer_app(FakeAudio::ready());
+        app.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pad_mix(pad(0)).muted);
+
+        let lines = render_lines(80, 24, &app);
+        let footer = lines[19..].join("\n");
+        assert!(footer.contains("PAD 01 · PAD MIX · Mute · ON"));
+        assert!(!footer.contains("Enter trigger"));
     }
 
     #[test]

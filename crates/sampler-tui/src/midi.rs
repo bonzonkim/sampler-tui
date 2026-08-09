@@ -315,6 +315,12 @@ impl MidiService {
             .as_ref()
             .map_or(0, |connected| connected.consumer.take_lost_count())
     }
+
+    pub(crate) fn queued_event_count(&self) -> usize {
+        self.connected
+            .as_ref()
+            .map_or(0, |connected| connected.consumer.consumer.slots())
+    }
 }
 
 impl Drop for MidiService {

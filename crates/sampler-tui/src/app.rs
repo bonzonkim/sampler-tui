@@ -4635,8 +4635,9 @@ pub struct App {
     midi_learn_target: Option<PadId>,
     midi_owned_pads: Box<[Option<MidiOwnedVoice>; MIDI_OWNERSHIP_COUNT]>,
     midi_overflow_pending: usize,
+    midi_overflow_discard_remaining: usize,
+    midi_overflow_release_pending: bool,
     midi_notice: Option<String>,
-    midi_deferred_events: VecDeque<MidiEvent>,
     overlay: Option<Overlay>,
     palette: LineEditor,
     palette_error: Option<String>,
@@ -4806,8 +4807,9 @@ impl App {
             midi_learn_target: None,
             midi_owned_pads: Box::new([None; MIDI_OWNERSHIP_COUNT]),
             midi_overflow_pending: 0,
+            midi_overflow_discard_remaining: 0,
+            midi_overflow_release_pending: false,
             midi_notice: None,
-            midi_deferred_events: VecDeque::with_capacity(crate::midi::MAX_MIDI_DRAIN),
             midi_service: None,
             overlay,
             palette: LineEditor::default(),
@@ -5847,8 +5849,9 @@ impl App {
         match result {
             Some(Ok(Some(MidiServiceEvent::PortDisappeared(port)))) => {
                 self.cancel_midi_learn();
-                self.midi_deferred_events.clear();
                 self.midi_overflow_pending = 0;
+                self.midi_overflow_discard_remaining = 0;
+                self.midi_overflow_release_pending = false;
                 let notice = match self.release_all_midi_owners() {
                     Ok(()) => format!("MIDI port disappeared: {}", port.name()),
                     Err(error) => format!(
@@ -5880,83 +5883,100 @@ impl App {
     }
 
     pub fn maintain_midi(&mut self, now: Instant) -> bool {
-        let mut changed = false;
         let observed_lost = self
             .midi_service
             .as_ref()
             .map_or(0, MidiService::take_lost_count);
-        self.midi_overflow_pending = self.midi_overflow_pending.saturating_add(observed_lost);
-        if self.midi_overflow_pending > 0 && !self.recover_midi_overflow() {
+        self.observe_midi_loss(observed_lost);
+        if self.midi_overflow_pending > 0 {
+            self.recover_midi_overflow(crate::midi::MAX_MIDI_DRAIN);
+            let _ = self.maintain_midi_service(now);
             return true;
         }
 
-        let mut applied = 0;
-        while applied < crate::midi::MAX_MIDI_DRAIN {
-            let Some(event) = self.midi_deferred_events.pop_front() else {
-                break;
-            };
+        let empty = MidiEvent::NoteOff {
+            channel: MidiChannel::new(1).expect("first MIDI channel is valid"),
+            note: MidiNote::new(0).expect("zero MIDI note is valid"),
+        };
+        let mut events = [empty; crate::midi::MAX_MIDI_DRAIN];
+        let drained = self
+            .midi_service
+            .as_mut()
+            .map_or(0, |service| service.drain_events(&mut events));
+        let lost_after_drain = self
+            .midi_service
+            .as_ref()
+            .map_or(0, MidiService::take_lost_count);
+        if lost_after_drain > 0 {
+            self.observe_midi_loss(lost_after_drain);
+            self.recover_midi_overflow(crate::midi::MAX_MIDI_DRAIN - drained);
+            let _ = self.maintain_midi_service(now);
+            return true;
+        }
+        for event in events.into_iter().take(drained) {
             self.apply_midi_event(event);
-            applied += 1;
-            changed = true;
         }
 
-        let remaining = crate::midi::MAX_MIDI_DRAIN - applied;
-        if remaining > 0 {
+        drained > 0 || self.maintain_midi_service(now)
+    }
+
+    fn observe_midi_loss(&mut self, lost: usize) {
+        if lost == 0 {
+            return;
+        }
+        self.midi_overflow_pending = self.midi_overflow_pending.saturating_add(lost);
+        self.midi_overflow_release_pending = true;
+        let queued = self
+            .midi_service
+            .as_ref()
+            .map_or(0, MidiService::queued_event_count);
+        self.midi_overflow_discard_remaining = self.midi_overflow_discard_remaining.max(queued);
+    }
+
+    fn recover_midi_overflow(&mut self, event_budget: usize) {
+        let discard = event_budget.min(self.midi_overflow_discard_remaining);
+        if discard > 0 {
             let empty = MidiEvent::NoteOff {
                 channel: MidiChannel::new(1).expect("first MIDI channel is valid"),
                 note: MidiNote::new(0).expect("zero MIDI note is valid"),
             };
             let mut events = [empty; crate::midi::MAX_MIDI_DRAIN];
-            let drained = self
+            let discarded = self
                 .midi_service
                 .as_mut()
-                .map_or(0, |service| service.drain_events(&mut events[..remaining]));
-            let lost_after_drain = self
-                .midi_service
-                .as_ref()
-                .map_or(0, MidiService::take_lost_count);
-            if lost_after_drain > 0 {
-                self.midi_overflow_pending =
-                    self.midi_overflow_pending.saturating_add(lost_after_drain);
-                self.midi_deferred_events
-                    .extend(events[..drained].iter().copied());
-                if !self.recover_midi_overflow() {
-                    return true;
-                }
-                while applied < crate::midi::MAX_MIDI_DRAIN {
-                    let Some(event) = self.midi_deferred_events.pop_front() else {
-                        break;
-                    };
-                    self.apply_midi_event(event);
-                    applied += 1;
-                    changed = true;
-                }
-            } else {
-                for event in events.into_iter().take(drained) {
-                    self.apply_midi_event(event);
-                    changed = true;
-                }
-            }
+                .map_or(0, |service| service.drain_events(&mut events[..discard]));
+            self.midi_overflow_discard_remaining = self
+                .midi_overflow_discard_remaining
+                .saturating_sub(discarded);
         }
 
-        changed | self.maintain_midi_service(now)
-    }
+        let concurrent_lost = self
+            .midi_service
+            .as_ref()
+            .map_or(0, MidiService::take_lost_count);
+        self.observe_midi_loss(concurrent_lost);
 
-    fn recover_midi_overflow(&mut self) -> bool {
         let dropped = self.midi_overflow_pending;
-        match self.release_all_midi_owners() {
-            Ok(()) => {
-                self.midi_overflow_pending = 0;
+        if self.midi_overflow_release_pending {
+            match self.release_all_midi_owners() {
+                Ok(()) => {
+                    self.midi_overflow_release_pending = false;
+                    self.set_midi_notice(format!(
+                        "MIDI overflow · {dropped} dropped · held notes released"
+                    ));
+                }
+                Err(error) => self.set_midi_notice(format!(
+                    "MIDI overflow · {dropped} dropped · held-note release failed: {error}"
+                )),
+            }
+        }
+        if !self.midi_overflow_release_pending && self.midi_overflow_discard_remaining == 0 {
+            let dropped = self.midi_overflow_pending;
+            self.midi_overflow_pending = 0;
+            if dropped > 0 {
                 self.set_midi_notice(format!(
                     "MIDI overflow · {dropped} dropped · held notes released"
                 ));
-                true
-            }
-            Err(error) => {
-                self.set_midi_notice(format!(
-                    "MIDI overflow · {dropped} dropped · held-note release failed: {error}"
-                ));
-                false
             }
         }
     }
@@ -6027,8 +6047,9 @@ impl App {
     }
 
     fn reset_midi_ingress_fence(&mut self) {
-        self.midi_deferred_events.clear();
         self.midi_overflow_pending = 0;
+        self.midi_overflow_discard_remaining = 0;
+        self.midi_overflow_release_pending = false;
         self.clear_midi_notice();
     }
 
@@ -19014,6 +19035,135 @@ mod tests {
             app.status(),
             "MIDI overflow · 7 dropped · held notes released"
         );
+        assert!(app.maintain_midi(now));
+        assert!(app.maintain_midi(now));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1))]
+        );
+        assert_eq!(app.midi_overflow_pending, 0);
+        assert_eq!(app.midi_overflow_discard_remaining, 0);
+    }
+
+    #[test]
+    fn midi_overflow_discards_retained_note_on_when_matching_note_off_was_dropped() {
+        let now = Instant::now();
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        state
+            .borrow_mut()
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_push_message(&[0x90, 36, 127]);
+        for _ in 0..crate::midi::MIDI_INGRESS_CAPACITY - 1 {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x80, 100, 0]);
+        }
+        state
+            .borrow_mut()
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_push_message(&[0x80, 36, 0]);
+
+        assert!(app.maintain_midi(now));
+
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert!(app.midi_owned_pads.iter().all(Option::is_none));
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI overflow · 1 dropped · held notes released")
+        );
+        assert_eq!(
+            app.midi_overflow_discard_remaining,
+            crate::midi::MIDI_INGRESS_CAPACITY - crate::midi::MAX_MIDI_DRAIN
+        );
+        for _ in 1..crate::midi::MIDI_INGRESS_CAPACITY / crate::midi::MAX_MIDI_DRAIN {
+            assert!(app.maintain_midi(now));
+        }
+        assert_eq!(app.midi_overflow_discard_remaining, 0);
+        assert_eq!(app.midi_overflow_pending, 0);
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+
+        state
+            .borrow_mut()
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_push_message(&[0x90, 37, 127]);
+        assert!(app.maintain_midi(now));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedTrigger(pad(0, 1), 1.0)]
+        );
+        assert!(app.midi_owned_pads[midi_owner_index(1, 37)].is_some());
+    }
+
+    #[test]
+    fn midi_overflow_extends_quarantine_and_exact_count_for_a_concurrent_loss_interval() {
+        let now = Instant::now();
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        for _ in 0..crate::midi::MIDI_INGRESS_CAPACITY {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x90, 36, 127]);
+        }
+        state
+            .borrow_mut()
+            .producer
+            .as_mut()
+            .unwrap()
+            .try_push_message(&[0x80, 36, 0]);
+        assert!(app.maintain_midi(now));
+
+        for _ in 0..crate::midi::MAX_MIDI_DRAIN {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x80, 100, 0]);
+        }
+        for _ in 0..3 {
+            state
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .try_push_message(&[0x80, 36, 0]);
+        }
+        assert!(app.maintain_midi(now));
+        assert_eq!(app.midi_overflow_pending, 4);
+        assert_eq!(
+            app.midi_overflow_discard_remaining,
+            crate::midi::MIDI_INGRESS_CAPACITY - crate::midi::MAX_MIDI_DRAIN
+        );
+        for _ in 0..3 {
+            assert!(app.maintain_midi(now));
+        }
+
+        assert_eq!(app.midi_overflow_pending, 0);
+        assert_eq!(app.midi_overflow_discard_remaining, 0);
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert_eq!(
+            app.midi_status_text().as_deref(),
+            Some("MIDI overflow · 4 dropped · held notes released")
+        );
     }
 
     #[test]
@@ -19050,10 +19200,14 @@ mod tests {
         let mut app = App::with_audio_and_midi(Box::new(audio), service);
         app.apply_midi_event(midi_on(1, 36, 127));
         app.midi_overflow_pending = 3;
-        assert!(app.recover_midi_overflow());
+        app.midi_overflow_release_pending = true;
+        app.recover_midi_overflow(crate::midi::MAX_MIDI_DRAIN);
+        assert_eq!(app.midi_overflow_pending, 0);
         app.apply_midi_event(midi_on(1, 36, 127));
         app.midi_overflow_pending = 4;
-        assert!(!app.recover_midi_overflow());
+        app.midi_overflow_release_pending = true;
+        app.recover_midi_overflow(crate::midi::MAX_MIDI_DRAIN);
+        assert!(app.midi_overflow_release_pending);
         assert_eq!(
             app.midi_status_text().as_deref(),
             Some(
@@ -19095,36 +19249,40 @@ mod tests {
     }
 
     #[test]
-    fn midi_source_boundaries_discard_deferred_old_connection_events() {
+    fn midi_source_boundaries_discard_pending_old_connection_recovery() {
         let now = Instant::now();
         let (mut service, _state) = fake_midi_service([("a", "Keys")]);
         service.startup(now).unwrap();
         let audio = FakeAudio::ready(48_000, 2);
         let calls = audio.call_log();
         let mut app = App::with_audio_and_midi(Box::new(audio), service);
-        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
         app.midi_overflow_pending = 2;
+        app.midi_overflow_discard_remaining = 12;
+        app.midi_overflow_release_pending = true;
         app.disconnect_midi_port().unwrap();
         calls.clear();
         assert!(!app.maintain_midi(now));
         assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
-        assert!(app.midi_deferred_events.is_empty());
         assert_eq!(app.midi_overflow_pending, 0);
+        assert_eq!(app.midi_overflow_discard_remaining, 0);
+        assert!(!app.midi_overflow_release_pending);
 
         let (mut replacement, replacement_state) =
             fake_midi_service([("a", "Keys"), ("b", "Pads")]);
         replacement.startup(now).unwrap();
         replacement.connect(0).unwrap();
         app.install_midi_service(replacement, now);
-        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
         app.midi_overflow_pending = 2;
+        app.midi_overflow_discard_remaining = 12;
+        app.midi_overflow_release_pending = true;
         app.connect_midi_port(1).unwrap();
         calls.clear();
         assert!(!app.maintain_midi(now));
         assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
 
-        app.midi_deferred_events.push_back(midi_on(1, 36, 127));
         app.midi_overflow_pending = 2;
+        app.midi_overflow_discard_remaining = 12;
+        app.midi_overflow_release_pending = true;
         replacement_state.borrow_mut().ports.clear();
         assert!(app.maintain_midi_service(now + Duration::from_secs(1)));
         calls.clear();

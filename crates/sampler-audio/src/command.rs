@@ -104,6 +104,97 @@ mod tests {
     }
 
     #[test]
+    fn owned_live_release_batch_reserves_every_command_before_admitting_any() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(1, 1, 1);
+        let pad = PadId::first();
+        let trigger = LiveCommandId::FIRST;
+
+        assert_eq!(
+            controller.release_owned_live_batch(&[(pad, trigger), (pad, trigger)]),
+            Err(ControlError::CommandQueueFull)
+        );
+        assert!(ports.immediate_commands.pop().is_err());
+        assert_eq!(
+            controller.trigger_live_tracked(pad, 1.0).unwrap(),
+            LiveCommandId::FIRST
+        );
+    }
+
+    #[test]
+    fn owned_live_release_batch_returns_ordered_ids_and_exact_targets() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        let first_target = LiveCommandId::new(40).unwrap();
+        let second_target = LiveCommandId::new(41).unwrap();
+
+        let ids = controller
+            .release_owned_live_batch(&[(pad, first_target), (pad, second_target)])
+            .unwrap();
+
+        assert_eq!(ids, [LiveCommandId::FIRST, LiveCommandId::new(2).unwrap()]);
+        for (expected_id, expected_target) in ids.into_iter().zip([first_target, second_target]) {
+            assert!(matches!(
+                ports.immediate_commands.pop().unwrap(),
+                AudioCommand::ReleaseOwnedLive {
+                    id,
+                    target_trigger_id,
+                    ..
+                } if id == expected_id && target_trigger_id == expected_target
+            ));
+        }
+    }
+
+    #[test]
+    fn owned_live_release_batch_exhaustion_preserves_ids_sequence_and_queue() {
+        let (mut controller, mut ports) = audio_channels();
+        let pad = PadId::first();
+        let target = LiveCommandId::new(40).unwrap();
+        controller.set_next_live_id_for_test(u64::MAX);
+
+        assert_eq!(
+            controller.release_owned_live_batch(&[(pad, target), (pad, target)]),
+            Err(ControlError::LiveCommandIdExhausted)
+        );
+        assert!(ports.immediate_commands.pop().is_err());
+
+        let id = controller.release_owned_live_tracked(pad, target).unwrap();
+        assert_eq!(id.get(), u64::MAX);
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::ReleaseOwnedLive { id: admitted, sequence: 1, .. }
+                if admitted == id
+        ));
+    }
+
+    #[test]
+    fn owned_live_release_batch_respects_shared_capacity_across_both_lanes() {
+        let (mut controller, mut ports) = audio_channels_with_capacities(3, 1, 1);
+        let pad = PadId::first();
+        let target = LiveCommandId::new(40).unwrap();
+        controller.trigger(pad, 10, 1.0).unwrap();
+        let trigger_id = controller.trigger_live_tracked(pad, 1.0).unwrap();
+
+        assert_eq!(
+            controller.release_owned_live_batch(&[(pad, target), (pad, target)]),
+            Err(ControlError::CommandQueueFull)
+        );
+        assert!(matches!(
+            ports.commands.pop().unwrap(),
+            AudioCommand::Trigger { at_frame: 10, .. }
+        ));
+        assert!(matches!(
+            ports.immediate_commands.pop().unwrap(),
+            AudioCommand::TriggerLive { id, .. } if id == trigger_id
+        ));
+
+        let ids = controller
+            .release_owned_live_batch(&[(pad, target), (pad, target)])
+            .unwrap();
+        assert_eq!(ids[0].get(), trigger_id.get() + 1);
+        assert_eq!(ids[1].get(), trigger_id.get() + 2);
+    }
+
+    #[test]
     fn live_command_ids_admit_max_once_then_report_exhaustion() {
         let (mut controller, mut ports) = audio_channels();
         controller.set_next_live_id_for_test(u64::MAX);
@@ -1213,9 +1304,15 @@ impl SharedControlState {
     }
 
     fn reserve_command(&self) -> bool {
+        self.reserve_commands(1)
+    }
+
+    fn reserve_commands(&self, amount: usize) -> bool {
         self.queued_commands
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                (queued < self.command_capacity).then_some(queued + 1)
+                queued
+                    .checked_add(amount)
+                    .filter(|total| *total <= self.command_capacity)
             })
             .is_ok()
     }
@@ -1698,6 +1795,53 @@ impl AudioController {
             self.advance_live_id();
         }
         result.map(|()| live_id)
+    }
+
+    pub fn release_owned_live_batch(
+        &mut self,
+        releases: &[(PadId, LiveCommandId)],
+    ) -> Result<Vec<LiveCommandId>, ControlError> {
+        self.ensure_open()?;
+        if releases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first_id = self
+            .next_live_id
+            .map(LiveCommandId)
+            .ok_or(ControlError::LiveCommandIdExhausted)?;
+        let last_offset =
+            u64::try_from(releases.len() - 1).map_err(|_| ControlError::LiveCommandIdExhausted)?;
+        first_id
+            .get()
+            .checked_add(last_offset)
+            .ok_or(ControlError::LiveCommandIdExhausted)?;
+        if !self.shared.reserve_commands(releases.len()) {
+            self.shared.record_command_overflow();
+            return Err(ControlError::CommandQueueFull);
+        }
+
+        let mut ids = Vec::with_capacity(releases.len());
+        for &(pad, target_trigger_id) in releases {
+            let id = self
+                .next_live_id
+                .map(LiveCommandId)
+                .expect("the complete live-id batch was preflighted");
+            let sequence = self.next_timed_sequence;
+            let command = AudioCommand::ReleaseOwnedLive {
+                id,
+                target_trigger_id,
+                pad,
+                sequence,
+            };
+            assert!(
+                self.immediate_commands.push(command).is_ok(),
+                "reserved immediate command capacity must admit the complete batch"
+            );
+            ids.push(id);
+            self.advance_timed_sequence();
+            self.advance_live_id();
+        }
+        Ok(ids)
     }
 
     pub fn update_pad(&mut self, pad: PadId, settings: PadSettings) -> Result<(), ControlError> {

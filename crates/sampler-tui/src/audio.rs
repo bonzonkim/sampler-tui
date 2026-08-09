@@ -129,6 +129,18 @@ pub trait AudioPort {
     ) -> Result<LiveCommandId, String> {
         Err("tracked live audio is unsupported".into())
     }
+    fn release_owned_live_batch(
+        &mut self,
+        releases: &[(PadId, LiveCommandId)],
+    ) -> Result<Vec<LiveCommandId>, String> {
+        match releases {
+            [] => Ok(Vec::new()),
+            &[(pad, trigger_id)] => self
+                .release_owned_live_tracked(pad, trigger_id)
+                .map(|id| vec![id]),
+            _ => Err("atomic owned live release batches are unsupported".into()),
+        }
+    }
     fn install_pattern(
         &mut self,
         _snapshot: Arc<PatternSnapshot>,
@@ -285,6 +297,10 @@ trait SessionLike {
         pad: PadId,
         target_trigger_id: LiveCommandId,
     ) -> Result<LiveCommandId, Self::CommandError>;
+    fn release_owned_live_batch(
+        &mut self,
+        releases: &[(PadId, LiveCommandId)],
+    ) -> Result<Vec<LiveCommandId>, Self::CommandError>;
     fn install_pattern(
         &mut self,
         snapshot: Arc<PatternSnapshot>,
@@ -459,6 +475,13 @@ impl SessionLike for AudioSession {
     ) -> Result<LiveCommandId, Self::CommandError> {
         self.controller_mut()
             .release_owned_live_tracked(pad, target_trigger_id)
+    }
+
+    fn release_owned_live_batch(
+        &mut self,
+        releases: &[(PadId, LiveCommandId)],
+    ) -> Result<Vec<LiveCommandId>, Self::CommandError> {
+        self.controller_mut().release_owned_live_batch(releases)
     }
 
     fn install_pattern(
@@ -740,6 +763,15 @@ where
     ) -> Result<LiveCommandId, String> {
         self.session_mut()
             .release_owned_live_tracked(pad, target_trigger_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_owned_live_batch(
+        &mut self,
+        releases: &[(PadId, LiveCommandId)],
+    ) -> Result<Vec<LiveCommandId>, String> {
+        self.session_mut()
+            .release_owned_live_batch(releases)
             .map_err(|error| error.to_string())
     }
 
@@ -1457,6 +1489,13 @@ mod tests {
             _target_trigger_id: LiveCommandId,
         ) -> Result<LiveCommandId, Self::CommandError> {
             Ok(LiveCommandId::FIRST)
+        }
+
+        fn release_owned_live_batch(
+            &mut self,
+            releases: &[(PadId, LiveCommandId)],
+        ) -> Result<Vec<LiveCommandId>, Self::CommandError> {
+            Ok(vec![LiveCommandId::FIRST; releases.len()])
         }
 
         fn install_pattern(

@@ -159,6 +159,18 @@ struct ConnectedMidi {
     consumer: MidiIngressConsumer,
 }
 
+pub(crate) struct PreparedMidiConnection {
+    connected: Option<ConnectedMidi>,
+}
+
+impl Drop for PreparedMidiConnection {
+    fn drop(&mut self) {
+        if let Some(connected) = self.connected.take() {
+            connected.connection.close();
+        }
+    }
+}
+
 pub struct MidiService {
     backend: Box<dyn MidiBackend>,
     backend_ports: Vec<MidiBackendPort>,
@@ -215,6 +227,15 @@ impl MidiService {
     }
 
     pub fn connect(&mut self, index: usize) -> Result<(), MidiServiceError> {
+        let prepared = self.prepare_connection(index)?;
+        self.commit_connection(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_connection(
+        &mut self,
+        index: usize,
+    ) -> Result<PreparedMidiConnection, MidiServiceError> {
         let port = self
             .backend_ports
             .get(index)
@@ -227,15 +248,24 @@ impl MidiService {
             .ok_or(MidiServiceError::PortIndex(index))?;
         let (producer, consumer) = midi_ingress();
         let connection = self.backend.connect(&port, producer)?;
-        let previous = self.connected.replace(ConnectedMidi {
-            port: info,
-            connection,
-            consumer,
-        });
+        Ok(PreparedMidiConnection {
+            connected: Some(ConnectedMidi {
+                port: info,
+                connection,
+                consumer,
+            }),
+        })
+    }
+
+    pub(crate) fn commit_connection(&mut self, mut prepared: PreparedMidiConnection) {
+        let connected = prepared
+            .connected
+            .take()
+            .expect("a prepared MIDI connection can be committed exactly once");
+        let previous = self.connected.replace(connected);
         if let Some(previous) = previous {
             previous.connection.close();
         }
-        Ok(())
     }
 
     pub fn disconnect(&mut self) -> bool {

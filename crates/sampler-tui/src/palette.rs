@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sampler_core::{BankId, ChokeGroup, PlaybackMode, Resolution};
+use sampler_core::{BankId, ChokeGroup, MidiChannel, MidiChannelFilter, PlaybackMode, Resolution};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
@@ -119,6 +119,13 @@ pub enum PaletteCommand {
     ReverbRoom(f32),
     ReverbDamping(f32),
     ReverbReturn(f32),
+    MidiPorts,
+    MidiConnect(usize),
+    MidiDisconnect,
+    MidiChannel(MidiChannelFilter),
+    MidiLearn,
+    MidiUnmap,
+    MidiResetBank,
 }
 
 pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
@@ -203,8 +210,38 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
             parse_finite_range(remainder, -60.0, 6.0, "reverb-return must be -60..6")
                 .map(|value| PaletteCommand::ReverbReturn(value as f32))
         }
+        "midi-ports" => no_arguments(remainder, "midi-ports", PaletteCommand::MidiPorts),
+        "midi-connect" => parse_midi_port_index(remainder).map(PaletteCommand::MidiConnect),
+        "midi-disconnect" => {
+            no_arguments(remainder, "midi-disconnect", PaletteCommand::MidiDisconnect)
+        }
+        "midi-channel" => parse_midi_channel(remainder).map(PaletteCommand::MidiChannel),
+        "midi-learn" => no_arguments(remainder, "midi-learn", PaletteCommand::MidiLearn),
+        "midi-unmap" => no_arguments(remainder, "midi-unmap", PaletteCommand::MidiUnmap),
+        "midi-reset-bank" => {
+            no_arguments(remainder, "midi-reset-bank", PaletteCommand::MidiResetBank)
+        }
         _ => Err(format!("unknown command: {command}")),
     }
+}
+
+fn parse_midi_port_index(input: &str) -> Result<usize, String> {
+    single_token(input, "midi-connect expects a zero-based port index")?
+        .parse::<usize>()
+        .map_err(|_| "midi-connect expects a zero-based port index".to_owned())
+}
+
+fn parse_midi_channel(input: &str) -> Result<MidiChannelFilter, String> {
+    let token = single_token(input, "midi-channel must be omni or 1..16")?;
+    if token == "omni" {
+        return Ok(MidiChannelFilter::Omni);
+    }
+    token
+        .parse::<u8>()
+        .ok()
+        .and_then(|channel| MidiChannel::new(channel).ok())
+        .map(MidiChannelFilter::Channel)
+        .ok_or_else(|| "midi-channel must be omni or 1..16".to_owned())
 }
 
 fn parse_choke(input: &str) -> Result<Option<ChokeGroup>, String> {
@@ -369,7 +406,9 @@ fn no_arguments(
 mod tests {
     use std::path::PathBuf;
 
-    use sampler_core::{BankId, ChokeGroup, PlaybackMode, Resolution};
+    use sampler_core::{
+        BankId, ChokeGroup, MidiChannel, MidiChannelFilter, PlaybackMode, Resolution,
+    };
 
     use super::{LineEditor, PaletteCommand, parse_palette};
 
@@ -490,6 +529,62 @@ mod tests {
             parse_palette("SELECT 1"),
             Err("unknown command: SELECT".into())
         );
+    }
+
+    #[test]
+    fn midi_commands_parse_strict_typed_values() {
+        assert_eq!(parse_palette("midi-ports"), Ok(PaletteCommand::MidiPorts));
+        assert_eq!(
+            parse_palette("midi-connect 0"),
+            Ok(PaletteCommand::MidiConnect(0))
+        );
+        assert_eq!(
+            parse_palette("midi-connect 12"),
+            Ok(PaletteCommand::MidiConnect(12))
+        );
+        assert_eq!(
+            parse_palette("midi-disconnect"),
+            Ok(PaletteCommand::MidiDisconnect)
+        );
+        assert_eq!(
+            parse_palette("midi-channel omni"),
+            Ok(PaletteCommand::MidiChannel(MidiChannelFilter::Omni))
+        );
+        assert_eq!(
+            parse_palette("midi-channel 16"),
+            Ok(PaletteCommand::MidiChannel(MidiChannelFilter::Channel(
+                MidiChannel::new(16).unwrap()
+            )))
+        );
+        assert_eq!(parse_palette("midi-learn"), Ok(PaletteCommand::MidiLearn));
+        assert_eq!(parse_palette("midi-unmap"), Ok(PaletteCommand::MidiUnmap));
+        assert_eq!(
+            parse_palette("midi-reset-bank"),
+            Ok(PaletteCommand::MidiResetBank)
+        );
+    }
+
+    #[test]
+    fn midi_commands_reject_missing_extra_and_out_of_range_input() {
+        for input in [
+            "midi-ports now",
+            "midi-connect",
+            "midi-connect -1",
+            "midi-connect 1.0",
+            "midi-connect 9999999999999999999999999999999999999999",
+            "midi-connect 1 now",
+            "midi-disconnect now",
+            "midi-channel",
+            "midi-channel 0",
+            "midi-channel 17",
+            "midi-channel OMNI",
+            "midi-channel 1 now",
+            "midi-learn now",
+            "midi-unmap now",
+            "midi-reset-bank now",
+        ] {
+            assert!(parse_palette(input).is_err(), "accepted invalid {input:?}");
+        }
     }
 
     #[test]

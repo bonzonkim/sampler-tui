@@ -19,26 +19,26 @@ const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const HELP_LINES: [&str; 20] = [
-    "GLOBAL: Ctrl+R retries audio first when the device is unavailable",
     "Tab / Shift+Tab: cycle Perform / Pattern / Sample / Mixer",
     "PATTERN: Space play/stop · Ctrl+R overdub · ,/. previous/next",
-    "Arrows / PgUp / PgDn: cursor / visible bar",
-    "Enter / Delete: toggle / remove event",
+    "Arrows/PgUp/PgDn cursor/bar · Enter/Delete toggle/remove",
     "+ / - / u / Ctrl+Delete: velocity / undo / clear",
     "SAMPLE: arrows trim · m marker · PgUp/PgDn zoom · n/u edits",
-    "Up/Down pitch · o/g/l mode · Enter apply · Ctrl+Z undo",
-    "plain z remains pad 13; Apply is in-memory only; Source file unchanged",
+    "Apply is in-memory only · Source file unchanged · pitch/mode controls",
     "MIXER: Ctrl+Left/Right section · Up/Down field · Left/Right edit",
     "Enter toggle · Backspace reset · Esc Perform",
     "unsupported edits: use : command palette",
+    "MIDI active bank · linear velocity · Note On 0=Off",
+    "midi-ports · midi-connect <index> · midi-disconnect",
+    "midi-channel <omni|1..16> · midi-learn/midi-unmap/midi-reset-bank",
+    "notes 36..51 map to pads 1..16 in every bank",
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
     "CAPTURE: resample · record-input · capture-stop · capture-cancel",
-    "Recording: Enter stop · Esc review discard · pads/pattern stay live",
-    "Capture lifecycle: Finalize · Discard · Cancel are explicit choices",
+    "Enter stop · Esc review · Finalize · Discard · Cancel explicit",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
     "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
-    "Ctrl+Q / Ctrl+C quit · Esc or ? close help",
+    "Ctrl+Q / Ctrl+C quit · Esc or ? close help · Ctrl+R retries audio",
 ];
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -1851,6 +1851,32 @@ mod tests {
         assert!(screen.contains("Source file unchanged"));
         assert!(screen.contains("save · save-as <directory> · open-project <directory>"));
         assert!(screen.contains("Recovery: R restore · D discard · C cancel"));
+    }
+
+    #[test]
+    fn help_lists_every_midi_command_and_the_default_bank_mapping() {
+        let mut app = ready_app();
+        app.open_help();
+
+        let screen = render_lines(80, 24, &app).join("\n");
+
+        for command in [
+            "midi-ports",
+            "midi-connect <index>",
+            "midi-disconnect",
+            "midi-channel <omni|1..16>",
+            "midi-learn",
+            "midi-unmap",
+            "midi-reset-bank",
+        ] {
+            assert!(screen.contains(command), "missing {command:?} from help");
+        }
+        assert!(screen.contains("MIDI active bank"));
+        assert!(screen.contains("linear velocity"));
+        assert!(screen.contains("Note On 0=Off"));
+        assert!(screen.contains("notes 36..51 map to pads 1..16 in every bank"));
+        assert!(screen.contains("Enter toggle · Backspace reset · Esc Perform"));
+        assert!(screen.contains("Finalize · Discard · Cancel explicit"));
     }
 
     #[test]

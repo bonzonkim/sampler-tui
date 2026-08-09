@@ -13,8 +13,8 @@ use sampler_audio::{
 };
 use sampler_core::pad::{BANK_COUNT, PADS_PER_BANK};
 use sampler_core::{
-    BankId, MasterMixSettings, MidiSettings, PadId, PadMixSettings, PadSettings, PatternSlotId,
-    PlaybackMode, ProjectDocument, ProjectId, SampleEditRecipe,
+    BankId, MasterMixSettings, MidiChannelFilter, MidiNote, MidiSettings, PadId, PadMixSettings,
+    PadSettings, PatternSlotId, PlaybackMode, ProjectDocument, ProjectId, SampleEditRecipe,
 };
 
 use crate::PatternSwitch;
@@ -28,7 +28,7 @@ use crate::loader::{
     ProjectSaveWorkerRequest, ProjectToken, RenderedSample, StageProjectSampleRequest,
     WORKER_CHANNEL_CAPACITY, WorkerRequest, WorkerResult, WorkerSendError,
 };
-use crate::midi::MidiEvent;
+use crate::midi::{MidiEvent, MidiService, MidiServiceEvent};
 use crate::mixer::{MixerAction, MixerContext, MixerCursor, MixerIntent};
 use crate::palette::{LineEditor, PaletteCommand, parse_palette};
 use crate::pattern::{PatternStatus, PatternWorkspace, WorkspaceView};
@@ -4626,10 +4626,12 @@ pub struct App {
     pending_managed_releases: VecDeque<ManagedCaptureId>,
     managed_release_in_flight: Option<ManagedCaptureId>,
     capture_discard_release_pending: Option<ManagedCaptureId>,
+    midi_service: Option<MidiService>,
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
     midi_settings: MidiSettings,
+    midi_learn_target: Option<PadId>,
     midi_owned_pads: Box<[Option<MidiOwnedVoice>; MIDI_OWNERSHIP_COUNT]>,
     overlay: Option<Overlay>,
     palette: LineEditor,
@@ -4738,6 +4740,12 @@ impl App {
         Self::new(None, Some(error))
     }
 
+    pub fn with_audio_and_midi(audio: Box<dyn AudioPort>, midi_service: MidiService) -> Self {
+        let mut app = Self::with_audio(audio);
+        app.midi_service = Some(midi_service);
+        app
+    }
+
     fn new(mut audio: Option<Box<dyn AudioPort>>, mut audio_error: Option<String>) -> Self {
         if let Some(candidate) = audio.as_mut()
             && let Err(error) = candidate.update_master_mix(MasterMixSettings::default())
@@ -4776,7 +4784,9 @@ impl App {
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
             midi_settings: MidiSettings::default(),
+            midi_learn_target: None,
             midi_owned_pads: Box::new([None; MIDI_OWNERSHIP_COUNT]),
+            midi_service: None,
             overlay,
             palette: LineEditor::default(),
             palette_error: None,
@@ -5791,6 +5801,204 @@ impl App {
         self.should_quit || self.project_open_is_admitting() || self.blocking_pad_overlay()
     }
 
+    pub const fn midi_settings(&self) -> MidiSettings {
+        self.midi_settings
+    }
+
+    pub const fn midi_learn_target(&self) -> Option<PadId> {
+        self.midi_learn_target
+    }
+
+    pub fn arm_midi_learn(&mut self) {
+        self.midi_learn_target = self.selected_pad_id();
+    }
+
+    pub fn cancel_midi_learn(&mut self) {
+        self.midi_learn_target = None;
+    }
+
+    pub fn maintain_midi_service(&mut self, now: Instant) -> bool {
+        let result = self
+            .midi_service
+            .as_mut()
+            .map(|service| service.maintain(now));
+        match result {
+            Some(Ok(Some(MidiServiceEvent::PortDisappeared(port)))) => {
+                self.cancel_midi_learn();
+                self.status = match self.release_all_midi_owners() {
+                    Ok(()) => format!("MIDI port disappeared: {}", port.name()),
+                    Err(error) => format!(
+                        "MIDI port disappeared: {}; held-note release failed: {error}",
+                        port.name()
+                    ),
+                };
+                true
+            }
+            Some(Err(error)) => {
+                self.status = error.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn list_midi_ports(&mut self) -> Result<(), String> {
+        let service = self
+            .midi_service
+            .as_mut()
+            .ok_or("MIDI input service is unavailable")?;
+        service.refresh_ports().map_err(|error| error.to_string())?;
+        self.status = if service.ports().is_empty() {
+            "MIDI ports: none".to_owned()
+        } else {
+            service
+                .ports()
+                .iter()
+                .map(|port| format!("#{} {}", port.index(), port.name()))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        Ok(())
+    }
+
+    fn connect_midi_port(&mut self, index: usize) -> Result<(), String> {
+        let (prepared, replacing) = {
+            let service = self
+                .midi_service
+                .as_mut()
+                .ok_or("MIDI input service is unavailable")?;
+            let replacing = service.connected_port().is_some();
+            let prepared = service
+                .prepare_connection(index)
+                .map_err(|error| error.to_string())?;
+            (prepared, replacing)
+        };
+        let needs_reconciliation = replacing || self.midi_owned_pads.iter().any(Option::is_some);
+        if needs_reconciliation {
+            self.release_all_midi_owners()?;
+        }
+        let service = self
+            .midi_service
+            .as_mut()
+            .expect("the MIDI service that prepared a connection still exists");
+        service.commit_connection(prepared);
+        if needs_reconciliation {
+            self.cancel_midi_learn();
+        }
+        self.status = format!("MIDI connected: #{index}");
+        Ok(())
+    }
+
+    fn disconnect_midi_port(&mut self) -> Result<(), String> {
+        self.release_all_midi_owners()?;
+        self.cancel_midi_learn();
+        if let Some(service) = self.midi_service.as_mut() {
+            service.disconnect();
+        }
+        Ok(())
+    }
+
+    fn release_all_midi_owners(&mut self) -> Result<(), String> {
+        self.release_midi_owners_where(|_, _| true)
+    }
+
+    pub fn update_midi_channel(&mut self, channel: MidiChannelFilter) -> Result<(), String> {
+        self.update_midi_settings(self.midi_settings.with_channel(channel))
+    }
+
+    pub fn unmap_selected_midi(&mut self) -> Result<(), String> {
+        let target = self
+            .selected_pad_id()
+            .expect("the selected pad is always in the active bank");
+        let candidate = self
+            .midi_settings
+            .unmap(target.bank(), target.index())
+            .map_err(|error| error.to_string())?;
+        self.update_midi_settings(candidate)
+    }
+
+    pub fn reset_active_midi_bank(&mut self) -> Result<(), String> {
+        self.update_midi_settings(self.midi_settings.reset_bank(self.active_bank))
+    }
+
+    fn learn_midi_note(&mut self, note: MidiNote) -> Result<(), String> {
+        let Some(target) = self.midi_learn_target else {
+            return Ok(());
+        };
+        let candidate = self
+            .midi_settings
+            .learn_swap(target.bank(), target.index(), note)
+            .map_err(|error| error.to_string())?;
+        self.update_midi_settings(candidate)?;
+        self.midi_learn_target = None;
+        Ok(())
+    }
+
+    fn update_midi_settings(&mut self, candidate: MidiSettings) -> Result<(), String> {
+        if candidate == self.midi_settings {
+            return Ok(());
+        }
+        self.ensure_project_mutation_available()?;
+        self.release_midi_owners_where(|owner, owned| {
+            let channel = sampler_core::MidiChannel::new((owner / 128 + 1) as u8)
+                .expect("MIDI ownership channel is bounded");
+            let note = MidiNote::new((owner % 128) as u8).expect("MIDI ownership note is bounded");
+            let remains_mapped = candidate.channel().accepts(channel)
+                && candidate.bank(owned.pad.bank()).owner(note) == Some(owned.pad.index());
+            !remains_mapped
+        })?;
+        self.midi_settings = candidate;
+        self.commit_project_mutation();
+        Ok(())
+    }
+
+    fn release_midi_owners_where(
+        &mut self,
+        mut should_release: impl FnMut(usize, MidiOwnedVoice) -> bool,
+    ) -> Result<(), String> {
+        let releases = self
+            .midi_owned_pads
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(owner, owned)| {
+                owned
+                    .filter(|owned| should_release(owner, *owned))
+                    .map(|owned| (owner, owned))
+            })
+            .collect::<Vec<_>>();
+        if releases.is_empty() {
+            return Ok(());
+        }
+        let Some(audio) = self.audio.as_mut() else {
+            self.report_audio_unavailable();
+            return Err(self.status.clone());
+        };
+        let commands = audio
+            .release_owned_live_batch(
+                &releases
+                    .iter()
+                    .map(|(_, owned)| (owned.pad, owned.trigger_id))
+                    .collect::<Vec<_>>(),
+            )
+            .inspect_err(|error| {
+                self.status = error.clone();
+            })?;
+        assert_eq!(
+            commands.len(),
+            releases.len(),
+            "audio release batch must return one command id per owner"
+        );
+        for ((owner, _), command) in releases.into_iter().zip(commands) {
+            self.midi_owned_pads[owner] = None;
+            if self.patterns.is_recording() {
+                self.patterns
+                    .note_live_release(MIDI_RECORDING_KEY_OFFSET + owner, command);
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_midi_event(&mut self, event: MidiEvent) {
         match event {
             MidiEvent::NoteOn {
@@ -5809,6 +6017,9 @@ impl App {
             } => {
                 if self.midi_trigger_is_fenced() || !self.midi_settings.channel().accepts(channel) {
                     return;
+                }
+                if let Err(error) = self.learn_midi_note(note) {
+                    self.status = error;
                 }
                 let Some(pad_index) = self.midi_settings.bank(self.active_bank).owner(note) else {
                     return;
@@ -5857,6 +6068,12 @@ impl App {
     pub fn apply_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Repeat {
             return;
+        }
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+        {
+            self.cancel_midi_learn();
         }
         if self.should_quit {
             if let Some(action @ (InputAction::StopAll | InputAction::PadRelease(_))) =
@@ -6011,6 +6228,7 @@ impl App {
             snapshot,
             save_as: false,
         });
+        self.cancel_midi_learn();
         Ok(())
     }
 
@@ -6059,6 +6277,7 @@ impl App {
             snapshot,
             save_as: true,
         });
+        self.cancel_midi_learn();
         Ok(())
     }
 
@@ -6171,6 +6390,7 @@ impl App {
         let token = self
             .allocate_project_token()
             .map_err(|_| ProjectOpenError::TokenExhausted)?;
+        self.cancel_midi_learn();
         let directory = directory.into();
         self.project_open_error = None;
         let progress = ProjectOpenStage {
@@ -6204,6 +6424,7 @@ impl App {
             self.status = "a project lifecycle operation is already pending".to_owned();
             return;
         }
+        self.cancel_midi_learn();
         self.pending_project_action = Some(action);
         self.advance_project_action();
     }
@@ -9145,6 +9366,34 @@ impl App {
                 self.stop_all();
                 self.overlay = None;
             }
+            PaletteCommand::MidiChannel(channel) => {
+                let result = self.update_midi_channel(channel);
+                self.finish_midi_palette_command(result);
+            }
+            PaletteCommand::MidiLearn => {
+                self.arm_midi_learn();
+                self.overlay = None;
+            }
+            PaletteCommand::MidiUnmap => {
+                let result = self.unmap_selected_midi();
+                self.finish_midi_palette_command(result);
+            }
+            PaletteCommand::MidiResetBank => {
+                let result = self.reset_active_midi_bank();
+                self.finish_midi_palette_command(result);
+            }
+            PaletteCommand::MidiPorts => {
+                let result = self.list_midi_ports();
+                self.finish_midi_palette_command(result);
+            }
+            PaletteCommand::MidiConnect(index) => {
+                let result = self.connect_midi_port(index);
+                self.finish_midi_palette_command(result);
+            }
+            PaletteCommand::MidiDisconnect => {
+                let result = self.disconnect_midi_port();
+                self.finish_midi_palette_command(result);
+            }
             PaletteCommand::Help => self.open_help(),
             PaletteCommand::Quit => {
                 self.begin_project_action(PendingProjectAction::Quit);
@@ -9279,6 +9528,13 @@ impl App {
             self.sync_editor_to_selected_pad();
         }
         self.finish_mixer_palette_command(result);
+    }
+
+    fn finish_midi_palette_command(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.overlay = None,
+            Err(error) => self.palette_error = Some(error),
+        }
     }
 
     fn apply_palette_pad_mix(&mut self, reduce: impl FnOnce(&mut PadMixSettings)) {
@@ -10399,6 +10655,7 @@ impl App {
         self.fail_project_sample_apply(self.editor.pad());
         self.audio_unavailable_message = Some(error.clone());
         self.held_pad_by_key.fill(None);
+        self.cancel_midi_learn();
         self.midi_owned_pads.fill(None);
         self.patterns.stop_recording();
         self.pending_pattern_transport = None;
@@ -10894,8 +11151,9 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // The stream/session is the only owner visible to the callback. It must be gone before
-        // application-owned rendered, base, or undo buffers can perform their final Arc drop.
+        // MIDI callbacks can feed commands into the App/audio ownership model, so quiesce them
+        // before the audio callback and its application-owned sample buffers are torn down.
+        drop(self.midi_service.take());
         drop(self.audio.take());
         for pad in &mut self.pads {
             pad.sample = None;
@@ -11050,7 +11308,10 @@ mod tests {
     use crate::audio::{AudioPort, CaptureSupport};
     use crate::capture_store::{CaptureStoreError, ManagedCaptureId};
     use crate::input::InputAction;
-    use crate::midi::MidiEvent;
+    use crate::midi::{
+        MidiBackend, MidiBackendPort, MidiConnection, MidiEvent, MidiIngressProducer, MidiService,
+        MidiServiceError,
+    };
 
     use crate::DirectoryScan;
     use crate::loader::{
@@ -11104,6 +11365,7 @@ mod tests {
         horizon_reads: Rc<Cell<usize>>,
         trigger_error: Option<String>,
         release_error: Option<String>,
+        owned_release_failure: Option<(usize, String)>,
         stop_pad_error: Option<String>,
         stop_all_error: Option<String>,
         stop_pattern_error: Option<String>,
@@ -11121,6 +11383,66 @@ mod tests {
         next_live_id: u64,
     }
 
+    #[derive(Default)]
+    struct FakeMidiState {
+        ports: Vec<MidiBackendPort>,
+        connected: Vec<String>,
+        connect_error_for: Option<String>,
+        closed: usize,
+        lifecycle: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    struct FakeMidiBackend(Rc<RefCell<FakeMidiState>>);
+
+    struct FakeMidiConnection(Rc<RefCell<FakeMidiState>>);
+
+    impl MidiConnection for FakeMidiConnection {
+        fn close(self: Box<Self>) {
+            let mut state = self.0.borrow_mut();
+            state.closed += 1;
+            if let Some(lifecycle) = &state.lifecycle {
+                lifecycle.borrow_mut().push("close-midi");
+            }
+        }
+    }
+
+    impl MidiBackend for FakeMidiBackend {
+        fn list_ports(&mut self) -> Result<Vec<MidiBackendPort>, MidiServiceError> {
+            Ok(self.0.borrow().ports.clone())
+        }
+
+        fn connect(
+            &mut self,
+            port: &MidiBackendPort,
+            _producer: MidiIngressProducer,
+        ) -> Result<Box<dyn MidiConnection>, MidiServiceError> {
+            self.0.borrow_mut().connected.push(port.backend_id.clone());
+            if self.0.borrow().connect_error_for.as_deref() == Some(port.backend_id.as_str()) {
+                return Err(MidiServiceError::Connect("candidate refused".to_owned()));
+            }
+            Ok(Box::new(FakeMidiConnection(Rc::clone(&self.0))))
+        }
+    }
+
+    fn fake_midi_service(
+        ports: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> (MidiService, Rc<RefCell<FakeMidiState>>) {
+        let state = Rc::new(RefCell::new(FakeMidiState {
+            ports: ports
+                .into_iter()
+                .map(|(backend_id, name)| MidiBackendPort {
+                    backend_id: backend_id.to_owned(),
+                    name: name.to_owned(),
+                })
+                .collect(),
+            ..FakeMidiState::default()
+        }));
+        (
+            MidiService::new(Box::new(FakeMidiBackend(Rc::clone(&state)))),
+            state,
+        )
+    }
+
     impl FakeAudio {
         fn ready(sample_rate: u32, channels: u16) -> Self {
             let (pattern_controller, pattern_ports) = audio_channels();
@@ -11131,6 +11453,7 @@ mod tests {
                 horizon_reads: Rc::new(Cell::new(0)),
                 trigger_error: None,
                 release_error: None,
+                owned_release_failure: None,
                 stop_pad_error: None,
                 stop_all_error: None,
                 stop_pattern_error: None,
@@ -11160,6 +11483,7 @@ mod tests {
                 horizon_reads: Rc::new(Cell::new(0)),
                 trigger_error: None,
                 release_error: None,
+                owned_release_failure: None,
                 stop_pad_error: None,
                 stop_all_error: None,
                 stop_pattern_error: None,
@@ -11190,6 +11514,11 @@ mod tests {
 
         fn failing_release_once(mut self, error: &str) -> Self {
             self.release_error = Some(error.to_owned());
+            self
+        }
+
+        fn failing_owned_release_at(mut self, attempt: usize, error: &str) -> Self {
+            self.owned_release_failure = Some((attempt, error.to_owned()));
             self
         }
 
@@ -11363,6 +11692,14 @@ mod tests {
             pad: PadId,
             target_trigger_id: LiveCommandId,
         ) -> Result<LiveCommandId, String> {
+            if let Some((remaining, error)) = self.owned_release_failure.as_mut() {
+                if *remaining == 1 {
+                    let error = error.clone();
+                    self.owned_release_failure = None;
+                    return Err(error);
+                }
+                *remaining -= 1;
+            }
             if let Some(error) = self.release_error.take() {
                 return Err(error);
             }
@@ -11371,6 +11708,32 @@ mod tests {
                 .borrow_mut()
                 .push(AudioCall::TrackedOwnedRelease(pad, target_trigger_id));
             Ok(self.admit_live_id())
+        }
+
+        fn release_owned_live_batch(
+            &mut self,
+            releases: &[(PadId, LiveCommandId)],
+        ) -> Result<Vec<LiveCommandId>, String> {
+            if let Some((attempt, error)) = self.owned_release_failure.as_mut() {
+                if *attempt <= releases.len() {
+                    let error = error.clone();
+                    self.owned_release_failure = None;
+                    return Err(error);
+                }
+                *attempt -= releases.len();
+            }
+            if let Some(error) = self.release_error.take() {
+                return Err(error);
+            }
+            let mut commands = Vec::with_capacity(releases.len());
+            for &(pad, target_trigger_id) in releases {
+                self.calls
+                    .0
+                    .borrow_mut()
+                    .push(AudioCall::TrackedOwnedRelease(pad, target_trigger_id));
+                commands.push(self.admit_live_id());
+            }
+            Ok(commands)
         }
 
         fn install_pattern(
@@ -11595,6 +11958,16 @@ mod tests {
             self.controller
                 .borrow_mut()
                 .release_owned_live_tracked(pad, target_trigger_id)
+                .map_err(|error| error.to_string())
+        }
+
+        fn release_owned_live_batch(
+            &mut self,
+            releases: &[(PadId, LiveCommandId)],
+        ) -> Result<Vec<LiveCommandId>, String> {
+            self.controller
+                .borrow_mut()
+                .release_owned_live_batch(releases)
                 .map_err(|error| error.to_string())
         }
 
@@ -18020,6 +18393,483 @@ mod tests {
                 AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
                 AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(2)),
             ]
+        );
+    }
+
+    #[test]
+    fn midi_channel_transaction_releases_rejected_owners_before_one_project_commit() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(2, 36, 127));
+        let revision = app.project_revision();
+
+        app.update_midi_channel(MidiChannelFilter::Channel(midi_channel(1)))
+            .unwrap();
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+            ]
+        );
+        assert_eq!(
+            app.midi_settings.channel(),
+            MidiChannelFilter::Channel(midi_channel(1))
+        );
+        assert_eq!(app.midi_owned_pads[midi_owner_index(2, 36)], None);
+        assert_eq!(app.project_revision(), revision + 1);
+    }
+
+    #[test]
+    fn midi_settings_release_failure_preserves_settings_revision_and_exact_owner() {
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(2, 36, 127));
+        let before = app.midi_settings;
+        let revision = app.project_revision();
+
+        assert_eq!(
+            app.update_midi_channel(MidiChannelFilter::Channel(midi_channel(1))),
+            Err("release queue full".to_owned())
+        );
+
+        assert_eq!(app.midi_settings, before);
+        assert_eq!(app.project_revision(), revision);
+        assert_eq!(
+            app.midi_owned_pads[midi_owner_index(2, 36)].map(|owner| owner.pad),
+            Some(pad(0, 0))
+        );
+    }
+
+    #[test]
+    fn midi_settings_second_release_failure_is_collectively_atomic_for_audio_app_and_pattern() {
+        let audio =
+            FakeAudio::ready(48_000, 2).failing_owned_release_at(2, "second release queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.patterns
+            .start_recording(TransportStamp {
+                slot: PatternSlotId::new(0).unwrap(),
+                generation: 0,
+                origin: 0,
+                loop_frames: 96_000,
+            })
+            .unwrap();
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.apply_midi_event(midi_on(2, 37, 127));
+        calls.clear();
+        let before_settings = app.midi_settings;
+        let before_revision = app.project_revision();
+        let before_pattern = app.patterns.selected_pattern().events().to_vec();
+
+        assert_eq!(
+            app.update_midi_channel(MidiChannelFilter::Channel(midi_channel(1))),
+            Err("second release queue full".to_owned())
+        );
+
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert_eq!(app.midi_settings, before_settings);
+        assert_eq!(app.project_revision(), before_revision);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        assert!(app.midi_owned_pads[midi_owner_index(2, 37)].is_some());
+        assert_eq!(app.patterns.selected_pattern().events(), before_pattern);
+    }
+
+    #[test]
+    fn midi_settings_revision_exhaustion_prevents_audio_and_domain_mutation() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(2, 36, 127));
+        calls.clear();
+        app.project_session
+            .set_current_revision_for_test(crate::MAX_PROJECT_REVISION);
+        let before = app.midi_settings;
+
+        assert_eq!(
+            app.update_midi_channel(MidiChannelFilter::Channel(midi_channel(1))),
+            Err("project revision is exhausted".to_owned())
+        );
+
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+        assert_eq!(app.midi_settings, before);
+        assert_eq!(app.project_revision(), crate::MAX_PROJECT_REVISION);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+    }
+
+    #[test]
+    fn midi_unmap_reset_and_channel_noops_have_exact_revision_counts() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        assert!(app.select_pad(3));
+        let initial = app.project_revision();
+
+        app.update_midi_channel(MidiChannelFilter::Omni).unwrap();
+        assert_eq!(app.project_revision(), initial);
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+
+        app.unmap_selected_midi().unwrap();
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(3),
+            Ok(None)
+        );
+        assert_eq!(app.project_revision(), initial + 1);
+        app.unmap_selected_midi().unwrap();
+        assert_eq!(app.project_revision(), initial + 1);
+
+        app.reset_active_midi_bank().unwrap();
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(3),
+            Ok(Some(midi_note(39)))
+        );
+        assert_eq!(app.project_revision(), initial + 2);
+        app.reset_active_midi_bank().unwrap();
+        assert_eq!(app.project_revision(), initial + 2);
+        assert_eq!(calls.snapshot(), Vec::<AudioCall>::new());
+    }
+
+    #[test]
+    fn midi_settings_palette_commands_route_to_transactional_app_reducers() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        assert!(app.select_pad(3));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-channel 2".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.midi_settings.channel(),
+            MidiChannelFilter::Channel(midi_channel(2))
+        );
+        assert_eq!(app.project_revision(), 1);
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-learn".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.midi_learn_target(), Some(pad(0, 3)));
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-unmap".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(3),
+            Ok(None)
+        );
+        assert_eq!(app.project_revision(), 2);
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-reset-bank".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(3),
+            Ok(Some(midi_note(39)))
+        );
+        assert_eq!(app.project_revision(), 3);
+    }
+
+    #[test]
+    fn midi_port_commands_control_the_runtime_service_without_project_revisions() {
+        let (service, state) = fake_midi_service([("a", "Keys"), ("b", "Pads")]);
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        let revision = app.project_revision();
+
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-ports".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status().contains("#0 Keys"));
+        assert!(app.status().contains("#1 Pads"));
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-connect 0".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.arm_midi_learn();
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-connect 1".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.borrow().connected, ["a", "b"]);
+        assert_eq!(state.borrow().closed, 1);
+        assert_eq!(app.midi_learn_target(), None);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_none());
+
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.arm_midi_learn();
+        app.open_palette();
+        app.apply_terminal_event(Event::Paste("midi-disconnect".to_owned()));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(state.borrow().closed, 2);
+        assert_eq!(app.midi_learn_target(), None);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_none());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(3)),
+            ]
+        );
+        assert_eq!(app.project_revision(), revision);
+    }
+
+    #[test]
+    fn midi_device_disappearance_cancels_learn_and_releases_held_owners() {
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        let now = Instant::now();
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.arm_midi_learn();
+        let revision = app.project_revision();
+        state.borrow_mut().ports.clear();
+
+        assert!(app.maintain_midi_service(now + Duration::from_secs(1)));
+
+        assert_eq!(state.borrow().closed, 1);
+        assert_eq!(app.midi_learn_target(), None);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_none());
+        assert!(app.status().contains("MIDI port disappeared: Keys"));
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+            ]
+        );
+        assert_eq!(app.project_revision(), revision);
+    }
+
+    #[test]
+    fn midi_reconnect_retries_owner_retained_after_disappearance_release_failure() {
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        let now = Instant::now();
+        service.startup(now).unwrap();
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.apply_midi_event(midi_on(2, 36, 127));
+        state.borrow_mut().ports.clear();
+
+        assert!(app.maintain_midi_service(now + Duration::from_secs(1)));
+        assert!(
+            app.status()
+                .contains("held-note release failed: release queue full")
+        );
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        assert_eq!(state.borrow().closed, 1);
+
+        state.borrow_mut().ports.push(MidiBackendPort {
+            backend_id: "a".to_owned(),
+            name: "Keys".to_owned(),
+        });
+        app.list_midi_ports().unwrap();
+        app.connect_midi_port(0).unwrap();
+
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_none());
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::TrackedTrigger(pad(0, 0), 1.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+            ]
+        );
+        assert_eq!(
+            app.midi_service
+                .as_ref()
+                .and_then(MidiService::connected_port)
+                .map(|port| port.backend_id()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn midi_replacement_release_failure_preserves_old_connection_owners_and_learn_for_retry() {
+        let (service, state) = fake_midi_service([("a", "Keys"), ("b", "Pads")]);
+        let audio = FakeAudio::ready(48_000, 2).failing_release_once("release queue full");
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.list_midi_ports().unwrap();
+        app.connect_midi_port(0).unwrap();
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.arm_midi_learn();
+        let revision = app.project_revision();
+
+        assert_eq!(
+            app.connect_midi_port(1),
+            Err("release queue full".to_owned())
+        );
+
+        assert_eq!(
+            app.midi_service
+                .as_ref()
+                .and_then(MidiService::connected_port)
+                .map(|port| port.backend_id()),
+            Some("a")
+        );
+        assert_eq!(state.borrow().closed, 1);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        assert_eq!(app.midi_learn_target(), Some(pad(0, 0)));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedTrigger(pad(0, 0), 1.0)]
+        );
+        assert_eq!(app.project_revision(), revision);
+
+        app.connect_midi_port(1).unwrap();
+        assert_eq!(
+            app.midi_service
+                .as_ref()
+                .and_then(MidiService::connected_port)
+                .map(|port| port.backend_id()),
+            Some("b")
+        );
+        assert_eq!(state.borrow().closed, 2);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_none());
+        assert_eq!(app.midi_learn_target(), None);
+    }
+
+    #[test]
+    fn midi_failed_replacement_preserves_healthy_connection_owners_and_learn() {
+        let (service, state) = fake_midi_service([("a", "Keys"), ("b", "Pads")]);
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio_and_midi(Box::new(audio), service);
+        app.list_midi_ports().unwrap();
+        app.connect_midi_port(0).unwrap();
+        app.apply_midi_event(midi_on(2, 36, 127));
+        app.arm_midi_learn();
+        state.borrow_mut().connect_error_for = Some("b".to_owned());
+        let revision = app.project_revision();
+
+        assert_eq!(
+            app.connect_midi_port(1),
+            Err("could not connect MIDI input: candidate refused".to_owned())
+        );
+
+        assert_eq!(
+            app.midi_service
+                .as_ref()
+                .and_then(MidiService::connected_port)
+                .map(|port| port.backend_id()),
+            Some("a")
+        );
+        assert_eq!(state.borrow().closed, 0);
+        assert!(app.midi_owned_pads[midi_owner_index(2, 36)].is_some());
+        assert_eq!(app.midi_learn_target(), Some(pad(0, 0)));
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedTrigger(pad(0, 0), 1.0)]
+        );
+        assert_eq!(app.project_revision(), revision);
+    }
+
+    #[test]
+    fn app_drops_midi_callback_ownership_before_audio() {
+        let lifecycle = Rc::new(RefCell::new(Vec::new()));
+        let (mut service, state) = fake_midi_service([("a", "Keys")]);
+        state.borrow_mut().lifecycle = Some(Rc::clone(&lifecycle));
+        service.startup(Instant::now()).unwrap();
+        let audio = FakeAudio::ready(48_000, 2).with_shutdown_log(Rc::clone(&lifecycle));
+
+        drop(App::with_audio_and_midi(Box::new(audio), service));
+
+        assert_eq!(*lifecycle.borrow(), ["close-midi", "drop-audio"]);
+    }
+
+    #[test]
+    fn midi_learn_escape_cancels_the_captured_target_without_mutating_the_project() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        assert!(app.select_pad(5));
+        let revision = app.project_revision();
+        app.arm_midi_learn();
+        assert_eq!(app.midi_learn_target(), Some(pad(0, 5)));
+
+        app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.midi_learn_target(), None);
+        assert_eq!(app.project_revision(), revision);
+    }
+
+    #[test]
+    fn midi_learn_is_canceled_when_project_open_is_admitted() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        assert!(app.select_pad(7));
+        app.arm_midi_learn();
+
+        app.request_open_project("next-project").unwrap();
+
+        assert_eq!(app.midi_learn_target(), None);
+    }
+
+    #[test]
+    fn midi_learn_is_canceled_when_save_or_save_as_is_admitted() {
+        let mut save = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        name_project(&mut save, "project-a", Instant::now());
+        save.arm_midi_learn();
+
+        save.request_save().unwrap();
+
+        assert_eq!(save.midi_learn_target(), None);
+
+        let mut save_as = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        save_as.arm_midi_learn();
+
+        save_as.request_save_as("project-b").unwrap();
+
+        assert_eq!(save_as.midi_learn_target(), None);
+    }
+
+    #[test]
+    fn midi_learn_is_canceled_on_audio_device_loss() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+        app.arm_midi_learn();
+
+        app.fail_audio("device disappeared".to_owned());
+
+        assert_eq!(app.midi_learn_target(), None);
+    }
+
+    #[test]
+    fn midi_learn_swaps_the_captured_pad_releases_displaced_owner_and_performs_once() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        app.apply_midi_event(midi_on(1, 36, 64));
+        assert!(app.select_pad(5));
+        app.arm_midi_learn();
+        let revision = app.project_revision();
+
+        app.apply_midi_event(midi_on(1, 36, 96));
+
+        assert_eq!(
+            calls.snapshot(),
+            vec![
+                AudioCall::TrackedTrigger(pad(0, 0), f32::from(64_u8) / 127.0),
+                AudioCall::TrackedOwnedRelease(pad(0, 0), midi_command(1)),
+                AudioCall::TrackedTrigger(pad(0, 5), f32::from(96_u8) / 127.0),
+            ]
+        );
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(5),
+            Ok(Some(midi_note(36)))
+        );
+        assert_eq!(
+            app.midi_settings.bank(BankId::new(0).unwrap()).note(0),
+            Ok(Some(midi_note(41)))
+        );
+        assert_eq!(app.project_revision(), revision + 1);
+        assert_eq!(app.midi_learn_target(), None);
+        assert_eq!(app.selected_pad(), 5);
+        assert_eq!(
+            app.midi_owned_pads[midi_owner_index(1, 36)].map(|owner| owner.pad),
+            Some(pad(0, 5))
         );
     }
 

@@ -330,6 +330,18 @@ impl OfflineFrameSink for CancellingSink<'_> {
     }
 }
 
+struct ExactErrorSink {
+    error: OfflineExportError,
+    attempts: Vec<usize>,
+}
+
+impl OfflineFrameSink for ExactErrorSink {
+    fn write_frames(&mut self, frames: &[[f32; 2]]) -> Result<(), OfflineExportError> {
+        self.attempts.push(frames.len());
+        Err(self.error.clone())
+    }
+}
+
 #[test]
 fn renderer_honors_cancellation_before_setup_and_between_chunks() {
     let (snapshot, staged) = fixture(false);
@@ -351,6 +363,22 @@ fn renderer_honors_cancellation_before_setup_and_between_chunks() {
         Err(OfflineExportError::Cancelled)
     );
     assert_eq!(sink.writes, 1);
+}
+
+#[test]
+fn renderer_preserves_the_exact_sink_error_and_stops_after_one_attempted_write() {
+    let (snapshot, staged) = fixture(false);
+    let expected = OfflineExportError::Encode(PathBuf::from("sentinel-render-error.wav"));
+    let mut sink = ExactErrorSink {
+        error: expected.clone(),
+        attempts: Vec::new(),
+    };
+
+    assert_eq!(
+        render_offline(&snapshot, &staged, &mut sink, &AtomicBool::new(false),),
+        Err(expected)
+    );
+    assert_eq!(sink.attempts, vec![EXPORT_CHUNK_FRAMES]);
 }
 
 #[test]

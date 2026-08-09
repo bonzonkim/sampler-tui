@@ -485,6 +485,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rejects_a_referenced_descriptor_without_a_source_path() {
+        let slot = PatternSlotId::new(0).unwrap();
+        let mut committed = descriptor(pad(0));
+        committed.source_path = PathBuf::new();
+        assert_eq!(
+            OfflineExportSnapshot::new(
+                ProjectId::from_bytes([1; 16]),
+                7,
+                slot,
+                pattern(slot, Some(pad(0))),
+                vec![committed],
+                MasterMixSettings::default(),
+                EXPORT_SAMPLE_RATE,
+            ),
+            Err(OfflineExportError::MissingPadSource { pad: pad(0) })
+        );
+    }
+
+    #[test]
     fn snapshot_rejects_duplicate_committed_pad_descriptors() {
         let slot = PatternSlotId::new(0).unwrap();
         assert_eq!(

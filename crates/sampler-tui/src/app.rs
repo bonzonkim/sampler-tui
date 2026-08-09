@@ -9592,7 +9592,7 @@ impl App {
             }
             PaletteCommand::Export(_) => {
                 self.overlay = None;
-                self.status = "Offline export renderer is not available".to_owned();
+                self.status = crate::OfflineExportError::RendererUnavailable.to_string();
             }
             PaletteCommand::Bank(bank) => {
                 if self.editor.is_dirty() {

@@ -552,6 +552,18 @@ mod tests {
     }
 
     #[test]
+    fn export_palette_rejects_unbalanced_or_compound_quoted_paths() {
+        for input in [
+            "export \"mix.wav",
+            "export 'mix.wav",
+            "export \"mix.wav\" trailing",
+            "export \"mix.wav\" \"other.wav\"",
+        ] {
+            assert!(parse_palette(input).is_err(), "accepted invalid {input:?}");
+        }
+    }
+
+    #[test]
     fn commands_are_strict_and_actionable() {
         assert_eq!(
             parse_palette("bank J"),

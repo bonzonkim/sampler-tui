@@ -8,8 +8,8 @@ use std::{
 use rustix::fs::{FileType as RustixFileType, FlockOperation, Mode, OFlags};
 use sampler_audio::{EncodedAudioFormat, probe_shared_audio_format};
 use sampler_core::{
-    AssetDigest, LegacyProjectDocument, PadId, PadSettings, ParsedProjectDocument, ProjectDocument,
-    ProjectId, ProjectPattern, SampleEditRecipe,
+    AssetDigest, LegacyProjectDocument, MasterMixSettings, PadId, PadMixSettings, PadSettings,
+    ParsedProjectDocument, ProjectDocument, ProjectId, ProjectPattern, SampleEditRecipe,
 };
 use sha2::{Digest, Sha256};
 
@@ -677,6 +677,7 @@ pub struct ProjectSaveSnapshot {
     pub project_id: ProjectId,
     pub name: String,
     pub revision: u64,
+    pub master_mix: MasterMixSettings,
     pub pads: Vec<ProjectSavePad>,
     pub patterns: Vec<ProjectPattern>,
 }
@@ -688,6 +689,7 @@ pub struct ProjectSavePad {
     pub source_generation: u64,
     pub fingerprint: SourceFingerprint,
     pub settings: PadSettings,
+    pub mix: PadMixSettings,
     pub recipe: SampleEditRecipe,
 }
 
@@ -888,6 +890,33 @@ impl ProjectStore {
     where
         F: FnMut(AtomicWritePoint) -> Option<io::ErrorKind>,
     {
+        let document_pads = request
+            .snapshot
+            .pads
+            .iter()
+            .map(|pad| {
+                sampler_core::ProjectPad::new(
+                    pad.pad,
+                    format!(
+                        "audio/{}.{}",
+                        pad.fingerprint.digest,
+                        pad.fingerprint.extension.as_str()
+                    ),
+                    pad.fingerprint.digest,
+                    pad.settings,
+                    pad.mix,
+                    pad.recipe,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let document = ProjectDocument::new_v3(
+            request.snapshot.project_id,
+            request.snapshot.name.clone(),
+            request.snapshot.revision,
+            document_pads,
+            request.snapshot.patterns.clone(),
+            request.snapshot.master_mix,
+        )?;
         let directory = prepare_project_directory(
             &request.directory,
             request.save_as,
@@ -909,7 +938,6 @@ impl ProjectStore {
         }
         let directory = project.path.clone();
         let audio_directory = project.ensure_audio_directory()?;
-        let mut document_pads = Vec::with_capacity(request.snapshot.pads.len());
         let mut mappings = Vec::with_capacity(request.snapshot.pads.len());
 
         for pad in &request.snapshot.pads {
@@ -945,14 +973,6 @@ impl ProjectStore {
                 &audio_directory,
                 &mut hook,
             )?;
-            document_pads.push(sampler_core::ProjectPad::new(
-                pad.pad,
-                relative_path,
-                pad.fingerprint.digest,
-                pad.settings,
-                sampler_core::PadMixSettings::default(),
-                pad.recipe,
-            )?);
             mappings.push(ProjectAssetMapping {
                 pad: pad.pad,
                 source_generation: pad.source_generation,
@@ -961,14 +981,6 @@ impl ProjectStore {
             });
         }
 
-        let document = ProjectDocument::new_v3(
-            request.snapshot.project_id,
-            request.snapshot.name,
-            request.snapshot.revision,
-            document_pads,
-            request.snapshot.patterns,
-            sampler_core::MasterMixSettings::default(),
-        )?;
         let canonical_toml = document.to_toml()?;
         let destination = directory.join(match request.kind {
             SaveKind::Explicit => "project.toml",
@@ -1915,12 +1927,14 @@ mod tests {
                     project_id: ProjectId::from_bytes([0x41; 16]),
                     name: "fixture".to_owned(),
                     revision,
+                    master_mix: sampler_core::MasterMixSettings::default(),
                     pads: vec![ProjectSavePad {
                         pad: PadId::first(),
                         source_path: self.source.clone(),
                         source_generation: 7,
                         fingerprint,
                         settings: PadSettings::default(),
+                        mix: sampler_core::PadMixSettings::default(),
                         recipe: SampleEditRecipe::identity(),
                     }],
                     patterns: Vec::<ProjectPattern>::new(),

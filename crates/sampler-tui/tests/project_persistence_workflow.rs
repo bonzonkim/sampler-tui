@@ -16,7 +16,8 @@ use sampler_audio::{
     PatternSwitch, SampleBuffer, SampleSlot, Telemetry, audio_channels_with_test_capacities,
 };
 use sampler_core::{
-    BankId, PadId, PadSettings, PatternSlotId, PatternSnapshot, PlaybackMode, SAMPLE_PHASE_SCALE,
+    BankId, ChokeGroup, DelaySettings, MasterMixSettings, PadId, PadMixSettings, PadSettings,
+    PatternSlotId, PatternSnapshot, PlaybackMode, ReverbSettings, SAMPLE_PHASE_SCALE,
     SampleEditRecipe,
 };
 use sampler_tui::{
@@ -446,6 +447,43 @@ fn pad(index: u8) -> PadId {
     PadId::new(BankId::new(0).unwrap(), index).unwrap()
 }
 
+fn explicit_pad_mix() -> PadMixSettings {
+    PadMixSettings::new(true, 0.25, 0.75).unwrap()
+}
+
+fn explicit_master_mix() -> MasterMixSettings {
+    MasterMixSettings::new(
+        -6.0,
+        DelaySettings::new(true, 320, 0.5, -9.0).unwrap(),
+        ReverbSettings::new(true, 0.75, 0.25, -8.0).unwrap(),
+    )
+    .unwrap()
+}
+
+fn recovery_pad_mix() -> PadMixSettings {
+    PadMixSettings::new(false, 0.875, 0.125).unwrap()
+}
+
+fn recovery_master_mix() -> MasterMixSettings {
+    MasterMixSettings::new(
+        3.0,
+        DelaySettings::new(true, 95, 0.75, -4.0).unwrap(),
+        ReverbSettings::new(true, 0.9, 0.6, -3.0).unwrap(),
+    )
+    .unwrap()
+}
+
+fn render_live_hit_bits(harness: &mut Harness, pad: PadId) -> Vec<[u32; 2]> {
+    harness
+        .app
+        .apply(InputAction::PadPress(pad.index() as usize));
+    let mut frames = Vec::new();
+    harness.engine.render_frames(65, |frame| {
+        frames.push([frame[0].to_bits(), frame[1].to_bits()]);
+    });
+    frames
+}
+
 fn copy_project(source: &Path, destination: &Path) {
     fs::create_dir(destination).unwrap();
     fs::copy(
@@ -480,7 +518,7 @@ fn assert_failed_open_preserves(harness: &mut Harness, directory: &Path, now: In
 }
 
 #[test]
-fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
+fn mixer_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     let fixture = FixtureTree::new();
     let wav = fixture.write_wav("asymmetric.wav");
     let flac = fixture.write_flac("asymmetric.flac");
@@ -533,10 +571,30 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     ];
     let preview_a = source.app.pad(pad(0)).preview;
     let preview_b = source.app.pad(pad(7)).preview;
-    let settings_a = PadSettings::new(PlaybackMode::Gate, -3.0, -0.25, -7.0, None).unwrap();
-    let settings_b = PadSettings::new(PlaybackMode::Loop, -6.0, 0.5, 12.0, None).unwrap();
+    let settings_a = PadSettings::new(
+        PlaybackMode::Gate,
+        -3.0,
+        -0.25,
+        -7.0,
+        Some(ChokeGroup::new(2).unwrap()),
+    )
+    .unwrap();
+    let settings_b = PadSettings::new(
+        PlaybackMode::Loop,
+        -6.0,
+        0.5,
+        12.0,
+        Some(ChokeGroup::new(7).unwrap()),
+    )
+    .unwrap();
+    let mix_a = explicit_pad_mix();
+    let mix_b = PadMixSettings::new(false, 0.625, 0.375).unwrap();
+    let master_mix = explicit_master_mix();
     source.app.update_pad_settings(pad(0), settings_a).unwrap();
     source.app.update_pad_settings(pad(7), settings_b).unwrap();
+    source.app.update_pad_mix(pad(0), mix_a).unwrap();
+    source.app.update_pad_mix(pad(7), mix_b).unwrap();
+    source.app.update_master_mix(master_mix).unwrap();
     source.palette("pattern 1");
     source.palette("tempo 137");
     source.palette("swing 63");
@@ -570,6 +628,25 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     let document = probe.explicit.unwrap().unwrap();
     assert_eq!(document.pads.len(), 2);
     assert_eq!(document.patterns.len(), 16);
+    assert_eq!(document.master_mix, master_mix);
+    assert_eq!(
+        document
+            .pads
+            .iter()
+            .find(|saved_pad| saved_pad.pad == pad(0))
+            .unwrap()
+            .mix,
+        mix_a
+    );
+    assert_eq!(
+        document
+            .pads
+            .iter()
+            .find(|saved_pad| saved_pad.pad == pad(7))
+            .unwrap()
+            .mix,
+        mix_b
+    );
     for saved_pad in &document.pads {
         assert!(saved_pad.audio_path.starts_with("audio/"));
         assert!(
@@ -607,6 +684,10 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
     assert_eq!(after_open.patterns, editable_before_save.patterns);
     assert_eq!(reopened.app.pad(pad(0)).settings, settings_a);
     assert_eq!(reopened.app.pad(pad(7)).settings, settings_b);
+    assert_eq!(reopened.app.pad_mix(pad(0)), mix_a);
+    assert_eq!(reopened.app.pad_mix(pad(7)), mix_b);
+    assert_eq!(reopened.app.master_mix(), master_mix);
+    assert_eq!(after_open.master_mix, master_mix);
     assert_eq!(reopened.app.committed_sample_recipe(pad(0)), Some(recipe_a));
     assert_eq!(reopened.app.committed_sample_recipe(pad(7)), Some(recipe_b));
     let reopened_a = reopened.app.pad(pad(0)).sample.as_ref().unwrap();
@@ -664,7 +745,7 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
         .engine
         .render_frames(65, |frame| wav_output = frame);
     assert!(reopened.engine.executed_triggers() > triggers);
-    assert!(wav_output[0] < 0.0 && wav_output[1] > 0.0);
+    assert_eq!(wav_output, [0.0; 2], "persisted mute must silence pad zero");
     reopened.app.apply(InputAction::PadRelease(0));
     reopened.engine.render_frames(65, |_| {});
     let triggers = reopened.engine.executed_triggers();
@@ -684,7 +765,7 @@ fn real_save_move_and_fresh_open_preserve_the_portable_project_tuple() {
 }
 
 #[test]
-fn real_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_truth() {
+fn mixer_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_truth() {
     let fixture = FixtureTree::new();
     let wav = fixture.write_wav("source.wav");
     let source_bytes = fs::read(&wav).unwrap();
@@ -692,9 +773,48 @@ fn real_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_tr
     let now = Instant::now();
     let mut source = Harness::new();
     source.load(pad(0), &wav);
+    source
+        .app
+        .update_pad_settings(
+            pad(0),
+            PadSettings::new(
+                PlaybackMode::OneShot,
+                -2.0,
+                -0.25,
+                0.0,
+                Some(ChokeGroup::new(3).unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    source
+        .app
+        .update_pad_mix(pad(0), explicit_pad_mix())
+        .unwrap();
+    source.app.update_master_mix(explicit_master_mix()).unwrap();
     source.save_as(&project, now);
+    let explicit_snapshot = source.app.project_snapshot().unwrap();
     let explicit_bytes = fs::read(project.join("project.toml")).unwrap();
 
+    source
+        .app
+        .update_pad_settings(
+            pad(0),
+            PadSettings::new(
+                PlaybackMode::Loop,
+                -5.0,
+                0.5,
+                4.0,
+                Some(ChokeGroup::new(9).unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    source
+        .app
+        .update_pad_mix(pad(0), recovery_pad_mix())
+        .unwrap();
+    source.app.update_master_mix(recovery_master_mix()).unwrap();
     source.palette("tempo 139");
     source.palette("tempo 144");
     source.palette("tempo 149");
@@ -712,6 +832,12 @@ fn real_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_tr
         restored.app.project_snapshot().unwrap().patterns,
         recovery_snapshot.patterns
     );
+    assert_eq!(restored.app.pad_mix(pad(0)), recovery_pad_mix());
+    assert_eq!(restored.app.master_mix(), recovery_master_mix());
+    assert_eq!(
+        restored.app.project_snapshot().unwrap().revision,
+        recovery_snapshot.revision
+    );
     assert!(restored.app.project_header().contains("MODIFIED"));
     drop(restored);
 
@@ -727,6 +853,12 @@ fn real_autosave_restore_discard_and_failed_open_preserve_explicit_or_running_tr
             .unwrap()
             .unwrap()
             .patterns
+    );
+    assert_eq!(discarded.app.pad_mix(pad(0)), explicit_pad_mix());
+    assert_eq!(discarded.app.master_mix(), explicit_master_mix());
+    assert_eq!(
+        discarded.app.project_snapshot().unwrap().revision,
+        explicit_snapshot.revision
     );
 
     let saved_document = ProjectStore
@@ -841,7 +973,71 @@ index = 0
 }
 
 #[test]
-fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
+fn literal_schema_v2_opens_with_exact_dry_mixer_defaults_and_unchanged_render() {
+    let fixture = FixtureTree::new();
+    let source_path = fixture.write_wav("schema-v2-source.wav");
+    let project = fixture.path("schema-v2-project");
+    let now = Instant::now();
+
+    let mut source = Harness::new();
+    source.load(pad(0), &source_path);
+    let dry_before = render_live_hit_bits(&mut source, pad(0));
+    source.save_as(&project, now);
+    let saved = ProjectStore
+        .probe(&project)
+        .unwrap()
+        .explicit
+        .unwrap()
+        .unwrap();
+    let saved_pad = &saved.pads[0];
+    let literal_v2 = format!(
+        r#"schema_version = 2
+project_id = "{}"
+name = "literal schema v2"
+revision = 17
+patterns = []
+
+[[pads]]
+audio_path = "{}"
+asset_digest = "{}"
+
+[pads.pad]
+bank = 0
+index = 0
+
+[pads.settings]
+mode = "OneShot"
+gain_db = 0.0
+pan = 0.0
+pitch_semitones = 0.0
+
+[pads.recipe]
+start_phase = 0
+end_phase = 4294967296
+reversed = false
+normalize = false
+"#,
+        saved.project_id, saved_pad.audio_path, saved_pad.asset_digest
+    );
+    fs::write(project.join("project.toml"), &literal_v2).unwrap();
+
+    let mut opened = Harness::new();
+    opened.open(&project, None, now);
+    assert_eq!(opened.app.pad_mix(pad(0)), PadMixSettings::default());
+    assert_eq!(opened.app.master_mix(), MasterMixSettings::default());
+    let snapshot = opened.app.project_snapshot().unwrap();
+    assert_eq!(snapshot.pads[0].mix, PadMixSettings::default());
+    assert_eq!(snapshot.master_mix, MasterMixSettings::default());
+    assert_eq!(snapshot.revision, 17);
+    assert_eq!(render_live_hit_bits(&mut opened, pad(0)), dry_before);
+    assert_eq!(
+        fs::read_to_string(project.join("project.toml")).unwrap(),
+        literal_v2
+    );
+}
+
+#[test]
+fn mixer_project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
     let fixture = FixtureTree::new();
     let wav = fixture.write_wav("source.wav");
     let project = fixture.path("backpressure-project");
@@ -851,6 +1047,12 @@ fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
     source.save_as(&project, now);
 
     let mut target = Harness::new();
+    target
+        .app
+        .update_pad_mix(pad(0), recovery_pad_mix())
+        .unwrap();
+    target.app.update_master_mix(recovery_master_mix()).unwrap();
+    target.engine.render_frames(0, |_| {});
     let old = target.app.project_snapshot().unwrap();
     target.app.request_open_project(&project).unwrap();
     assert_eq!(target.dispatch_queued(), 1);
@@ -880,6 +1082,8 @@ fn project_open_install_backpressure_keeps_the_old_tuple_until_retry_commits() {
     assert!(target.app.status().contains("queue is full"));
     assert_eq!(target.app.project_open_stage().unwrap(), &blocked_progress);
     assert_eq!(target.app.project_snapshot().unwrap(), old);
+    assert_eq!(target.app.pad_mix(pad(0)), recovery_pad_mix());
+    assert_eq!(target.app.master_mix(), recovery_master_mix());
     assert!(target.app.pad(pad(0)).sample.is_none());
 
     target.engine.render_frames(0, |_| {});

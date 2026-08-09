@@ -73,6 +73,7 @@ pub enum ProjectOpenError {
     UnresolvedState(String),
     Probe(ProjectStoreError),
     RecoveryDiscard(ProjectStoreError),
+    InvalidDocument(String),
     InvalidPatterns(String),
     Stage {
         pad: PadId,
@@ -103,6 +104,9 @@ impl std::fmt::Display for ProjectOpenError {
             Self::Probe(error) => write!(formatter, "project probe failed: {error}"),
             Self::RecoveryDiscard(error) => {
                 write!(formatter, "recovery discard failed: {error}")
+            }
+            Self::InvalidDocument(message) => {
+                write!(formatter, "project document is invalid: {message}")
             }
             Self::InvalidPatterns(message) => {
                 write!(formatter, "project patterns are invalid: {message}")

@@ -3801,6 +3801,7 @@ enum InFlightProjectOperation {
 struct StagedProjectPad {
     path: PathBuf,
     settings: PadSettings,
+    mix: PadMixSettings,
     loaded: crate::LoadedSample,
 }
 
@@ -6180,7 +6181,7 @@ impl App {
                             Err(error) => self.status = error,
                         },
                         ProjectAdmission::Master => {
-                            match audio.update_master_mix(MasterMixSettings::default()) {
+                            match audio.update_master_mix(candidate.document.master_mix) {
                                 Ok(()) => {
                                     candidate.progress.admitted_actions += 1;
                                     candidate.admission = ProjectAdmission::Pads(0);
@@ -6198,7 +6199,7 @@ impl App {
                                             pad,
                                             Arc::clone(&staged.loaded.rendered),
                                             staged.settings,
-                                            PadMixSettings::default(),
+                                            staged.mix,
                                         )
                                         .map(|_| ())
                                 } else {
@@ -6273,6 +6274,7 @@ impl App {
         let mut pads: [PadView; PAD_VIEW_COUNT] = array::from_fn(|_| PadView::default());
         let mut commits: [SampleCommit; PAD_VIEW_COUNT] =
             array::from_fn(|_| SampleCommit::default());
+        let mut pad_mixes = [PadMixSettings::default(); PAD_VIEW_COUNT];
         for offset in 0..PAD_VIEW_COUNT {
             let Some(staged) = candidate.staged_pads[offset].take() else {
                 continue;
@@ -6280,6 +6282,7 @@ impl App {
             let StagedProjectPad {
                 path,
                 settings,
+                mix,
                 loaded,
             } = *staged;
             let label = path
@@ -6306,6 +6309,7 @@ impl App {
                 rendered_preview: Some(loaded.rendered_preview),
                 managed_capture: None,
             };
+            pad_mixes[offset] = mix;
         }
 
         let dirty_since = candidate.restored_recovery.then_some(now);
@@ -6315,8 +6319,8 @@ impl App {
             candidate.saved_revision
         };
         self.pads = pads;
-        self.pad_mixes = [PadMixSettings::default(); PAD_VIEW_COUNT];
-        self.master_mix = MasterMixSettings::default();
+        self.pad_mixes = pad_mixes;
+        self.master_mix = candidate.document.master_mix;
         self.patterns = candidate.patterns;
         self.project_session = ProjectSession::opened(
             candidate.document.project_id,
@@ -6465,6 +6469,18 @@ impl App {
         let Some((sample_rate, _)) = self.audio_format else {
             return Err(ProjectOpenError::AudioUnavailable);
         };
+        document
+            .master_mix
+            .validate()
+            .map_err(|error| ProjectOpenError::InvalidDocument(error.to_string()))?;
+        for pad in &document.pads {
+            pad.settings
+                .validate()
+                .map_err(|error| ProjectOpenError::InvalidDocument(error.to_string()))?;
+            pad.mix
+                .validate()
+                .map_err(|error| ProjectOpenError::InvalidDocument(error.to_string()))?;
+        }
         let mut patterns = PatternWorkspace::new(sample_rate);
         patterns
             .replace_project_patterns(document.patterns.clone())
@@ -6613,6 +6629,7 @@ impl App {
             return false;
         };
         let expected_settings = expected.settings;
+        let expected_mix = expected.mix;
         let expected_path = candidate.progress.directory.join(&expected.audio_path);
         if candidate.progress.token != token
             || candidate.decode_in_flight != Some((pad, generation))
@@ -6664,6 +6681,7 @@ impl App {
         candidate.staged_pads[pad_offset(pad)] = Some(Box::new(StagedProjectPad {
             path,
             settings: expected_settings,
+            mix: expected_mix,
             loaded,
         }));
         candidate.next_decode += 1;
@@ -6873,6 +6891,7 @@ impl App {
                 source_generation: self.sample_editor.commits[offset].source_generation,
                 fingerprint,
                 settings: self.pads[offset].settings,
+                mix: self.pad_mixes[offset],
                 recipe: self.sample_editor.commits[offset].recipe,
             });
         }
@@ -6884,6 +6903,7 @@ impl App {
             project_id: self.project_session.project_id(),
             name: self.project_session.name().to_owned(),
             revision: self.project_session.current_revision(),
+            master_mix: self.master_mix,
             pads,
             patterns,
         })
@@ -15432,6 +15452,41 @@ mod tests {
             Some(crate::ProjectOpenError::InvalidPatterns(_))
         ));
         assert_eq!(invalid.project_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn project_open_rejects_malformed_mixer_document_before_staging_or_audio_admission() {
+        let audio = FakeAudio::ready(48_000, 2);
+        let calls = audio.call_log();
+        let mut app = App::with_audio(Box::new(audio));
+        let before = app.project_snapshot().unwrap();
+        let token = app.request_open_project("project-invalid-mixer").unwrap();
+        app.take_worker_requests();
+        let mut document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x9a; 16]),
+            "Invalid mixer",
+            7,
+            vec![project_open_pad(pad(0, 0), PadSettings::default())],
+        );
+        document.master_mix.gain_db = f32::NAN;
+
+        assert!(app.apply_worker_result(WorkerResult::ProjectProbed {
+            token,
+            directory: "project-invalid-mixer".into(),
+            result: Ok(crate::ProjectProbe {
+                directory: "project-invalid-mixer".into(),
+                explicit: Some(Ok(document)),
+                recovery: None,
+            }),
+        }));
+
+        assert!(matches!(
+            app.project_open_error(),
+            Some(crate::ProjectOpenError::InvalidDocument(_))
+        ));
+        assert_eq!(app.project_snapshot().unwrap(), before);
+        assert!(calls.snapshot().is_empty());
+        assert!(app.take_worker_requests().is_empty());
     }
 
     #[test]

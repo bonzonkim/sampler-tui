@@ -136,10 +136,13 @@ pub enum CaptureState {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureProgressSnapshot {
+    pub token: u64,
     pub frames: usize,
     pub peak: f32,
     pub hard_limit: bool,
 }
+
+const PROGRESS_SNAPSHOT_ATTEMPTS: usize = 3;
 
 impl CaptureState {
     const IDLE: u8 = 0;
@@ -169,6 +172,10 @@ impl CaptureState {
 struct CaptureShared {
     state: AtomicU8,
     failed: AtomicBool,
+    progress_sequence: AtomicUsize,
+    progress_published: AtomicBool,
+    token_low: AtomicU32,
+    token_high: AtomicU32,
     frames: AtomicUsize,
     peak_bits: AtomicU32,
     hard_limit: AtomicBool,
@@ -212,24 +219,45 @@ impl CaptureShared {
         );
     }
 
-    fn reset_progress(&self) {
-        self.frames.store(0, Ordering::Release);
-        self.peak_bits.store(0.0_f32.to_bits(), Ordering::Release);
-        self.hard_limit.store(false, Ordering::Release);
+    fn reset_progress(&self, token: u64) {
+        self.publish_progress(token, 0, 0.0, false);
     }
 
-    fn publish_progress(&self, frames: usize, peak: f32, hard_limit: bool) {
-        self.frames.store(frames, Ordering::Release);
-        self.peak_bits.store(peak.to_bits(), Ordering::Release);
-        self.hard_limit.store(hard_limit, Ordering::Release);
+    fn publish_progress(&self, token: u64, frames: usize, peak: f32, hard_limit: bool) {
+        self.progress_sequence.fetch_add(1, Ordering::AcqRel);
+        self.token_low.store(token as u32, Ordering::Relaxed);
+        self.token_high
+            .store((token >> u32::BITS) as u32, Ordering::Relaxed);
+        self.frames.store(frames, Ordering::Relaxed);
+        self.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+        self.hard_limit.store(hard_limit, Ordering::Relaxed);
+        self.progress_published.store(true, Ordering::Relaxed);
+        self.progress_sequence.fetch_add(1, Ordering::Release);
     }
 
-    fn progress(&self) -> CaptureProgressSnapshot {
-        CaptureProgressSnapshot {
-            frames: self.frames.load(Ordering::Acquire),
-            peak: f32::from_bits(self.peak_bits.load(Ordering::Acquire)),
-            hard_limit: self.hard_limit.load(Ordering::Acquire),
+    fn progress(&self) -> Option<CaptureProgressSnapshot> {
+        for _ in 0..PROGRESS_SNAPSHOT_ATTEMPTS {
+            let before = self.progress_sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                continue;
+            }
+            let published = self.progress_published.load(Ordering::Relaxed);
+            let token_low = self.token_low.load(Ordering::Relaxed);
+            let token_high = self.token_high.load(Ordering::Relaxed);
+            let frames = self.frames.load(Ordering::Relaxed);
+            let peak = f32::from_bits(self.peak_bits.load(Ordering::Relaxed));
+            let hard_limit = self.hard_limit.load(Ordering::Relaxed);
+            let after = self.progress_sequence.load(Ordering::Acquire);
+            if before == after {
+                return published.then_some(CaptureProgressSnapshot {
+                    token: u64::from(token_low) | (u64::from(token_high) << u32::BITS),
+                    frames,
+                    peak,
+                    hard_limit,
+                });
+            }
         }
+        None
     }
 }
 
@@ -301,7 +329,7 @@ impl CaptureController {
         self.shared.state()
     }
 
-    pub fn progress(&self) -> CaptureProgressSnapshot {
+    pub fn progress(&self) -> Option<CaptureProgressSnapshot> {
         self.shared.progress()
     }
 
@@ -369,7 +397,8 @@ impl CaptureCore {
         self.peak = self.peak.max(left.abs()).max(right.abs());
         let frames = buffer.stereo.len() / 2;
         let hard_limit = frames == buffer.max_frames;
-        self.shared.publish_progress(frames, self.peak, hard_limit);
+        self.shared
+            .publish_progress(buffer.token, frames, self.peak, hard_limit);
 
         if hard_limit {
             self.finish_completed(true);
@@ -405,7 +434,12 @@ impl CaptureCore {
         }
         self.active = Some(buffer);
         self.peak = 0.0;
-        self.shared.reset_progress();
+        self.shared.reset_progress(
+            self.active
+                .as_ref()
+                .expect("armed capture remains active")
+                .token,
+        );
         self.set_state(CaptureState::Armed);
     }
 
@@ -531,6 +565,10 @@ pub fn capture_channels(
     let shared = Arc::new(CaptureShared {
         state: AtomicU8::new(CaptureState::IDLE),
         failed: AtomicBool::new(false),
+        progress_sequence: AtomicUsize::new(0),
+        progress_published: AtomicBool::new(false),
+        token_low: AtomicU32::new(0),
+        token_high: AtomicU32::new(0),
         frames: AtomicUsize::new(0),
         peak_bits: AtomicU32::new(0.0_f32.to_bits()),
         hard_limit: AtomicBool::new(false),
@@ -808,29 +846,79 @@ mod tests {
 
         assert_eq!(
             controller.progress(),
-            CaptureProgressSnapshot {
+            Some(CaptureProgressSnapshot {
+                token: 61,
                 frames: 0,
                 peak: 0.0,
                 hard_limit: false,
-            }
+            })
         );
         core.push_frame([0.25, -0.5]);
         assert_eq!(
             controller.progress(),
-            CaptureProgressSnapshot {
+            Some(CaptureProgressSnapshot {
+                token: 61,
                 frames: 1,
                 peak: 0.5,
                 hard_limit: false,
-            }
+            })
         );
         core.push_frame([1.25, -0.75]);
         assert_eq!(
             controller.progress(),
-            CaptureProgressSnapshot {
+            Some(CaptureProgressSnapshot {
+                token: 61,
                 frames: 2,
                 peak: 1.25,
                 hard_limit: true,
-            }
+            })
         );
+    }
+
+    #[test]
+    fn controller_progress_changes_take_identity_only_after_callback_polls_arm() {
+        let (mut controller, mut core) = capture_channels(4, 2);
+        controller.arm(buffer(71, 1)).unwrap();
+        core.poll_commands();
+        controller.start(71).unwrap();
+        core.poll_commands();
+        core.push_frame([0.25, -0.75]);
+        let CaptureOutcome::Completed(_) = controller.try_next_outcome().unwrap() else {
+            panic!("first hard-limit take must complete");
+        };
+
+        controller.arm(buffer(72, 2)).unwrap();
+        assert_eq!(
+            controller.progress(),
+            Some(CaptureProgressSnapshot {
+                token: 71,
+                frames: 1,
+                peak: 0.75,
+                hard_limit: true,
+            }),
+            "enqueuing Arm must not attribute prior callback progress to the new take",
+        );
+
+        core.poll_commands();
+        assert_eq!(
+            controller.progress(),
+            Some(CaptureProgressSnapshot {
+                token: 72,
+                frames: 0,
+                peak: 0.0,
+                hard_limit: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn controller_progress_returns_none_when_fixed_snapshot_attempts_remain_torn() {
+        let (controller, _core) = capture_channels(1, 1);
+        controller
+            .shared
+            .progress_sequence
+            .store(1, Ordering::Release);
+
+        assert_eq!(controller.progress(), None);
     }
 }

@@ -313,7 +313,7 @@ trait InputSessionLike {
     fn stop_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
     fn cancel_capture(&mut self, token: u64) -> Result<(), CaptureSendFailure>;
     fn capture_status(&mut self) -> Option<CaptureStatus>;
-    fn capture_progress(&mut self) -> CaptureProgressSnapshot;
+    fn capture_progress(&mut self) -> Option<CaptureProgressSnapshot>;
     fn capture_completion(&mut self) -> Option<CaptureOutcome>;
     fn capture_state(&mut self) -> sampler_audio::CaptureState;
     fn poll_error(&mut self) -> Option<String>;
@@ -344,7 +344,7 @@ impl InputSessionLike for InputCaptureSession {
         None
     }
 
-    fn capture_progress(&mut self) -> CaptureProgressSnapshot {
+    fn capture_progress(&mut self) -> Option<CaptureProgressSnapshot> {
         self.controller_mut().progress()
     }
 
@@ -919,7 +919,10 @@ where
                     .filter(|identity| identity.source == CaptureSource::Input)?;
                 let input = self.input.as_mut()?;
                 let state = input.capture_state();
-                let progress = input.capture_progress();
+                let progress = input.capture_progress()?;
+                if progress.token != identity.token {
+                    return None;
+                }
                 Some(CaptureStatus {
                     token: identity.token,
                     source: identity.source,
@@ -1486,6 +1489,8 @@ mod tests {
         sample_rate: u32,
         polls: Rc<Cell<usize>>,
         errors: VecDeque<ControlError>,
+        poll_callback_on_begin: Rc<Cell<bool>>,
+        poll_callback_on_status: Rc<Cell<bool>>,
     }
 
     impl InputSessionLike for FakeInputSession {
@@ -1495,7 +1500,9 @@ mod tests {
 
         fn begin_capture(&mut self, buffer: CaptureBuffer) -> Result<(), CaptureSendFailure> {
             self.controller.inner.arm(buffer)?;
-            self.core.inner.poll_commands();
+            if self.poll_callback_on_begin.get() {
+                self.core.inner.poll_commands();
+            }
             Ok(())
         }
 
@@ -1522,7 +1529,7 @@ mod tests {
             None
         }
 
-        fn capture_progress(&mut self) -> CaptureProgressSnapshot {
+        fn capture_progress(&mut self) -> Option<CaptureProgressSnapshot> {
             self.controller.inner.progress()
         }
 
@@ -1532,6 +1539,9 @@ mod tests {
         }
 
         fn capture_state(&mut self) -> CaptureState {
+            if self.poll_callback_on_status.get() {
+                self.core.inner.poll_commands();
+            }
             self.controller.inner.state()
         }
 
@@ -1563,6 +1573,8 @@ mod tests {
             sample_rate: 44_100,
             polls: Rc::new(Cell::new(0)),
             errors: VecDeque::new(),
+            poll_callback_on_begin: Rc::new(Cell::new(true)),
+            poll_callback_on_status: Rc::new(Cell::new(false)),
         }
     }
 
@@ -1842,6 +1854,53 @@ mod tests {
         assert_eq!(completion.sample_rate, 44_100);
         assert!(maintenance.completion(CaptureSource::Resample).is_none());
         assert_eq!(input_polls.get(), 1);
+    }
+
+    #[test]
+    fn input_status_does_not_attribute_prior_progress_before_callback_polls_new_arm() {
+        let (output, _output_core, _) = FakeSession::capture_ready(48_000);
+        let (input_controller, input_core) = capture_channels(4, 2);
+        let opened_input = fake_input_session(input_controller, input_core, None);
+        let poll_on_begin = Rc::clone(&opened_input.poll_callback_on_begin);
+        let poll_on_status = Rc::clone(&opened_input.poll_callback_on_status);
+        let mut input = Some(opened_input);
+        let mut port = SessionAudioPort::new_with_input_opener(output, move || {
+            Ok(Box::new(input.take().unwrap()) as Box<dyn InputSessionLike>)
+        });
+
+        port.begin_capture(
+            CaptureBuffer::try_new(81, PadId::first(), CaptureSource::Input, 44_100, 1).unwrap(),
+        )
+        .unwrap();
+        port.start_capture(CaptureSource::Input, 81).unwrap();
+        let maintenance = port.poll_capture_maintenance();
+        assert!(maintenance.completion(CaptureSource::Input).is_some());
+
+        poll_on_begin.set(false);
+        port.begin_capture(
+            CaptureBuffer::try_new(82, PadId::first(), CaptureSource::Input, 44_100, 2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            port.capture_status(CaptureSource::Input),
+            None,
+            "the prior callback take must render unavailable during the Arm scheduling window",
+        );
+
+        poll_on_status.set(true);
+        assert_eq!(
+            port.capture_status(CaptureSource::Input),
+            Some(CaptureStatus {
+                token: 82,
+                source: CaptureSource::Input,
+                target: PadId::first(),
+                state: CaptureState::Armed,
+                frames: 0,
+                max_frames: 2,
+                peak: 0.0,
+                hard_limit: false,
+            }),
+        );
     }
 
     #[test]

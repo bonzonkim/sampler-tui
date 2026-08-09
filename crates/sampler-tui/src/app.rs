@@ -74,7 +74,9 @@ mod capture_task7_tests {
     };
     use sampler_core::{BankId, PadId, PadSettings, PatternSnapshot, ProjectId, SampleEditRecipe};
 
-    use super::{App, EDIT_PREVIEW_COLUMNS, PadLoadState, PreviewColumn, ProjectAction};
+    use super::{
+        App, EDIT_PREVIEW_COLUMNS, PadLoadState, PendingProjectAction, PreviewColumn, ProjectAction,
+    };
     use crate::audio::{AudioPort, CaptureCommandFailure, CaptureSupport};
     use crate::capture::{CaptureError, CaptureFailureCause, CapturePhase};
     use crate::capture_store::{ManagedCapture, ManagedCaptureId};
@@ -908,6 +910,18 @@ mod capture_task7_tests {
         ));
 
         app.cancel_capture().unwrap();
+        assert!(Arc::ptr_eq(
+            app.capture_source_pcm.as_ref().unwrap(),
+            &rerender.stereo
+        ));
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert!(app.apply_worker_result(finalized(
+            &rerender,
+            Err(CaptureFinalizeError::Prepare(
+                "discarded after device loss".to_owned(),
+            )),
+        )));
+        assert!(app.maintain_capture());
         assert!(app.capture_source_pcm.is_none());
         assert_eq!(app.capture_session().phase(), None);
         let recovery = app.take_worker_requests();
@@ -1496,6 +1510,350 @@ mod capture_task7_tests {
         app
     }
 
+    struct CaptureLifecycleMatrixFixture {
+        app: App,
+        probe: CaptureProbe,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CaptureLifecycleChoice {
+        Finalize,
+        Discard,
+        Cancel,
+    }
+
+    impl CaptureLifecycleChoice {
+        const fn key(self) -> KeyCode {
+            match self {
+                Self::Finalize => KeyCode::Enter,
+                Self::Discard => KeyCode::Backspace,
+                Self::Cancel => KeyCode::Esc,
+            }
+        }
+    }
+
+    fn capture_lifecycle_matrix_fixture(phase: CapturePhase) -> CaptureLifecycleMatrixFixture {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        install_imported(&mut app, pad(0), "matrix-occupied.wav");
+        app.project_session
+            .mark_explicit_saved(app.project_revision());
+        app.request_capture_with_limit_for_test(CaptureSource::Resample, 8)
+            .unwrap();
+        if phase == CapturePhase::Confirm {
+            return CaptureLifecycleMatrixFixture { app, probe };
+        }
+        app.confirm_capture().unwrap();
+        if phase == CapturePhase::Recording {
+            return CaptureLifecycleMatrixFixture { app, probe };
+        }
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        if phase == CapturePhase::Finalizing {
+            return CaptureLifecycleMatrixFixture { app, probe };
+        }
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        let result = if phase == CapturePhase::Failed {
+            Err(CaptureFinalizeError::Prepare(
+                "matrix worker failure".to_owned(),
+            ))
+        } else {
+            Ok(managed_capture(301, 48_000, b"matrix-ready"))
+        };
+        assert!(app.apply_worker_result(finalized(&request, result)));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(phase));
+        CaptureLifecycleMatrixFixture { app, probe }
+    }
+
+    fn begin_matrix_project_action(app: &mut App, action: ProjectAction) {
+        match action {
+            ProjectAction::Quit => app.apply(InputAction::Quit),
+            ProjectAction::Open => app.request_open_project_interactive("matrix-open"),
+        }
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ResolveCapture { action: shown }) if *shown == action
+        ));
+    }
+
+    fn insert_matrix_async_boundary(
+        fixture: &mut CaptureLifecycleMatrixFixture,
+        phase: CapturePhase,
+    ) {
+        match phase {
+            CapturePhase::Confirm | CapturePhase::Failed => {
+                let _ = fixture.app.maintain_capture();
+            }
+            CapturePhase::Recording => {
+                fixture.probe.complete(completion(
+                    &fixture.app,
+                    CaptureSource::Resample,
+                    vec![0.5, -0.5],
+                    false,
+                ));
+                assert!(fixture.app.maintain_capture());
+            }
+            CapturePhase::Finalizing => {
+                assert!(fixture.app.maintain_capture());
+                let request = take_finalize(&mut fixture.app);
+                assert!(fixture.app.apply_worker_result(finalized(
+                    &request,
+                    Ok(managed_capture(302, 48_000, b"matrix-async")),
+                )));
+                assert!(fixture.app.maintain_capture());
+            }
+            CapturePhase::ReadyToInstall => {
+                assert!(
+                    !fixture.app.maintain_capture(),
+                    "Ready capture must not install before the explicit lifecycle choice"
+                );
+            }
+            CapturePhase::Arming => unreachable!("matrix excludes transient Arming"),
+        }
+    }
+
+    fn assert_matrix_action_waiting(app: &App, action: ProjectAction) {
+        assert!(!app.should_quit());
+        assert!(app.project_open_stage().is_none());
+        assert_eq!(
+            app.pending_project_action
+                .as_ref()
+                .map(PendingProjectAction::label),
+            Some(action),
+        );
+    }
+
+    fn assert_matrix_action_continued(app: &App, action: ProjectAction) {
+        assert_eq!(app.capture_session().phase(), None);
+        assert_eq!(app.pending_project_action, None);
+        match action {
+            ProjectAction::Quit => assert!(app.should_quit()),
+            ProjectAction::Open => assert!(app.project_open_stage().is_some()),
+        }
+    }
+
+    fn finish_matrix_finalize(
+        fixture: &mut CaptureLifecycleMatrixFixture,
+        action: ProjectAction,
+        managed_id: u64,
+    ) {
+        if fixture.app.capture_session().phase() == Some(CapturePhase::Recording) {
+            fixture.probe.complete(completion(
+                &fixture.app,
+                CaptureSource::Resample,
+                vec![0.75, -0.75],
+                false,
+            ));
+            assert!(fixture.app.maintain_capture());
+        }
+        if fixture.app.capture_session().phase() == Some(CapturePhase::Finalizing) {
+            assert!(fixture.app.maintain_capture());
+            let request = take_finalize(&mut fixture.app);
+            assert!(fixture.app.apply_worker_result(finalized(
+                &request,
+                Ok(managed_capture(managed_id, 48_000, b"matrix-finalize")),
+            )));
+            assert!(fixture.app.maintain_capture());
+        }
+        assert_eq!(
+            fixture.app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+        assert!(fixture.app.maintain_capture());
+        assert_eq!(fixture.app.capture_session().phase(), None);
+        assert!(matches!(
+            fixture.app.overlay(),
+            Some(super::Overlay::UnsavedProject { action: shown }) if *shown == action
+        ));
+        assert_matrix_action_waiting(&fixture.app, action);
+    }
+
+    #[test]
+    fn capture_resolution_survives_async_completion_worker_result_and_ready_maintenance() {
+        let mut fixture = capture_lifecycle_matrix_fixture(CapturePhase::Recording);
+        begin_matrix_project_action(&mut fixture.app, ProjectAction::Open);
+        insert_matrix_async_boundary(&mut fixture, CapturePhase::Recording);
+        assert!(matches!(
+            fixture.app.overlay(),
+            Some(super::Overlay::ResolveCapture {
+                action: ProjectAction::Open
+            })
+        ));
+
+        assert!(fixture.app.maintain_capture());
+        let request = take_finalize(&mut fixture.app);
+        assert!(fixture.app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(303, 48_000, b"resolution-survives")),
+        )));
+        assert!(fixture.app.maintain_capture());
+        assert_eq!(
+            fixture.app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+        assert!(matches!(
+            fixture.app.overlay(),
+            Some(super::Overlay::ResolveCapture {
+                action: ProjectAction::Open
+            })
+        ));
+        assert!(!fixture.app.maintain_capture());
+        assert_eq!(
+            fixture.app.capture_session().phase(),
+            Some(CapturePhase::ReadyToInstall)
+        );
+    }
+
+    #[test]
+    fn capture_worker_ownership_survives_device_loss_until_exact_discard_result_returns() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        app.request_open_project_interactive("after-device-loss");
+        app.apply_key(press(KeyCode::Enter));
+
+        probe.fail_device(
+            CaptureSource::Resample,
+            "output disappeared during worker finalize",
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        app.apply_key(press(KeyCode::Backspace));
+        assert_matrix_action_waiting(&app, ProjectAction::Open);
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(304, 48_000, b"device-loss-discard")),
+        )));
+        assert!(app.maintain_capture());
+        assert_matrix_action_continued(&app, ProjectAction::Open);
+        assert!(
+            app.pending_managed_releases
+                .contains(&ManagedCaptureId::new(304))
+        );
+    }
+
+    #[test]
+    fn recovered_device_does_not_admit_worker_result_after_capture_was_marked_failed() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        start_capture(&mut app, CaptureSource::Resample, 8);
+        probe.complete(completion(
+            &app,
+            CaptureSource::Resample,
+            vec![0.25, -0.25],
+            false,
+        ));
+        assert!(app.maintain_capture());
+        assert!(app.maintain_capture());
+        let request = take_finalize(&mut app);
+        app.apply(InputAction::Quit);
+        app.apply_key(press(KeyCode::Enter));
+
+        probe.fail_device(
+            CaptureSource::Resample,
+            "output disappeared before worker return",
+        );
+        assert!(app.maintain_capture());
+        let (replacement, _) = CaptureAudio::new(48_000, 44_100);
+        app.retry_default_device_with(|| Ok(Box::new(replacement)));
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+
+        assert!(app.apply_worker_result(finalized(
+            &request,
+            Ok(managed_capture(305, 48_000, b"failed-device-result")),
+        )));
+        assert!(app.maintain_capture());
+        assert_eq!(app.capture_session().phase(), Some(CapturePhase::Failed));
+        assert_matrix_action_waiting(&app, ProjectAction::Quit);
+        assert!(
+            app.pending_managed_releases
+                .contains(&ManagedCaptureId::new(305))
+        );
+
+        app.apply_key(press(KeyCode::Backspace));
+        assert_matrix_action_continued(&app, ProjectAction::Quit);
+    }
+
+    #[test]
+    fn capture_lifecycle_async_choice_matrix_preserves_intent_ownership_and_continuation() {
+        let phases = [
+            CapturePhase::Confirm,
+            CapturePhase::Recording,
+            CapturePhase::Finalizing,
+            CapturePhase::ReadyToInstall,
+            CapturePhase::Failed,
+        ];
+        let choices = [
+            CaptureLifecycleChoice::Finalize,
+            CaptureLifecycleChoice::Discard,
+            CaptureLifecycleChoice::Cancel,
+        ];
+        let actions = [ProjectAction::Quit, ProjectAction::Open];
+        let mut managed_id = 400;
+
+        for action in actions {
+            for phase in phases {
+                for choice in choices {
+                    managed_id += 1;
+                    let mut fixture = capture_lifecycle_matrix_fixture(phase);
+                    begin_matrix_project_action(&mut fixture.app, action);
+                    insert_matrix_async_boundary(&mut fixture, phase);
+                    assert!(
+                        matches!(
+                            fixture.app.overlay(),
+                            Some(super::Overlay::ResolveCapture { action: shown }) if *shown == action
+                        ),
+                        "async boundary erased {action:?}/{phase:?}/{choice:?}",
+                    );
+                    assert_matrix_action_waiting(&fixture.app, action);
+
+                    let before_choice_phase = fixture.app.capture_session().phase();
+                    let was_retryable = fixture.app.capture_session().failure_is_retryable();
+                    fixture.app.apply_key(press(choice.key()));
+                    match choice {
+                        CaptureLifecycleChoice::Cancel => {
+                            assert_eq!(
+                                fixture.app.capture_session().phase(),
+                                before_choice_phase,
+                                "Cancel failed to preserve {action:?}/{phase:?}",
+                            );
+                            assert_eq!(fixture.app.pending_project_action, None);
+                            assert!(!fixture.app.should_quit());
+                            assert!(fixture.app.project_open_stage().is_none());
+                        }
+                        CaptureLifecycleChoice::Discard => {
+                            assert_matrix_action_continued(&fixture.app, action);
+                        }
+                        CaptureLifecycleChoice::Finalize => {
+                            if phase == CapturePhase::Failed {
+                                assert!(was_retryable, "matrix Failed fixture must be retryable");
+                            }
+                            finish_matrix_finalize(&mut fixture, action, managed_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn capture_lifecycle_quit_and_open_cancel_preserve_every_unresolved_phase() {
         for phase in [
@@ -2078,6 +2436,7 @@ impl PendingProjectAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectLifecycleWait {
+    ChoosingCapture,
     CaptureFinalize,
     CaptureDiscard,
     SampleApply,
@@ -2114,8 +2473,7 @@ pub struct App {
     capture_session: crate::CaptureSession,
     capture_source_pcm: Option<Arc<[f32]>>,
     capture_hard_limit: bool,
-    capture_worker_queued: bool,
-    capture_engine_rate_in_flight: Option<u32>,
+    capture_worker_request: Option<FinalizeCaptureRequest>,
     capture_ready: Option<ManagedCapture>,
     capture_status: Option<CaptureStatus>,
     capture_discard_pending: bool,
@@ -2195,8 +2553,7 @@ impl App {
             capture_session: crate::CaptureSession::default(),
             capture_source_pcm: None,
             capture_hard_limit: false,
-            capture_worker_queued: false,
-            capture_engine_rate_in_flight: None,
+            capture_worker_request: None,
             capture_ready: None,
             capture_status: None,
             capture_discard_pending: false,
@@ -2461,7 +2818,7 @@ impl App {
             self.status = "Discarding capture after callback ownership returns…".to_owned();
             return Ok(());
         }
-        if phase == CapturePhase::Finalizing && self.capture_worker_queued {
+        if self.capture_worker_request.is_some() {
             self.capture_discard_pending = true;
             self.overlay = Some(Overlay::CaptureProgress {
                 action: self.pending_capture_project_action(),
@@ -2480,8 +2837,7 @@ impl App {
         }
         self.capture_session
             .retry_finalization_with_next_generation()?;
-        self.capture_worker_queued = false;
-        self.capture_engine_rate_in_flight = None;
+        debug_assert!(self.capture_worker_request.is_none());
         if let Some(candidate) = self.capture_ready.take() {
             self.queue_managed_release(candidate.id);
         }
@@ -2497,7 +2853,11 @@ impl App {
     fn pending_capture_project_action(&self) -> Option<ProjectAction> {
         matches!(
             self.project_lifecycle_wait,
-            Some(ProjectLifecycleWait::CaptureFinalize | ProjectLifecycleWait::CaptureDiscard)
+            Some(
+                ProjectLifecycleWait::ChoosingCapture
+                    | ProjectLifecycleWait::CaptureFinalize
+                    | ProjectLifecycleWait::CaptureDiscard
+            )
         )
         .then(|| {
             self.pending_project_action
@@ -2508,6 +2868,14 @@ impl App {
     }
 
     pub fn maintain_capture(&mut self) -> bool {
+        let changed = self.maintain_capture_once();
+        if changed && self.capture_resolution_choice_pending() {
+            self.present_capture_resolution_choice();
+        }
+        changed
+    }
+
+    fn maintain_capture_once(&mut self) -> bool {
         if let Some(result) = self.capture_worker_results.pop_front() {
             return self.apply_capture_worker_result(result);
         }
@@ -2521,23 +2889,24 @@ impl App {
                         | CapturePhase::Failed
                 )
             )
-            && !self.capture_worker_queued
+            && self.capture_worker_request.is_none()
         {
             self.finish_capture_discard();
             return true;
         }
         if self.capture_ready.is_some()
             && self.capture_session.phase() == Some(CapturePhase::ReadyToInstall)
+            && !self.capture_resolution_choice_pending()
         {
             return self.install_ready_capture();
         }
         if self.capture_session.phase() == Some(CapturePhase::Finalizing)
-            && !self.capture_worker_queued
+            && self.capture_worker_request.is_none()
         {
             return self.queue_capture_finalization();
         }
         if self.capture_session.phase() == Some(CapturePhase::Finalizing)
-            && self.capture_worker_queued
+            && self.capture_worker_request.is_some()
         {
             if self.capture_discard_pending {
                 if self.poll_capture_runtime_error_once() {
@@ -2569,8 +2938,6 @@ impl App {
         let _ = self
             .capture_session
             .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, message.clone());
-        self.capture_worker_queued = false;
-        self.capture_engine_rate_in_flight = None;
         self.fail_audio(message);
         true
     }
@@ -2661,8 +3028,7 @@ impl App {
                         .take_completion_stereo()
                         .expect("accepted completion owns stereo");
                     self.capture_source_pcm = Some(Arc::from(stereo.into_boxed_slice()));
-                    self.capture_worker_queued = false;
-                    self.capture_engine_rate_in_flight = None;
+                    debug_assert!(self.capture_worker_request.is_none());
                     self.overlay = Some(Overlay::CaptureProgress {
                         action: self.pending_capture_project_action(),
                         discarding: false,
@@ -2699,22 +3065,22 @@ impl App {
             });
             return true;
         };
+        let request = FinalizeCaptureRequest {
+            token: self.capture_session.token().expect("finalizing token"),
+            generation: self
+                .capture_session
+                .generation()
+                .expect("finalizing generation"),
+            target: self.capture_session.target().expect("finalizing target"),
+            source: self.capture_session.source().expect("finalizing source"),
+            source_rate: self.capture_session.source_rate().expect("finalizing rate"),
+            engine_rate,
+            stereo,
+            hard_limit: self.capture_hard_limit,
+        };
+        self.capture_worker_request = Some(request.clone());
         self.pending_worker_requests
-            .push(WorkerRequest::FinalizeCapture(FinalizeCaptureRequest {
-                token: self.capture_session.token().expect("finalizing token"),
-                generation: self
-                    .capture_session
-                    .generation()
-                    .expect("finalizing generation"),
-                target: self.capture_session.target().expect("finalizing target"),
-                source: self.capture_session.source().expect("finalizing source"),
-                source_rate: self.capture_session.source_rate().expect("finalizing rate"),
-                engine_rate,
-                stereo,
-                hard_limit: self.capture_hard_limit,
-            }));
-        self.capture_worker_queued = true;
-        self.capture_engine_rate_in_flight = Some(engine_rate);
+            .push(WorkerRequest::FinalizeCapture(request));
         true
     }
 
@@ -2745,31 +3111,35 @@ impl App {
                 hard_limit,
                 result,
             } => {
-                let exact = self.capture_worker_queued
-                    && self.capture_engine_rate_in_flight == Some(engine_rate)
-                    && self.capture_session.token() == Some(token)
-                    && self.capture_session.generation() == Some(generation)
-                    && self.capture_session.target() == Some(target)
-                    && self.capture_session.source() == Some(source)
-                    && self.capture_session.source_rate() == Some(source_rate)
-                    && self.capture_hard_limit == hard_limit
-                    && self
-                        .capture_source_pcm
-                        .as_ref()
-                        .is_some_and(|owned| Arc::ptr_eq(owned, &stereo));
+                let exact = self.capture_worker_request.as_ref().is_some_and(|request| {
+                    request.token == token
+                        && request.generation == generation
+                        && request.target == target
+                        && request.source == source
+                        && request.source_rate == source_rate
+                        && request.engine_rate == engine_rate
+                        && request.hard_limit == hard_limit
+                        && Arc::ptr_eq(&request.stereo, &stereo)
+                });
                 if !exact {
                     if let Ok(candidate) = result {
                         self.queue_managed_release(candidate.id);
                     }
                     return false;
                 }
-                self.capture_worker_queued = false;
-                self.capture_engine_rate_in_flight = None;
+                self.capture_worker_request = None;
                 if self.capture_discard_pending {
                     if let Ok(candidate) = result {
                         self.queue_managed_release(candidate.id);
                     }
                     self.finish_capture_discard();
+                    return true;
+                }
+                if self.capture_session.phase() == Some(CapturePhase::Failed) {
+                    if let Ok(candidate) = result {
+                        self.queue_managed_release(candidate.id);
+                    }
+                    self.restore_capture_presentation();
                     return true;
                 }
                 let current_rate = self.audio.as_ref().map(|audio| audio.sample_rate());
@@ -2967,10 +3337,9 @@ impl App {
     }
 
     fn clear_capture_transaction_fields(&mut self) {
+        debug_assert!(self.capture_worker_request.is_none());
         self.capture_source_pcm = None;
         self.capture_hard_limit = false;
-        self.capture_worker_queued = false;
-        self.capture_engine_rate_in_flight = None;
         self.capture_ready = None;
         self.capture_status = None;
         self.capture_discard_pending = false;
@@ -3461,9 +3830,8 @@ impl App {
         };
         let label = action.label();
         if self.capture_session.phase().is_some() {
-            self.project_lifecycle_wait = None;
-            self.overlay = Some(Overlay::ResolveCapture { action: label });
-            self.status = "Resolve the active capture before the project action".to_owned();
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingCapture);
+            self.present_capture_resolution_choice();
             return;
         }
         if self.editor.is_dirty() {
@@ -3521,7 +3889,29 @@ impl App {
         self.restore_capture_presentation();
     }
 
+    fn capture_resolution_choice_pending(&self) -> bool {
+        self.project_lifecycle_wait == Some(ProjectLifecycleWait::ChoosingCapture)
+            && self.pending_project_action.is_some()
+            && self.capture_session.phase().is_some()
+    }
+
+    fn present_capture_resolution_choice(&mut self) {
+        let Some(action) = self
+            .pending_project_action
+            .as_ref()
+            .map(PendingProjectAction::label)
+        else {
+            return;
+        };
+        self.overlay = Some(Overlay::ResolveCapture { action });
+        self.status = "Resolve the active capture before the project action".to_owned();
+    }
+
     fn restore_capture_presentation(&mut self) {
+        if self.capture_resolution_choice_pending() {
+            self.present_capture_resolution_choice();
+            return;
+        }
         let action = self.pending_capture_project_action();
         self.overlay = match self.capture_session.phase() {
             Some(CapturePhase::Confirm) => Some(Overlay::CaptureConfirm),
@@ -3667,7 +4057,7 @@ impl App {
             None => Err(CaptureError::NoActiveCapture),
         };
         if let Err(error) = result {
-            self.project_lifecycle_wait = None;
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::ChoosingCapture);
             self.status = error.to_string();
             self.overlay = Some(Overlay::CaptureFailed {
                 action: self
@@ -5182,21 +5572,18 @@ impl App {
                 true
             }
             WorkerRequest::FinalizeCapture(request) => {
-                let exact = self.capture_worker_queued
-                    && self.capture_engine_rate_in_flight == Some(request.engine_rate)
-                    && self.capture_session.token() == Some(request.token)
-                    && self.capture_session.generation() == Some(request.generation)
-                    && self.capture_session.target() == Some(request.target)
-                    && self.capture_session.source() == Some(request.source)
-                    && self.capture_session.source_rate() == Some(request.source_rate)
-                    && self.capture_hard_limit == request.hard_limit
-                    && self
-                        .capture_source_pcm
-                        .as_ref()
-                        .is_some_and(|owned| Arc::ptr_eq(owned, &request.stereo));
+                let exact = self.capture_worker_request.as_ref().is_some_and(|owned| {
+                    owned.token == request.token
+                        && owned.generation == request.generation
+                        && owned.target == request.target
+                        && owned.source == request.source
+                        && owned.source_rate == request.source_rate
+                        && owned.engine_rate == request.engine_rate
+                        && owned.hard_limit == request.hard_limit
+                        && Arc::ptr_eq(&owned.stereo, &request.stereo)
+                });
                 if exact {
-                    self.capture_worker_queued = false;
-                    self.capture_engine_rate_in_flight = None;
+                    self.capture_worker_request = None;
                 }
                 exact
             }
@@ -7266,8 +7653,6 @@ impl App {
                 .capture_session
                 .mark_failed_with_cause(CaptureFailureCause::DeviceRuntime, error.clone());
         }
-        self.capture_worker_queued = false;
-        self.capture_engine_rate_in_flight = None;
         self.audio = None;
         self.audio_format = None;
         self.recovery_cursor = None;

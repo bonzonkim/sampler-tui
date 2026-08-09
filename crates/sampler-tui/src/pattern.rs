@@ -14,8 +14,8 @@ mod tests {
     use crate::{AudioPort, CaptureSupport};
 
     use super::{
-        MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace,
-        RecordingIntent, RecordingState,
+        HeldRecordingKey, MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus,
+        PatternWorkspace, RecordingIntent, RecordingState,
     };
 
     #[derive(Default)]
@@ -468,6 +468,59 @@ mod tests {
             assert!(workspace.held_keys.iter().all(Option::is_none));
             assert!(workspace.retiring_keys.iter().all(Option::is_none));
         }
+    }
+
+    #[test]
+    fn overflow_reports_one_committed_mutation_per_affected_pattern_within_budget() {
+        let mut workspace = recording_workspace();
+        for (index, key) in [(0, 0), (1, 1)] {
+            let event_id = workspace.patterns[index]
+                .insert_new(pad(), 10, 1.0, None)
+                .unwrap();
+            workspace.commit_project_pattern(index);
+            let slot = workspace.patterns[index].slot();
+            workspace.held_keys[key] = Some(HeldRecordingKey {
+                pad: pad(),
+                velocity: 1.0,
+                trigger_id: None,
+                release_id: Some(command(50 + key as u64)),
+                event_id: Some(event_id),
+                event_slot: Some(slot),
+                trigger_frame: Some(10),
+                trigger_absolute_frame: Some(1_010),
+                record_duration: true,
+            });
+        }
+        let mut overflow = recording_telemetry(origin(1_000));
+        overflow.live_ack_overflows = 1;
+
+        let maintenance =
+            workspace.maintain_with_recording_budget(&mut FakeAudio::default(), overflow, 2);
+
+        assert_eq!(maintenance.committed_mutations, 2);
+        assert!(workspace.patterns[0].events().is_empty());
+        assert!(workspace.patterns[1].events().is_empty());
+    }
+
+    #[test]
+    fn finalized_correlated_event_survives_adjacent_overflow_cleanup() {
+        let mut workspace = recording_workspace();
+        workspace.note_live_trigger(key(0), command(70), pad(), 1.0);
+        assert!(workspace.apply_ack(trigger_ack(70, 1_010)));
+        let event_id = workspace.selected_pattern().events()[0].id;
+        workspace.patterns[0]
+            .set_duration(event_id, Some(5))
+            .unwrap();
+        workspace.commit_project_pattern(0);
+
+        let mut overflow = recording_telemetry(origin(1_000));
+        overflow.live_ack_overflows = 1;
+        let maintenance = workspace.maintain(&mut FakeAudio::default(), overflow);
+
+        assert_eq!(maintenance.committed_mutations, 0);
+        assert_eq!(workspace.selected_pattern().events().len(), 1);
+        assert_eq!(workspace.selected_pattern().events()[0].duration, Some(5));
+        assert!(workspace.held_keys.iter().all(Option::is_none));
     }
 
     #[test]
@@ -2058,7 +2111,10 @@ impl PatternWorkspace {
     ) -> PatternMaintenance {
         let mut result = PatternMaintenance::empty();
         result.reclaimed_snapshots = audio.reclaim_retired_patterns();
-        self.recover_from_live_ack_overflow(telemetry.live_ack_overflows);
+        result.committed_mutations = self.recover_from_live_ack_overflow(
+            telemetry.live_ack_overflows,
+            recording_mutation_budget,
+        );
 
         let mut acks = [LiveAck::EMPTY; MAX_ACKS_PER_MAINTENANCE];
         result.drained_acks = audio.drain_live_acks(&mut acks).min(acks.len());
@@ -2164,10 +2220,16 @@ impl PatternWorkspace {
         result
     }
 
-    fn recover_from_live_ack_overflow(&mut self, live_ack_overflows: u64) {
+    /// Overflow cleanup commits at most one mutation for each of the 16 pattern slots. The
+    /// caller-provided per-maintenance budget must cover that atomic cleanup before later ACKs.
+    fn recover_from_live_ack_overflow(
+        &mut self,
+        live_ack_overflows: u64,
+        recording_mutation_budget: usize,
+    ) -> usize {
         if live_ack_overflows <= self.observed_live_ack_overflows {
             self.observed_live_ack_overflows = live_ack_overflows;
-            return;
+            return 0;
         }
         self.observed_live_ack_overflows = live_ack_overflows;
 
@@ -2192,6 +2254,11 @@ impl PatternWorkspace {
             }
             unfinalized
         });
+        let affected_patterns = removal_counts.iter().filter(|count| **count != 0).count();
+        assert!(
+            affected_patterns <= recording_mutation_budget,
+            "live ACK overflow cleanup affects at most {PATTERN_SLOT_COUNT} patterns and must fit the per-maintenance mutation budget"
+        );
         debug_assert!(removal_counts.iter().enumerate().all(|(index, count)| {
             self.patterns[index]
                 .generation()
@@ -2226,6 +2293,7 @@ impl PatternWorkspace {
         if refresh_selection {
             self.refresh_selected_event();
         }
+        affected_patterns
     }
 
     fn slot_index(&self) -> usize {

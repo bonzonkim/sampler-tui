@@ -15489,6 +15489,68 @@ mod tests {
     }
 
     #[test]
+    fn overflow_cleanup_marks_saved_project_dirty_and_schedules_exact_recovery() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "overflow-accounting", now);
+        let target = pad(0, 0);
+        let stamp = TransportStamp {
+            slot: PatternSlotId::new(0).unwrap(),
+            generation: app.patterns.selected_pattern().generation(),
+            origin: 1_000,
+            loop_frames: app.patterns.selected_pattern().transport().loop_frames(),
+        };
+        app.patterns.start_recording(stamp).unwrap();
+        app.patterns
+            .note_live_trigger(0, LiveCommandId::FIRST, target, 1.0);
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2).with_live_acks([
+            LiveAck {
+                id: LiveCommandId::FIRST,
+                pad: target,
+                kind: LiveAckKind::Trigger { velocity: 1.0 },
+                frame: 1_120,
+                transport: Some(stamp),
+            },
+        ])));
+        assert!(app.maintain_audio());
+        assert_eq!(app.project_snapshot().unwrap().patterns[0].events.len(), 1);
+
+        let clean_revision = app.project_revision();
+        app.project_session.mark_explicit_saved(clean_revision);
+        app.project_session.mark_autosaved(clean_revision);
+        assert_eq!(
+            app.project_session.status(),
+            crate::project_session::ProjectStatus::Clean
+        );
+
+        app.patterns.note_live_release(0, midi_command(2));
+        app.telemetry.live_ack_overflows = 1;
+        app.audio = Some(Box::new(FakeAudio::ready(48_000, 2)));
+        assert!(app.maintain_audio());
+
+        assert!(
+            app.project_snapshot().unwrap().patterns[0]
+                .events
+                .is_empty()
+        );
+        assert_eq!(app.project_revision(), clean_revision + 1);
+        assert_eq!(
+            app.project_session.status(),
+            crate::project_session::ProjectStatus::Modified
+        );
+
+        assert!(
+            app.maintain_project(
+                Instant::now() + super::AUTOSAVE_DEBOUNCE + Duration::from_secs(1)
+            )
+        );
+        let recovery = take_project_save(&mut app);
+        assert_eq!(recovery.request.kind, SaveKind::Recovery);
+        assert_eq!(recovery.request.snapshot.revision, clean_revision + 1);
+        assert!(recovery.request.snapshot.patterns[0].events.is_empty());
+    }
+
+    #[test]
     fn disconnected_loaded_pad_rejects_settings_without_changing_snapshot_or_revision() {
         let mut app = project_app();
         let pad = pad(0, 0);

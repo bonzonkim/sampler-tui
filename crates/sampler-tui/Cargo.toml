@@ -9,6 +9,7 @@ license.workspace = true
 crossterm.workspace = true
 getrandom.workspace = true
 hound = "3.5.1"
+midir.workspace = true
 ratatui.workspace = true
 rtrb.workspace = true
 sampler-audio = { path = "../sampler-audio" }

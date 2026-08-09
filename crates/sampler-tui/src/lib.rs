@@ -38,8 +38,9 @@ pub use loader::{
     WorkerResult, WorkerSendError, WorkerSendFailure, downsample_preview,
 };
 pub use midi::{
-    MAX_MIDI_DRAIN, MIDI_INGRESS_CAPACITY, MidiEvent, MidiIngressConsumer, MidiIngressProducer,
-    midi_ingress, parse_midi_message,
+    MAX_MIDI_DRAIN, MIDI_INGRESS_CAPACITY, MidiBackend, MidiBackendPort, MidiConnection, MidiEvent,
+    MidiIngressConsumer, MidiIngressProducer, MidiPortInfo, MidiService, MidiServiceError,
+    MidiServiceEvent, MidiServiceStatus, MidirBackend, midi_ingress, parse_midi_message,
 };
 pub use mixer::{
     DelayField, MasterField, MixerAction, MixerContext, MixerCursor, MixerIntent, MixerSection,

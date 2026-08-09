@@ -32,9 +32,10 @@ pub use audio::{AudioPort, CaptureSupport};
 pub use capture::{CaptureError, CaptureFailureCause, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
 pub use export::{
-    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportCancel, ExportPatternSlot, ExportToken,
-    OfflineExportCancellation, OfflineExportError, OfflineExportReceipt, OfflineExportRequest,
-    OfflineExportSnapshot, validate_wav_destination,
+    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportCancel, ExportOperation, ExportPatternSlot,
+    ExportPhase, ExportResultFence, ExportStatusView, ExportToken, OfflineExportCancellation,
+    OfflineExportError, OfflineExportReceipt, OfflineExportRequest, OfflineExportSnapshot,
+    validate_wav_destination,
 };
 pub use export_file::AtomicWavPublisher;
 pub use export_render::{OfflineFrameSink, OfflineRenderSummary, render_offline};

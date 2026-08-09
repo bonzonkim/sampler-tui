@@ -197,6 +197,9 @@ impl<O: KeyboardEnhancementOps> Drop for KeyboardEnhancementGuard<O> {
 trait EventLoopApp {
     fn should_quit(&self) -> bool;
     fn maintain_audio(&mut self) -> bool;
+    fn maintain_export(&mut self, _progress: Option<WorkerResult>) -> bool {
+        false
+    }
     fn maintain_midi(&mut self, _now: Instant) -> bool {
         false
     }
@@ -221,6 +224,10 @@ impl EventLoopApp for App {
 
     fn maintain_audio(&mut self) -> bool {
         App::maintain_audio(self)
+    }
+
+    fn maintain_export(&mut self, progress: Option<WorkerResult>) -> bool {
+        App::maintain_export(self, progress)
     }
 
     fn maintain_midi(&mut self, now: Instant) -> bool {
@@ -270,12 +277,19 @@ impl EventLoopApp for App {
 
 pub trait EventLoopWorker {
     fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError>;
+    fn try_recv_export_progress(&mut self) -> Option<WorkerResult> {
+        None
+    }
     fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure>;
 }
 
 impl EventLoopWorker for WorkerHandle {
     fn try_recv(&mut self) -> Result<WorkerResult, TryRecvError> {
         WorkerHandle::try_recv(self)
+    }
+
+    fn try_recv_export_progress(&mut self) -> Option<WorkerResult> {
+        WorkerHandle::try_recv_export_progress(self)
     }
 
     fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
@@ -334,6 +348,7 @@ where
     D: EventLoopDrawer<A>,
 {
     state.dirty |= app.maintain_audio();
+    state.dirty |= app.maintain_export(worker.try_recv_export_progress());
 
     for _ in 0..MAX_WORKER_RESULTS_PER_ITERATION {
         match worker.try_recv() {
@@ -688,35 +703,35 @@ where
             shutdown.worker(),
         )
     }));
+    shutdown.request_shutdown();
+    let worker_cleanup = join(shutdown.worker());
     let audio_cleanup = audio.shutdown();
     let keyboard_cleanup = keyboard
         .as_mut()
         .map_or(Ok(()), KeyboardEnhancementGuard::release)
         .map_err(E::from);
-    shutdown.request_shutdown();
     let cursor_cleanup = terminal
         .as_mut()
         .map_or(Ok(()), |terminal| lifecycle.show_cursor(terminal))
         .map_err(E::from);
     drop(terminal.take());
     let terminal_cleanup = lifecycle.restore().map_err(E::from);
-    let worker_cleanup = join(shutdown.worker());
     let panic_report = panic_capture.restore();
 
     match outcome {
         Ok(primary) => {
+            let primary = preserve_primary(primary, worker_cleanup);
             let primary = preserve_primary(primary, audio_cleanup);
             let primary = preserve_primary(primary, keyboard_cleanup);
             let primary = preserve_primary(primary, cursor_cleanup);
-            let primary = preserve_primary(primary, terminal_cleanup);
-            preserve_primary(primary, worker_cleanup)
+            preserve_primary(primary, terminal_cleanup)
         }
         Err(payload) => {
+            drop(worker_cleanup);
             drop(audio_cleanup);
             drop(keyboard_cleanup);
             drop(cursor_cleanup);
             drop(terminal_cleanup);
-            drop(worker_cleanup);
             report_panic(
                 panic_report
                     .as_deref()
@@ -890,6 +905,8 @@ mod tests {
         should_quit: bool,
         quit_on_worker_result: bool,
         maintenance_calls: usize,
+        export_maintenance_calls: usize,
+        export_progress_results: usize,
         capture_maintenance_calls: usize,
         midi_maintenance_calls: usize,
         midi_connected: bool,
@@ -913,6 +930,12 @@ mod tests {
         fn maintain_audio(&mut self) -> bool {
             self.maintenance_calls += 1;
             false
+        }
+
+        fn maintain_export(&mut self, progress: Option<WorkerResult>) -> bool {
+            self.export_maintenance_calls += 1;
+            self.export_progress_results += usize::from(progress.is_some());
+            progress.is_some()
         }
 
         fn maintain_midi(&mut self, _now: Instant) -> bool {
@@ -977,6 +1000,7 @@ mod tests {
     #[derive(Default)]
     struct FakeWorker {
         results: VecDeque<WorkerResult>,
+        progress: VecDeque<WorkerResult>,
         send_error: Option<WorkerSendError>,
         sent: usize,
     }
@@ -986,6 +1010,10 @@ mod tests {
             self.results
                 .pop_front()
                 .ok_or(std::sync::mpsc::TryRecvError::Empty)
+        }
+
+        fn try_recv_export_progress(&mut self) -> Option<WorkerResult> {
+            self.progress.pop_front()
         }
 
         fn try_send(&mut self, request: WorkerRequest) -> Result<(), WorkerSendFailure> {
@@ -1062,6 +1090,7 @@ mod tests {
             ..FakeApp::default()
         };
         let mut worker = FakeWorker {
+            progress: VecDeque::from([failed_scan()]),
             results: (0..20).map(|_| failed_scan()).collect(),
             ..FakeWorker::default()
         };
@@ -1079,6 +1108,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.midi_events_applied, crate::MAX_MIDI_DRAIN);
+        assert_eq!(app.export_maintenance_calls, 1);
+        assert_eq!(app.export_progress_results, 1);
         assert_eq!(app.worker_results, MAX_WORKER_RESULTS_PER_ITERATION);
         assert_eq!(app.capture_maintenance_calls, 1);
         assert_eq!(app.project_maintenance_times, [now]);
@@ -1170,6 +1201,10 @@ mod tests {
                 self.0.lock().unwrap().push("audio");
                 false
             }
+            fn maintain_export(&mut self, _progress: Option<WorkerResult>) -> bool {
+                self.0.lock().unwrap().push("export-progress");
+                true
+            }
             fn maintain_capture(&mut self) -> bool {
                 self.0.lock().unwrap().push("capture");
                 false
@@ -1258,6 +1293,7 @@ mod tests {
             *trace.lock().unwrap(),
             [
                 "audio",
+                "export-progress",
                 "worker-result",
                 "capture",
                 "project",
@@ -1865,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_is_shown_and_terminal_dropped_before_screen_restore_and_worker_join() {
+    fn worker_joins_before_audio_then_cursor_and_terminal_restore() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = CursorTrackedLifecycle {
             calls: Arc::clone(&calls),
@@ -1899,14 +1935,14 @@ mod tests {
             [
                 "init",
                 "loop",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
-                "request",
                 "show-cursor",
                 "drop-terminal",
                 "restore",
-                "join",
             ]
         );
     }
@@ -2016,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn initialization_error_cleans_audio_before_partial_terminal_and_join() {
+    fn initialization_error_joins_worker_before_audio_and_partial_terminal_cleanup() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = PartialInitErrorLifecycle {
             calls: Arc::clone(&calls),
@@ -2049,12 +2085,12 @@ mod tests {
             *calls.lock().unwrap(),
             [
                 "init-partial",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
-                "request",
                 "restore",
-                "join",
             ]
         );
     }
@@ -2101,12 +2137,12 @@ mod tests {
             [
                 "init",
                 "query",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
-                "request",
                 "restore",
-                "join",
                 "report",
             ]
         );
@@ -2155,19 +2191,19 @@ mod tests {
                 "init",
                 "query",
                 "push",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
-                "request",
                 "restore",
-                "join",
                 "report",
             ]
         );
     }
 
     #[test]
-    fn audio_stops_and_drops_before_keyboard_and_terminal_restoration() {
+    fn export_worker_cancels_and_joins_before_midi_audio_keyboard_and_terminal() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = FakeTerminalLifecycle {
             calls: Arc::clone(&calls),
@@ -2206,13 +2242,13 @@ mod tests {
                 "query",
                 "push",
                 "loop",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
                 "pop",
-                "request",
                 "restore",
-                "join",
             ]
         );
     }
@@ -2263,20 +2299,20 @@ mod tests {
                 "query",
                 "push",
                 "loop",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
                 "pop",
-                "request",
                 "restore",
-                "join",
                 "report",
             ]
         );
     }
 
     #[test]
-    fn worker_is_requested_before_terminal_restore_and_joined_afterward() {
+    fn worker_is_requested_and_joined_before_audio_and_terminal_restore() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut lifecycle = FakeTerminalLifecycle {
             calls: Arc::clone(&calls),
@@ -2310,12 +2346,12 @@ mod tests {
             [
                 "init",
                 "loop",
+                "request",
+                "join",
                 "close-midi",
                 "stop-all",
                 "drop-audio",
-                "request",
                 "restore",
-                "join",
             ]
         );
     }

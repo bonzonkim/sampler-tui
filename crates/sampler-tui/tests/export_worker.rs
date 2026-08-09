@@ -254,6 +254,7 @@ fn slow_progress_consumer_observes_one_coalesced_value_and_one_terminal_result()
             token: result_token,
             completed_units,
             total_units,
+            ..
         } if *result_token == token && completed_units == total_units
     )));
     assert!(fixture.root.join("mix.wav").is_file());

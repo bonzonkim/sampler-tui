@@ -1043,16 +1043,16 @@ fn max_iterations_is_an_enforced_execution_bound() {
 }
 
 #[test]
-fn every_exit_path_restores_before_reporting_and_joins_worker() {
+fn every_exit_path_joins_worker_before_audio_keyboard_terminal_and_reporting() {
     for outcome in [Quit, DrawError, ReadError, AppError, Panic] {
         let result = LifecycleHarness::new(outcome).run();
         let mut expected = vec![
+            "request-worker",
+            "join-worker",
             "stop-all",
             "drop-audio",
             "pop-keys",
-            "request-worker",
             "restore",
-            "join-worker",
         ];
         if matches!(outcome, Panic) {
             expected.extend(["report", "resume"]);

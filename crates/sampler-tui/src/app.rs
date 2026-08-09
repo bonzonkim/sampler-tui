@@ -4554,6 +4554,7 @@ impl PendingProjectAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectLifecycleWait {
+    ExportCleanup,
     ChoosingCapture,
     CaptureFinalize,
     CaptureDiscard,
@@ -4680,6 +4681,10 @@ pub struct App {
     project_open_error: Option<ProjectOpenError>,
     pending_project_action: Option<PendingProjectAction>,
     project_lifecycle_wait: Option<ProjectLifecycleWait>,
+    export_operation: Option<crate::export::ExportOperation>,
+    next_export_token: u64,
+    export_outcome: Option<crate::export::ExportStatusView>,
+    export_status_focused: bool,
 }
 
 impl CaptureTargetFence {
@@ -4884,7 +4889,166 @@ impl App {
             project_open_error: None,
             pending_project_action: None,
             project_lifecycle_wait: None,
+            export_operation: None,
+            next_export_token: 1,
+            export_outcome: None,
+            export_status_focused: false,
         }
+    }
+
+    pub fn start_export(
+        &mut self,
+        destination: impl Into<PathBuf>,
+    ) -> Result<crate::ExportToken, crate::OfflineExportError> {
+        use crate::export::{ExportOperation, ExportPhase, OfflineExportSnapshot};
+
+        if self.export_operation.is_some() {
+            return Err(crate::OfflineExportError::OperationPending);
+        }
+        if self.project_open.is_some()
+            || self.in_flight_project.is_some()
+            || self.pending_explicit_save.is_some()
+            || self.pending_autosave_save.is_some()
+        {
+            return Err(crate::OfflineExportError::UnresolvedAppState(
+                "a project open/save operation is pending".to_owned(),
+            ));
+        }
+        if self.pending_worker_requests.len() >= WORKER_CHANNEL_CAPACITY {
+            return Err(crate::OfflineExportError::WorkerBusy);
+        }
+        let destination = destination.into();
+        crate::validate_wav_destination(&destination)?;
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                return Err(crate::OfflineExportError::OutputDirectory(destination));
+            }
+            Ok(_) => return Err(crate::OfflineExportError::DestinationExists(destination)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(crate::OfflineExportError::DestinationAccess {
+                    path: destination,
+                    kind: error.kind(),
+                });
+            }
+        }
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            return Err(crate::OfflineExportError::OutputParent(
+                parent.to_path_buf(),
+            ));
+        }
+        let next = self
+            .next_export_token
+            .checked_add(1)
+            .ok_or(crate::OfflineExportError::TokenExhausted)?;
+        let project = self
+            .project_snapshot()
+            .map_err(|error| crate::OfflineExportError::UnresolvedAppState(error.to_string()))?;
+        let selected = self.patterns.selected_slot();
+        let slot = crate::ExportPatternSlot::try_from(selected.get().saturating_add(1))?;
+        let snapshot =
+            OfflineExportSnapshot::from_save_snapshot(&self.current_dir, &project, slot)?;
+        let token = crate::ExportToken::new(self.next_export_token);
+        let cancel = crate::ExportCancel::default();
+        let request =
+            crate::OfflineExportRequest::new(token, destination.clone(), snapshot, cancel.clone())?;
+        let operation = ExportOperation {
+            token,
+            project_id: project.project_id,
+            revision: project.revision,
+            slot: selected,
+            destination,
+            cancel,
+            phase: ExportPhase::Queued,
+        };
+        self.next_export_token = next;
+        self.pending_worker_requests
+            .push(WorkerRequest::Export(request));
+        self.export_operation = Some(operation);
+        self.export_outcome = None;
+        self.export_status_focused = true;
+        self.status = format!(
+            "Export queued · pattern {} · revision {}",
+            selected.get() + 1,
+            project.revision
+        );
+        Ok(token)
+    }
+
+    pub const fn export_operation(&self) -> Option<&crate::export::ExportOperation> {
+        self.export_operation.as_ref()
+    }
+
+    pub fn export_status_view(&self) -> Option<crate::ExportStatusView> {
+        self.export_operation.as_ref().map_or_else(
+            || self.export_outcome.clone(),
+            |operation| {
+                Some(crate::ExportStatusView::Active {
+                    operation: operation.clone(),
+                    focused: self.export_status_focused,
+                })
+            },
+        )
+    }
+
+    pub fn cancel_export(&mut self) -> bool {
+        let Some(operation) = self.export_operation.as_mut() else {
+            return false;
+        };
+        if operation.phase == crate::ExportPhase::Cancelling {
+            return false;
+        }
+        operation.cancel.cancel();
+        operation.phase = crate::ExportPhase::Cancelling;
+        self.export_status_focused = false;
+        self.status = format!(
+            "Cancelling export · pattern {} · revision {}",
+            operation.slot.get() + 1,
+            operation.revision
+        );
+        true
+    }
+
+    pub fn maintain_export(&mut self, progress: Option<WorkerResult>) -> bool {
+        let Some(WorkerResult::ExportProgress {
+            token,
+            fence,
+            completed_units,
+            total_units,
+        }) = progress
+        else {
+            return false;
+        };
+        let Some(operation) = self.export_operation.as_mut() else {
+            return false;
+        };
+        if operation.token != token
+            || operation.project_id != fence.project_id
+            || operation.revision != fence.revision
+            || operation.slot != fence.slot
+            || operation.destination != fence.destination
+        {
+            return false;
+        }
+        if operation.phase == crate::ExportPhase::Cancelling {
+            return true;
+        }
+        operation.phase = crate::ExportPhase::Running {
+            completed_units,
+            total_units,
+        };
+        let percent = completed_units
+            .min(total_units)
+            .saturating_mul(100)
+            .checked_div(total_units)
+            .unwrap_or(0);
+        self.status = format!(
+            "Export pattern {} · {percent}% · revision {}",
+            operation.slot.get() + 1,
+            operation.revision
+        );
+        true
     }
 
     pub const fn capture_session(&self) -> &crate::CaptureSession {
@@ -6340,6 +6504,15 @@ impl App {
             return;
         }
 
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+            && self.export_status_focused
+            && self.cancel_export()
+        {
+            return;
+        }
+
         match self.overlay.as_ref() {
             Some(Overlay::DeviceError(_)) => self.apply_device_error_key(key),
             Some(Overlay::ProjectOpenProgress) => self.apply_project_open_key(key),
@@ -6594,6 +6767,10 @@ impl App {
         &mut self,
         directory: impl Into<PathBuf>,
     ) -> Result<ProjectToken, ProjectOpenError> {
+        if self.export_operation.is_some() {
+            self.cancel_export();
+            return Err(ProjectOpenError::OperationPending);
+        }
         if self.project_open.is_some()
             || self.in_flight_project.is_some()
             || self.pending_explicit_save.is_some()
@@ -6650,6 +6827,13 @@ impl App {
             return;
         };
         let label = action.label();
+        if self.export_operation.is_some() {
+            self.cancel_export();
+            self.project_lifecycle_wait = Some(ProjectLifecycleWait::ExportCleanup);
+            self.overlay = Some(Overlay::ProjectLifecycleProgress { action: label });
+            self.status = "Waiting for offline export cleanup…".to_owned();
+            return;
+        }
         if self.capture_discard_release_pending.is_some() {
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
             self.overlay = Some(Overlay::CaptureProgress {
@@ -8356,10 +8540,12 @@ impl App {
     }
 
     pub fn open_help(&mut self) {
+        self.export_status_focused = false;
         self.overlay = Some(Overlay::Help);
     }
 
     pub fn open_palette(&mut self) {
+        self.export_status_focused = false;
         self.palette.clear();
         self.palette_error = None;
         self.overlay = Some(Overlay::Palette);
@@ -8377,6 +8563,7 @@ impl App {
     }
 
     pub fn open_picker_at(&mut self, directory: impl Into<PathBuf>) {
+        self.export_status_focused = false;
         let directory = resolve_picker_directory(&self.current_dir, directory.into());
         let request_id = self.file_picker.begin_scan(directory.clone());
         self.queue_worker_request(WorkerRequest::ScanDirectory {
@@ -8603,6 +8790,28 @@ impl App {
                 }
                 exact
             }
+            WorkerRequest::Export(request) => {
+                let exact = self.export_operation.as_ref().is_some_and(|operation| {
+                    operation.token == request.token()
+                        && operation.project_id == request.snapshot().project_id()
+                        && operation.revision == request.snapshot().revision()
+                        && operation.slot == request.snapshot().slot()
+                        && operation.destination == request.destination()
+                        && operation.cancel == request.cancellation()
+                });
+                if exact && error == WorkerSendError::WorkerBusy {
+                    if let Some(operation) = self.export_operation.as_mut()
+                        && operation.phase != crate::ExportPhase::Cancelling
+                    {
+                        operation.phase = crate::ExportPhase::Queued;
+                    }
+                    self.pending_worker_requests
+                        .push(WorkerRequest::Export(request));
+                    true
+                } else {
+                    false
+                }
+            }
             WorkerRequest::ReleaseManagedCapture { id }
                 if self.managed_release_in_flight == Some(id) =>
             {
@@ -8612,11 +8821,16 @@ impl App {
             }
             WorkerRequest::ReleaseManagedCapture { .. }
             | WorkerRequest::ScanDirectory { .. }
-            | WorkerRequest::Export(_)
             | WorkerRequest::Shutdown => false,
         };
         if applied {
-            self.status = message;
+            if self
+                .export_operation
+                .as_ref()
+                .is_none_or(|operation| operation.phase != crate::ExportPhase::Cancelling)
+            {
+                self.status = message;
+            }
             if let Some(offset) = affected_offset {
                 self.refresh_editor_for_offset(offset);
             }
@@ -9013,6 +9227,24 @@ impl App {
 
     pub fn apply_worker_result(&mut self, result: WorkerResult) -> bool {
         let result = match result {
+            WorkerResult::ExportProgress { .. } => return self.maintain_export(Some(result)),
+            WorkerResult::ExportFinished {
+                token,
+                project_id,
+                revision,
+                slot,
+                destination,
+                result,
+            } => {
+                return self.apply_export_finished(
+                    token,
+                    project_id,
+                    revision,
+                    slot,
+                    destination,
+                    result,
+                );
+            }
             result @ (WorkerResult::CaptureFinalized { .. }
             | WorkerResult::ManagedCaptureReleased { .. }) => {
                 self.capture_worker_results.push_back(result);
@@ -9167,6 +9399,74 @@ impl App {
             return true;
         }
         self.install_pending_load(offset, kind);
+        true
+    }
+
+    fn apply_export_finished(
+        &mut self,
+        token: crate::ExportToken,
+        project_id: ProjectId,
+        revision: u64,
+        slot: PatternSlotId,
+        destination: PathBuf,
+        result: Result<crate::OfflineExportReceipt, crate::OfflineExportError>,
+    ) -> bool {
+        let Some(operation) = self.export_operation.as_ref() else {
+            return false;
+        };
+        if operation.token != token
+            || operation.project_id != project_id
+            || operation.revision != revision
+            || operation.slot != slot
+            || operation.destination != destination
+        {
+            return false;
+        }
+        if let Ok(receipt) = &result
+            && (receipt.token != token
+                || receipt.project_id != project_id
+                || receipt.revision != revision
+                || receipt.slot != slot
+                || receipt.destination != destination)
+        {
+            return false;
+        }
+        let fence = operation.result_fence();
+        self.export_operation = None;
+        self.export_status_focused = false;
+        self.status = match result {
+            Ok(receipt) => {
+                self.export_outcome = Some(crate::ExportStatusView::Completed {
+                    receipt: receipt.clone(),
+                });
+                format!(
+                    "Exported pattern {} · revision {} · {} frames",
+                    receipt.slot.get() + 1,
+                    receipt.revision,
+                    receipt.rendered_frames
+                )
+            }
+            Err(crate::OfflineExportError::Cancelled) => {
+                self.export_outcome = Some(crate::ExportStatusView::Cancelled { fence });
+                format!(
+                    "Export cancelled · pattern {} · revision {revision}",
+                    slot.get() + 1
+                )
+            }
+            Err(error) => {
+                self.export_outcome = Some(crate::ExportStatusView::Failed {
+                    fence,
+                    error: error.clone(),
+                });
+                format!("Export failed · revision {revision} · {error}")
+            }
+        };
+        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::ExportCleanup)
+            && self.pending_project_action.is_some()
+        {
+            self.project_lifecycle_wait = None;
+            self.advance_project_action();
+        }
         true
     }
 
@@ -9592,9 +9892,11 @@ impl App {
             PaletteCommand::OpenProject(directory) => {
                 self.request_open_project_interactive(directory);
             }
-            PaletteCommand::Export(_) => {
+            PaletteCommand::Export(destination) => {
                 self.overlay = None;
-                self.status = crate::OfflineExportError::RendererUnavailable.to_string();
+                if let Err(error) = self.start_export(destination) {
+                    self.status = error.to_string();
+                }
             }
             PaletteCommand::Bank(bank) => {
                 if self.editor.is_dirty() {
@@ -20216,5 +20518,23 @@ mod tests {
         app.midi_settings = midi;
 
         assert_eq!(app.project_snapshot().unwrap().midi, midi);
+    }
+
+    #[test]
+    fn exhausted_export_token_rejects_before_installing_any_operation_or_request() {
+        let mut app = App::without_audio("no output device");
+        app.next_export_token = u64::MAX;
+        let destination = std::env::temp_dir().join(format!(
+            "sampler-tui-export-token-exhausted-{}.wav",
+            std::process::id()
+        ));
+
+        assert_eq!(
+            app.start_export(destination),
+            Err(crate::OfflineExportError::TokenExhausted)
+        );
+        assert_eq!(app.next_export_token, u64::MAX);
+        assert!(app.export_operation.is_none());
+        assert!(app.pending_worker_requests.is_empty());
     }
 }

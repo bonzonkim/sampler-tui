@@ -15,15 +15,13 @@ use sampler_audio::{
     CaptureSource, DecodeLimits, SampleBuffer, decode_shared_bytes_with_limits,
     prepare_sample_with_frame_limit, probe_shared_audio_format, resample_stereo_with_frame_limit,
 };
-use sampler_core::{
-    AssetDigest, PadId, ProjectId, ProjectPad, SampleEditRecipe, apply_sample_edit,
-};
+use sampler_core::{AssetDigest, PadId, ProjectId, SampleEditRecipe, apply_sample_edit};
 
 use crate::app::{EDIT_PREVIEW_COLUMNS, PREVIEW_COLUMNS, PreviewColumn};
 use crate::capture_store::{CaptureStore, CaptureStoreError, ManagedCapture, ManagedCaptureId};
 use crate::export::{
-    EXPORT_CHUNK_FRAMES, ExportCancel, ExportToken, OfflineExportError, OfflineExportReceipt,
-    OfflineExportRequest, stage_export_samples_with_observers,
+    EXPORT_CHUNK_FRAMES, ExportCancel, ExportResultFence, ExportToken, OfflineExportError,
+    OfflineExportReceipt, OfflineExportRequest, stage_export_samples_with_observers,
 };
 use crate::export_file::AtomicWavPublisher;
 #[cfg(test)]
@@ -31,8 +29,8 @@ use crate::export_file::PublisherCheckpoint;
 use crate::export_render::{OfflineFrameSink, render_offline};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 use crate::project_store::{
-    ProjectProbe, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind, SaveReceipt,
-    SourceFingerprint,
+    ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind,
+    SaveReceipt, SourceFingerprint,
 };
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
@@ -229,6 +227,7 @@ pub enum WorkerResult {
     },
     ExportProgress {
         token: ExportToken,
+        fence: Arc<ExportResultFence>,
         completed_units: u64,
         total_units: u64,
     },
@@ -236,6 +235,7 @@ pub enum WorkerResult {
         token: ExportToken,
         project_id: ProjectId,
         revision: u64,
+        slot: sampler_core::PatternSlotId,
         destination: PathBuf,
         result: Result<OfflineExportReceipt, OfflineExportError>,
     },
@@ -356,9 +356,10 @@ impl fmt::Display for WorkerPanicked {
 
 impl Error for WorkerPanicked {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportProgressSnapshot {
     token: ExportToken,
+    fence: Arc<ExportResultFence>,
     completed_units: u64,
     total_units: u64,
 }
@@ -392,6 +393,7 @@ impl CoalescedExportProgress {
     fn publish(&self, result: WorkerResult) {
         let WorkerResult::ExportProgress {
             token,
+            fence,
             completed_units,
             total_units,
         } = result
@@ -401,6 +403,7 @@ impl CoalescedExportProgress {
         };
         let next = ExportProgressSnapshot {
             token,
+            fence,
             completed_units,
             total_units,
         };
@@ -438,6 +441,7 @@ impl CoalescedExportProgress {
             .ok()
             .map(|snapshot| WorkerResult::ExportProgress {
                 token: snapshot.token,
+                fence: snapshot.fence,
                 completed_units: snapshot.completed_units,
                 total_units: snapshot.total_units,
             })
@@ -954,10 +958,17 @@ fn worker_loop_with_store_and_asset_hook(
                 let token = request.token();
                 let project_id = request.snapshot().project_id();
                 let revision = request.snapshot().revision();
+                let slot = request.snapshot().slot();
                 let destination = request.destination().to_path_buf();
+                let fence = Arc::new(ExportResultFence {
+                    project_id,
+                    revision,
+                    slot,
+                    destination: destination.clone(),
+                });
                 let cancel = request.cancellation();
                 let result = match catch_unwind(AssertUnwindSafe(|| {
-                    run_export(request, &export_progress, &hooks)
+                    run_export(request, &export_progress, &hooks, fence)
                 })) {
                     Ok(result) => result,
                     Err(payload) => {
@@ -972,6 +983,7 @@ fn worker_loop_with_store_and_asset_hook(
                     token,
                     project_id,
                     revision,
+                    slot,
                     destination,
                     result,
                 }
@@ -988,6 +1000,7 @@ struct ExportProgressSink<'a> {
     publisher: &'a mut AtomicWavPublisher,
     progress: &'a CoalescedExportProgress,
     token: ExportToken,
+    fence: Arc<ExportResultFence>,
     completed_units: u64,
     total_units: u64,
 }
@@ -1001,6 +1014,7 @@ impl OfflineFrameSink for ExportProgressSink<'_> {
             .ok_or(OfflineExportError::Arithmetic)?;
         self.progress.publish(WorkerResult::ExportProgress {
             token: self.token,
+            fence: Arc::clone(&self.fence),
             completed_units: self.completed_units,
             total_units: self.total_units,
         });
@@ -1012,6 +1026,7 @@ fn run_export(
     request: OfflineExportRequest,
     progress: &CoalescedExportProgress,
     hooks: &WorkerHooks,
+    fence: Arc<ExportResultFence>,
 ) -> Result<OfflineExportReceipt, OfflineExportError> {
     let (token, destination, snapshot, cancel) = request.into_parts();
     let loop_frames = snapshot.loop_frames()?;
@@ -1024,6 +1039,7 @@ fn run_export(
         .ok_or(OfflineExportError::Arithmetic)?;
     progress.publish(WorkerResult::ExportProgress {
         token,
+        fence: Arc::clone(&fence),
         completed_units: 0,
         total_units,
     });
@@ -1041,6 +1057,7 @@ fn run_export(
             completed_units += 1;
             progress.publish(WorkerResult::ExportProgress {
                 token,
+                fence: Arc::clone(&fence),
                 completed_units,
                 total_units,
             });
@@ -1064,6 +1081,7 @@ fn run_export(
             publisher: &mut publisher,
             progress,
             token,
+            fence: Arc::clone(&fence),
             completed_units,
             total_units,
         };
@@ -1072,6 +1090,7 @@ fn run_export(
     let receipt = publisher.publish(token, &snapshot, summary, cancel.as_atomic())?;
     progress.publish(WorkerResult::ExportProgress {
         token,
+        fence,
         completed_units: total_units,
         total_units,
     });
@@ -1202,23 +1221,16 @@ fn load_project_sample(
     .map_err(LoadSampleError::ProjectAsset)
 }
 
-/// Opens, verifies, decodes, edits, and resamples one committed project pad.
-///
-/// This is the shared project-asset pipeline used by project-open and offline export staging.
-/// It intentionally delegates the filesystem fence to `ProjectStore` and the PCM pipeline to
-/// `decode_and_render_sample`; callers must not add a second, weaker export decoder.
-pub(crate) fn decode_committed_project_pad(
-    directory: &Path,
-    pad: &ProjectPad,
+pub(crate) fn decode_committed_source_pad(
+    pad: &ProjectSavePad,
     target_rate: u32,
     cancelled: &AtomicBool,
 ) -> Result<LoadedSample, ProjectStoreError> {
-    decode_committed_project_pad_after_open(directory, pad, target_rate, cancelled, || {})
+    decode_committed_source_pad_after_open(pad, target_rate, cancelled, || {})
 }
 
-pub(crate) fn decode_committed_project_pad_after_open<F>(
-    directory: &Path,
-    pad: &ProjectPad,
+pub(crate) fn decode_committed_source_pad_after_open<F>(
+    pad: &ProjectSavePad,
     target_rate: u32,
     cancelled: &AtomicBool,
     after_open: F,
@@ -1226,15 +1238,33 @@ pub(crate) fn decode_committed_project_pad_after_open<F>(
 where
     F: FnOnce(),
 {
-    decode_committed_project_asset(
-        directory,
-        &pad.audio_path,
-        pad.asset_digest,
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    let asset = ProjectStore.read_committed_source_after_open(
+        &pad.source_path,
+        pad.fingerprint,
+        after_open,
+    )?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    let path = asset.path.clone();
+    let sample = decode_and_render_sample(
+        &path,
+        asset.encoded,
+        asset.fingerprint,
         target_rate,
         pad.recipe,
-        cancelled,
-        after_open,
     )
+    .map_err(|error| ProjectStoreError::Decode {
+        path,
+        message: error.to_string(),
+    })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProjectStoreError::Cancelled);
+    }
+    Ok(sample)
 }
 
 fn decode_committed_project_asset<F>(
@@ -1848,8 +1878,21 @@ mod tests {
     #[test]
     fn coalesced_export_progress_retains_the_latest_update_under_consumer_contention() {
         let progress = Arc::new(CoalescedExportProgress::default());
+        let first_fence = Arc::new(crate::ExportResultFence {
+            project_id: ProjectId::from_bytes([1; 16]),
+            revision: 1,
+            slot: PatternSlotId::new(0).unwrap(),
+            destination: PathBuf::from("first.wav"),
+        });
+        let latest_fence = Arc::new(crate::ExportResultFence {
+            project_id: ProjectId::from_bytes([2; 16]),
+            revision: 2,
+            slot: PatternSlotId::new(1).unwrap(),
+            destination: PathBuf::from("latest.wav"),
+        });
         progress.publish(WorkerResult::ExportProgress {
             token: crate::ExportToken::new(1),
+            fence: first_fence,
             completed_units: 1,
             total_units: 8,
         });
@@ -1864,6 +1907,7 @@ mod tests {
 
         progress.publish(WorkerResult::ExportProgress {
             token: crate::ExportToken::new(2),
+            fence: Arc::clone(&latest_fence),
             completed_units: 7,
             total_units: 8,
         });
@@ -1873,6 +1917,7 @@ mod tests {
             consumer.join().unwrap(),
             Some(WorkerResult::ExportProgress {
                 token: crate::ExportToken::new(2),
+                fence: latest_fence,
                 completed_units: 7,
                 total_units: 8,
             })
@@ -1896,6 +1941,12 @@ mod tests {
         let (_, baseline_counts) = crate::audio::count_test_thread_allocations(|| ());
         assert_eq!(baseline_counts.allocations, 0);
         assert_eq!(baseline_counts.deallocations, 0);
+        let fence = Arc::new(crate::ExportResultFence {
+            project_id: ProjectId::from_bytes([3; 16]),
+            revision: 3,
+            slot: PatternSlotId::new(0).unwrap(),
+            destination: PathBuf::from("allocation.wav"),
+        });
         let (_, empty_take_counts) =
             crate::audio::count_test_thread_allocations(|| std::hint::black_box(progress.take()));
         assert_eq!(empty_take_counts.allocations, 0);
@@ -1903,6 +1954,7 @@ mod tests {
         let (_, first_publish_counts) = crate::audio::count_test_thread_allocations(|| {
             progress.publish(WorkerResult::ExportProgress {
                 token: crate::ExportToken::new(100),
+                fence: Arc::clone(&fence),
                 completed_units: 1,
                 total_units: 2,
             });
@@ -1918,6 +1970,7 @@ mod tests {
             for token in 1..=64 {
                 progress.publish(WorkerResult::ExportProgress {
                     token: crate::ExportToken::new(token),
+                    fence: Arc::clone(&fence),
                     completed_units: token * 2,
                     total_units: token * 3,
                 });
@@ -2245,6 +2298,7 @@ mod tests {
                 token,
                 project_id,
                 revision,
+                slot: _,
                 ref destination,
                 result: Err(crate::OfflineExportError::ExportPanicked),
             } if token == crate::ExportToken::new(113)
@@ -2274,6 +2328,7 @@ mod tests {
                 token,
                 project_id,
                 revision,
+                slot: _,
                 ref destination,
                 result: Ok(ref receipt),
             } if token == crate::ExportToken::new(114)

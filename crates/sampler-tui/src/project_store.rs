@@ -365,6 +365,45 @@ impl ProjectDirectory {
 }
 
 impl ProjectStore {
+    pub(crate) fn read_committed_source_after_open<F>(
+        &self,
+        path: &Path,
+        expected: SourceFingerprint,
+        after_open: F,
+    ) -> Result<ProjectAssetBytes, ProjectStoreError>
+    where
+        F: FnOnce(),
+    {
+        let mut source = ValidatedSource::open(path)?;
+        after_open();
+        if source.fingerprint != expected {
+            return Err(ProjectStoreError::AssetIntegrity { path: source.path });
+        }
+        source.rewind()?;
+        let mut encoded = Vec::with_capacity(source.fingerprint.encoded_bytes as usize);
+        source
+            .file
+            .take(MAX_ENCODED_FILE_BYTES + 1)
+            .read_to_end(&mut encoded)
+            .map_err(|error| ProjectStoreError::SourceRead {
+                path: source.path.clone(),
+                kind: error.kind(),
+            })?;
+        let fingerprint = SourceFingerprint::from_encoded_bytes_with_extension(
+            &source.path,
+            &encoded,
+            source.fingerprint.extension,
+        )?;
+        if fingerprint != source.fingerprint || fingerprint != expected {
+            return Err(ProjectStoreError::AssetIntegrity { path: source.path });
+        }
+        Ok(ProjectAssetBytes {
+            path: source.path,
+            encoded: Arc::from(encoded),
+            fingerprint,
+        })
+    }
+
     pub(crate) fn read_project_asset_after_open<F>(
         &self,
         directory: &Path,

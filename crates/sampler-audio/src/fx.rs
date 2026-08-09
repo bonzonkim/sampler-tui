@@ -7,6 +7,8 @@ const TAP_CROSSFADE_FRAMES: u32 = 128;
 const MAX_DELAY_MS: usize = 2_000;
 const REVERB_REFERENCE_RATE: u64 = 44_100;
 const REVERB_INPUT_GAIN: f32 = 0.125;
+// Freeverb-style damping stays strictly below one so stored low-pass energy decays.
+const MAX_COMB_DAMPING: f32 = 0.4;
 
 const COMB_LENGTHS_LEFT: [u32; 8] = [1_116, 1_188, 1_277, 1_356, 1_422, 1_491, 1_557, 1_617];
 const COMB_LENGTHS_RIGHT: [u32; 8] = [1_139, 1_211, 1_300, 1_379, 1_445, 1_514, 1_580, 1_640];
@@ -271,7 +273,7 @@ impl ReverbBus {
             invalid_commands,
         );
         let feedback = 0.7 + self.room_size.next() * 0.28;
-        let damping = self.damping.next();
+        let damping = self.damping.next() * MAX_COMB_DAMPING;
 
         let mut left = 0.0;
         for comb in &mut self.combs_left {
@@ -626,12 +628,58 @@ mod tests {
         )
         .unwrap();
         reverb.set_settings(disabled_reverb);
-        let _ = render_impulse(&mut reverb, 96_000, [0.0; 2], Bus::Reverb);
+        let _ = render_impulse(&mut reverb, 24_000, [0.0; 2], Bus::Reverb);
+        let advanced_reference =
+            render_impulse(&mut unadvanced_reference, 24_000, [0.0; 2], Bus::Reverb);
         reverb.set_settings(enabled_reverb(0.8, 0.4, 0.0));
-        let resumed_reverb = render_impulse(&mut reverb, 4_000, [0.0; 2], Bus::Reverb);
-        let unadvanced_reverb =
-            render_impulse(&mut unadvanced_reference, 4_000, [0.0; 2], Bus::Reverb);
-        assert!(peak(&resumed_reverb) < peak(&unadvanced_reverb));
+        let resumed_reverb = render_impulse(&mut reverb, 128, [0.0; 2], Bus::Reverb);
+        let advanced_reverb = render_impulse(&mut unadvanced_reference, 128, [0.0; 2], Bus::Reverb);
+        assert!(peak(&advanced_reference) > 0.0);
+        assert_eq!(&resumed_reverb[63..], &advanced_reverb[63..]);
+    }
+
+    #[test]
+    fn maximum_damping_keeps_an_excited_disabled_tail_finite_and_decaying() {
+        let mut reverb =
+            ReverbBus::new(1_000, ReverbSettings::new(true, 0.8, 0.2, 0.0).unwrap()).unwrap();
+        let mut invalid_commands = 0;
+        let excited: Vec<_> = (0..256)
+            .map(|_| reverb.process([1.0, 0.0], &mut invalid_commands))
+            .collect();
+        assert!(peak(&excited) > 0.0);
+
+        reverb.set_settings(ReverbSettings::new(false, 0.8, 1.0, 0.0).unwrap());
+        let early_tail: Vec<_> = (0..1_024)
+            .map(|_| reverb.process([0.0; 2], &mut invalid_commands))
+            .collect();
+        let later_tail: Vec<_> = (0..16_000)
+            .map(|_| reverb.process([0.0; 2], &mut invalid_commands))
+            .collect();
+        let latest_tail: Vec<_> = (0..16_000)
+            .map(|_| reverb.process([0.0; 2], &mut invalid_commands))
+            .collect();
+        assert!(early_tail.iter().flatten().all(|sample| sample.is_finite()));
+        assert!(later_tail.iter().flatten().all(|sample| sample.is_finite()));
+        assert!(
+            latest_tail
+                .iter()
+                .flatten()
+                .all(|sample| sample.is_finite())
+        );
+        let early_peak = peak(&early_tail);
+        let later_peak = peak(&later_tail);
+        let latest_peak = peak(&latest_tail);
+        assert!(early_peak > 0.0);
+        assert!(later_peak < early_peak);
+        assert!(latest_peak < later_peak * 0.9);
+
+        reverb.set_settings(ReverbSettings::new(true, 0.8, 1.0, 0.0).unwrap());
+        let resumed: Vec<_> = (0..128)
+            .map(|_| reverb.process([0.0; 2], &mut invalid_commands))
+            .collect();
+        assert!(resumed.iter().flatten().all(|sample| sample.is_finite()));
+        assert!(peak(&resumed) <= latest_peak);
+        assert_eq!(invalid_commands, 0);
     }
 
     #[test]

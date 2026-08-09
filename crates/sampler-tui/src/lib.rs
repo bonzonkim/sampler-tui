@@ -5,6 +5,7 @@ mod capture_store;
 pub mod cli;
 pub mod diagnostic;
 pub mod export;
+pub mod export_render;
 pub mod file_picker;
 pub mod input;
 pub mod loader;
@@ -34,6 +35,7 @@ pub use export::{
     OfflineExportCancellation, OfflineExportError, OfflineExportReceipt, OfflineExportRequest,
     OfflineExportSnapshot, validate_wav_destination,
 };
+pub use export_render::{OfflineFrameSink, OfflineRenderSummary, render_offline};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};
 pub use loader::{

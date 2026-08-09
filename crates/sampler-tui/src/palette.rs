@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use sampler_core::{BankId, ChokeGroup, MidiChannel, MidiChannelFilter, PlaybackMode, Resolution};
 
+use crate::validate_wav_destination;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
     text: String,
@@ -77,6 +79,7 @@ pub enum PaletteCommand {
     Save,
     SaveAs(PathBuf),
     OpenProject(PathBuf),
+    Export(PathBuf),
     Bank(BankId),
     Select(usize),
     StopAll,
@@ -146,6 +149,7 @@ pub fn parse_palette(input: &str) -> Result<PaletteCommand, String> {
         "open-project" => {
             parse_project_path(remainder, "open-project").map(PaletteCommand::OpenProject)
         }
+        "export" => parse_export_path(remainder).map(PaletteCommand::Export),
         "bank" => parse_bank(remainder).map(PaletteCommand::Bank),
         "select" => parse_selection(remainder).map(PaletteCommand::Select),
         "stop-all" => no_arguments(remainder, "stop-all", PaletteCommand::StopAll),
@@ -283,6 +287,32 @@ fn parse_project_path(input: &str, command: &str) -> Result<PathBuf, String> {
         return Err(format!("{command} expects one project directory"));
     }
     Ok(PathBuf::from(content))
+}
+
+fn parse_export_path(input: &str) -> Result<PathBuf, String> {
+    if input.is_empty() {
+        return Err("export expects one WAV destination".to_owned());
+    }
+    let mut characters = input.chars();
+    let Some(quote @ ('\'' | '\"')) = characters.next() else {
+        let destination = PathBuf::from(input);
+        return validate_wav_destination(&destination)
+            .map(|_| destination)
+            .map_err(|_| "export expects one WAV destination".to_owned());
+    };
+    let Some(content) = input
+        .strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+    else {
+        return Err("export expects one WAV destination".to_owned());
+    };
+    if content.is_empty() || content.contains(quote) {
+        return Err("export expects one WAV destination".to_owned());
+    }
+    let destination = PathBuf::from(content);
+    validate_wav_destination(&destination)
+        .map(|_| destination)
+        .map_err(|_| "export expects one WAV destination".to_owned())
 }
 
 fn parse_frame(input: &str) -> Result<u64, String> {
@@ -501,6 +531,24 @@ mod tests {
             parse_palette("save-as \"unterminated"),
             Err("save-as expects one project directory".into())
         );
+    }
+
+    #[test]
+    fn export_palette_consumes_one_path_remainder_strictly() {
+        assert_eq!(
+            parse_palette("export mixes/final take.wav"),
+            Ok(PaletteCommand::Export(PathBuf::from(
+                "mixes/final take.wav"
+            )))
+        );
+        assert_eq!(
+            parse_palette("export \"mixes/final take.wav\""),
+            Ok(PaletteCommand::Export(PathBuf::from(
+                "mixes/final take.wav"
+            )))
+        );
+        assert!(parse_palette("export").is_err());
+        assert!(parse_palette("export mix.flac").is_err());
     }
 
     #[test]

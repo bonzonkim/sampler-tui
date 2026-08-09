@@ -4,6 +4,7 @@ pub mod capture;
 mod capture_store;
 pub mod cli;
 pub mod diagnostic;
+pub mod export;
 pub mod file_picker;
 pub mod input;
 pub mod loader;
@@ -28,6 +29,11 @@ pub use app::{
 pub use audio::{AudioPort, CaptureSupport};
 pub use capture::{CaptureError, CaptureFailureCause, CapturePhase, CaptureSession};
 pub use capture_store::{CaptureStoreError, ManagedCapture, ManagedCaptureId};
+pub use export::{
+    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportPatternSlot, ExportToken,
+    OfflineExportCancellation, OfflineExportError, OfflineExportReceipt, OfflineExportRequest,
+    OfflineExportSnapshot, validate_wav_destination,
+};
 pub use file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, FilePicker};
 pub use input::{InputAction, KeyboardCapabilities, PAD_KEYS, map_key};
 pub use loader::{

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use sampler_tui::cli::{CliCommand, USAGE, parse_args_os};
-use sampler_tui::{diagnostic, run_tui};
+use sampler_tui::{OfflineExportError, diagnostic, run_tui};
 
 fn main() -> ExitCode {
     let command = match parse_args_os(std::env::args_os()) {
@@ -17,6 +17,9 @@ fn main() -> ExitCode {
         CliCommand::Tui => run_tui(None),
         CliCommand::Open(directory) => run_tui(Some(directory)),
         CliCommand::Play(path) => diagnostic::play(path),
+        CliCommand::Export { .. } => {
+            Err(Box::new(OfflineExportError::RendererUnavailable) as Box<dyn Error>)
+        }
         CliCommand::Help => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

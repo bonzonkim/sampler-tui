@@ -1,13 +1,20 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "Usage:\n  sampler-tui\n  sampler-tui open <project-directory>\n  sampler-tui play <path>\n  sampler-tui --help";
+use crate::{ExportPatternSlot, validate_wav_destination};
+
+pub const USAGE: &str = "Usage:\n  sampler-tui\n  sampler-tui open <project-directory>\n  sampler-tui play <path>\n  sampler-tui export <project-directory> <pattern-1..16> <output.wav>\n  sampler-tui --help";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliCommand {
     Tui,
     Open(PathBuf),
     Play(PathBuf),
+    Export {
+        project: PathBuf,
+        slot: ExportPatternSlot,
+        destination: PathBuf,
+    },
     Help,
 }
 
@@ -18,15 +25,36 @@ pub fn parse_args_os(mut args: impl Iterator<Item = OsString>) -> Result<CliComm
     let Some(_program) = args.next() else {
         return Err(InvalidUsage);
     };
-    match (args.next(), args.next(), args.next()) {
-        (None, None, None) => Ok(CliCommand::Tui),
-        (Some(command), Some(path), None) if command == "open" => {
-            Ok(CliCommand::Open(PathBuf::from(path)))
+    match args.next() {
+        None => Ok(CliCommand::Tui),
+        Some(command) if command == "--help" && args.next().is_none() => Ok(CliCommand::Help),
+        Some(command) if command == "open" => match (args.next(), args.next()) {
+            (Some(path), None) => Ok(CliCommand::Open(PathBuf::from(path))),
+            _ => Err(InvalidUsage),
+        },
+        Some(command) if command == "play" => match (args.next(), args.next()) {
+            (Some(path), None) => Ok(CliCommand::Play(PathBuf::from(path))),
+            _ => Err(InvalidUsage),
+        },
+        Some(command) if command == "export" => {
+            let (Some(project), Some(slot), Some(destination), None) =
+                (args.next(), args.next(), args.next(), args.next())
+            else {
+                return Err(InvalidUsage);
+            };
+            let slot = slot
+                .to_str()
+                .and_then(|value| value.parse::<u8>().ok())
+                .ok_or(InvalidUsage)
+                .and_then(|value| ExportPatternSlot::try_from(value).map_err(|_| InvalidUsage))?;
+            let destination = PathBuf::from(destination);
+            validate_wav_destination(&destination).map_err(|_| InvalidUsage)?;
+            Ok(CliCommand::Export {
+                project: PathBuf::from(project),
+                slot,
+                destination,
+            })
         }
-        (Some(command), Some(path), None) if command == "play" => {
-            Ok(CliCommand::Play(PathBuf::from(path)))
-        }
-        (Some(command), None, None) if command == "--help" => Ok(CliCommand::Help),
         _ => Err(InvalidUsage),
     }
 }
@@ -35,6 +63,8 @@ pub fn parse_args_os(mut args: impl Iterator<Item = OsString>) -> Result<CliComm
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    use crate::export::{ExportPatternSlot, OfflineExportError};
 
     use super::*;
 
@@ -70,6 +100,40 @@ mod tests {
         );
         assert!(parse_args_os(args(&["sampler-tui", "open"])).is_err());
         assert!(parse_args_os(args(&["sampler-tui", "open", "project-a", "project-b"])).is_err());
+    }
+
+    #[test]
+    fn export_slot_is_strictly_one_based() {
+        assert_eq!(ExportPatternSlot::try_from(1).unwrap().slot().get(), 0);
+        assert_eq!(ExportPatternSlot::try_from(16).unwrap().slot().get(), 15);
+        assert_eq!(
+            ExportPatternSlot::try_from(0),
+            Err(OfflineExportError::PatternSlot(0))
+        );
+        assert_eq!(
+            ExportPatternSlot::try_from(17),
+            Err(OfflineExportError::PatternSlot(17))
+        );
+    }
+
+    #[test]
+    fn export_cli_requires_project_slot_and_wav_destination() {
+        assert_eq!(
+            parse_args_os(args(&[
+                "sampler-tui",
+                "export",
+                "projects/set",
+                "4",
+                "mix.wav",
+            ])),
+            Ok(CliCommand::Export {
+                project: PathBuf::from("projects/set"),
+                slot: ExportPatternSlot::try_from(4).unwrap(),
+                destination: PathBuf::from("mix.wav"),
+            })
+        );
+        assert!(parse_args_os(args(&["sampler-tui", "export", "set", "0", "mix.wav"])).is_err());
+        assert!(parse_args_os(args(&["sampler-tui", "export", "set", "1", "mix.flac"])).is_err());
     }
 
     #[cfg(unix)]

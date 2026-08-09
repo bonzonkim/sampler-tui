@@ -9590,6 +9590,10 @@ impl App {
             PaletteCommand::OpenProject(directory) => {
                 self.request_open_project_interactive(directory);
             }
+            PaletteCommand::Export(_) => {
+                self.overlay = None;
+                self.status = "Offline export renderer is not available".to_owned();
+            }
             PaletteCommand::Bank(bank) => {
                 if self.editor.is_dirty() {
                     self.status = "discard sample draft before changing bank".to_owned();

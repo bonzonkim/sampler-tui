@@ -18,6 +18,12 @@ const CAPTURE_DIRECTORY_PREFIX: &str = "sampler-tui-capture-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureWritePoint {
+    BeforeRootOpen,
+    BeforeTempDirectoryClone,
+    BeforeTempIdentityClone,
+    BeforePublicationDirectoryClone,
+    BeforePublicationIdentityClone,
+    BeforePublishedVerification,
     AfterPublish,
 }
 
@@ -147,14 +153,21 @@ impl fmt::Debug for CaptureStore {
 
 impl CaptureStore {
     pub(crate) fn new() -> Result<Self, CaptureStoreError> {
-        Self::new_with_entropy(|bytes| {
-            getrandom::fill(bytes).map_err(|error| CaptureStoreError::Entropy(error.to_string()))
-        })
+        Self::new_with_controls(os_entropy, |_, _| Ok(()))
     }
 
+    #[cfg(test)]
     fn new_with_entropy<F>(mut fill_entropy: F) -> Result<Self, CaptureStoreError>
     where
         F: FnMut(&mut [u8; 32]) -> Result<(), CaptureStoreError>,
+    {
+        Self::new_with_controls(&mut fill_entropy, |_, _| Ok(()))
+    }
+
+    fn new_with_controls<F, H>(mut fill_entropy: F, mut hook: H) -> Result<Self, CaptureStoreError>
+    where
+        F: FnMut(&mut [u8; 32]) -> Result<(), CaptureStoreError>,
+        H: FnMut(CaptureWritePoint, &Path) -> Result<(), CaptureStoreError>,
     {
         let parent_path = std::env::temp_dir();
         let parent_owned = rustix::fs::open(
@@ -166,9 +179,23 @@ impl CaptureStore {
         let parent = File::from(parent_owned);
         for _ in 0..MAX_NAME_ATTEMPTS {
             let leaf = random_leaf(CAPTURE_DIRECTORY_PREFIX, "", &mut fill_entropy)?;
+            let root_path = parent_path.join(&leaf);
+            let rollback_leaf = leaf.clone();
+            let rollback_parent = parent.try_clone().map_err(|error| {
+                io_error("clone OS temporary directory handle", &parent_path, error)
+            })?;
             match rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    let root_path = parent_path.join(&leaf);
+                    let identity = path_identity(&parent, Path::new(&leaf)).map_err(|error| {
+                        io_error("inspect created capture directory", &root_path, error)
+                    })?;
+                    let mut creation = CreatedDirectory {
+                        parent: rollback_parent,
+                        leaf: rollback_leaf,
+                        identity,
+                        armed: true,
+                    };
+                    hook(CaptureWritePoint::BeforeRootOpen, &root_path)?;
                     let root_owned = rustix::fs::openat(
                         &parent,
                         &leaf,
@@ -178,9 +205,21 @@ impl CaptureStore {
                     .map_err(|error| {
                         filesystem_error("open capture directory", &root_path, error)
                     })?;
+                    let root = File::from(root_owned);
+                    if file_identity(&root).map_err(|error| {
+                        io_error("inspect opened capture directory", &root_path, error)
+                    })? != identity
+                    {
+                        return Err(CaptureStoreError::Filesystem {
+                            operation: "verify opened capture directory identity",
+                            path: root_path,
+                            kind: io::ErrorKind::Other,
+                        });
+                    }
+                    creation.armed = false;
                     return Ok(Self {
                         parent,
-                        root: File::from(root_owned),
+                        root,
                         root_leaf: leaf,
                         root_path,
                         next_id: 1,
@@ -229,25 +268,43 @@ impl CaptureStore {
     where
         F: FnMut(CaptureWritePoint) -> Result<(), CaptureStoreError>,
     {
+        let mut hook = hook;
+        self.finalize_with_controls(stereo, sample_rate, os_entropy, |point, _| hook(point))
+    }
+
+    #[cfg(test)]
+    fn finalize_with_controls<F, H>(
+        &mut self,
+        stereo: Arc<[f32]>,
+        sample_rate: u32,
+        fill_entropy: F,
+        hook: H,
+    ) -> Result<ManagedCapture, CaptureStoreError>
+    where
+        F: FnMut(&mut [u8; 32]) -> Result<(), CaptureStoreError>,
+        H: FnMut(CaptureWritePoint, &Path) -> Result<(), CaptureStoreError>,
+    {
         let sample = SampleBuffer::new(sample_rate, stereo.as_ref().to_vec())
             .map_err(|error| CaptureStoreError::Sample(error.to_string()))?;
-        self.finalize_sample_with_hook(sample, hook)
+        self.finalize_sample_with_controls(sample, fill_entropy, hook)
     }
 
     pub(crate) fn finalize_sample(
         &mut self,
         sample: SampleBuffer,
     ) -> Result<ManagedCapture, CaptureStoreError> {
-        self.finalize_sample_with_hook(sample, |_| Ok(()))
+        self.finalize_sample_with_controls(sample, os_entropy, |_, _| Ok(()))
     }
 
-    fn finalize_sample_with_hook<F>(
+    fn finalize_sample_with_controls<F, H>(
         &mut self,
         sample: SampleBuffer,
-        mut hook: F,
+        mut fill_entropy: F,
+        mut hook: H,
     ) -> Result<ManagedCapture, CaptureStoreError>
     where
-        F: FnMut(CaptureWritePoint) -> Result<(), CaptureStoreError>,
+        F: FnMut(&mut [u8; 32]) -> Result<(), CaptureStoreError>,
+        H: FnMut(CaptureWritePoint, &Path) -> Result<(), CaptureStoreError>,
     {
         let frames = sample.frames();
         if frames > MAX_PREPARED_FRAMES {
@@ -277,7 +334,8 @@ impl CaptureStore {
             .ok_or(CaptureStoreError::IdExhausted)?;
         let leaf = std::ffi::OsString::from(format!("capture-{:020}.wav", id.get()));
         let path = self.root_path.join(&leaf);
-        let (file, mut temporary) = self.create_temp(&path)?;
+        let (file, mut temporary) =
+            self.create_temp_with_controls(&path, &mut fill_entropy, &mut hook)?;
         let sync_handle = file
             .try_clone()
             .map_err(|error| io_error("clone capture temporary file", &path, error))?;
@@ -286,6 +344,22 @@ impl CaptureStore {
             .sync_all()
             .map_err(|error| io_error("sync captured WAV", &path, error))?;
         temporary.verify_path_identity()?;
+        hook(CaptureWritePoint::BeforePublicationDirectoryClone, &path)?;
+        let publication_directory = self
+            .root
+            .try_clone()
+            .map_err(|error| io_error("clone capture directory handle", &self.root_path, error))?;
+        hook(CaptureWritePoint::BeforePublicationIdentityClone, &path)?;
+        let publication_identity = temporary
+            .identity
+            .try_clone()
+            .map_err(|error| io_error("retain published capture identity", &path, error))?;
+        let mut publication = PublishedCapture::new_provisional(
+            publication_directory,
+            publication_identity,
+            leaf.clone(),
+            path.clone(),
+        );
         rustix::fs::linkat(
             &self.root,
             &temporary.leaf,
@@ -296,19 +370,10 @@ impl CaptureStore {
         .map_err(|error| {
             filesystem_error("publish captured WAV without replacement", &path, error)
         })?;
+        publication.arm();
+        hook(CaptureWritePoint::BeforePublishedVerification, &path)?;
         temporary.verify_published_identity(Path::new(&leaf), &path)?;
-        let mut publication = PublishedCapture::new(
-            self.root.try_clone().map_err(|error| {
-                io_error("clone capture directory handle", &self.root_path, error)
-            })?,
-            temporary
-                .identity
-                .try_clone()
-                .map_err(|error| io_error("retain published capture identity", &path, error))?,
-            leaf.clone(),
-            path.clone(),
-        );
-        hook(CaptureWritePoint::AfterPublish)?;
+        hook(CaptureWritePoint::AfterPublish, &path)?;
         temporary.unlink_owned()?;
         self.root
             .sync_all()
@@ -364,15 +429,26 @@ impl CaptureStore {
             .map_err(|error| io_error("sync managed capture release", &self.root_path, error))
     }
 
-    fn create_temp(&self, destination: &Path) -> Result<(File, CaptureTemp), CaptureStoreError> {
+    fn create_temp_with_controls<F, H>(
+        &self,
+        destination: &Path,
+        fill_entropy: &mut F,
+        hook: &mut H,
+    ) -> Result<(File, CaptureTemp), CaptureStoreError>
+    where
+        F: FnMut(&mut [u8; 32]) -> Result<(), CaptureStoreError>,
+        H: FnMut(CaptureWritePoint, &Path) -> Result<(), CaptureStoreError>,
+    {
         let base = destination
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("capture.wav");
         for _ in 0..MAX_NAME_ATTEMPTS {
-            let leaf = random_leaf(&format!(".{base}.sampler-tui-tmp-"), "", |bytes| {
-                getrandom::fill(bytes)
-                    .map_err(|error| CaptureStoreError::Entropy(error.to_string()))
+            let leaf = random_leaf(&format!(".{base}.sampler-tui-tmp-"), "", &mut *fill_entropy)?;
+            let temporary_path = destination.to_path_buf();
+            hook(CaptureWritePoint::BeforeTempDirectoryClone, destination)?;
+            let directory = self.root.try_clone().map_err(|error| {
+                io_error("clone capture directory handle", &self.root_path, error)
             })?;
             match rustix::fs::openat(
                 &self.root,
@@ -381,22 +457,18 @@ impl CaptureStore {
                 Mode::from_raw_mode(0o600),
             ) {
                 Ok(owned) => {
-                    let file = File::from(owned);
-                    let identity = file.try_clone().map_err(|error| {
+                    let temporary = CaptureTemp {
+                        directory,
+                        identity: File::from(owned),
+                        leaf,
+                        path: temporary_path,
+                        armed: true,
+                    };
+                    hook(CaptureWritePoint::BeforeTempIdentityClone, destination)?;
+                    let file = temporary.identity.try_clone().map_err(|error| {
                         io_error("retain capture temporary identity", destination, error)
                     })?;
-                    return Ok((
-                        file,
-                        CaptureTemp {
-                            directory: self.root.try_clone().map_err(|error| {
-                                io_error("clone capture directory handle", &self.root_path, error)
-                            })?,
-                            identity,
-                            leaf,
-                            path: destination.to_path_buf(),
-                            armed: true,
-                        },
-                    ));
+                    return Ok((file, temporary));
                 }
                 Err(rustix::io::Errno::EXIST) => continue,
                 Err(error) => {
@@ -424,14 +496,23 @@ struct PublishedCapture {
 }
 
 impl PublishedCapture {
-    fn new(directory: File, identity: File, leaf: std::ffi::OsString, path: PathBuf) -> Self {
+    fn new_provisional(
+        directory: File,
+        identity: File,
+        leaf: std::ffi::OsString,
+        path: PathBuf,
+    ) -> Self {
         Self {
             directory,
             identity,
             leaf,
             path,
-            armed: true,
+            armed: false,
         }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
     }
 
     fn promote_to_live(&mut self) -> Result<LiveCapture, CaptureStoreError> {
@@ -439,12 +520,36 @@ impl PublishedCapture {
             .identity
             .try_clone()
             .map_err(|error| io_error("retain managed capture identity", &self.path, error))?;
+        let leaf = self.leaf.clone();
+        let path = self.path.clone();
         self.armed = false;
         Ok(LiveCapture {
-            leaf: self.leaf.clone(),
-            path: self.path.clone(),
+            leaf,
+            path,
             identity,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct CreatedDirectory {
+    parent: File,
+    leaf: std::ffi::OsString,
+    identity: FileIdentity,
+    armed: bool,
+}
+
+impl Drop for CreatedDirectory {
+    fn drop(&mut self) {
+        if self.armed && path_has_identity(&self.parent, Path::new(&self.leaf), self.identity) {
+            let _ = rustix::fs::unlinkat(&self.parent, &self.leaf, rustix::fs::AtFlags::REMOVEDIR);
+            let _ = self.parent.sync_all();
+        }
     }
 }
 
@@ -590,6 +695,31 @@ fn path_matches_identity(directory: &File, leaf: &Path, expected: &File) -> bool
         return false;
     };
     expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino
+}
+
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let stat = rustix::fs::fstat(file).map_err(io::Error::from)?;
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+fn path_identity(directory: &File, leaf: &Path) -> io::Result<FileIdentity> {
+    let stat = rustix::fs::statat(directory, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)?;
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+fn path_has_identity(directory: &File, leaf: &Path, expected: FileIdentity) -> bool {
+    path_identity(directory, leaf).is_ok_and(|actual| actual == expected)
+}
+
+fn os_entropy(bytes: &mut [u8; 32]) -> Result<(), CaptureStoreError> {
+    getrandom::fill(bytes).map_err(|error| CaptureStoreError::Entropy(error.to_string()))
 }
 
 fn filesystem_error(
@@ -747,6 +877,193 @@ mod tests {
     }
 
     #[test]
+    fn root_open_failure_rolls_back_the_exact_created_directory_and_retry_succeeds() {
+        let entropy = [0x57_u8; 32];
+        let root = std::env::temp_dir().join(format!(
+            "sampler-tui-capture-{}",
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+
+        let error = CaptureStore::new_with_controls(
+            |bytes| {
+                *bytes = entropy;
+                Ok(())
+            },
+            |point, _| injected_failure(point, CaptureWritePoint::BeforeRootOpen),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert!(!root.exists());
+        let retry = CaptureStore::new_with_entropy(|bytes| {
+            *bytes = entropy;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retry.root_path(), root);
+    }
+
+    #[test]
+    fn root_open_failure_preserves_a_foreign_replacement() {
+        let entropy = [0x58_u8; 32];
+        let root = std::env::temp_dir().join(format!(
+            "sampler-tui-capture-{}",
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+
+        let error = CaptureStore::new_with_controls(
+            |bytes| {
+                *bytes = entropy;
+                Ok(())
+            },
+            |point, path| {
+                if point == CaptureWritePoint::BeforeRootOpen {
+                    fs::remove_dir(path).unwrap();
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("foreign"), b"foreign root").unwrap();
+                    return Err(injected_error(point));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert_eq!(fs::read(root.join("foreign")).unwrap(), b"foreign root");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temp_identity_clone_failure_removes_owned_temp_and_retry_reuses_id() {
+        assert_finalize_boundary_cleanup(CaptureWritePoint::BeforeTempIdentityClone);
+    }
+
+    #[test]
+    fn temp_directory_clone_failure_leaves_no_temp_and_retry_reuses_id() {
+        assert_finalize_boundary_cleanup(CaptureWritePoint::BeforeTempDirectoryClone);
+    }
+
+    #[test]
+    fn publication_directory_clone_failure_leaves_no_final_and_retry_reuses_id() {
+        assert_finalize_boundary_cleanup(CaptureWritePoint::BeforePublicationDirectoryClone);
+    }
+
+    #[test]
+    fn publication_identity_clone_failure_leaves_no_final_and_retry_reuses_id() {
+        assert_finalize_boundary_cleanup(CaptureWritePoint::BeforePublicationIdentityClone);
+    }
+
+    #[test]
+    fn post_link_verification_failure_removes_owned_final_and_retry_reuses_id() {
+        assert_finalize_boundary_cleanup(CaptureWritePoint::BeforePublishedVerification);
+    }
+
+    #[test]
+    fn post_link_verification_failure_preserves_a_foreign_final() {
+        let mut store = CaptureStore::new().unwrap();
+        let final_path = store.root_path().join("capture-00000000000000000001.wav");
+
+        let error = store
+            .finalize_with_controls(
+                Arc::from([0.25_f32, -0.25]),
+                48_000,
+                |bytes| {
+                    bytes.fill(0x61);
+                    Ok(())
+                },
+                |point, path| {
+                    if point == CaptureWritePoint::BeforePublishedVerification {
+                        fs::remove_file(path).unwrap();
+                        fs::write(path, b"foreign final").unwrap();
+                        return Err(injected_error(point));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert_eq!(fs::read(&final_path).unwrap(), b"foreign final");
+        assert_eq!(fs::read_dir(store.root_path()).unwrap().count(), 1);
+        fs::remove_file(&final_path).unwrap();
+        let retry = store
+            .finalize(Arc::from([0.25_f32, -0.25]), 48_000)
+            .unwrap();
+        assert_eq!(retry.id, ManagedCaptureId::new(1));
+    }
+
+    #[test]
+    fn temporary_name_collisions_retry_then_exhaust_without_removing_foreign_entry() {
+        let mut store = CaptureStore::new().unwrap();
+        let collision_leaf = format!(
+            ".capture-00000000000000000001.wav.sampler-tui-tmp-{}",
+            "41".repeat(32)
+        );
+        let collision = store.root_path().join(collision_leaf);
+        fs::write(&collision, b"foreign temp").unwrap();
+        let attempts = Cell::new(0_u8);
+
+        let capture = store
+            .finalize_with_controls(
+                Arc::from([0.25_f32, -0.25]),
+                48_000,
+                |bytes| {
+                    let attempt = attempts.get();
+                    attempts.set(attempt + 1);
+                    bytes.fill(if attempt == 0 { 0x41 } else { 0x42 });
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(fs::read(&collision).unwrap(), b"foreign temp");
+        store.release(capture.id).unwrap();
+        fs::remove_file(&collision).unwrap();
+
+        let exhausted_collision_leaf = format!(
+            ".capture-00000000000000000002.wav.sampler-tui-tmp-{}",
+            "41".repeat(32)
+        );
+        let exhausted_collision = store.root_path().join(exhausted_collision_leaf);
+        fs::write(&exhausted_collision, b"foreign exhausted temp").unwrap();
+
+        let exhausted_attempts = Cell::new(0_usize);
+        let error = store
+            .finalize_with_controls(
+                Arc::from([0.25_f32, -0.25]),
+                48_000,
+                |bytes| {
+                    exhausted_attempts.set(exhausted_attempts.get() + 1);
+                    bytes.fill(0x41);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(exhausted_attempts.get(), 16);
+        assert!(matches!(
+            error,
+            CaptureStoreError::NameExhausted { attempts: 16, .. }
+        ));
+        assert_eq!(
+            fs::read(&exhausted_collision).unwrap(),
+            b"foreign exhausted temp"
+        );
+        fs::remove_file(exhausted_collision).unwrap();
+        let retry = store
+            .finalize(Arc::from([0.25_f32, -0.25]), 48_000)
+            .unwrap();
+        assert_eq!(retry.id, ManagedCaptureId::new(2));
+    }
+
+    #[test]
     fn release_requires_the_exact_live_id_and_preserves_mismatches() {
         let mut store = CaptureStore::new().unwrap();
         let capture = store.finalize(Arc::from([0.5_f32, -0.5]), 48_000).unwrap();
@@ -795,5 +1112,47 @@ mod tests {
             error,
             CaptureStoreError::FrameLimitExceeded { .. }
         ));
+    }
+
+    fn assert_finalize_boundary_cleanup(boundary: CaptureWritePoint) {
+        let mut store = CaptureStore::new().unwrap();
+
+        let error = store
+            .finalize_with_controls(
+                Arc::from([0.25_f32, -0.25]),
+                48_000,
+                |bytes| {
+                    bytes.fill(0x62);
+                    Ok(())
+                },
+                |point, _| injected_failure(point, boundary),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CaptureStoreError::Filesystem { .. }));
+        assert!(fs::read_dir(store.root_path()).unwrap().next().is_none());
+        let retry = store
+            .finalize(Arc::from([0.25_f32, -0.25]), 48_000)
+            .unwrap();
+        assert_eq!(retry.id, ManagedCaptureId::new(1));
+    }
+
+    fn injected_failure(
+        point: CaptureWritePoint,
+        boundary: CaptureWritePoint,
+    ) -> Result<(), CaptureStoreError> {
+        if point == boundary {
+            Err(injected_error(point))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn injected_error(_point: CaptureWritePoint) -> CaptureStoreError {
+        CaptureStoreError::Filesystem {
+            operation: "injected capture-store boundary failure",
+            path: PathBuf::from("injected"),
+            kind: std::io::ErrorKind::Other,
+        }
     }
 }

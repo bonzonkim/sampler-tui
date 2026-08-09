@@ -731,6 +731,9 @@ pub fn scale_frame_phase(
     old_loop_frames: Frame,
     new_loop_frames: Frame,
 ) -> Result<Frame, PatternEditError> {
+    if old_loop_frames == 0 || new_loop_frames == 0 {
+        return Err(PatternEditError::InvalidLoopFrames);
+    }
     let scaled = u128::from(frame)
         .checked_mul(u128::from(new_loop_frames))
         .and_then(|value| value.checked_add(u128::from(old_loop_frames / 2)))
@@ -1124,6 +1127,29 @@ mod tests {
         pattern.insert(event_with_duration(1, 100, 10)).unwrap();
         pattern.rebuild_sample_rate(200).unwrap();
         assert_eq!(pattern.event(EventId(1)).unwrap().duration, Some(20));
+    }
+
+    #[test]
+    fn phase_scaling_rejects_zero_loop_sizes_with_the_exact_typed_error() {
+        assert_eq!(
+            scale_frame_phase(1, 0, 4),
+            Err(PatternEditError::InvalidLoopFrames)
+        );
+        assert_eq!(
+            scale_frame_phase(1, 4, 0),
+            Err(PatternEditError::InvalidLoopFrames)
+        );
+    }
+
+    #[test]
+    fn phase_scaling_preserves_nearest_frame_boundary_rounding() {
+        assert_eq!(scale_frame_phase(1, 2, 3), Ok(2));
+        assert_eq!(scale_frame_phase(2, 3, 4), Ok(3));
+        assert_eq!(scale_frame_phase(1, 2, 4), Ok(2));
+        assert_eq!(
+            scale_frame_phase(u64::MAX, u64::MAX, u64::MAX),
+            Ok(u64::MAX)
+        );
     }
 
     #[test]

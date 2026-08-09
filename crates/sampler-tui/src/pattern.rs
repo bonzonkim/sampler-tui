@@ -11,7 +11,7 @@ mod tests {
         EventId, PATTERN_SLOT_COUNT, PadId, PadSettings, PatternSlotId, PatternSnapshot, Tempo,
     };
 
-    use crate::{AudioPort, CaptureSupport};
+    use crate::{AudioPort, CaptureSupport, MAX_HELD_RECORDING_TRANSPORT_RESIZES};
 
     use super::{
         MAX_ACKS_PER_MAINTENANCE, PatternCaptureState, PatternStatus, PatternWorkspace,
@@ -486,6 +486,271 @@ mod tests {
         release_resized_gate(&mut workspace, release_stamp, 37);
 
         assert_gate_matches_reference(&workspace, reference);
+    }
+
+    #[test]
+    fn delayed_trigger_ack_replays_non_associative_resize_rounding_like_acked_and_existing_notes() {
+        let mut workspace = PatternWorkspace::new(1);
+        let pattern = workspace.selected_pattern();
+        let stamp = TransportStamp {
+            slot: pattern.slot(),
+            generation: pattern.generation(),
+            origin: 1_000,
+            loop_frames: pattern.transport().loop_frames(),
+        };
+        assert_eq!(pattern.transport().loop_frames(), 2);
+        workspace.start_recording(stamp).unwrap();
+
+        workspace.note_live_trigger(key(0), command(120), pad(), 0.5);
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            120,
+            1_001,
+            LiveAckKind::Trigger { velocity: 0.5 },
+            stamp,
+        )));
+        workspace.note_live_trigger(key(1), command(130), pad(), 0.75);
+        let reference = workspace.patterns[0]
+            .insert_new(pad(), 1, 0.25, Some(1))
+            .unwrap();
+        workspace.commit_project_pattern(0);
+
+        workspace.set_tempo(Tempo::new(80.0).unwrap()).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace.set_tempo(Tempo::new(60.0).unwrap()).unwrap();
+        let current_stamp = admit_current_transport(&mut workspace);
+        assert_eq!(current_stamp.loop_frames, 4);
+
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            130,
+            1_001,
+            LiveAckKind::Trigger { velocity: 0.75 },
+            stamp,
+        )));
+        workspace.note_live_release(key(0), command(121));
+        assert!(workspace.apply_ack(ack_for_stamp(
+            121,
+            1_002,
+            LiveAckKind::Release,
+            current_stamp,
+        )));
+        workspace.note_live_release(key(1), command(131));
+        assert!(workspace.apply_ack(ack_for_stamp(
+            131,
+            1_002,
+            LiveAckKind::Release,
+            current_stamp,
+        )));
+
+        assert_eq!(workspace.patterns[0].event(reference).unwrap().frame, 3);
+        assert_eq!(
+            workspace.patterns[0].event(reference).unwrap().duration,
+            Some(3)
+        );
+        for velocity in [0.5, 0.75] {
+            let recorded = workspace.patterns[0]
+                .events()
+                .iter()
+                .find(|event| event.velocity == velocity)
+                .expect("both acknowledged timing paths insert their Gate");
+            assert_eq!(recorded.frame, 3);
+            assert_eq!(recorded.duration, Some(3));
+        }
+    }
+
+    #[test]
+    fn delayed_active_and_retiring_acks_replay_multiple_resizes_in_fifo_order() {
+        let mut workspace = PatternWorkspace::new(100);
+        let pattern = workspace.selected_pattern();
+        let stamp = TransportStamp {
+            slot: pattern.slot(),
+            generation: pattern.generation(),
+            origin: 1_000,
+            loop_frames: pattern.transport().loop_frames(),
+        };
+        workspace.start_recording(stamp).unwrap();
+        for (trigger, release, velocity) in [(200, 201, 0.2), (202, 203, 0.4)] {
+            workspace.note_live_trigger(key(16), command(trigger), pad(), velocity);
+            workspace.note_live_release(key(16), command(release));
+        }
+        workspace.note_live_trigger(key(16), command(204), pad(), 0.6);
+        for velocity in [0.2, 0.4, 0.6] {
+            workspace.patterns[0]
+                .insert_new(pad(), 1, velocity, Some(1))
+                .unwrap();
+        }
+        workspace.commit_project_pattern(0);
+        workspace.set_tempo(Tempo::new(240.0).unwrap()).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace.set_tempo(Tempo::new(60.0).unwrap()).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace.set_tempo(Tempo::new(300.0).unwrap()).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace.set_tempo(Tempo::new(80.0).unwrap()).unwrap();
+        let current_stamp = admit_current_transport(&mut workspace);
+
+        for (trigger, release, velocity) in [(200, 201, 0.2), (202, 203, 0.4)] {
+            assert!(!workspace.apply_ack(ack_for_stamp(
+                trigger,
+                1_001,
+                LiveAckKind::Trigger { velocity },
+                stamp,
+            )));
+            assert!(workspace.apply_ack(ack_for_stamp(
+                release,
+                1_002,
+                LiveAckKind::Release,
+                stamp,
+            )));
+        }
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            204,
+            1_001,
+            LiveAckKind::Trigger { velocity: 0.6 },
+            stamp,
+        )));
+        workspace.note_live_release(key(16), command(205));
+        assert!(workspace.apply_ack(ack_for_stamp(
+            205,
+            1_002,
+            LiveAckKind::Release,
+            current_stamp,
+        )));
+
+        for velocity in [0.2, 0.4, 0.6] {
+            let matching = workspace.patterns[0]
+                .events()
+                .iter()
+                .filter(|event| event.velocity == velocity)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 2);
+            assert!(
+                matching
+                    .iter()
+                    .all(|event| event.frame == 4 && event.duration == Some(4))
+            );
+        }
+    }
+
+    #[test]
+    fn non_length_generation_edits_do_not_consume_held_resize_history() {
+        let (mut workspace, stamp) = transport_recording_workspace(1);
+        workspace.note_live_trigger(key(0), command(140), pad(), 0.5);
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            140,
+            stamp.origin + 1,
+            LiveAckKind::Trigger { velocity: 0.5 },
+            stamp,
+        )));
+        let history_ptr = workspace.recording_transport_resizes.as_ptr();
+
+        workspace.set_quantize(0.5).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace.set_swing(0.6).unwrap();
+        admit_current_transport(&mut workspace);
+        workspace
+            .set_resolution(sampler_core::Resolution::Quarter)
+            .unwrap();
+        admit_current_transport(&mut workspace);
+
+        assert_eq!(workspace.recording_transport_resizes.len(), 0);
+        assert_eq!(workspace.recording_transport_resizes.as_ptr(), history_ptr);
+        workspace.set_tempo(Tempo::new(240.0).unwrap()).unwrap();
+        assert_eq!(workspace.recording_transport_resizes.len(), 1);
+    }
+
+    #[test]
+    fn held_resize_history_exact_boundary_rejects_atomically_and_reuses_storage() {
+        let mut workspace = PatternWorkspace::new(1);
+        let reference = workspace.patterns[0]
+            .insert_new(pad(), 1, 0.25, Some(1))
+            .unwrap();
+        workspace.commit_project_pattern(0);
+        let pattern = workspace.selected_pattern();
+        let stamp = TransportStamp {
+            slot: pattern.slot(),
+            generation: pattern.generation(),
+            origin: 1_000,
+            loop_frames: pattern.transport().loop_frames(),
+        };
+        workspace.start_recording(stamp).unwrap();
+        workspace.note_live_trigger(key(0), command(150), pad(), 0.5);
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            150,
+            stamp.origin + 1,
+            LiveAckKind::Trigger { velocity: 0.5 },
+            stamp,
+        )));
+        let history_ptr = workspace.recording_transport_resizes.as_ptr();
+
+        for index in 0..MAX_HELD_RECORDING_TRANSPORT_RESIZES {
+            let tempo = if index % 2 == 0 { 80.0 } else { 120.0 };
+            workspace.set_tempo(Tempo::new(tempo).unwrap()).unwrap();
+            admit_current_transport(&mut workspace);
+            assert_eq!(workspace.recording_transport_resizes.len(), index + 1);
+            assert_eq!(workspace.recording_transport_resizes.as_ptr(), history_ptr);
+        }
+
+        let before_transport = workspace.patterns[0].transport();
+        let before_generation = workspace.patterns[0].generation();
+        let before_reference = *workspace.patterns[0].event(reference).unwrap();
+        let before_project_pattern = workspace.project_patterns[0].clone();
+        let before_correlation = workspace.held_keys[key(0)].unwrap();
+        let rejected_tempo = if before_transport.tempo().bpm() == 80.0 {
+            120.0
+        } else {
+            80.0
+        };
+        assert_eq!(
+            workspace.set_tempo(Tempo::new(rejected_tempo).unwrap()),
+            Err(sampler_core::PatternEditError::HeldRecordingResizeHistoryFull)
+        );
+        assert_eq!(workspace.patterns[0].transport(), before_transport);
+        assert_eq!(workspace.patterns[0].generation(), before_generation);
+        assert_eq!(
+            workspace.patterns[0].event(reference),
+            Some(&before_reference)
+        );
+        assert_eq!(workspace.project_patterns[0], before_project_pattern);
+        let after_correlation = workspace.held_keys[key(0)].unwrap();
+        assert_eq!(
+            after_correlation.trigger_frame,
+            before_correlation.trigger_frame
+        );
+        assert_eq!(
+            after_correlation.trigger_stamp,
+            before_correlation.trigger_stamp
+        );
+        assert_eq!(
+            workspace.recording_transport_resizes.len(),
+            MAX_HELD_RECORDING_TRANSPORT_RESIZES
+        );
+
+        let current_stamp = workspace.recording.unwrap().intent().stamp;
+        workspace.note_live_release(key(0), command(151));
+        assert!(workspace.apply_ack(ack_for_stamp(
+            151,
+            stamp.origin + 2,
+            LiveAckKind::Release,
+            current_stamp,
+        )));
+        assert_eq!(workspace.recording_transport_resizes.len(), 0);
+        workspace
+            .set_tempo(Tempo::new(rejected_tempo).unwrap())
+            .unwrap();
+        let fresh_stamp = admit_current_transport(&mut workspace);
+        workspace.note_live_trigger(key(0), command(152), pad(), 0.5);
+        assert!(!workspace.apply_ack(ack_for_stamp(
+            152,
+            fresh_stamp.origin + 1,
+            LiveAckKind::Trigger { velocity: 0.5 },
+            fresh_stamp,
+        )));
+        let reuse_tempo = if rejected_tempo == 80.0 { 120.0 } else { 80.0 };
+        workspace
+            .set_tempo(Tempo::new(reuse_tempo).unwrap())
+            .unwrap();
+        assert_eq!(workspace.recording_transport_resizes.len(), 1);
+        assert_eq!(workspace.recording_transport_resizes.as_ptr(), history_ptr);
     }
 
     #[test]
@@ -1370,6 +1635,11 @@ use crate::AudioPort;
 pub const MAX_RECORDING_KEYS: usize = 16;
 const MAX_LIVE_RECORDING_KEYS: usize = MAX_RECORDING_KEYS + 16 * 128;
 pub const MAX_ACKS_PER_MAINTENANCE: usize = 64;
+/// Maximum loop-length transitions retained while Gate/Loop acknowledgements are outstanding.
+///
+/// The fixed history keeps correlation bookkeeping bounded. At the limit, another loop-length
+/// edit is rejected until every correlation that can reference the retained stages is gone.
+pub const MAX_HELD_RECORDING_TRANSPORT_RESIZES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectPatternWorkspaceError {
@@ -1635,6 +1905,52 @@ struct RecordingTransportResize {
     new_loop_frames: u64,
 }
 
+#[derive(Debug)]
+struct RecordingTransportResizeHistory {
+    entries: Box<[Option<RecordingTransportResize>; MAX_HELD_RECORDING_TRANSPORT_RESIZES]>,
+    len: usize,
+}
+
+impl RecordingTransportResizeHistory {
+    fn new() -> Self {
+        Self {
+            entries: Box::new([None; MAX_HELD_RECORDING_TRANSPORT_RESIZES]),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == MAX_HELD_RECORDING_TRANSPORT_RESIZES
+    }
+
+    fn push(&mut self, resize: RecordingTransportResize) {
+        debug_assert!(!self.is_full());
+        self.entries[self.len] = Some(resize);
+        self.len += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RecordingTransportResize> {
+        self.entries[..self.len].iter().flatten()
+    }
+
+    fn iter_from(&self, index: usize) -> impl Iterator<Item = &RecordingTransportResize> {
+        self.entries[index.min(self.len)..self.len].iter().flatten()
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[cfg(test)]
+    fn as_ptr(&self) -> *const Option<RecordingTransportResize> {
+        self.entries.as_ptr()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeldRecordingLocation {
     Active(usize),
@@ -1673,7 +1989,7 @@ pub struct PatternWorkspace {
     recording: Option<RecordingState>,
     held_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
     retiring_keys: Box<[Option<HeldRecordingKey>; MAX_LIVE_RECORDING_KEYS]>,
-    recording_transport_resizes: Vec<RecordingTransportResize>,
+    recording_transport_resizes: RecordingTransportResizeHistory,
     observed_live_ack_overflows: u64,
     dirty_patterns: [Option<DirtyPattern>; PATTERN_SLOT_COUNT],
     next_dirty_ticket: u64,
@@ -1717,7 +2033,7 @@ impl PatternWorkspace {
             recording: None,
             held_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
             retiring_keys: Box::new([None; MAX_LIVE_RECORDING_KEYS]),
-            recording_transport_resizes: Vec::new(),
+            recording_transport_resizes: RecordingTransportResizeHistory::new(),
             observed_live_ack_overflows: 0,
             dirty_patterns: array::from_fn(|_| {
                 Some(DirtyPattern {
@@ -1951,7 +2267,22 @@ impl PatternWorkspace {
 
     pub fn set_tempo(&mut self, tempo: Tempo) -> Result<(), PatternEditError> {
         let index = self.slot_index();
+        let transport = self.patterns[index].transport();
+        let new_loop_frames = Transport::new(
+            transport.sample_rate(),
+            tempo,
+            transport.meter(),
+            transport.bars(),
+            transport.resolution(),
+        )?
+        .loop_frames();
+        let retain_resize = self.preflight_held_recording_resize(index, new_loop_frames)?;
+        let old_generation = self.patterns[index].generation();
+        let old_loop_frames = transport.loop_frames();
         self.patterns[index].set_tempo(tempo)?;
+        if retain_resize {
+            self.record_held_recording_resize(index, old_generation, old_loop_frames);
+        }
         self.commit_project_pattern(index);
         self.clamp_cursor();
         self.refresh_selected_event();
@@ -1960,7 +2291,22 @@ impl PatternWorkspace {
 
     pub fn set_bars(&mut self, bars: u16) -> Result<(), PatternEditError> {
         let index = self.slot_index();
+        let transport = self.patterns[index].transport();
+        let new_loop_frames = Transport::new(
+            transport.sample_rate(),
+            transport.tempo(),
+            transport.meter(),
+            bars,
+            transport.resolution(),
+        )?
+        .loop_frames();
+        let retain_resize = self.preflight_held_recording_resize(index, new_loop_frames)?;
+        let old_generation = self.patterns[index].generation();
+        let old_loop_frames = transport.loop_frames();
         self.patterns[index].set_bars(bars)?;
+        if retain_resize {
+            self.record_held_recording_resize(index, old_generation, old_loop_frames);
+        }
         self.commit_project_pattern(index);
         self.clamp_cursor();
         self.refresh_selected_event();
@@ -2167,10 +2513,23 @@ impl PatternWorkspace {
                         .expect("accepted recording ACK retains recording state")
                         .intent()
                         .stamp;
-                    let frame =
-                        scale_frame_phase(frame, stamp.loop_frames, current_stamp.loop_frames)
-                            .expect("valid loop frames keep held-note phase scaling bounded")
-                            .min(current_stamp.loop_frames - 1);
+                    let duration_resize_index = self
+                        .recording_transport_resizes
+                        .iter()
+                        .position(|resize| {
+                            resize.slot == stamp.slot && resize.to_generation > stamp.generation
+                        })
+                        .unwrap_or(self.recording_transport_resizes.len());
+                    let frame = self
+                        .remap_held_frame(
+                            frame,
+                            stamp.loop_frames,
+                            stamp.generation,
+                            duration_resize_index,
+                            current_stamp,
+                        )
+                        .expect("valid loop frames keep held-note phase scaling bounded")
+                        .min(current_stamp.loop_frames - 1);
                     let mut entry = entry;
                     entry.velocity = velocity;
                     entry.trigger_id = None;
@@ -2179,13 +2538,7 @@ impl PatternWorkspace {
                     entry.trigger_stamp = Some(current_stamp);
                     entry.duration_basis_loop_frames = Some(stamp.loop_frames);
                     entry.duration_basis_generation = Some(stamp.generation);
-                    entry.duration_resize_index = self
-                        .recording_transport_resizes
-                        .iter()
-                        .position(|resize| {
-                            resize.slot == stamp.slot && resize.from_generation == stamp.generation
-                        })
-                        .unwrap_or(self.recording_transport_resizes.len());
+                    entry.duration_resize_index = duration_resize_index;
                     self.set_recording_key(location, Some(entry));
                     return false;
                 }
@@ -2290,6 +2643,9 @@ impl PatternWorkspace {
             HeldRecordingLocation::Active(index) => self.held_keys[index] = entry,
             HeldRecordingLocation::Retiring(index) => self.retiring_keys[index] = entry,
         }
+        if !self.has_held_recording_correlations() {
+            self.recording_transport_resizes.clear();
+        }
     }
 
     fn reconcile_record_capture(&mut self, telemetry: Telemetry) {
@@ -2380,10 +2736,37 @@ impl PatternWorkspace {
     }
 
     pub fn rebuild_sample_rate(&mut self, sample_rate: u32) -> Result<(), PatternEditError> {
+        let recording_index = self.recording.and_then(|state| {
+            state
+                .accepts_acks()
+                .then(|| usize::from(state.intent().stamp.slot.get()))
+        });
+        let resize = if let Some(index) = recording_index {
+            let transport = self.patterns[index].transport();
+            let new_loop_frames = Transport::new(
+                sample_rate,
+                transport.tempo(),
+                transport.meter(),
+                transport.bars(),
+                transport.resolution(),
+            )?
+            .loop_frames();
+            let retain = self.preflight_held_recording_resize(index, new_loop_frames)?;
+            retain.then_some((
+                index,
+                self.patterns[index].generation(),
+                transport.loop_frames(),
+            ))
+        } else {
+            None
+        };
         for index in 0..PATTERN_SLOT_COUNT {
             self.patterns[index].rebuild_sample_rate(sample_rate)?;
             self.mark_dirty(index);
             self.reinstall_pending[index] = true;
+        }
+        if let Some((index, old_generation, old_loop_frames)) = resize {
+            self.record_held_recording_resize(index, old_generation, old_loop_frames);
         }
         self.clamp_cursor();
         self.refresh_selected_event();
@@ -2637,22 +3020,8 @@ impl PatternWorkspace {
                 .loop_frames(),
             ..intent.stamp
         };
-        if self
-            .held_keys
-            .iter()
-            .chain(self.retiring_keys.iter())
-            .all(Option::is_none)
-        {
+        if !self.has_held_recording_correlations() {
             self.recording_transport_resizes.clear();
-        } else {
-            self.recording_transport_resizes
-                .push(RecordingTransportResize {
-                    slot,
-                    from_generation: intent.stamp.generation,
-                    to_generation: stamp.generation,
-                    old_loop_frames: intent.stamp.loop_frames,
-                    new_loop_frames: stamp.loop_frames,
-                });
         }
         self.remap_held_recording_transport(slot, stamp);
         let target = RecordingIntent { stamp };
@@ -2675,6 +3044,65 @@ impl PatternWorkspace {
             RecordingState::Disarming(intent) => RecordingState::Disarming(intent),
         });
         true
+    }
+
+    fn has_held_recording_correlations(&self) -> bool {
+        self.held_keys
+            .iter()
+            .chain(self.retiring_keys.iter())
+            .any(Option::is_some)
+    }
+
+    fn preflight_held_recording_resize(
+        &mut self,
+        index: usize,
+        new_loop_frames: u64,
+    ) -> Result<bool, PatternEditError> {
+        let slot = self.patterns[index].slot();
+        let relevant = self
+            .recording
+            .is_some_and(|state| state.accepts_acks() && state.intent().stamp.slot == slot)
+            && self.has_held_recording_correlations();
+        if !relevant {
+            self.recording_transport_resizes.clear();
+            return Ok(false);
+        }
+        if self.patterns[index].transport().loop_frames() == new_loop_frames {
+            return Ok(false);
+        }
+        if self.recording_transport_resizes.is_full() {
+            return Err(PatternEditError::HeldRecordingResizeHistoryFull);
+        }
+        Ok(true)
+    }
+
+    fn record_held_recording_resize(
+        &mut self,
+        index: usize,
+        old_generation: u64,
+        old_loop_frames: u64,
+    ) {
+        let pattern = &self.patterns[index];
+        let slot = pattern.slot();
+        let intent = self
+            .recording
+            .expect("preflight retained a resize only for active recording")
+            .intent();
+        let target = TransportStamp {
+            slot,
+            generation: pattern.generation(),
+            origin: intent.stamp.origin,
+            loop_frames: pattern.transport().loop_frames(),
+        };
+        self.recording_transport_resizes
+            .push(RecordingTransportResize {
+                slot,
+                from_generation: old_generation,
+                to_generation: target.generation,
+                old_loop_frames,
+                new_loop_frames: target.loop_frames,
+            });
+        self.remap_held_recording_transport(slot, target);
     }
 
     fn remap_held_recording_transport(&mut self, slot: PatternSlotId, target: TransportStamp) {
@@ -2701,6 +3129,37 @@ impl PatternWorkspace {
         }
     }
 
+    fn remap_held_frame(
+        &self,
+        mut frame: u64,
+        mut loop_frames: u64,
+        mut generation: u64,
+        resize_index: usize,
+        target: TransportStamp,
+    ) -> Result<u64, PatternEditError> {
+        for resize in self
+            .recording_transport_resizes
+            .iter_from(resize_index)
+            .filter(|resize| resize.slot == target.slot)
+        {
+            if resize.to_generation <= generation {
+                continue;
+            }
+            if resize.to_generation > target.generation {
+                break;
+            }
+            debug_assert!(resize.from_generation >= generation);
+            debug_assert_eq!(resize.old_loop_frames, loop_frames);
+            frame = scale_frame_phase(frame, resize.old_loop_frames, resize.new_loop_frames)?;
+            loop_frames = resize.new_loop_frames;
+            generation = resize.to_generation;
+        }
+        if loop_frames != target.loop_frames {
+            frame = scale_frame_phase(frame, loop_frames, target.loop_frames)?;
+        }
+        Ok(frame)
+    }
+
     fn remap_held_duration(
         &self,
         mut duration: u64,
@@ -2709,20 +3168,25 @@ impl PatternWorkspace {
         resize_index: usize,
         target: TransportStamp,
     ) -> Result<u64, PatternEditError> {
-        for resize in self.recording_transport_resizes[resize_index..]
-            .iter()
+        for resize in self
+            .recording_transport_resizes
+            .iter_from(resize_index)
             .filter(|resize| resize.slot == target.slot)
         {
-            if resize.from_generation != generation {
+            if resize.to_generation <= generation {
                 continue;
             }
+            if resize.to_generation > target.generation {
+                break;
+            }
+            debug_assert!(resize.from_generation >= generation);
             debug_assert_eq!(resize.old_loop_frames, loop_frames);
             duration =
                 scale_frame_phase(duration, resize.old_loop_frames, resize.new_loop_frames)?.max(1);
             loop_frames = resize.new_loop_frames;
             generation = resize.to_generation;
         }
-        if generation != target.generation {
+        if loop_frames != target.loop_frames {
             duration = scale_frame_phase(duration, loop_frames, target.loop_frames)?.max(1);
         }
         Ok(duration.min(target.loop_frames))

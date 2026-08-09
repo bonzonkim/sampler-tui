@@ -48,9 +48,9 @@ pub use mixer::{
 };
 pub use palette::{LineEditor, PaletteCommand, parse_palette};
 pub use pattern::{
-    MAX_ACKS_PER_MAINTENANCE, MAX_RECORDING_KEYS, PatternCaptureState, PatternCursor,
-    PatternMaintenance, PatternStatus, PatternWorkspace, ProjectPatternWorkspaceError,
-    WorkspaceView,
+    MAX_ACKS_PER_MAINTENANCE, MAX_HELD_RECORDING_TRANSPORT_RESIZES, MAX_RECORDING_KEYS,
+    PatternCaptureState, PatternCursor, PatternMaintenance, PatternStatus, PatternWorkspace,
+    ProjectPatternWorkspaceError, WorkspaceView,
 };
 pub use project_session::{
     AutosaveDescriptor, MAX_PROJECT_REVISION, ProjectMutationError, ProjectOpenError,

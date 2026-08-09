@@ -36,6 +36,10 @@ pub enum PatternEditError {
     MissingRawFrame,
     #[error("pattern frame arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("pattern loop frame sizes must be non-zero")]
+    InvalidLoopFrames,
+    #[error("held-note transport resize history is full")]
+    HeldRecordingResizeHistoryFull,
     #[error("pattern generation overflowed")]
     GenerationOverflow,
     #[error("pattern event {0:?} does not exist")]

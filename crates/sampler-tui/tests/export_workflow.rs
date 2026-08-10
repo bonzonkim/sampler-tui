@@ -3,12 +3,15 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
+use hound::{SampleFormat, WavSpec, WavWriter};
 use sampler_audio::{AudioEngine, PatternSwitch, audio_channels};
 use sampler_core::{BankId, PadId, PlaybackMode, SAMPLE_PHASE_SCALE, SampleEditRecipe};
 use sampler_tui::export::{StagedExportPad, stage_export_samples};
@@ -16,8 +19,8 @@ use sampler_tui::terminal::{
     KeyboardEnhancementOps, TerminalLifecycle, run_with_runtime_lifecycle,
 };
 use sampler_tui::{
-    ExportPatternSlot, ExportStatusView, InputAction, OfflineExportSnapshot, ProjectStore,
-    WorkerHandle, WorkerRequest, parse_midi_message,
+    ExportStatusView, InputAction, OfflineExportSnapshot, ProjectStore, WorkerHandle,
+    WorkerRequest, parse_midi_message,
 };
 
 #[path = "support/mixer_harness.rs"]
@@ -34,6 +37,27 @@ struct ExportPause {
 
 fn pad(index: u8) -> PadId {
     PadId::new(BankId::new(0).unwrap(), index).unwrap()
+}
+
+fn write_long_wav(tree: &FixtureTree, name: &str) -> PathBuf {
+    let path = tree.path(name);
+    let mut writer = WavWriter::create(
+        &path,
+        WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for frame in 0..16_384_u32 {
+        let phase = (frame % 64) as f32 / 63.0;
+        writer.write_sample(0.2 + phase * 0.3).unwrap();
+        writer.write_sample(-0.15 - phase * 0.25).unwrap();
+    }
+    writer.finalize().unwrap();
+    path
 }
 
 fn set_selected_mode(harness: &mut Harness, command: &str) {
@@ -133,6 +157,39 @@ fn temporary_entries(root: &Path) -> Vec<PathBuf> {
     entries
 }
 
+fn owned_temporary_entries(destination: &Path) -> Vec<PathBuf> {
+    let leaf = destination.file_name().unwrap().to_string_lossy();
+    let prefix = format!(".{leaf}.sampler-tui-tmp-");
+    fs::read_dir(destination.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect()
+}
+
+fn wait_for_owned_temporary(destination: &Path, timeout: Duration) -> PathBuf {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let entries = owned_temporary_entries(destination);
+        if let [temporary] = entries.as_slice() {
+            return temporary.clone();
+        }
+        assert!(entries.is_empty(), "more than one owned export temporary");
+        assert!(
+            !destination.exists(),
+            "export completed before cancellation observation"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "publisher temporary did not appear before timeout"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[derive(Clone)]
 struct RestoreKeyboard {
     calls: Rc<RefCell<Vec<&'static str>>>,
@@ -192,8 +249,8 @@ impl TerminalLifecycle for RestoreLifecycle {
 #[test]
 fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
     let tree = FixtureTree::new();
-    let gate_source = tree.write_wav("gate-source.wav");
-    let one_shot_source = tree.write_wav("one-shot-source.wav");
+    let gate_source = write_long_wav(&tree, "gate-source.wav");
+    let one_shot_source = write_long_wav(&tree, "one-shot-source.wav");
     let first_destination = tree.path("revision-n.wav");
     let project = tree.path("saved-project");
     let moved_project = tree.path("moved-project");
@@ -210,7 +267,11 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
         state.reached = true;
         changed.notify_all();
         while !state.released {
-            state = changed.wait(state).unwrap();
+            let (next, timeout) = changed.wait_timeout(state, Duration::from_secs(5)).unwrap();
+            state = next;
+            if timeout.timed_out() {
+                break;
+            }
         }
     });
     let mut harness = Harness::new_with_worker(worker);
@@ -299,30 +360,66 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
     if let Some(progress) = harness.worker.try_recv_export_progress() {
         assert!(harness.app.maintain_export(Some(progress)));
     }
+    let wet_master = harness.app.master_mix();
+    let mut dry_probe_master = wet_master;
+    dry_probe_master.delay.enabled = false;
+    dry_probe_master.reverb.enabled = false;
+    harness
+        .controller
+        .borrow_mut()
+        .update_master_mix(dry_probe_master)
+        .unwrap();
+    harness.controller.borrow_mut().stop_pattern().unwrap();
+    harness.app.apply(InputAction::StopAll);
+    harness.engine.render_frames(128, |_| {});
     let before_live = harness.engine.rendered_frame();
-    let mut live_peak = 0.0_f32;
-    harness.app.apply(InputAction::PadPress(1));
-    harness.engine.render_frames(64, |frame| {
-        live_peak = live_peak.max(frame[0].abs()).max(frame[1].abs());
+
+    let mut gate_held_peak = 0.0_f32;
+    harness.app.apply(InputAction::PadPress(0));
+    harness.engine.render_frames(128, |frame| {
+        gate_held_peak = gate_held_peak.max(frame[0].abs()).max(frame[1].abs());
     });
-    harness.app.apply(InputAction::PadRelease(1));
+    harness.app.apply(InputAction::PadRelease(0));
+    harness.engine.render_frames(128, |_| {});
+    let mut gate_released_peak = 0.0_f32;
+    harness.engine.render_frames(128, |frame| {
+        gate_released_peak = gate_released_peak.max(frame[0].abs()).max(frame[1].abs());
+    });
+    assert!(gate_held_peak > 0.0, "Gate pad must sound while held");
+    assert_eq!(gate_released_peak, 0.0, "Gate pad must stop on release");
+
+    let mut one_shot_held_peak = 0.0_f32;
     harness
         .app
-        .apply_midi_event(parse_midi_message(&[0x90, 36, 100]).unwrap());
-    harness.engine.render_frames(64, |frame| {
-        live_peak = live_peak.max(frame[0].abs()).max(frame[1].abs());
+        .apply_midi_event(parse_midi_message(&[0x90, 37, 100]).unwrap());
+    harness.engine.render_frames(128, |frame| {
+        one_shot_held_peak = one_shot_held_peak.max(frame[0].abs()).max(frame[1].abs());
     });
     harness
         .app
-        .apply_midi_event(parse_midi_message(&[0x80, 36, 0]).unwrap());
-    harness.engine.render_frames(64, |frame| {
-        live_peak = live_peak.max(frame[0].abs()).max(frame[1].abs());
+        .apply_midi_event(parse_midi_message(&[0x80, 37, 0]).unwrap());
+    harness.engine.render_frames(128, |_| {});
+    let mut one_shot_released_peak = 0.0_f32;
+    harness.engine.render_frames(128, |frame| {
+        one_shot_released_peak = one_shot_released_peak
+            .max(frame[0].abs())
+            .max(frame[1].abs());
     });
-    assert!(harness.engine.rendered_frame() >= before_live + 192);
     assert!(
-        live_peak > 0.0,
-        "pads and MIDI must remain audibly live during export"
+        one_shot_held_peak > 0.0,
+        "parsed MIDI OneShot must sound while held"
     );
+    assert!(
+        one_shot_released_peak > 0.0,
+        "OneShot must continue after parsed MIDI Note Off"
+    );
+    assert!(harness.engine.rendered_frame() >= before_live + 768);
+    harness
+        .controller
+        .borrow_mut()
+        .update_master_mix(wet_master)
+        .unwrap();
+    harness.engine.render_frames(0, |_| {});
     assert_eq!(harness.app.project_revision(), revision_n);
     harness.palette("master-level -3");
     assert_eq!(harness.app.project_revision(), revision_n + 1);
@@ -354,18 +451,29 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
         harness.dispatch_queued();
     }
     fs::rename(&project, &moved_project).unwrap();
-    let headless_receipt = sampler_tui::headless_export::run(
-        moved_project.clone(),
-        ExportPatternSlot::try_from(1).unwrap(),
-        headless_destination.clone(),
-    )
-    .unwrap();
-    assert_eq!(headless_receipt.revision, revision_n + 1);
+    let headless = Command::new(env!("CARGO_BIN_EXE_sampler-tui"))
+        .arg("export")
+        .arg(&moved_project)
+        .arg("1")
+        .arg(&headless_destination)
+        .output()
+        .unwrap();
+    assert!(
+        headless.status.success(),
+        "headless process failed: {}",
+        String::from_utf8_lossy(&headless.stderr)
+    );
+    let headless_stdout = String::from_utf8(headless.stdout).unwrap();
+    assert!(headless_stdout.contains("pattern=1 rate=48000"));
+    assert!(headless_stdout.contains(&format!("revision={}", revision_n + 1)));
     assert!(!decoded_wav_bits(&headless_destination).is_empty());
 
     drop(harness);
     let mut reopened = Harness::new();
     reopened.open(&moved_project, None, now + Duration::from_secs(1));
+    reopened.palette("tempo 20");
+    reopened.palette("bars 8");
+    let cancellation_revision = reopened.app.project_revision();
     let cancel_token = reopened
         .app
         .start_export(cancelled_destination.clone())
@@ -375,38 +483,27 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
         panic!("expected cancellable export request")
     };
     let cancel_request = cancel_request.clone();
-    assert!(reopened.app.cancel_export());
     reopened
         .worker
         .try_send(WorkerRequest::Export(cancel_request))
         .unwrap();
-    let cancelled = reopened
-        .worker
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-    assert!(reopened.app.apply_worker_result(cancelled));
-    assert!(matches!(
-        reopened.app.export_status_view(),
-        Some(ExportStatusView::Cancelled { fence }) if fence.revision == revision_n + 1
-    ));
-    assert!(!cancelled_destination.exists());
-    assert!(first_destination.exists());
-    assert!(headless_destination.exists());
-    assert!(temporary_entries(&tree.path(".")).is_empty());
+    let observed_temporary =
+        wait_for_owned_temporary(&cancelled_destination, Duration::from_secs(5));
+    assert!(observed_temporary.exists());
+    assert!(reopened.app.cancel_export());
     assert_eq!(cancel_token.get(), 1);
 
     let calls = Rc::new(RefCell::new(Vec::new()));
     let mut lifecycle = RestoreLifecycle {
         calls: Rc::clone(&calls),
     };
-    let mut lifecycle_worker = std::mem::replace(&mut reopened.worker, WorkerHandle::spawn());
     let result: Result<(), Box<dyn Error>> = run_with_runtime_lifecycle(
         &mut reopened.app,
         RestoreKeyboard {
             calls: Rc::clone(&calls),
         },
         &mut lifecycle,
-        &mut lifecycle_worker,
+        &mut reopened.worker,
         |_, _, release_events, _| {
             assert!(release_events);
             calls.borrow_mut().push("run");
@@ -434,6 +531,13 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
             "terminal-off",
         ]
     );
+    assert!(!cancelled_destination.exists());
+    assert!(!observed_temporary.exists());
+    assert!(owned_temporary_entries(&cancelled_destination).is_empty());
+    assert!(first_destination.exists());
+    assert!(headless_destination.exists());
+    assert!(temporary_entries(&tree.path(".")).is_empty());
+    assert!(cancellation_revision > revision_n + 1);
 
     let probe = ProjectStore.probe(&moved_project).unwrap();
     assert_eq!(probe.explicit.unwrap().unwrap().revision, revision_n + 1);

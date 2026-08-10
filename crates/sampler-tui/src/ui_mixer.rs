@@ -7,7 +7,9 @@ use sampler_core::PlaybackMode;
 
 use crate::App;
 use crate::mixer::{DelayField, MixerSection, PadField, ReverbField};
-use crate::ui::{load_state_name, pad_label, safe_meter_ratio, truncate};
+use crate::ui::{
+    is_verbose_export_status_text, load_state_name, pad_label, safe_meter_ratio, truncate,
+};
 
 pub(crate) fn render_mixer(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
@@ -55,7 +57,7 @@ fn render_mixer_status(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let mut context = focused_context(app);
-    if !app.status().is_empty() {
+    if !app.status().is_empty() && !is_verbose_export_status_text(app.status()) {
         context.push_str(" · ");
         context.push_str(app.status());
     }

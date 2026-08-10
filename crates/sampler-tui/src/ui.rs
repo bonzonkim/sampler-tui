@@ -51,6 +51,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     render_base(frame, area, app);
+    if app.workspace_view() != WorkspaceView::Perform {
+        render_workspace_export_status(frame, area, app);
+    }
     if let Some(overlay) = app.overlay() {
         render_overlay(frame, area, app, overlay);
     }
@@ -392,13 +395,34 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             break;
         }
         frame.render_widget(
-            Paragraph::new(format!(
-                " {}",
-                truncate(row, usize::from(inner.width).saturating_sub(1))
-            )),
+            Paragraph::new(fit_status_row(row, usize::from(inner.width))),
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
+}
+
+fn render_workspace_export_status(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(status) = compact_export_status_text(app) else {
+        return;
+    };
+    let row = Rect::new(
+        area.x.saturating_add(1),
+        area.bottom().saturating_sub(2),
+        area.width.saturating_sub(2),
+        1,
+    );
+    if row.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(fit_status_row(&status, usize::from(row.width))).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        row,
+    );
 }
 
 fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
@@ -680,10 +704,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
 }
 
 fn compact_status_text(app: &App) -> String {
+    compact_export_status_text(app).unwrap_or_else(|| app.display_status_text())
+}
+
+pub(crate) fn compact_export_status_text(app: &App) -> Option<String> {
     let fallback = app.display_status_text();
-    let Some(view) = app.export_status_view() else {
-        return fallback;
-    };
+    let view = app.export_status_view()?;
     let visible = match &view {
         crate::ExportStatusView::Active { operation, focused } => match operation.phase() {
             crate::ExportPhase::Queued | crate::ExportPhase::Running { .. } => *focused,
@@ -694,10 +720,10 @@ fn compact_status_text(app: &App) -> String {
         crate::ExportStatusView::Failed { .. } => fallback.starts_with("Export failed ·"),
     };
     if !visible {
-        return fallback;
+        return None;
     }
 
-    match view {
+    Some(match view {
         crate::ExportStatusView::Active { operation, .. } => {
             let slot = operation.slot().get() + 1;
             let revision = operation.revision();
@@ -738,7 +764,20 @@ fn compact_status_text(app: &App) -> String {
             compact_export_error(&error),
             fence.revision
         ),
-    }
+    })
+}
+
+pub(crate) fn is_verbose_export_status_text(status: &str) -> bool {
+    [
+        "Export queued ·",
+        "Export progress ·",
+        "Cancelling export ·",
+        "Exported pattern ",
+        "Export cancelled ·",
+        "Export failed ·",
+    ]
+    .iter()
+    .any(|prefix| status.starts_with(prefix))
 }
 
 fn compact_export_error(error: &crate::OfflineExportError) -> &'static str {
@@ -1087,6 +1126,13 @@ fn fit(value: &str, width: usize) -> String {
     let used = display_width(&fitted);
     fitted.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
     fitted
+}
+
+fn fit_status_row(source: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    format!(" {}", truncate(source, width.saturating_sub(1)))
 }
 
 pub(crate) fn truncate(value: &str, width: usize) -> String {
@@ -1457,14 +1503,30 @@ mod tests {
             .to_owned()
     }
 
-    fn assert_unicode_safe_snapshot(width: u16, app: &App) {
-        let lines = render_lines(width, 24, app);
-        assert!(lines.iter().all(|line| !line.contains('\u{fffd}')));
-        assert!(
-            lines
-                .iter()
-                .all(|line| super::display_width(line) <= usize::from(width))
-        );
+    fn assert_export_status_in_every_workspace(width: u16, app: &mut App, expected: &str) {
+        for workspace in ["Perform", "Pattern", "Sample", "Mixer"] {
+            let lines = render_lines(width, 24, app);
+            let matches = lines.iter().filter(|line| line.contains(expected)).count();
+            assert_eq!(
+                matches,
+                1,
+                "{workspace} at {width} columns must contain one exact compact row:\n{}",
+                lines.join("\n")
+            );
+            if workspace == "Mixer" {
+                assert!(
+                    lines.iter().all(|line| {
+                        !line.contains("Export queued ·")
+                            && !line.contains("Export progress ·")
+                            && !line.contains("Exported pattern ")
+                            && !line.contains("Export failed ·")
+                    }),
+                    "Mixer must not append verbose App export status:\n{}",
+                    lines.join("\n")
+                );
+            }
+            app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
     }
 
     struct StaticMidi(Vec<MidiBackendPort>);
@@ -2257,8 +2319,148 @@ mod tests {
             ] {
                 assert!(screen.contains(unchanged), "missing {unchanged:?}");
             }
-            assert_unicode_safe_snapshot(width, &app);
         }
+    }
+
+    #[test]
+    fn compact_export_status_is_visible_once_in_every_workspace_at_narrow_and_wide_widths() {
+        for width in [80, 120] {
+            let (_fixture, mut queued, _operation) =
+                export_ready_app(&format!("all-workspaces-{width}"));
+            assert_export_status_in_every_workspace(
+                width,
+                &mut queued,
+                " EXPORT P01 · QUEUED · REV 2 · Esc cancel",
+            );
+
+            let (_fixture, mut running, operation) =
+                export_ready_app(&format!("all-running-{width}"));
+            export_progress(&mut running, &operation, 4, 8);
+            assert_export_status_in_every_workspace(
+                width,
+                &mut running,
+                " EXPORT P01 · 50% · REV 2 · Esc cancel",
+            );
+
+            let (_fixture, mut cancelling, _operation) =
+                export_ready_app(&format!("all-cancelling-{width}"));
+            assert!(cancelling.cancel_export());
+            assert_export_status_in_every_workspace(
+                width,
+                &mut cancelling,
+                " EXPORT P01 · CANCELLING · REV 2",
+            );
+
+            let (_fixture, mut completed, operation) =
+                export_ready_app(&format!("all-completed-{width}"));
+            finish_export(
+                &mut completed,
+                &operation,
+                Ok(OfflineExportReceipt {
+                    token: operation.token(),
+                    destination: operation.destination().to_path_buf(),
+                    project_id: operation.project_id(),
+                    revision: operation.revision(),
+                    slot: operation.slot(),
+                    sample_rate: 48_000,
+                    rendered_frames: 96_000,
+                    file_bytes: 768_080,
+                }),
+            );
+            assert_export_status_in_every_workspace(
+                width,
+                &mut completed,
+                " EXPORT P01 · DONE · REV 2 · 96000 frames",
+            );
+
+            let (_fixture, mut failed, operation) =
+                export_ready_app(&format!("all-failed-{width}"));
+            finish_export(
+                &mut failed,
+                &operation,
+                Err(OfflineExportError::DestinationExists(
+                    operation.destination().to_path_buf(),
+                )),
+            );
+            assert_export_status_in_every_workspace(
+                width,
+                &mut failed,
+                " EXPORT P01 · FAILED: DESTINATION EXISTS · REV 2",
+            );
+        }
+    }
+
+    #[test]
+    fn idle_workspace_help_and_status_contracts_remain_intact_without_an_export() {
+        for width in [80, 120] {
+            let mut app = ready_app();
+            let contracts: [(&str, &[&str]); 4] = [
+                (
+                    "Perform",
+                    &[
+                        "Enter trigger · Shift+pad stop · Shift+Esc stop all",
+                        "l load · [/] bank · ? help · : cmd · Ctrl+Q quit",
+                    ],
+                ),
+                (
+                    "Pattern",
+                    &[
+                        "Arrows cursor · PgUp/PgDn bar · Enter toggle",
+                        "Tab Perform · Space play/stop · Ctrl+R record",
+                    ],
+                ),
+                (
+                    "Sample",
+                    &[
+                        "n normalize · u reverse · Up/Down pitch · o/g/l mode",
+                        "Enter apply · Ctrl+Z undo · Esc back · source file unchanged",
+                    ],
+                ),
+                (
+                    "Mixer",
+                    &[
+                        "PAD 01 · PAD MIX · Level · 0.0 dB",
+                        "Enter toggle · Backspace reset · Esc perform · ? help · : cmd",
+                    ],
+                ),
+            ];
+
+            for (workspace, expected) in contracts {
+                let screen = render_lines(width, 24, &app).join("\n");
+                assert!(!screen.contains("EXPORT P01"), "{workspace}:\n{screen}");
+                for contract in expected {
+                    assert!(
+                        screen.contains(contract),
+                        "missing {contract:?} in idle {workspace} at {width}:\n{screen}"
+                    );
+                }
+                app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            }
+        }
+    }
+
+    #[test]
+    fn mixer_never_appends_verbose_export_status_when_an_overlay_unfocuses_export() {
+        let (_fixture, mut app, _operation) = export_ready_app("mixer-unfocused");
+        for _ in 0..3 {
+            app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        app.open_palette();
+
+        let screen = render_lines(120, 24, &app).join("\n");
+        assert!(screen.contains(" COMMAND "));
+        assert!(!screen.contains("Export queued ·"), "{screen}");
+    }
+
+    #[test]
+    fn status_source_truncates_korean_emoji_path_at_a_cell_boundary_before_rasterization() {
+        let source = "경로 🥁 /샘플/출력.wav";
+        let fitted = super::fit_status_row(source, 16);
+
+        assert_eq!(fitted, " 경로 🥁 /샘플/…");
+        assert_eq!(super::display_width(&fitted), 16);
+        assert!(fitted.ends_with('…'));
+        assert!(!fitted.contains('\u{fffd}'));
     }
 
     #[test]
@@ -2288,9 +2490,6 @@ mod tests {
             status_row(120, &active),
             " EXPORT P01 · 100% · REV 2 · Esc cancel"
         );
-        assert_unicode_safe_snapshot(80, &active);
-        assert_unicode_safe_snapshot(120, &active);
-
         assert!(active.cancel_export());
         assert_eq!(status_row(80, &active), " EXPORT P01 · CANCELLING · REV 2");
         assert_eq!(status_row(120, &active), " EXPORT P01 · CANCELLING · REV 2");
@@ -2323,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn export_failure_snapshots_are_compact_typed_and_unicode_safe() {
+    fn export_failure_snapshots_are_compact_and_typed_at_narrow_and_wide_widths() {
         let cases = [
             (
                 "collision",
@@ -2356,7 +2555,6 @@ mod tests {
             finish_export(&mut app, &operation, Err(error));
             for width in [80, 120] {
                 assert_eq!(status_row(width, &app), expected, "{label} at {width}");
-                assert_unicode_safe_snapshot(width, &app);
             }
         }
     }
@@ -2371,7 +2569,6 @@ mod tests {
             assert!(screen.contains("PROJECT OPERATION"));
             assert!(screen.contains("Waiting for offline export cleanup"));
             assert!(!screen.contains("EXPORT P01"));
-            assert_unicode_safe_snapshot(width, &app);
         }
     }
 

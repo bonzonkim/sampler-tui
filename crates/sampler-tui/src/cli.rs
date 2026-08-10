@@ -1,7 +1,8 @@
+use std::error::Error;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::{ExportPatternSlot, validate_wav_destination};
+use crate::{ExportPatternSlot, OfflineExportReceipt, validate_wav_destination};
 
 pub const USAGE: &str = "Usage:\n  sampler-tui\n  sampler-tui open <project-directory>\n  sampler-tui play <path>\n  sampler-tui export <project-directory> <pattern-1..16> <output.wav>\n  sampler-tui --help";
 
@@ -20,6 +21,39 @@ pub enum CliCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidUsage;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliOutcome {
+    Silent,
+    Help,
+    Export(OfflineExportReceipt),
+}
+
+/// Dispatches a parsed command while keeping the headless export path separate from every TUI
+/// and diagnostic startup factory.
+pub fn dispatch_command<T, P, E>(
+    command: CliCommand,
+    run_tui: T,
+    play: P,
+    export: E,
+) -> Result<CliOutcome, Box<dyn Error>>
+where
+    T: FnOnce(Option<PathBuf>) -> Result<(), Box<dyn Error>>,
+    P: FnOnce(PathBuf) -> Result<(), Box<dyn Error>>,
+    E: FnOnce(PathBuf, ExportPatternSlot, PathBuf) -> Result<OfflineExportReceipt, Box<dyn Error>>,
+{
+    match command {
+        CliCommand::Tui => run_tui(None).map(|()| CliOutcome::Silent),
+        CliCommand::Open(directory) => run_tui(Some(directory)).map(|()| CliOutcome::Silent),
+        CliCommand::Play(path) => play(path).map(|()| CliOutcome::Silent),
+        CliCommand::Export {
+            project,
+            slot,
+            destination,
+        } => export(project, slot, destination).map(CliOutcome::Export),
+        CliCommand::Help => Ok(CliOutcome::Help),
+    }
+}
 
 pub fn parse_args_os(mut args: impl Iterator<Item = OsString>) -> Result<CliCommand, InvalidUsage> {
     let Some(_program) = args.next() else {

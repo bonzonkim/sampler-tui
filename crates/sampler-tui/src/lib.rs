@@ -8,6 +8,7 @@ pub mod export;
 pub mod export_file;
 pub mod export_render;
 pub mod file_picker;
+pub mod headless_export;
 pub mod input;
 pub mod loader;
 pub mod midi;

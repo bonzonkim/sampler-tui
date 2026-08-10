@@ -1,6 +1,10 @@
 use std::error::Error;
+use std::mem;
+use std::panic::{self, AssertUnwindSafe, PanicHookInfo, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::thread;
 
 use sampler_core::ProjectDocument;
 
@@ -8,7 +12,11 @@ use crate::export::{
     ExportPatternSlot, ExportToken, OfflineExportError, OfflineExportReceipt,
     OfflineExportSnapshot, stage_export_samples,
 };
+#[cfg(debug_assertions)]
+use crate::export_file::PublisherCheckpoint;
 use crate::{AtomicWavPublisher, ProjectProbe, ProjectStore, ProjectStoreError, render_offline};
+
+type PanicHook = dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static;
 
 #[derive(Debug, thiserror::Error)]
 enum HeadlessExportError {
@@ -52,7 +60,36 @@ pub fn run(
     slot: ExportPatternSlot,
     destination: PathBuf,
 ) -> Result<OfflineExportReceipt, Box<dyn Error>> {
-    run_typed(&project, slot, &destination).map_err(|error| Box::new(error) as Box<dyn Error>)
+    match catch_headless_panic(AssertUnwindSafe(|| run_typed(&project, slot, &destination))) {
+        Ok(result) => result.map_err(|error| Box::new(error) as Box<dyn Error>),
+        Err(payload) => {
+            mem::forget(payload);
+            Err(Box::new(HeadlessExportError::Export(
+                OfflineExportError::ExportPanicked,
+            )))
+        }
+    }
+}
+
+fn catch_headless_panic<F, R>(operation: AssertUnwindSafe<F>) -> std::thread::Result<R>
+where
+    F: FnOnce() -> R,
+{
+    let hook_lock = crate::PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = Arc::<PanicHook>::from(panic::take_hook());
+    let previous_for_other_threads = Arc::clone(&previous);
+    let owner = thread::current().id();
+    panic::set_hook(Box::new(move |info| {
+        if thread::current().id() != owner {
+            previous_for_other_threads(info);
+        }
+    }));
+    let outcome = catch_unwind(operation);
+    panic::set_hook(Box::new(move |info| previous(info)));
+    drop(hook_lock);
+    outcome
 }
 
 fn run_typed(
@@ -60,6 +97,7 @@ fn run_typed(
     slot: ExportPatternSlot,
     destination: &Path,
 ) -> Result<OfflineExportReceipt, HeadlessExportError> {
+    inject_test_panic("before-probe");
     let probe = ProjectStore
         .probe(project)
         .map_err(|source| HeadlessExportError::Probe {
@@ -72,13 +110,69 @@ fn run_typed(
     let cancelled = AtomicBool::new(false);
     let staged =
         stage_export_samples(&snapshot, &cancelled).map_err(HeadlessExportError::Export)?;
-    let mut publisher =
-        AtomicWavPublisher::prepare(destination).map_err(HeadlessExportError::Export)?;
+    let mut publisher = prepare_publisher(destination).map_err(HeadlessExportError::Export)?;
+    inject_test_panic("after-prepare");
     let summary = render_offline(&snapshot, &staged, &mut publisher, &cancelled)
         .map_err(HeadlessExportError::Export)?;
     publisher
         .publish(ExportToken::new(1), &snapshot, summary, &cancelled)
         .map_err(HeadlessExportError::Export)
+}
+
+fn prepare_publisher(destination: &Path) -> Result<AtomicWavPublisher, OfflineExportError> {
+    #[cfg(debug_assertions)]
+    if test_panic_checkpoint() == Some("after-link") {
+        return AtomicWavPublisher::prepare_with_mutation_hook(destination, |checkpoint| {
+            if checkpoint == PublisherCheckpoint::BeforeDirectorySync {
+                panic_with_hostile_payload();
+            }
+        });
+    }
+    AtomicWavPublisher::prepare(destination)
+}
+
+#[cfg(debug_assertions)]
+fn test_panic_checkpoint() -> Option<&'static str> {
+    match std::env::var("SAMPLER_TUI_TEST_HEADLESS_PANIC")
+        .ok()
+        .as_deref()
+    {
+        Some("before-probe") => Some("before-probe"),
+        Some("after-prepare") => Some("after-prepare"),
+        Some("after-link") => Some("after-link"),
+        _ => None,
+    }
+}
+
+#[cfg(not(debug_assertions))]
+const fn test_panic_checkpoint() -> Option<&'static str> {
+    None
+}
+
+fn inject_test_panic(checkpoint: &'static str) {
+    if test_panic_checkpoint() == Some(checkpoint) {
+        panic_with_hostile_payload();
+    }
+}
+
+#[cfg(debug_assertions)]
+struct HostilePanicPayload;
+
+#[cfg(debug_assertions)]
+impl Drop for HostilePanicPayload {
+    fn drop(&mut self) {
+        panic!("hostile headless export panic payload destructor");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn panic_with_hostile_payload() -> ! {
+    panic::panic_any(HostilePanicPayload)
+}
+
+#[cfg(not(debug_assertions))]
+fn panic_with_hostile_payload() -> ! {
+    unreachable!("headless export panic injection is disabled")
 }
 
 fn select_explicit_document(

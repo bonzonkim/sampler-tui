@@ -15,7 +15,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::audio::{AudioPort, open_default_audio};
+#[cfg(test)]
+use crate::audio::AudioPort;
+use crate::audio::{
+    DefaultAudioInputFactory, audio_port_with_input_factory, default_audio_input_factory,
+    open_default_audio_output,
+};
+use crate::cli::TuiStartup;
 use crate::input::KeyboardCapabilities;
 use crate::loader::{
     WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError, WorkerSendFailure,
@@ -29,8 +35,6 @@ const TICK_INTERVAL: Duration = Duration::from_millis(16);
 type DynError = Box<dyn Error>;
 type PanicHook = dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static;
 
-static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
-
 struct UiPanicCapture {
     _hook_lock: MutexGuard<'static, ()>,
     previous: Arc<PanicHook>,
@@ -39,7 +43,7 @@ struct UiPanicCapture {
 
 impl UiPanicCapture {
     fn install() -> Self {
-        let hook_lock = PANIC_HOOK_LOCK
+        let hook_lock = crate::PANIC_HOOK_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = Arc::<PanicHook>::from(panic::take_hook());
@@ -598,7 +602,7 @@ impl TerminalModeState {
 }
 
 #[derive(Default)]
-struct RatatuiTerminalLifecycle {
+pub struct RatatuiTerminalLifecycle {
     modes: TerminalModeState,
 }
 
@@ -813,6 +817,7 @@ fn preserve_primary<T, E>(primary: Result<T, E>, cleanup: Result<(), E>) -> Resu
     }
 }
 
+#[cfg(test)]
 fn app_with_default_audio(open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>, String>) -> App {
     match open_audio() {
         Ok(audio) => App::with_audio(audio),
@@ -820,6 +825,7 @@ fn app_with_default_audio(open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>
     }
 }
 
+#[cfg(test)]
 fn app_with_default_audio_and_project(
     open_audio: impl FnOnce() -> Result<Box<dyn AudioPort>, String>,
     initial_project: Option<std::path::PathBuf>,
@@ -833,15 +839,50 @@ fn app_with_default_audio_and_project(
 }
 
 pub fn run_tui(initial_project: Option<std::path::PathBuf>) -> Result<(), DynError> {
-    let mut app = app_with_default_audio_and_project(open_default_audio, initial_project);
-    app.install_midi_service(MidiService::new(Box::new(MidirBackend)), Instant::now());
+    run_tui_with_startup(
+        initial_project,
+        TuiStartup {
+            terminal: RatatuiTerminalLifecycle::default(),
+            keyboard: CrosstermKeyboardEnhancementOps,
+            midi: MidiService::new(Box::new(MidirBackend)),
+            audio_input: default_audio_input_factory(),
+            audio_output: open_default_audio_output(),
+        },
+    )
+}
+
+pub fn run_tui_with_startup(
+    initial_project: Option<std::path::PathBuf>,
+    startup: TuiStartup<
+        RatatuiTerminalLifecycle,
+        CrosstermKeyboardEnhancementOps,
+        MidiService,
+        DefaultAudioInputFactory,
+        Result<sampler_audio::AudioSession, String>,
+    >,
+) -> Result<(), DynError> {
+    let TuiStartup {
+        terminal: mut lifecycle,
+        keyboard,
+        midi,
+        audio_input,
+        audio_output,
+    } = startup;
+    let mut app = match audio_output {
+        Ok(output) => App::with_audio(audio_port_with_input_factory(output, audio_input)),
+        Err(error) => App::without_audio(error),
+    };
+    if let Some(directory) = initial_project {
+        app.request_open_project(directory)
+            .expect("a fresh app can queue its startup project");
+    }
+    app.install_midi_service(midi, Instant::now());
     let mut events = CrosstermEventSource;
     let mut worker = WorkerHandle::spawn();
-    let mut lifecycle = RatatuiTerminalLifecycle::default();
 
     run_with_runtime_lifecycle(
         &mut app,
-        CrosstermKeyboardEnhancementOps,
+        keyboard,
         &mut lifecycle,
         &mut worker,
         |terminal, app, release_events, worker| {

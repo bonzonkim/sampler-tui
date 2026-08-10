@@ -29,28 +29,85 @@ pub enum CliOutcome {
     Export(OfflineExportReceipt),
 }
 
-/// Dispatches a parsed command while keeping the headless export path separate from every TUI
-/// and diagnostic startup factory.
-pub fn dispatch_command<T, P, E>(
-    command: CliCommand,
-    run_tui: T,
+pub struct CliStartupFactories<T, K, M, I, O> {
+    terminal: T,
+    keyboard: K,
+    midi: M,
+    audio_input: I,
+    audio_output: O,
+}
+
+impl<T, K, M, I, O> CliStartupFactories<T, K, M, I, O> {
+    pub const fn new(terminal: T, keyboard: K, midi: M, audio_input: I, audio_output: O) -> Self {
+        Self {
+            terminal,
+            keyboard,
+            midi,
+            audio_input,
+            audio_output,
+        }
+    }
+}
+
+pub struct TuiStartup<T, K, M, I, O> {
+    pub terminal: T,
+    pub keyboard: K,
+    pub midi: M,
+    pub audio_input: I,
+    pub audio_output: O,
+}
+
+#[derive(Debug)]
+pub enum CliEntryError {
+    Usage(InvalidUsage),
+    Runtime(Box<dyn Error>),
+}
+
+pub fn dispatch_args_os_with_startup<TF, KF, MF, IF, OF, T, K, M, I, O, R, P, E>(
+    args: impl Iterator<Item = OsString>,
+    factories: CliStartupFactories<TF, KF, MF, IF, OF>,
+    run_tui: R,
     play: P,
     export: E,
-) -> Result<CliOutcome, Box<dyn Error>>
+) -> Result<CliOutcome, CliEntryError>
 where
-    T: FnOnce(Option<PathBuf>) -> Result<(), Box<dyn Error>>,
+    TF: FnOnce() -> T,
+    KF: FnOnce() -> K,
+    MF: FnOnce() -> M,
+    IF: FnOnce() -> I,
+    OF: FnOnce() -> O,
+    R: FnOnce(Option<PathBuf>, TuiStartup<T, K, M, I, O>) -> Result<(), Box<dyn Error>>,
     P: FnOnce(PathBuf) -> Result<(), Box<dyn Error>>,
     E: FnOnce(PathBuf, ExportPatternSlot, PathBuf) -> Result<OfflineExportReceipt, Box<dyn Error>>,
 {
+    let command = parse_args_os(args).map_err(CliEntryError::Usage)?;
     match command {
-        CliCommand::Tui => run_tui(None).map(|()| CliOutcome::Silent),
-        CliCommand::Open(directory) => run_tui(Some(directory)).map(|()| CliOutcome::Silent),
-        CliCommand::Play(path) => play(path).map(|()| CliOutcome::Silent),
+        CliCommand::Tui | CliCommand::Open(_) => {
+            let initial_project = match command {
+                CliCommand::Open(directory) => Some(directory),
+                _ => None,
+            };
+            let startup = TuiStartup {
+                terminal: (factories.terminal)(),
+                keyboard: (factories.keyboard)(),
+                midi: (factories.midi)(),
+                audio_input: (factories.audio_input)(),
+                audio_output: (factories.audio_output)(),
+            };
+            run_tui(initial_project, startup)
+                .map(|()| CliOutcome::Silent)
+                .map_err(CliEntryError::Runtime)
+        }
+        CliCommand::Play(path) => play(path)
+            .map(|()| CliOutcome::Silent)
+            .map_err(CliEntryError::Runtime),
         CliCommand::Export {
             project,
             slot,
             destination,
-        } => export(project, slot, destination).map(CliOutcome::Export),
+        } => export(project, slot, destination)
+            .map(CliOutcome::Export)
+            .map_err(CliEntryError::Runtime),
         CliCommand::Help => Ok(CliOutcome::Help),
     }
 }

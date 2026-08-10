@@ -618,6 +618,7 @@ struct AdapterCaptureIdentity {
 }
 
 impl<S> SessionAudioPort<S> {
+    #[cfg(test)]
     fn new(session: S) -> Self {
         Self::new_with_input_opener(session, || {
             InputCaptureSession::open_default()
@@ -1104,10 +1105,30 @@ impl<S> SessionAudioPort<S> {
 }
 
 pub fn open_default_audio() -> Result<Box<dyn AudioPort>, String> {
-    AudioSession::open_default()
-        .map(SessionAudioPort::new)
-        .map(|port| Box::new(port) as Box<dyn AudioPort>)
-        .map_err(|error| error.to_string())
+    let output = open_default_audio_output()?;
+    Ok(audio_port_with_input_factory(
+        output,
+        default_audio_input_factory(),
+    ))
+}
+
+pub type DefaultAudioInputFactory = Box<dyn FnMut() -> Result<InputCaptureSession, String>>;
+
+pub fn default_audio_input_factory() -> DefaultAudioInputFactory {
+    Box::new(|| InputCaptureSession::open_default().map_err(|error| error.to_string()))
+}
+
+pub fn open_default_audio_output() -> Result<AudioSession, String> {
+    AudioSession::open_default().map_err(|error| error.to_string())
+}
+
+pub(crate) fn audio_port_with_input_factory(
+    output: AudioSession,
+    mut input: DefaultAudioInputFactory,
+) -> Box<dyn AudioPort> {
+    Box::new(SessionAudioPort::new_with_input_opener(output, move || {
+        input().map(|session| Box::new(session) as Box<dyn InputSessionLike>)
+    }))
 }
 
 #[cfg(test)]

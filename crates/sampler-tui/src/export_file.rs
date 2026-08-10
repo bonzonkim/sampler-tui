@@ -25,7 +25,7 @@ pub(crate) enum PublisherCheckpoint {
     BeforeDirectorySync,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 type MutationHook = Box<dyn FnMut(PublisherCheckpoint)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +210,7 @@ pub struct AtomicWavPublisher {
     written_frames: u64,
     publication_linked: bool,
     io: PublisherIo,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     mutation_hook: MutationHook,
 }
 
@@ -219,12 +219,12 @@ impl AtomicWavPublisher {
         Self::prepare_internal(
             destination,
             PublisherIo::default(),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Box::new(|_| {}),
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn prepare_with_mutation_hook<F>(
         destination: &Path,
         hook: F,
@@ -250,7 +250,7 @@ impl AtomicWavPublisher {
     fn prepare_internal(
         destination: &Path,
         io: PublisherIo,
-        #[cfg(test)] mutation_hook: MutationHook,
+        #[cfg(any(test, debug_assertions))] mutation_hook: MutationHook,
     ) -> Result<Self, OfflineExportError> {
         validate_wav_destination(destination)?;
         let (parent, destination_leaf) = open_anchored_parent(destination, false)
@@ -304,7 +304,7 @@ impl AtomicWavPublisher {
             written_frames: 0,
             publication_linked: false,
             io,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             mutation_hook,
         };
         Ok(publisher)
@@ -457,10 +457,10 @@ impl AtomicWavPublisher {
             })
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     fn mutate(&mut self, _point: PublisherCheckpoint) {}
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn mutate(&mut self, point: PublisherCheckpoint) {
         (self.mutation_hook)(point);
     }

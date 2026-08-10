@@ -12,7 +12,9 @@ use sampler_core::{
     EditablePattern, MasterMixSettings, Meter, MidiSettings, PadMixSettings, PadSettings,
     PatternSlotId, ProjectId, ProjectPattern, Resolution, SampleEditRecipe, Tempo, Transport,
 };
-use sampler_tui::cli::{CliCommand, CliOutcome, dispatch_command, parse_args_os};
+use sampler_tui::cli::{
+    CliOutcome, CliStartupFactories, TuiStartup, dispatch_args_os_with_startup, parse_args_os,
+};
 use sampler_tui::export::{StagedExportPad, stage_export_samples};
 use sampler_tui::headless_export;
 use sampler_tui::{
@@ -187,29 +189,52 @@ fn independent_engine(
 
 #[derive(Default)]
 struct StartupCalls {
-    terminal: Cell<usize>,
-    keyboard: Cell<usize>,
-    midi: Cell<usize>,
-    audio_input: Cell<usize>,
-    audio_output: Cell<usize>,
+    terminal: Rc<Cell<usize>>,
+    keyboard: Rc<Cell<usize>>,
+    midi: Rc<Cell<usize>>,
+    audio_input: Rc<Cell<usize>>,
+    audio_output: Rc<Cell<usize>>,
 }
 
 impl StartupCalls {
-    fn record_tui_startup(&self) {
-        self.terminal.set(self.terminal.get() + 1);
-        self.keyboard.set(self.keyboard.get() + 1);
-        self.midi.set(self.midi.get() + 1);
-        self.audio_input.set(self.audio_input.get() + 1);
-        self.audio_output.set(self.audio_output.get() + 1);
+    fn assert_all(&self, expected: usize) {
+        assert_eq!(self.terminal.get(), expected);
+        assert_eq!(self.keyboard.get(), expected);
+        assert_eq!(self.midi.get(), expected);
+        assert_eq!(self.audio_input.get(), expected);
+        assert_eq!(self.audio_output.get(), expected);
     }
+}
 
-    fn assert_zero(&self) {
-        assert_eq!(self.terminal.get(), 0);
-        assert_eq!(self.keyboard.get(), 0);
-        assert_eq!(self.midi.get(), 0);
-        assert_eq!(self.audio_input.get(), 0);
-        assert_eq!(self.audio_output.get(), 0);
+#[derive(Debug, PartialEq, Eq)]
+struct StartupMarker(&'static str);
+
+fn counted_factory(
+    counter: Rc<Cell<usize>>,
+    marker: &'static str,
+) -> impl FnOnce() -> StartupMarker {
+    move || {
+        counter.set(counter.get() + 1);
+        StartupMarker(marker)
     }
+}
+
+fn startup_factories(
+    calls: &Rc<StartupCalls>,
+) -> CliStartupFactories<
+    impl FnOnce() -> StartupMarker,
+    impl FnOnce() -> StartupMarker,
+    impl FnOnce() -> StartupMarker,
+    impl FnOnce() -> StartupMarker,
+    impl FnOnce() -> StartupMarker,
+> {
+    CliStartupFactories::new(
+        counted_factory(Rc::clone(&calls.terminal), "terminal"),
+        counted_factory(Rc::clone(&calls.keyboard), "keyboard"),
+        counted_factory(Rc::clone(&calls.midi), "midi"),
+        counted_factory(Rc::clone(&calls.audio_input), "audio-input"),
+        counted_factory(Rc::clone(&calls.audio_output), "audio-output"),
+    )
 }
 
 #[test]
@@ -222,18 +247,18 @@ fn moved_real_project_exports_byte_equal_without_any_tui_or_device_startup() {
     let destination = fixture.path("headless.wav");
     let reference = fixture.path("reference.wav");
     let calls = Rc::new(StartupCalls::default());
-    let tui_calls = Rc::clone(&calls);
 
-    let outcome = dispatch_command(
-        CliCommand::Export {
-            project: moved.clone(),
-            slot: ExportPatternSlot::try_from(1).unwrap(),
-            destination: destination.clone(),
-        },
-        move |_| {
-            tui_calls.record_tui_startup();
-            panic!("headless export entered the TUI startup path")
-        },
+    let outcome = dispatch_args_os_with_startup(
+        [
+            std::ffi::OsString::from("sampler-tui"),
+            std::ffi::OsString::from("export"),
+            moved.clone().into_os_string(),
+            std::ffi::OsString::from("1"),
+            destination.clone().into_os_string(),
+        ]
+        .into_iter(),
+        startup_factories(&calls),
+        |_, _: TuiStartup<_, _, _, _, _>| panic!("headless export entered the TUI startup path"),
         |_| panic!("headless export entered diagnostic playback"),
         headless_export::run,
     )
@@ -242,7 +267,7 @@ fn moved_real_project_exports_byte_equal_without_any_tui_or_device_startup() {
     let CliOutcome::Export(receipt) = outcome else {
         panic!("export command returned a non-export outcome")
     };
-    calls.assert_zero();
+    calls.assert_all(0);
     assert_eq!(receipt.destination, destination);
     assert_eq!(receipt.revision, 11);
     render_with_independent_engine(&moved, 1, &reference);
@@ -250,6 +275,30 @@ fn moved_real_project_exports_byte_equal_without_any_tui_or_device_startup() {
         fs::read(receipt.destination).unwrap(),
         fs::read(reference).unwrap()
     );
+}
+
+#[test]
+fn tui_control_invokes_each_distinct_production_startup_factory_seam_once() {
+    let calls = Rc::new(StartupCalls::default());
+    let outcome = dispatch_args_os_with_startup(
+        ["sampler-tui"].into_iter().map(std::ffi::OsString::from),
+        startup_factories(&calls),
+        |initial_project, startup| {
+            assert_eq!(initial_project, None);
+            assert_eq!(startup.terminal, StartupMarker("terminal"));
+            assert_eq!(startup.keyboard, StartupMarker("keyboard"));
+            assert_eq!(startup.midi, StartupMarker("midi"));
+            assert_eq!(startup.audio_input, StartupMarker("audio-input"));
+            assert_eq!(startup.audio_output, StartupMarker("audio-output"));
+            Ok(())
+        },
+        |_| panic!("TUI command entered diagnostic playback"),
+        |_, _, _| panic!("TUI command entered headless export"),
+    )
+    .unwrap();
+
+    assert_eq!(outcome, CliOutcome::Silent);
+    calls.assert_all(1);
 }
 
 fn run_export_binary(project: &Path, slot: &str, destination: &Path) -> Output {
@@ -260,6 +309,52 @@ fn run_export_binary(project: &Path, slot: &str, destination: &Path) -> Output {
         .arg(destination)
         .output()
         .unwrap()
+}
+
+fn run_panicking_export_binary(project: &Path, destination: &Path, checkpoint: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sampler-tui"))
+        .arg("export")
+        .arg(project)
+        .arg("1")
+        .arg(destination)
+        .env("SAMPLER_TUI_TEST_HEADLESS_PANIC", checkpoint)
+        .output()
+        .unwrap()
+}
+
+fn temporary_export_entries(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".sampler-tui-tmp-"))
+        })
+        .collect()
+}
+
+#[test]
+fn production_binary_contains_hostile_panics_across_the_complete_headless_pipeline() {
+    let fixture = Fixture::new("contained-panics");
+    let project = fixture.path("project");
+    save_project(&fixture, &project, 31, SaveKind::Explicit, &[0]);
+
+    for checkpoint in ["before-probe", "after-prepare", "after-link"] {
+        let destination = fixture.path(&format!("panic-{checkpoint}.wav"));
+        let output = run_panicking_export_binary(&project, &destination, checkpoint);
+        assert_eq!(output.status.code(), Some(1), "checkpoint={checkpoint}");
+        assert!(output.stdout.is_empty(), "checkpoint={checkpoint}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "sampler-tui: offline pattern export failed\n  caused by: offline export request panicked\n",
+            "checkpoint={checkpoint}"
+        );
+        assert!(!destination.exists(), "checkpoint={checkpoint}");
+        assert!(
+            temporary_export_entries(&fixture.root).is_empty(),
+            "checkpoint={checkpoint}"
+        );
+    }
 }
 
 #[test]
@@ -421,6 +516,61 @@ fn newer_or_ambiguous_recovery_is_never_chosen_silently() {
             .contains("recovery document belongs to a different project")
     );
     assert!(!mismatched_destination.exists());
+}
+
+#[test]
+fn equal_and_older_same_project_recovery_leave_bytes_and_mtime_untouched_and_export_explicit() {
+    let fixture = Fixture::new("non-newer-recovery");
+    for (name, explicit_revision, recovery_revision) in
+        [("equal", 41_u64, 41_u64), ("older", 43_u64, 42_u64)]
+    {
+        let project = fixture.path(&format!("{name}-project"));
+        save_project(
+            &fixture,
+            &project,
+            explicit_revision,
+            SaveKind::Explicit,
+            &[0],
+        );
+        save_project(
+            &fixture,
+            &project,
+            recovery_revision,
+            SaveKind::Recovery,
+            &[0],
+        );
+        let recovery_path = project.join(".sampler-tui-recovery.toml");
+        let distinct_recovery = fs::read_to_string(&recovery_path)
+            .unwrap()
+            .replace("velocity = 0.73", "velocity = 0.25");
+        fs::write(&recovery_path, distinct_recovery).unwrap();
+        let recovery_before = fs::read(&recovery_path).unwrap();
+        let modified_before = fs::metadata(&recovery_path).unwrap().modified().unwrap();
+        let destination = fixture.path(&format!("{name}.wav"));
+        let reference = fixture.path(&format!("{name}-explicit-reference.wav"));
+
+        let output = run_export_binary(&project, "1", &destination);
+
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("revision={explicit_revision}"))
+        );
+        render_with_independent_engine(&project, 1, &reference);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            fs::read(reference).unwrap()
+        );
+        assert_eq!(fs::read(&recovery_path).unwrap(), recovery_before);
+        assert_eq!(
+            fs::metadata(&recovery_path).unwrap().modified().unwrap(),
+            modified_before
+        );
+    }
 }
 
 #[test]

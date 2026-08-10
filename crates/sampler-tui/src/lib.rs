@@ -24,6 +24,8 @@ mod ui_mixer;
 mod ui_pattern;
 mod ui_sample;
 
+pub(crate) static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use app::{
     App, EDIT_PREVIEW_COLUMNS, Overlay, PAD_VIEW_COUNT, PREVIEW_COLUMNS, PadLoadState, PadView,
     PreviewColumn, ProjectAction, ProjectSaveError, ProjectSaveFailure, SampleEditRequestError,

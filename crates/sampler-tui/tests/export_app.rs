@@ -9,7 +9,8 @@ use sampler_core::{BankId, PadId};
 use sampler_tui::{
     App, AtomicWavPublisher, ExportPatternSlot, ExportPhase, ExportResultFence, ExportStatusView,
     ExportToken, InputAction, OfflineExportError, OfflineExportReceipt, OfflineExportSnapshot,
-    ProjectOpenError, WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError, render_offline,
+    ProjectOpenError, ProjectStoreError, WorkerHandle, WorkerRequest, WorkerResult,
+    WorkerSendError, render_offline,
 };
 
 #[path = "support/mixer_harness.rs"]
@@ -61,6 +62,29 @@ fn saved_pattern_harness() -> (FixtureTree, Harness, std::path::PathBuf) {
         harness.dispatch_queued();
     }
     (tree, harness, destination)
+}
+
+fn fail_explicit_save(app: &mut App, now: Instant) {
+    app.request_save().unwrap();
+    assert!(app.maintain_project(now));
+    let requests = app.take_worker_requests();
+    let [WorkerRequest::SaveProject(request)] = requests.as_slice() else {
+        panic!("expected explicit save request")
+    };
+    let request = (**request).clone();
+    let save = &request.request;
+    assert!(app.apply_worker_result(WorkerResult::ProjectSaved {
+        token: request.token,
+        kind: save.kind,
+        project_id: save.snapshot.project_id,
+        directory: save.directory.clone(),
+        revision: save.snapshot.revision,
+        result: Err(ProjectStoreError::Filesystem {
+            operation: "save fixture",
+            path: save.directory.clone(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        }),
+    }));
 }
 
 fn assert_no_export_temp(tree: &FixtureTree) {
@@ -338,6 +362,140 @@ fn busy_worker_returns_the_exact_export_request_to_app_owned_retry_state() {
         ExportPhase::Cancelling
     );
     assert_eq!(cancelling.app.status(), cancelling_status);
+}
+
+#[test]
+fn hidden_queued_retry_preserves_prompt_and_reveals_exact_queued_state() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    harness.app.start_export(destination).unwrap();
+    let request = harness.app.take_worker_requests().pop().unwrap();
+    harness.app.open_help();
+    let prompt = harness.app.status().to_owned();
+
+    assert!(
+        harness
+            .app
+            .apply_worker_send_error(request, WorkerSendError::WorkerBusy)
+    );
+
+    assert_eq!(harness.app.status(), prompt);
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active {
+            operation,
+            focused: false,
+        }) if operation.phase() == ExportPhase::Queued
+    ));
+    harness.app.close_overlay();
+    assert!(harness.app.status().starts_with("Export queued"));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: true, .. })
+    ));
+}
+
+#[test]
+fn hidden_progress_then_cancel_reveals_truthful_unfocused_cancelling_state() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    harness.app.start_export(destination).unwrap();
+    harness.app.take_worker_requests();
+    let operation = harness.app.export_operation().unwrap().clone();
+    harness.app.open_help();
+    assert!(
+        harness
+            .app
+            .maintain_export(Some(WorkerResult::ExportProgress {
+                token: operation.token(),
+                fence: Arc::new(operation.result_fence()),
+                completed_units: 1,
+                total_units: 2,
+            }))
+    );
+
+    assert!(harness.app.cancel_export());
+    harness.app.close_overlay();
+
+    assert!(harness.app.status().starts_with("Cancelling export"));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active {
+            operation,
+            focused: false,
+        }) if operation.phase() == ExportPhase::Cancelling
+    ));
+    harness.app.open_help();
+    harness.app.close_overlay();
+    assert!(harness.app.status().starts_with("Cancelling export"));
+}
+
+#[test]
+fn export_admission_hidden_by_help_preserves_prompt_until_queued_reveal() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    harness.app.apply(InputAction::BankDelta(-1));
+    let prompt = harness.app.status().to_owned();
+    harness.app.open_help();
+
+    harness.app.start_export(destination).unwrap();
+
+    assert_eq!(harness.app.status(), prompt);
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: false, .. })
+    ));
+    harness.app.close_overlay();
+    assert!(harness.app.status().starts_with("Export queued"));
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: true, .. })
+    ));
+}
+
+#[test]
+fn persistent_save_error_outranks_export_admission_until_a_reveal_is_eligible() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    fail_explicit_save(&mut harness.app, Instant::now());
+    let error = harness.app.status().to_owned();
+
+    harness.app.start_export(destination).unwrap();
+
+    assert_eq!(harness.app.status(), error);
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: false, .. })
+    ));
+}
+
+#[test]
+fn persistent_open_error_outranks_export_admission() {
+    let (_tree, mut harness, destination) = saved_pattern_harness();
+    let failed = std::path::PathBuf::from("failed-open");
+    let token = harness.app.request_open_project(failed.clone()).unwrap();
+    let [WorkerRequest::ProbeProject { .. }] = harness.app.take_worker_requests().as_slice() else {
+        panic!("expected project probe")
+    };
+    assert!(
+        harness
+            .app
+            .apply_worker_result(WorkerResult::ProjectProbed {
+                token,
+                directory: failed.clone(),
+                result: Err(ProjectStoreError::Filesystem {
+                    operation: "probe fixture",
+                    path: failed,
+                    kind: std::io::ErrorKind::PermissionDenied,
+                }),
+            })
+    );
+    let error = harness.app.status().to_owned();
+    harness.app.close_overlay();
+
+    harness.app.start_export(destination).unwrap();
+
+    assert_eq!(harness.app.status(), error);
+    assert!(matches!(
+        harness.app.export_status_view(),
+        Some(ExportStatusView::Active { focused: false, .. })
+    ));
 }
 
 #[test]
@@ -1338,6 +1496,15 @@ fn quit_and_open_cancel_export_then_continue_only_after_matching_cleanup_ack() {
     direct.worker.try_send(request.clone()).unwrap();
     let save_result = direct.worker.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(direct.app.apply_worker_result(save_result));
+    assert!(direct.app.project_open_stage().is_none());
+    assert!(direct.app.maintain_project(Instant::now()));
+    let cleanup_requests = direct.app.take_worker_requests();
+    let [request @ WorkerRequest::DiscardRecovery { .. }] = cleanup_requests.as_slice() else {
+        panic!("direct open must also wait behind save-triggered recovery cleanup")
+    };
+    direct.worker.try_send(request.clone()).unwrap();
+    let cleanup_result = direct.worker.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(direct.app.apply_worker_result(cleanup_result));
     assert_eq!(
         direct.app.project_open_stage().unwrap().directory,
         direct_open

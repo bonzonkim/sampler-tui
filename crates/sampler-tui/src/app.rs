@@ -4544,6 +4544,22 @@ enum ExportPresentationDismissal {
     Defer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPresentationTransition {
+    StateChanged,
+    RevealSuppressed,
+    RevealActive,
+    PreserveNewerStatus,
+}
+
+enum DirectPreflightExit {
+    Continue,
+    Abort {
+        title: &'static str,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingProjectAction {
     Open(PathBuf),
@@ -4978,13 +4994,7 @@ impl App {
             .push(WorkerRequest::Export(request));
         self.export_operation = Some(operation);
         self.export_outcome = None;
-        self.export_status_focused = true;
-        self.suppressed_export_presentation_pending = false;
-        self.status = format!(
-            "Export queued · pattern {} · revision {}",
-            selected.get() + 1,
-            project.revision
-        );
+        self.transition_export_presentation(ExportPresentationTransition::StateChanged);
         Ok(token)
     }
 
@@ -5005,7 +5015,6 @@ impl App {
     }
 
     pub fn cancel_export(&mut self) -> bool {
-        let update_status = self.export_status_has_priority();
         let Some(operation) = self.export_operation.as_mut() else {
             return false;
         };
@@ -5014,14 +5023,7 @@ impl App {
         }
         operation.cancel.cancel();
         operation.phase = crate::ExportPhase::Cancelling;
-        self.export_status_focused = false;
-        if update_status {
-            self.status = format!(
-                "Cancelling export · pattern {} · revision {}",
-                operation.slot.get() + 1,
-                operation.revision
-            );
-        }
+        self.transition_export_presentation(ExportPresentationTransition::StateChanged);
         true
     }
 
@@ -5041,44 +5043,47 @@ impl App {
             && self.capture_discard_release_pending.is_none()
     }
 
-    fn restore_suppressed_export_presentation(&mut self) {
-        if !self.suppressed_export_presentation_pending || !self.export_status_has_priority() {
-            return;
-        }
-        self.suppressed_export_presentation_pending = false;
-        self.export_status_focused = false;
+    fn current_export_presentation(&self) -> Option<(String, bool)> {
         if let Some(operation) = self.export_operation.as_ref() {
-            self.status = match operation.phase {
-                crate::ExportPhase::Queued => {
-                    self.export_status_focused = true;
+            return Some(match operation.phase {
+                crate::ExportPhase::Queued => (
                     format!(
                         "Export queued · pattern {} · revision {}",
                         operation.slot.get() + 1,
                         operation.revision
-                    )
-                }
+                    ),
+                    true,
+                ),
                 crate::ExportPhase::Running {
                     completed_units,
                     total_units,
                 } => {
-                    self.export_status_focused = true;
                     let percent = completed_units
                         .min(total_units)
                         .saturating_mul(100)
                         .checked_div(total_units)
                         .unwrap_or(0);
-                    format!(
-                        "Export pattern {} · {percent}% · revision {}",
-                        operation.slot.get() + 1,
-                        operation.revision
+                    (
+                        format!(
+                            "Export pattern {} · {percent}% · revision {}",
+                            operation.slot.get() + 1,
+                            operation.revision
+                        ),
+                        true,
                     )
                 }
-                crate::ExportPhase::Cancelling => return,
-            };
-            return;
+                crate::ExportPhase::Cancelling => (
+                    format!(
+                        "Cancelling export · pattern {} · revision {}",
+                        operation.slot.get() + 1,
+                        operation.revision
+                    ),
+                    false,
+                ),
+            });
         }
-        if let Some(outcome) = self.export_outcome.as_ref() {
-            self.status = match outcome {
+        self.export_outcome.as_ref().and_then(|outcome| {
+            let message = match outcome {
                 crate::ExportStatusView::Completed { receipt } => format!(
                     "Exported pattern {} · revision {} · {} frames",
                     receipt.slot.get() + 1,
@@ -5093,48 +5098,51 @@ impl App {
                 crate::ExportStatusView::Failed { fence, error } => {
                     format!("Export failed · revision {} · {error}", fence.revision)
                 }
-                crate::ExportStatusView::Active { .. } => return,
+                crate::ExportStatusView::Active { .. } => return None,
             };
-        }
+            Some((message, false))
+        })
     }
 
-    fn restore_active_export_after_audio_recovery(&mut self) {
-        if !self.export_status_has_priority() {
+    fn transition_export_presentation(&mut self, transition: ExportPresentationTransition) {
+        if transition == ExportPresentationTransition::PreserveNewerStatus {
+            self.export_status_focused = false;
+            if !matches!(
+                self.export_operation
+                    .as_ref()
+                    .map(|operation| operation.phase),
+                Some(crate::ExportPhase::Cancelling)
+            ) {
+                self.suppressed_export_presentation_pending = false;
+            }
             return;
         }
-        self.suppressed_export_presentation_pending = false;
-        let Some(operation) = self.export_operation.as_ref() else {
+        let priority = self.export_status_has_priority();
+        let reveal = match transition {
+            ExportPresentationTransition::StateChanged => priority,
+            ExportPresentationTransition::RevealSuppressed => {
+                priority && self.suppressed_export_presentation_pending
+            }
+            ExportPresentationTransition::RevealActive => {
+                priority && self.export_operation.is_some()
+            }
+            ExportPresentationTransition::PreserveNewerStatus => unreachable!(),
+        };
+        if !reveal {
+            if transition == ExportPresentationTransition::StateChanged
+                && self.current_export_presentation().is_some()
+            {
+                self.export_status_focused = false;
+                self.suppressed_export_presentation_pending = true;
+            }
+            return;
+        }
+        let Some((message, focused)) = self.current_export_presentation() else {
             return;
         };
-        match operation.phase {
-            crate::ExportPhase::Queued => {
-                self.export_status_focused = true;
-                self.status = format!(
-                    "Export queued · pattern {} · revision {}",
-                    operation.slot.get() + 1,
-                    operation.revision
-                );
-            }
-            crate::ExportPhase::Running {
-                completed_units,
-                total_units,
-            } => {
-                let percent = completed_units
-                    .min(total_units)
-                    .saturating_mul(100)
-                    .checked_div(total_units)
-                    .unwrap_or(0);
-                self.export_status_focused = true;
-                self.status = format!(
-                    "Export pattern {} · {percent}% · revision {}",
-                    operation.slot.get() + 1,
-                    operation.revision
-                );
-            }
-            crate::ExportPhase::Cancelling => {
-                self.export_status_focused = false;
-            }
-        }
+        self.status = message;
+        self.export_status_focused = focused;
+        self.suppressed_export_presentation_pending = false;
     }
 
     pub fn maintain_export(&mut self, progress: Option<WorkerResult>) -> bool {
@@ -5147,7 +5155,6 @@ impl App {
         else {
             return false;
         };
-        let update_status = self.export_status_has_priority();
         let Some(operation) = self.export_operation.as_mut() else {
             return false;
         };
@@ -5160,29 +5167,14 @@ impl App {
             return false;
         }
         if operation.phase == crate::ExportPhase::Cancelling {
+            self.transition_export_presentation(ExportPresentationTransition::StateChanged);
             return true;
         }
         operation.phase = crate::ExportPhase::Running {
             completed_units,
             total_units,
         };
-        let percent = completed_units
-            .min(total_units)
-            .saturating_mul(100)
-            .checked_div(total_units)
-            .unwrap_or(0);
-        if update_status {
-            self.suppressed_export_presentation_pending = false;
-            self.export_status_focused = true;
-            self.status = format!(
-                "Export pattern {} · {percent}% · revision {}",
-                operation.slot.get() + 1,
-                operation.revision
-            );
-        } else {
-            self.export_status_focused = false;
-            self.suppressed_export_presentation_pending = true;
-        }
+        self.transition_export_presentation(ExportPresentationTransition::StateChanged);
         true
     }
 
@@ -5703,7 +5695,12 @@ impl App {
                     }
                     Err(error) => {
                         self.pending_managed_releases.push_front(id);
-                        self.status = error.to_string();
+                        let message = error.to_string();
+                        self.status = message.clone();
+                        self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                            title: "CAPTURE CLEANUP ERROR",
+                            message,
+                        });
                         true
                     }
                 }
@@ -6001,9 +5998,13 @@ impl App {
     }
 
     fn complete_capture_discard(&mut self) {
-        self.status = "Capture discarded; prior pad unchanged".to_owned();
-        self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
-        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureDiscard) {
+        if !matches!(self.overlay, Some(Overlay::ProjectError { .. })) {
+            self.status = "Capture discarded; prior pad unchanged".to_owned();
+            self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
+        }
+        if !self.resolve_direct_preflight_exit(DirectPreflightExit::Continue)
+            && self.project_lifecycle_wait == Some(ProjectLifecycleWait::CaptureDiscard)
+        {
             self.project_lifecycle_wait = None;
             self.advance_project_action();
         }
@@ -6907,6 +6908,7 @@ impl App {
             || self.in_flight_project.is_some()
             || self.pending_explicit_save.is_some()
             || self.pending_autosave_save.is_some()
+            || self.capture_discard_release_pending.is_some()
             || self.pending_project_action.is_some()
             || self.project_lifecycle_wait.is_some()
         {
@@ -7031,9 +7033,10 @@ impl App {
         if self.capture_session.phase().is_some() {
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
             if let Err(error) = self.cancel_capture() {
-                self.status = error.to_string();
-                self.overlay = Some(Overlay::CaptureFailed {
-                    action: Some(ProjectAction::Open),
+                let message = error.to_string();
+                self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                    title: "CAPTURE CLEANUP ERROR",
+                    message,
                 });
             }
             return;
@@ -7042,6 +7045,7 @@ impl App {
             || self.in_flight_project.is_some()
             || self.pending_explicit_save.is_some()
             || self.pending_autosave_save.is_some()
+            || !self.pending_recovery_cleanup.is_empty()
         {
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::DirectPreflight);
             self.overlay = Some(Overlay::ProjectLifecycleProgress {
@@ -7053,14 +7057,56 @@ impl App {
         if let Err(error) = self.project_snapshot() {
             let message = error.to_string();
             self.project_lifecycle_wait = Some(ProjectLifecycleWait::DirectPreflight);
-            self.status = message.clone();
-            self.overlay = Some(Overlay::ProjectError {
-                title: "OPEN PROJECT ERROR".to_owned(),
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                title: "OPEN PROJECT ERROR",
                 message,
             });
             return;
         }
         self.complete_project_action();
+    }
+
+    fn resolve_direct_preflight_exit(&mut self, exit: DirectPreflightExit) -> bool {
+        if !self.retained_direct_preflight_active() {
+            return false;
+        }
+        self.project_lifecycle_wait = None;
+        match exit {
+            DirectPreflightExit::Continue => {
+                if matches!(
+                    self.overlay,
+                    Some(
+                        Overlay::ProjectLifecycleProgress { .. }
+                            | Overlay::ProjectOpenProgress
+                            | Overlay::ProjectSaveProgress
+                            | Overlay::CaptureProgress { .. }
+                    )
+                ) {
+                    self.dismiss_overlay(ExportPresentationDismissal::Defer);
+                }
+                self.advance_project_action();
+            }
+            DirectPreflightExit::Abort { title, message } => {
+                self.pending_project_action = None;
+                self.export_status_focused = false;
+                self.status = message.clone();
+                self.overlay = Some(Overlay::ProjectError {
+                    title: title.to_owned(),
+                    message,
+                });
+            }
+        }
+        true
+    }
+
+    fn retained_direct_preflight_active(&self) -> bool {
+        matches!(
+            self.pending_project_action,
+            Some(PendingProjectAction::OpenDirect(_))
+        ) && matches!(
+            self.project_lifecycle_wait,
+            Some(ProjectLifecycleWait::DirectPreflight | ProjectLifecycleWait::CaptureDiscard)
+        )
     }
 
     fn complete_project_action(&mut self) {
@@ -7452,6 +7498,11 @@ impl App {
         });
         self.status = message;
         self.project_open_error = Some(error);
+        let message = self.status.clone();
+        self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+            title: "OPEN PROJECT ERROR",
+            message,
+        });
     }
 
     pub fn cancel_project_open(&mut self) -> Result<(), ProjectOpenError> {
@@ -7469,15 +7520,7 @@ impl App {
             self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
         }
         self.status = "Project open cancelled".to_owned();
-        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
-            && matches!(
-                self.pending_project_action,
-                Some(PendingProjectAction::OpenDirect(_))
-            )
-        {
-            self.project_lifecycle_wait = None;
-            self.advance_project_action();
-        }
+        self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
         Ok(())
     }
 
@@ -7830,15 +7873,7 @@ impl App {
         self.project_open_error = None;
         self.status = format!("Opened {}", self.project_session.name());
         self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
-        if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
-            && matches!(
-                self.pending_project_action,
-                Some(PendingProjectAction::OpenDirect(_))
-            )
-        {
-            self.project_lifecycle_wait = None;
-            self.advance_project_action();
-        }
+        self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
     }
 
     fn apply_project_probe(
@@ -8033,6 +8068,7 @@ impl App {
             RecoveryChoice::Cancel => {
                 self.status = "Project open cancelled".to_owned();
                 self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
+                self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
             }
             RecoveryChoice::Restore => {
                 let saved_revision = explicit
@@ -8249,8 +8285,12 @@ impl App {
         if error == WorkerSendError::WorkerBusy {
             choice.discard_queued = false;
         } else {
-            self.project_open = None;
-            self.dismiss_overlay(ExportPresentationDismissal::PreserveNewerStatus);
+            let error = ProjectStoreError::Filesystem {
+                operation: "send recovery discard",
+                path: directory.to_owned(),
+                kind: std::io::ErrorKind::BrokenPipe,
+            };
+            self.fail_project_open(ProjectOpenError::RecoveryDiscard(error));
         }
         Some(true)
     }
@@ -8802,13 +8842,6 @@ impl App {
     pub fn close_overlay(&mut self) {
         let device_error = matches!(self.overlay, Some(Overlay::DeviceError(_)));
         let project_error = matches!(self.overlay, Some(Overlay::ProjectError { .. }));
-        let resume_direct = project_error
-            && self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
-            && matches!(
-                self.pending_project_action,
-                Some(PendingProjectAction::OpenDirect(_))
-            )
-            && self.project_open.is_none();
         if matches!(
             self.overlay,
             Some(Overlay::ApplySample { .. } | Overlay::DiscardSample { .. })
@@ -8822,9 +8855,6 @@ impl App {
         if let Some(Overlay::DeviceError(error)) = &self.overlay {
             self.status = format!("{error} · Ctrl+R retries audio");
         }
-        if resume_direct {
-            self.project_open_error = None;
-        }
         self.dismiss_overlay(if project_error {
             ExportPresentationDismissal::PreserveNewerStatus
         } else {
@@ -8834,10 +8864,6 @@ impl App {
             && self.pending_project_action.is_some()
             && self.project_lifecycle_wait.is_none()
         {
-            self.advance_project_action();
-        }
-        if resume_direct {
-            self.project_lifecycle_wait = None;
             self.advance_project_action();
         }
     }
@@ -8852,11 +8878,12 @@ impl App {
         self.overlay = None;
         match presentation {
             ExportPresentationDismissal::RestoreSuppressed => {
-                self.restore_suppressed_export_presentation();
+                self.transition_export_presentation(ExportPresentationTransition::RevealSuppressed);
             }
             ExportPresentationDismissal::PreserveNewerStatus => {
-                self.suppressed_export_presentation_pending = false;
-                self.export_status_focused = false;
+                self.transition_export_presentation(
+                    ExportPresentationTransition::PreserveNewerStatus,
+                );
             }
             ExportPresentationDismissal::Defer => {}
         }
@@ -9020,7 +9047,17 @@ impl App {
                 if progress.token != token || progress.directory != directory {
                     return false;
                 }
-                *worker_queued = false;
+                if error == WorkerSendError::WorkerBusy {
+                    *worker_queued = false;
+                } else {
+                    self.fail_project_open(ProjectOpenError::Probe(
+                        ProjectStoreError::Filesystem {
+                            operation: "send project probe",
+                            path: directory,
+                            kind: std::io::ErrorKind::BrokenPipe,
+                        },
+                    ));
+                }
                 true
             }
             WorkerRequest::StageProjectSample(request) => {
@@ -9035,7 +9072,13 @@ impl App {
                 {
                     return false;
                 }
-                candidate.decode_in_flight = None;
+                if error == WorkerSendError::WorkerBusy {
+                    candidate.decode_in_flight = None;
+                } else {
+                    self.fail_project_open(ProjectOpenError::Admission(
+                        "project staging worker disconnected".to_owned(),
+                    ));
+                }
                 true
             }
             WorkerRequest::FinalizeCapture(request) => {
@@ -9051,6 +9094,12 @@ impl App {
                 });
                 if exact {
                     self.capture_worker_request = None;
+                    if error == WorkerSendError::WorkerClosed {
+                        self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                            title: "CAPTURE CLEANUP ERROR",
+                            message: error.to_string(),
+                        });
+                    }
                 }
                 exact
             }
@@ -9071,7 +9120,8 @@ impl App {
                     }
                     self.pending_worker_requests
                         .push(WorkerRequest::Export(request));
-                    true
+                    self.transition_export_presentation(ExportPresentationTransition::StateChanged);
+                    return true;
                 } else {
                     false
                 }
@@ -9081,6 +9131,12 @@ impl App {
             {
                 self.managed_release_in_flight = None;
                 self.pending_managed_releases.push_front(id);
+                if error == WorkerSendError::WorkerClosed {
+                    self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                        title: "CAPTURE CLEANUP ERROR",
+                        message: error.to_string(),
+                    });
+                }
                 true
             }
             WorkerRequest::ReleaseManagedCapture { .. }
@@ -9088,10 +9144,12 @@ impl App {
             | WorkerRequest::Shutdown => false,
         };
         if applied {
-            if self
-                .export_operation
-                .as_ref()
-                .is_none_or(|operation| operation.phase != crate::ExportPhase::Cancelling)
+            if !self.retained_direct_preflight_active()
+                && !matches!(self.overlay, Some(Overlay::ProjectError { .. }))
+                && self
+                    .export_operation
+                    .as_ref()
+                    .is_none_or(|operation| operation.phase != crate::ExportPhase::Cancelling)
             {
                 self.status = message;
             }
@@ -9139,6 +9197,7 @@ impl App {
                     self.pending_autosave_save = Some(save);
                 }
             }
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
         } else {
             self.project_save_error = Some(ProjectSaveFailure {
                 kind: save.descriptor.kind,
@@ -9147,6 +9206,16 @@ impl App {
                     path: save.descriptor.directory,
                     kind: std::io::ErrorKind::BrokenPipe,
                 },
+            });
+            let message = self
+                .project_save_error
+                .as_ref()
+                .expect("closed save send records its exact failure")
+                .error
+                .to_string();
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                title: "SAVE PROJECT ERROR",
+                message,
             });
         }
         true
@@ -9167,11 +9236,21 @@ impl App {
         self.in_flight_project = None;
         if error == WorkerSendError::WorkerBusy {
             self.pending_recovery_cleanup.push_front(request);
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
         } else {
             self.recovery_cleanup_warning = Some(ProjectStoreError::Filesystem {
                 operation: "send recovery cleanup",
                 path: request.directory,
                 kind: std::io::ErrorKind::BrokenPipe,
+            });
+            let message = self
+                .recovery_cleanup_warning
+                .as_ref()
+                .expect("closed cleanup send records its exact failure")
+                .to_string();
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                title: "RECOVERY CLEANUP ERROR",
+                message,
             });
         }
         true
@@ -9695,44 +9774,17 @@ impl App {
         {
             return false;
         }
-        let update_status = self.export_status_has_priority();
         let fence = operation.result_fence();
         self.export_operation = None;
-        self.export_status_focused = false;
-        let (outcome, message) = match result {
-            Ok(receipt) => (
-                crate::ExportStatusView::Completed {
-                    receipt: receipt.clone(),
-                },
-                format!(
-                    "Exported pattern {} · revision {} · {} frames",
-                    receipt.slot.get() + 1,
-                    receipt.revision,
-                    receipt.rendered_frames
-                ),
-            ),
-            Err(crate::OfflineExportError::Cancelled) => (
-                crate::ExportStatusView::Cancelled { fence },
-                format!(
-                    "Export cancelled · pattern {} · revision {revision}",
-                    slot.get() + 1,
-                ),
-            ),
-            Err(error) => (
-                crate::ExportStatusView::Failed {
-                    fence,
-                    error: error.clone(),
-                },
-                format!("Export failed · revision {revision} · {error}"),
-            ),
+        let outcome = match result {
+            Ok(receipt) => crate::ExportStatusView::Completed { receipt },
+            Err(crate::OfflineExportError::Cancelled) => {
+                crate::ExportStatusView::Cancelled { fence }
+            }
+            Err(error) => crate::ExportStatusView::Failed { fence, error },
         };
         self.export_outcome = Some(outcome);
-        if update_status {
-            self.suppressed_export_presentation_pending = false;
-            self.status = message;
-        } else {
-            self.suppressed_export_presentation_pending = true;
-        }
+        self.transition_export_presentation(ExportPresentationTransition::StateChanged);
         if self.project_lifecycle_wait == Some(ProjectLifecycleWait::ExportCleanup)
             && self.pending_project_action.is_some()
         {
@@ -9866,16 +9918,13 @@ impl App {
             }
         }
         if save_succeeded {
-            self.restore_suppressed_export_presentation();
-            if self.project_lifecycle_wait == Some(ProjectLifecycleWait::DirectPreflight)
-                && matches!(
-                    self.pending_project_action,
-                    Some(PendingProjectAction::OpenDirect(_))
-                )
-            {
-                self.project_lifecycle_wait = None;
-                self.advance_project_action();
-            }
+            self.transition_export_presentation(ExportPresentationTransition::RevealSuppressed);
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
+        } else {
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                title: "SAVE PROJECT ERROR",
+                message: self.status.clone(),
+            });
         }
         true
     }
@@ -9957,6 +10006,18 @@ impl App {
                     self.status = error.to_string();
                 }
             }
+        }
+        if cleanup_succeeded {
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Continue);
+        } else {
+            let message = self
+                .recovery_cleanup_warning
+                .as_ref()
+                .map_or_else(|| "Recovery cleanup failed".to_owned(), ToString::to_string);
+            self.resolve_direct_preflight_exit(DirectPreflightExit::Abort {
+                title: "RECOVERY CLEANUP ERROR",
+                message,
+            });
         }
         true
     }
@@ -11668,8 +11729,8 @@ impl App {
         if self.pending_project_action.is_some() && self.project_lifecycle_wait.is_none() {
             self.advance_project_action();
         }
-        self.restore_suppressed_export_presentation();
-        self.restore_active_export_after_audio_recovery();
+        self.transition_export_presentation(ExportPresentationTransition::RevealSuppressed);
+        self.transition_export_presentation(ExportPresentationTransition::RevealActive);
     }
 
     fn pump_recovery_requests(&mut self) -> bool {
@@ -12153,14 +12214,15 @@ mod tests {
 
     use crate::DirectoryScan;
     use crate::loader::{
-        LoadPurpose, LoadSampleError, LoadedSample, ProjectSaveWorkerRequest, RenderedSample,
-        WORKER_CHANNEL_CAPACITY, WorkerHandle, WorkerRequest, WorkerResult, WorkerSendError,
+        FinalizeCaptureRequest, LoadPurpose, LoadSampleError, LoadedSample,
+        ProjectSaveWorkerRequest, RenderedSample, WORKER_CHANNEL_CAPACITY, WorkerHandle,
+        WorkerRequest, WorkerResult, WorkerSendError,
     };
 
     use super::{
         App, EDIT_PREVIEW_COLUMNS, MIDI_NOTE_COUNT, MIDI_OWNERSHIP_COUNT, MidiOwnedVoice,
-        PADS_PER_BANK, PREVIEW_COLUMNS, PadLoadState, PreviewColumn, RecoveryCleanup,
-        SampleEditStatus,
+        PADS_PER_BANK, PREVIEW_COLUMNS, PadLoadState, PendingProjectAction, PreviewColumn,
+        ProjectLifecycleWait, RecoveryCleanup, SampleEditStatus,
     };
     use crate::pattern::{PatternWorkspace, WorkspaceView};
     use crate::project_session::ProjectSnapshotError;
@@ -12986,6 +13048,17 @@ mod tests {
         operation
     }
 
+    fn finish_seeded_export_cancelled(app: &mut App, operation: &crate::ExportOperation) {
+        assert!(app.apply_worker_result(WorkerResult::ExportFinished {
+            token: operation.token(),
+            project_id: operation.project_id(),
+            revision: operation.revision(),
+            slot: operation.slot(),
+            destination: operation.destination().to_owned(),
+            result: Err(crate::OfflineExportError::Cancelled),
+        }));
+    }
+
     #[test]
     fn device_failure_guidance_remains_above_an_active_export_after_dismissal() {
         let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
@@ -13034,6 +13107,31 @@ mod tests {
         assert!(matches!(
             app.export_status_view(),
             Some(crate::ExportStatusView::Active { focused: true, .. })
+        ));
+    }
+
+    #[test]
+    fn audio_recovery_reveals_truthful_unfocused_cancelling_export() {
+        let audio = FakeAudio::ready(48_000, 2).failing_runtime("device disconnected");
+        let mut app = App::with_audio(Box::new(audio));
+        seed_active_export(&mut app, crate::ExportPhase::Queued);
+        assert!(app.cancel_export());
+        assert!(app.maintain_audio());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::DeviceError(_))
+        ));
+
+        assert!(app.retry_with(Box::new(FakeAudio::ready(48_000, 2))));
+
+        assert_eq!(app.overlay(), None);
+        assert!(app.status().starts_with("Cancelling export"));
+        assert!(matches!(
+            app.export_status_view(),
+            Some(crate::ExportStatusView::Active {
+                operation,
+                focused: false,
+            }) if operation.phase() == crate::ExportPhase::Cancelling
         ));
     }
 
@@ -21037,7 +21135,43 @@ mod tests {
     }
 
     #[test]
-    fn retained_direct_open_preserves_newer_open_error_until_dismissed_then_resumes() {
+    fn retained_direct_open_resumes_once_after_existing_open_success() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("exact-after-open-success");
+        assert_eq!(
+            app.request_open_project(exact.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        let other = PathBuf::from("opened-first");
+        app.start_project_open_probe(other.clone()).unwrap();
+        app.take_worker_requests();
+        finish_seeded_export_cancelled(&mut app, &operation);
+
+        let document = project_open_document(
+            sampler_core::ProjectId::from_bytes([0x88; 16]),
+            "Opened first",
+            0,
+            Vec::new(),
+        );
+        let super::ProjectOpenOperation::Staging(candidate) = app
+            .build_project_open_candidate(crate::ProjectToken::new(90), other, document, 0, false)
+            .unwrap()
+        else {
+            panic!("open-success fixture must stage")
+        };
+        app.project_open = None;
+        app.commit_project_open(candidate, Instant::now());
+
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
+        ));
+        assert!(app.pending_project_action.is_none());
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_open_error_and_later_retry_probes_once() {
         let mut app = project_app();
         let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
         let exact = PathBuf::from("exact-after-error");
@@ -21065,14 +21199,323 @@ mod tests {
         assert_eq!(app.project_open_error(), Some(&error));
         assert!(app.take_worker_requests().is_empty());
 
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
         app.apply_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.project_open_stage().is_none());
+        assert!(app.take_worker_requests().is_empty());
 
-        assert_eq!(app.project_open_error(), None);
+        app.request_open_project(exact.clone()).unwrap();
         assert_eq!(app.project_open_stage().unwrap().directory, exact);
         assert!(matches!(
             app.take_worker_requests().as_slice(),
             [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
         ));
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_save_failure_and_later_retry_probes_once() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("exact-after-save-error");
+        assert_eq!(
+            app.request_open_project(exact.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        app.request_save().unwrap();
+        assert!(app.maintain_project(now));
+        let save = take_project_save(&mut app);
+
+        finish_seeded_export_cancelled(&mut app, &operation);
+        assert!(app.apply_worker_result(save_error(&save, "save denied")));
+
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.take_worker_requests().is_empty());
+        app.close_overlay();
+        app.request_open_project(exact.clone()).unwrap();
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
+        ));
+        assert!(!app.apply_worker_result(save_error(&save, "save denied")));
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_direct_open_resumes_after_recovery_cleanup_success() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("exact-after-cleanup");
+        assert_eq!(
+            app.request_open_project(exact.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        let cleanup = RecoveryCleanup {
+            token: crate::ProjectToken::new(80),
+            directory: PathBuf::from("cleanup-project"),
+            project_id: app.project_session.project_id(),
+            revision: app.project_revision(),
+        };
+        app.in_flight_project = Some(super::InFlightProjectOperation::Cleanup(cleanup.clone()));
+
+        finish_seeded_export_cancelled(&mut app, &operation);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup.token,
+            directory: cleanup.directory,
+            project_id: cleanup.project_id,
+            revision: cleanup.revision,
+            result: Ok(()),
+        }));
+
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &exact
+        ));
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_recovery_cleanup_failure() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let exact = PathBuf::from("never-overlap-cleanup-error");
+        assert_eq!(
+            app.request_open_project(exact),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        let cleanup = RecoveryCleanup {
+            token: crate::ProjectToken::new(81),
+            directory: PathBuf::from("cleanup-project"),
+            project_id: app.project_session.project_id(),
+            revision: app.project_revision(),
+        };
+        app.in_flight_project = Some(super::InFlightProjectOperation::Cleanup(cleanup.clone()));
+
+        finish_seeded_export_cancelled(&mut app, &operation);
+        assert!(app.apply_worker_result(WorkerResult::RecoveryDiscarded {
+            token: cleanup.token,
+            directory: cleanup.directory.clone(),
+            project_id: cleanup.project_id,
+            revision: cleanup.revision,
+            result: Err(ProjectStoreError::Filesystem {
+                operation: "discard recovery",
+                path: cleanup.directory,
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+        }));
+
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_direct_open_busy_save_send_waits_but_closed_send_aborts() {
+        let now = Instant::now();
+        let mut app = project_app();
+        name_project(&mut app, "named", now);
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        assert_eq!(
+            app.request_open_project("send-error-target"),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        app.request_save().unwrap();
+        assert!(app.maintain_project(now));
+        let save = take_project_save(&mut app);
+        finish_seeded_export_cancelled(&mut app, &operation);
+
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::SaveProject(Box::new(save.clone())),
+            WorkerSendError::WorkerBusy,
+        ));
+        assert!(app.pending_project_action.is_some());
+        assert!(app.project_open_stage().is_none());
+        assert!(app.maintain_project(now));
+        let retried = take_project_save(&mut app);
+        assert_eq!(retried.token, save.token);
+
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::SaveProject(Box::new(retried)),
+            WorkerSendError::WorkerClosed,
+        ));
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.take_worker_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_capture_cleanup_failure_without_probing() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        assert_eq!(
+            app.request_open_project("capture-cleanup-target"),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        let id = ManagedCaptureId::new(777);
+        app.capture_discard_release_pending = Some(id);
+        app.managed_release_in_flight = Some(id);
+        finish_seeded_export_cancelled(&mut app, &operation);
+
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased {
+                id,
+                result: Err(crate::capture_store::CaptureStoreError::NotLive { id }),
+            })
+        );
+        assert!(app.maintain_capture());
+
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.project_open_stage().is_none());
+        assert!(app.take_worker_requests().is_empty());
+
+        app.close_overlay();
+        assert_eq!(
+            app.request_open_project("capture-cleanup-target"),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased { id, result: Ok(()) })
+        );
+        assert!(app.maintain_capture());
+        app.request_open_project("capture-cleanup-target").unwrap();
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }]
+                if directory == &PathBuf::from("capture-cleanup-target")
+        ));
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_capture_cleanup_send_close_then_retries_later() {
+        let mut app = project_app();
+        let operation = seed_active_export(&mut app, crate::ExportPhase::Queued);
+        let target = PathBuf::from("capture-send-close-target");
+        assert_eq!(
+            app.request_open_project(target.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        let id = ManagedCaptureId::new(778);
+        app.capture_discard_release_pending = Some(id);
+        app.managed_release_in_flight = Some(id);
+        finish_seeded_export_cancelled(&mut app, &operation);
+
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::ReleaseManagedCapture { id },
+            WorkerSendError::WorkerClosed,
+        ));
+
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.project_open_stage().is_none());
+        app.close_overlay();
+        assert_eq!(
+            app.request_open_project(target.clone()),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        assert!(app.maintain_capture());
+        assert_eq!(
+            app.take_worker_requests(),
+            [WorkerRequest::ReleaseManagedCapture { id }]
+        );
+        assert!(
+            app.apply_worker_result(WorkerResult::ManagedCaptureReleased { id, result: Ok(()) })
+        );
+        assert!(app.maintain_capture());
+        app.request_open_project(target.clone()).unwrap();
+        assert!(matches!(
+            app.take_worker_requests().as_slice(),
+            [WorkerRequest::ProbeProject { directory, .. }] if directory == &target
+        ));
+    }
+
+    fn direct_preflight_with_capture_finalize_request() -> (App, FinalizeCaptureRequest) {
+        let mut app = project_app();
+        seed_active_export(&mut app, crate::ExportPhase::Queued);
+        assert_eq!(
+            app.request_open_project("finalize-send-target"),
+            Err(crate::ProjectOpenError::OperationPending)
+        );
+        app.project_lifecycle_wait = Some(ProjectLifecycleWait::CaptureDiscard);
+        let request = FinalizeCaptureRequest {
+            token: 50,
+            generation: 3,
+            target: pad(0, 0),
+            source: sampler_audio::CaptureSource::Resample,
+            source_rate: 48_000,
+            engine_rate: 48_000,
+            stereo: Arc::from([0.25_f32, -0.25]),
+            hard_limit: false,
+        };
+        app.capture_worker_request = Some(request.clone());
+        (app, request)
+    }
+
+    #[test]
+    fn retained_direct_open_keeps_waiting_on_busy_capture_finalize_send() {
+        let (mut app, request) = direct_preflight_with_capture_finalize_request();
+
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::FinalizeCapture(request),
+            WorkerSendError::WorkerBusy,
+        ));
+
+        assert!(matches!(
+            app.pending_project_action,
+            Some(PendingProjectAction::OpenDirect(_))
+        ));
+        assert_eq!(
+            app.project_lifecycle_wait,
+            Some(ProjectLifecycleWait::CaptureDiscard)
+        );
+        assert!(app.capture_worker_request.is_none());
+        assert!(app.project_open_stage().is_none());
+    }
+
+    #[test]
+    fn retained_direct_open_aborts_on_closed_capture_finalize_send() {
+        let (mut app, request) = direct_preflight_with_capture_finalize_request();
+
+        assert!(app.apply_worker_send_error(
+            WorkerRequest::FinalizeCapture(request),
+            WorkerSendError::WorkerClosed,
+        ));
+
+        assert!(app.pending_project_action.is_none());
+        assert!(app.project_lifecycle_wait.is_none());
+        assert!(app.capture_worker_request.is_none());
+        assert!(matches!(
+            app.overlay(),
+            Some(super::Overlay::ProjectError { .. })
+        ));
+        assert!(app.project_open_stage().is_none());
     }
 
     #[test]

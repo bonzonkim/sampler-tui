@@ -5104,6 +5104,11 @@ impl App {
         })
     }
 
+    pub(crate) fn status_is_export_presentation(&self) -> bool {
+        self.current_export_presentation()
+            .is_some_and(|(message, _)| self.status == message)
+    }
+
     fn transition_export_presentation(&mut self, transition: ExportPresentationTransition) {
         if transition == ExportPresentationTransition::PreserveNewerStatus {
             self.export_status_focused = false;

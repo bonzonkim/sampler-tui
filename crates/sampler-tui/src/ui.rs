@@ -767,19 +767,6 @@ pub(crate) fn compact_export_status_text(app: &App) -> Option<String> {
     })
 }
 
-pub(crate) fn is_verbose_export_status_text(status: &str) -> bool {
-    [
-        "Export queued ·",
-        "Export progress ·",
-        "Cancelling export ·",
-        "Exported pattern ",
-        "Export cancelled ·",
-        "Export failed ·",
-    ]
-    .iter()
-    .any(|prefix| status.starts_with(prefix))
-}
-
 fn compact_export_error(error: &crate::OfflineExportError) -> &'static str {
     match error {
         crate::OfflineExportError::DestinationExists(_) => "DESTINATION EXISTS",
@@ -1503,7 +1490,17 @@ mod tests {
             .to_owned()
     }
 
-    fn assert_export_status_in_every_workspace(width: u16, app: &mut App, expected: &str) {
+    fn assert_export_status_in_every_workspace(
+        width: u16,
+        app: &mut App,
+        expected: &str,
+        verbose_prefix: &str,
+    ) {
+        assert!(
+            app.status().starts_with(verbose_prefix),
+            "actual App status {:?} must expose prefix {verbose_prefix:?}",
+            app.status()
+        );
         for workspace in ["Perform", "Pattern", "Sample", "Mixer"] {
             let lines = render_lines(width, 24, app);
             let matches = lines.iter().filter(|line| line.contains(expected)).count();
@@ -1515,12 +1512,7 @@ mod tests {
             );
             if workspace == "Mixer" {
                 assert!(
-                    lines.iter().all(|line| {
-                        !line.contains("Export queued ·")
-                            && !line.contains("Export progress ·")
-                            && !line.contains("Exported pattern ")
-                            && !line.contains("Export failed ·")
-                    }),
+                    lines.iter().all(|line| !line.contains(verbose_prefix)),
                     "Mixer must not append verbose App export status:\n{}",
                     lines.join("\n")
                 );
@@ -2331,6 +2323,7 @@ mod tests {
                 width,
                 &mut queued,
                 " EXPORT P01 · QUEUED · REV 2 · Esc cancel",
+                "Export queued ·",
             );
 
             let (_fixture, mut running, operation) =
@@ -2340,6 +2333,7 @@ mod tests {
                 width,
                 &mut running,
                 " EXPORT P01 · 50% · REV 2 · Esc cancel",
+                "Export pattern ",
             );
 
             let (_fixture, mut cancelling, _operation) =
@@ -2349,6 +2343,7 @@ mod tests {
                 width,
                 &mut cancelling,
                 " EXPORT P01 · CANCELLING · REV 2",
+                "Cancelling export ·",
             );
 
             let (_fixture, mut completed, operation) =
@@ -2371,6 +2366,21 @@ mod tests {
                 width,
                 &mut completed,
                 " EXPORT P01 · DONE · REV 2 · 96000 frames",
+                "Exported pattern ",
+            );
+
+            let (_fixture, mut cancelled, operation) =
+                export_ready_app(&format!("all-cancelled-{width}"));
+            finish_export(
+                &mut cancelled,
+                &operation,
+                Err(OfflineExportError::Cancelled),
+            );
+            assert_export_status_in_every_workspace(
+                width,
+                &mut cancelled,
+                " EXPORT P01 · CANCELLED · REV 2",
+                "Export cancelled ·",
             );
 
             let (_fixture, mut failed, operation) =
@@ -2386,6 +2396,7 @@ mod tests {
                 width,
                 &mut failed,
                 " EXPORT P01 · FAILED: DESTINATION EXISTS · REV 2",
+                "Export failed ·",
             );
         }
     }
@@ -2441,15 +2452,44 @@ mod tests {
 
     #[test]
     fn mixer_never_appends_verbose_export_status_when_an_overlay_unfocuses_export() {
-        let (_fixture, mut app, _operation) = export_ready_app("mixer-unfocused");
+        let (_fixture, mut queued, _operation) = export_ready_app("mixer-unfocused-queued");
+        for _ in 0..3 {
+            queued.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        queued.open_palette();
+
+        let queued_screen = render_lines(120, 24, &queued).join("\n");
+        assert!(queued_screen.contains(" COMMAND "));
+        assert!(!queued_screen.contains(queued.status()), "{queued_screen}");
+
+        let (_fixture, mut running, operation) = export_ready_app("mixer-unfocused-running");
+        export_progress(&mut running, &operation, 4, 8);
+        assert_eq!(running.status(), "Export pattern 1 · 50% · revision 2");
+        for _ in 0..3 {
+            running.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        running.open_palette();
+
+        let running_screen = render_lines(120, 24, &running).join("\n");
+        assert!(running_screen.contains(" COMMAND "));
+        assert!(
+            !running_screen.contains(running.status()),
+            "{running_screen}"
+        );
+    }
+
+    #[test]
+    fn focused_mixer_running_status_shows_only_compact_progress() {
+        let (_fixture, mut app, operation) = export_ready_app("mixer-focused-running");
+        export_progress(&mut app, &operation, 4, 8);
+        assert_eq!(app.status(), "Export pattern 1 · 50% · revision 2");
         for _ in 0..3 {
             app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         }
-        app.open_palette();
 
         let screen = render_lines(120, 24, &app).join("\n");
-        assert!(screen.contains(" COMMAND "));
-        assert!(!screen.contains("Export queued ·"), "{screen}");
+        assert!(screen.contains(" EXPORT P01 · 50% · REV 2 · Esc cancel"));
+        assert!(!screen.contains(app.status()), "{screen}");
     }
 
     #[test]

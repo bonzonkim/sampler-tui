@@ -166,6 +166,11 @@ pub(crate) struct ProjectAssetBytes {
     pub(crate) fingerprint: SourceFingerprint,
 }
 
+pub(crate) struct CapturedProjectAssetAuthority {
+    pub(crate) path: PathBuf,
+    pub(crate) encoded_bytes: u64,
+}
+
 impl ValidatedSource {
     fn open(path: &Path) -> Result<Self, ProjectStoreError> {
         let (parent, leaf) = open_anchored_parent(path, true)?;
@@ -297,6 +302,26 @@ impl ProjectDirectory {
     }
 
     fn open_asset(&self, relative: &str) -> Result<ValidatedSource, ProjectStoreError> {
+        let (directory, leaf, display) = self.resolve_asset_parent(relative)?;
+        directory.open_leaf(Path::new(&leaf), &display)
+    }
+
+    fn capture_asset_authority(
+        &self,
+        relative: &str,
+    ) -> Result<CapturedProjectAssetAuthority, ProjectStoreError> {
+        let (directory, leaf, display) = self.resolve_asset_parent(relative)?;
+        let encoded_bytes = directory.regular_leaf_size(Path::new(&leaf), &display)?;
+        Ok(CapturedProjectAssetAuthority {
+            path: display,
+            encoded_bytes,
+        })
+    }
+
+    fn resolve_asset_parent(
+        &self,
+        relative: &str,
+    ) -> Result<(AudioDirectory, std::ffi::OsString, PathBuf), ProjectStoreError> {
         use std::path::Component;
 
         let relative = Path::new(relative);
@@ -323,7 +348,7 @@ impl ProjectDirectory {
             unreachable!()
         };
         let display = self.path.join(relative);
-        directory.open_leaf(Path::new(leaf), &display)
+        Ok((directory, leaf.to_os_string(), display))
     }
 
     fn lock_exclusive(&self) -> Result<ProjectLock, ProjectStoreError> {
@@ -372,6 +397,25 @@ impl ProjectStore {
         directory: &Path,
     ) -> Result<AnchoredDirectoryIdentity, ProjectStoreError> {
         ProjectDirectory::open_existing(directory)?.identity()
+    }
+
+    pub(crate) fn capture_project_asset_authority(
+        &self,
+        directory: &Path,
+        relative: &str,
+        expected_directory: AnchoredDirectoryIdentity,
+    ) -> Result<CapturedProjectAssetAuthority, ProjectStoreError> {
+        let project = ProjectDirectory::open_existing(directory)?;
+        if project.identity()? != expected_directory {
+            return Err(ProjectStoreError::Filesystem {
+                operation: "verify project directory identity",
+                path: directory.to_path_buf(),
+                kind: io::ErrorKind::Other,
+            });
+        }
+        let authority = project.capture_asset_authority(relative)?;
+        project.revalidate_path_identity()?;
+        Ok(authority)
     }
 
     pub(crate) fn committed_source_parent_identity(
@@ -672,6 +716,36 @@ impl AudioDirectory {
             file,
             fingerprint,
             path: display_path.to_path_buf(),
+        })
+    }
+
+    fn regular_leaf_size(
+        &self,
+        leaf: &Path,
+        display_path: &Path,
+    ) -> Result<u64, ProjectStoreError> {
+        if leaf.components().count() != 1
+            || !matches!(
+                leaf.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(ProjectStoreError::DocumentInvalid {
+                path: display_path.to_path_buf(),
+                message: "asset leaf is not a single normal component".to_owned(),
+            });
+        }
+        let stat = rustix::fs::statat(&self.file, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| open_source_error(display_path, error))?;
+        if RustixFileType::from_raw_mode(stat.st_mode) != RustixFileType::RegularFile {
+            return Err(ProjectStoreError::NonRegularFile {
+                path: display_path.to_path_buf(),
+            });
+        }
+        u64::try_from(stat.st_size).map_err(|_| ProjectStoreError::Filesystem {
+            operation: "inspect committed project asset",
+            path: display_path.to_path_buf(),
+            kind: io::ErrorKind::Other,
         })
     }
 

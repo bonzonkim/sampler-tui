@@ -1,6 +1,7 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use sampler_core::{
@@ -16,6 +17,35 @@ use sampler_tui::{
 
 fn pad(index: u8) -> PadId {
     PadId::new(BankId::new(0).unwrap(), index).unwrap()
+}
+
+static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+struct CurrentDirGuard {
+    original: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CurrentDirGuard {
+    fn enter(directory: &Path) -> Self {
+        let lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(directory).unwrap();
+        Self {
+            original,
+            _lock: lock,
+        }
+    }
+
+    fn set(&self, directory: &Path) {
+        std::env::set_current_dir(directory).unwrap();
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
 }
 
 struct Fixture {
@@ -151,6 +181,30 @@ fn save_snapshot(source: PathBuf, fingerprint: SourceFingerprint) -> ProjectSave
         }],
         patterns: vec![pattern(slot, &[pad(1)])],
     }
+}
+
+#[test]
+fn save_snapshot_defers_project_asset_fingerprint_and_payload_read_until_staging() {
+    let fixture = Fixture::new("defer-project-payload");
+    let source = fixture.directory.join("audio/source.wav");
+    write_wav(&source, 0.25);
+    let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+    let project = save_snapshot(source.clone(), fingerprint);
+    write_wav(&source, 0.75);
+
+    let snapshot = OfflineExportSnapshot::from_save_snapshot(
+        &fixture.directory,
+        &project,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .expect("metadata-only admission must defer project payload integrity checks");
+
+    assert!(matches!(
+        stage_export_samples(&snapshot, &AtomicBool::new(false)),
+        Err(OfflineExportError::ProjectStore(
+            sampler_tui::ProjectStoreError::AssetIntegrity { .. }
+        ))
+    ));
 }
 
 #[test]
@@ -403,6 +457,8 @@ fn save_snapshot_rejects_same_and_different_byte_loose_ancestor_symlink_substitu
 fn save_snapshot_with_relative_project_directory_rejects_project_audio_symlink() {
     use std::os::unix::fs::symlink;
 
+    let current = std::env::current_dir().unwrap();
+    let _cwd = CurrentDirGuard::enter(&current);
     let name = format!(
         ".sampler-tui-export-relative-project-{}",
         std::process::id()
@@ -440,6 +496,78 @@ fn save_snapshot_with_relative_project_directory_rejects_project_audio_symlink()
         ),
         "{result:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn save_snapshot_with_relative_root_and_source_rejects_project_audio_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!(
+        "sampler-tui-export-both-relative-symlink-{}",
+        std::process::id()
+    ));
+    let project_directory = base.join("project");
+    let attacker = base.join("attacker");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&project_directory).unwrap();
+    fs::create_dir_all(&attacker).unwrap();
+    let source = attacker.join("source.wav");
+    write_wav(&source, 0.5);
+    symlink(&attacker, project_directory.join("audio")).unwrap();
+    let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+    let project = save_snapshot(PathBuf::from("audio/source.wav"), fingerprint);
+    let cwd = CurrentDirGuard::enter(&base);
+
+    let result = OfflineExportSnapshot::from_save_snapshot(
+        Path::new("project"),
+        &project,
+        ExportPatternSlot::try_from(1).unwrap(),
+    );
+
+    cwd.set(&cwd.original);
+    fs::remove_dir_all(&base).unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(OfflineExportError::ProjectStore(
+                sampler_tui::ProjectStoreError::SymlinkRejected { .. }
+                    | sampler_tui::ProjectStoreError::Filesystem { .. }
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn relative_project_authority_is_stable_after_the_admission_cwd_changes() {
+    let base = std::env::temp_dir().join(format!(
+        "sampler-tui-export-relative-cwd-fence-{}",
+        std::process::id()
+    ));
+    let project_directory = base.join("project");
+    let other_directory = base.join("other");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(project_directory.join("audio")).unwrap();
+    fs::create_dir_all(&other_directory).unwrap();
+    let source = project_directory.join("audio/source.wav");
+    write_wav(&source, 0.5);
+    let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+    let project = save_snapshot(PathBuf::from("audio/source.wav"), fingerprint);
+    let cwd = CurrentDirGuard::enter(&base);
+    let snapshot = OfflineExportSnapshot::from_save_snapshot(
+        Path::new("project"),
+        &project,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .unwrap();
+
+    cwd.set(&other_directory);
+    let staged = stage_export_samples(&snapshot, &AtomicBool::new(false));
+
+    cwd.set(&cwd.original);
+    fs::remove_dir_all(&base).unwrap();
+    assert_eq!(staged.unwrap().len(), 1);
 }
 
 #[test]

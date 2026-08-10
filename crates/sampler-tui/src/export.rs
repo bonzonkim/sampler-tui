@@ -9,7 +9,10 @@ use sampler_core::{
 };
 
 use crate::project_store::AnchoredDirectoryIdentity;
-use crate::{ProjectSavePad, ProjectSaveSnapshot, ProjectStore, ProjectStoreError};
+use crate::{
+    ProjectSavePad, ProjectSaveSnapshot, ProjectStore, ProjectStoreError, SourceFingerprint,
+    SupportedAudioExtension,
+};
 
 pub const EXPORT_SAMPLE_RATE: u32 = 48_000;
 pub const EXPORT_CHUNK_FRAMES: usize = 4_096;
@@ -264,8 +267,10 @@ impl OfflineExportSnapshot {
             referenced.push(event.event.pad);
         }
 
+        let admission_cwd = export_admission_cwd()?;
+        let directory = lexical_absolute_at(&admission_cwd, directory);
         let directory_identity = ProjectStore
-            .project_directory_identity(directory)
+            .project_directory_identity(&directory)
             .map_err(OfflineExportError::ProjectStore)?;
         let mut project_sources = Vec::with_capacity(referenced.len());
         let mut pads = Vec::with_capacity(referenced.len());
@@ -276,22 +281,20 @@ impl OfflineExportSnapshot {
                 .find(|candidate| candidate.pad == pad)
                 .ok_or(OfflineExportError::MissingPadSource { pad })?
                 .clone();
-            let asset = ProjectStore
-                .read_project_asset_after_open(
-                    directory,
+            let authority = ProjectStore
+                .capture_project_asset_authority(
+                    &directory,
                     &project_pad.audio_path,
-                    project_pad.asset_digest,
-                    Some(directory_identity),
-                    || {},
+                    directory_identity,
                 )
                 .map_err(OfflineExportError::ProjectStore)?;
-            let source_path = asset.path;
-            let fingerprint = asset.fingerprint;
-            if fingerprint.digest != project_pad.asset_digest {
-                return Err(OfflineExportError::ProjectStore(
-                    ProjectStoreError::AssetIntegrity { path: source_path },
-                ));
-            }
+            let source_path = authority.path;
+            let fingerprint = SourceFingerprint {
+                digest: project_pad.asset_digest,
+                encoded_bytes: authority.encoded_bytes,
+                extension: SupportedAudioExtension::from_path(&source_path)
+                    .map_err(OfflineExportError::ProjectStore)?,
+            };
             let source = ProjectSavePad {
                 pad: project_pad.pad,
                 source_path,
@@ -304,7 +307,7 @@ impl OfflineExportSnapshot {
             project_sources.push(ExportPadSource {
                 descriptor: source.clone(),
                 authority: ExportSourceAuthority::Project {
-                    directory: directory.to_path_buf(),
+                    directory: directory.clone(),
                     directory_identity,
                     relative: project_pad.audio_path,
                     expected_digest: project_pad.asset_digest,
@@ -363,21 +366,17 @@ impl OfflineExportSnapshot {
             }
         }
 
+        let admission_cwd = export_admission_cwd()?;
+        let loose_directory = lexical_absolute_at(&admission_cwd, loose_directory);
         let mut pads = Vec::with_capacity(referenced.len());
         let mut project_sources = Vec::with_capacity(referenced.len());
         let project_authority = project_directory
             .map(|directory| {
+                let absolute = lexical_absolute_at(&admission_cwd, directory);
                 let identity = ProjectStore
-                    .project_directory_identity(directory)
+                    .project_directory_identity(&absolute)
                     .map_err(OfflineExportError::ProjectStore)?;
-                let absolute = std::path::absolute(directory).map_err(|error| {
-                    OfflineExportError::ProjectStore(ProjectStoreError::Filesystem {
-                        operation: "resolve project directory",
-                        path: directory.to_path_buf(),
-                        kind: error.kind(),
-                    })
-                })?;
-                Ok::<_, OfflineExportError>((directory.to_path_buf(), absolute, identity))
+                Ok::<_, OfflineExportError>((absolute, identity))
             })
             .transpose()?;
         for pad_id in referenced {
@@ -405,30 +404,17 @@ impl OfflineExportSnapshot {
             let source_project_authority =
                 project_authority
                     .as_ref()
-                    .and_then(|(directory, absolute, directory_identity)| {
-                        lexical_project_asset(absolute, &source.source_path)
+                    .and_then(|(directory, directory_identity)| {
+                        lexical_project_asset(directory, &source.source_path)
                             .map(|relative| (directory, *directory_identity, relative))
                     });
             let authority =
                 if let Some((directory, directory_identity, relative)) = source_project_authority {
-                    let asset = ProjectStore
-                        .read_project_asset_after_open(
-                            directory,
-                            &relative,
-                            source.fingerprint.digest,
-                            Some(directory_identity),
-                            || {},
-                        )
+                    ProjectStore
+                        .capture_project_asset_authority(directory, &relative, directory_identity)
                         .map_err(OfflineExportError::ProjectStore)?;
-                    if asset.fingerprint != source.fingerprint {
-                        return Err(OfflineExportError::ProjectStore(
-                            ProjectStoreError::AssetIntegrity {
-                                path: source.source_path.clone(),
-                            },
-                        ));
-                    }
                     ExportSourceAuthority::Project {
-                        directory: directory.to_path_buf(),
+                        directory: directory.clone(),
                         directory_identity,
                         relative,
                         expected_digest: source.fingerprint.digest,
@@ -584,6 +570,24 @@ fn lexical_project_asset(directory: &Path, source: &Path) -> Option<String> {
         return None;
     }
     relative.to_str().map(str::to_owned)
+}
+
+fn export_admission_cwd() -> Result<PathBuf, OfflineExportError> {
+    std::env::current_dir().map_err(|error| {
+        OfflineExportError::ProjectStore(ProjectStoreError::Filesystem {
+            operation: "read export admission directory",
+            path: PathBuf::from("."),
+            kind: error.kind(),
+        })
+    })
+}
+
+fn lexical_absolute_at(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// A fully decoded, edited, and canonical-rate pad ready for an offline engine.

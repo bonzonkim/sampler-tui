@@ -154,6 +154,12 @@ struct ValidatedSource {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnchoredDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
 pub(crate) struct ProjectAssetBytes {
     pub(crate) path: PathBuf,
     pub(crate) encoded: Arc<[u8]>,
@@ -163,9 +169,13 @@ pub(crate) struct ProjectAssetBytes {
 impl ValidatedSource {
     fn open(path: &Path) -> Result<Self, ProjectStoreError> {
         let (parent, leaf) = open_anchored_parent(path, true)?;
+        Self::open_at(&parent, Path::new(&leaf), path)
+    }
+
+    fn open_at(parent: &File, leaf: &Path, path: &Path) -> Result<Self, ProjectStoreError> {
         let owned = rustix::fs::openat(
-            &parent,
-            &leaf,
+            parent,
+            leaf,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         )
@@ -217,13 +227,7 @@ impl ProjectDirectory {
     }
 
     fn revalidate_path_identity(&self) -> Result<(), ProjectStoreError> {
-        let opened = rustix::fs::fstat(&self.file).map_err(|error| {
-            filesystem_error(
-                "inspect opened project directory",
-                &self.path,
-                io::Error::from(error),
-            )
-        })?;
+        let opened = anchored_directory_identity(&self.file, &self.path)?;
         let (parent, leaf) = open_anchored_parent(&self.path, false)?;
         let current_file = rustix::fs::openat(
             &parent,
@@ -236,14 +240,8 @@ impl ProjectDirectory {
             path: self.path.clone(),
             kind: io::Error::from(error).kind(),
         })?;
-        let current = rustix::fs::fstat(&current_file).map_err(|error| {
-            filesystem_error(
-                "inspect current project directory",
-                &self.path,
-                io::Error::from(error),
-            )
-        })?;
-        if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
+        let current = anchored_directory_identity(&File::from(current_file), &self.path)?;
+        if opened != current {
             return Err(ProjectStoreError::Filesystem {
                 operation: "verify project directory identity",
                 path: self.path.clone(),
@@ -251,6 +249,10 @@ impl ProjectDirectory {
             });
         }
         Ok(())
+    }
+
+    fn identity(&self) -> Result<AnchoredDirectoryIdentity, ProjectStoreError> {
+        anchored_directory_identity(&self.file, &self.path)
     }
 
     fn open_audio_directory(&self) -> Result<AudioDirectory, ProjectStoreError> {
@@ -365,16 +367,49 @@ impl ProjectDirectory {
 }
 
 impl ProjectStore {
-    pub(crate) fn read_committed_source_after_open<F>(
+    pub(crate) fn project_directory_identity(
+        &self,
+        directory: &Path,
+    ) -> Result<AnchoredDirectoryIdentity, ProjectStoreError> {
+        ProjectDirectory::open_existing(directory)?.identity()
+    }
+
+    pub(crate) fn committed_source_parent_identity(
+        &self,
+        path: &Path,
+    ) -> Result<AnchoredDirectoryIdentity, ProjectStoreError> {
+        let (parent, leaf) = open_anchored_parent(path, true)?;
+        let identity = anchored_directory_identity(&parent, path)?;
+        let owned = rustix::fs::openat(
+            &parent,
+            Path::new(&leaf),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| open_source_error(path, error))?;
+        ensure_fd_type(&owned, path, RustixFileType::RegularFile)?;
+        Ok(identity)
+    }
+
+    pub(crate) fn read_committed_source_from_parent_after_open<F>(
         &self,
         path: &Path,
         expected: SourceFingerprint,
+        expected_parent: AnchoredDirectoryIdentity,
         after_open: F,
     ) -> Result<ProjectAssetBytes, ProjectStoreError>
     where
         F: FnOnce(),
     {
-        let mut source = ValidatedSource::open(path)?;
+        let (parent, leaf) = open_anchored_parent(path, true)?;
+        if anchored_directory_identity(&parent, path)? != expected_parent {
+            return Err(ProjectStoreError::Filesystem {
+                operation: "verify committed source parent identity",
+                path: path.to_path_buf(),
+                kind: io::ErrorKind::Other,
+            });
+        }
+        let mut source = ValidatedSource::open_at(&parent, Path::new(&leaf), path)?;
         after_open();
         if source.fingerprint != expected {
             return Err(ProjectStoreError::AssetIntegrity { path: source.path });
@@ -397,6 +432,7 @@ impl ProjectStore {
         if fingerprint != source.fingerprint || fingerprint != expected {
             return Err(ProjectStoreError::AssetIntegrity { path: source.path });
         }
+        revalidate_source_parent(path, &parent, expected_parent)?;
         Ok(ProjectAssetBytes {
             path: source.path,
             encoded: Arc::from(encoded),
@@ -409,12 +445,22 @@ impl ProjectStore {
         directory: &Path,
         relative: &str,
         expected_digest: AssetDigest,
+        expected_directory: Option<AnchoredDirectoryIdentity>,
         after_open: F,
     ) -> Result<ProjectAssetBytes, ProjectStoreError>
     where
         F: FnOnce(),
     {
         let project = ProjectDirectory::open_existing(directory)?;
+        if let Some(expected) = expected_directory
+            && project.identity()? != expected
+        {
+            return Err(ProjectStoreError::Filesystem {
+                operation: "verify project directory identity",
+                path: directory.to_path_buf(),
+                kind: io::ErrorKind::Other,
+            });
+        }
         let mut source = project.open_asset(relative)?;
         after_open();
         if source.fingerprint.digest != expected_digest {
@@ -445,6 +491,41 @@ impl ProjectStore {
             fingerprint,
         })
     }
+}
+
+fn anchored_directory_identity(
+    directory: &File,
+    path: &Path,
+) -> Result<AnchoredDirectoryIdentity, ProjectStoreError> {
+    let stat = rustix::fs::fstat(directory).map_err(|error| {
+        filesystem_error("inspect opened directory", path, io::Error::from(error))
+    })?;
+    Ok(AnchoredDirectoryIdentity {
+        device: u64::try_from(stat.st_dev).map_err(|_| ProjectStoreError::Filesystem {
+            operation: "inspect opened directory",
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+        })?,
+        inode: stat.st_ino,
+    })
+}
+
+fn revalidate_source_parent(
+    path: &Path,
+    opened: &File,
+    expected: AnchoredDirectoryIdentity,
+) -> Result<(), ProjectStoreError> {
+    let (current, _) = open_anchored_parent(path, true)?;
+    if anchored_directory_identity(opened, path)? != expected
+        || anchored_directory_identity(&current, path)? != expected
+    {
+        return Err(ProjectStoreError::Filesystem {
+            operation: "verify committed source parent identity",
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn open_anchored_parent(

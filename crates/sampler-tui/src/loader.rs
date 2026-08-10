@@ -29,8 +29,8 @@ use crate::export_file::PublisherCheckpoint;
 use crate::export_render::{OfflineFrameSink, render_offline};
 use crate::file_picker::{DirectoryEntry, DirectoryEntryKind, DirectoryScan, supported_audio_path};
 use crate::project_store::{
-    ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectStore, ProjectStoreError, SaveKind,
-    SaveReceipt, SourceFingerprint,
+    AnchoredDirectoryIdentity, ProjectProbe, ProjectSavePad, ProjectSaveRequest, ProjectStore,
+    ProjectStoreError, SaveKind, SaveReceipt, SourceFingerprint,
 };
 
 pub(crate) const WORKER_CHANNEL_CAPACITY: usize = 8;
@@ -1206,11 +1206,14 @@ fn load_project_sample(
 ) -> Result<LoadedSample, LoadSampleError> {
     let cancelled = AtomicBool::new(false);
     decode_committed_project_asset(
-        project_directory,
-        asset_path,
-        expected_digest,
-        engine_rate,
-        recipe,
+        CommittedProjectAssetRequest {
+            directory: project_directory,
+            asset_path,
+            expected_digest,
+            expected_directory: None,
+            target_rate: engine_rate,
+            recipe,
+        },
         &cancelled,
         || {
             if let Some(hook) = asset_hook {
@@ -1221,16 +1224,9 @@ fn load_project_sample(
     .map_err(LoadSampleError::ProjectAsset)
 }
 
-pub(crate) fn decode_committed_source_pad(
-    pad: &ProjectSavePad,
-    target_rate: u32,
-    cancelled: &AtomicBool,
-) -> Result<LoadedSample, ProjectStoreError> {
-    decode_committed_source_pad_after_open(pad, target_rate, cancelled, || {})
-}
-
 pub(crate) fn decode_committed_source_pad_after_open<F>(
     pad: &ProjectSavePad,
+    parent_identity: AnchoredDirectoryIdentity,
     target_rate: u32,
     cancelled: &AtomicBool,
     after_open: F,
@@ -1241,9 +1237,10 @@ where
     if cancelled.load(Ordering::Acquire) {
         return Err(ProjectStoreError::Cancelled);
     }
-    let asset = ProjectStore.read_committed_source_after_open(
+    let asset = ProjectStore.read_committed_source_from_parent_after_open(
         &pad.source_path,
         pad.fingerprint,
+        parent_identity,
         after_open,
     )?;
     if cancelled.load(Ordering::Acquire) {
@@ -1267,12 +1264,17 @@ where
     Ok(sample)
 }
 
-fn decode_committed_project_asset<F>(
-    directory: &Path,
-    asset_path: &str,
-    expected_digest: AssetDigest,
-    target_rate: u32,
-    recipe: SampleEditRecipe,
+pub(crate) struct CommittedProjectAssetRequest<'a> {
+    pub(crate) directory: &'a Path,
+    pub(crate) asset_path: &'a str,
+    pub(crate) expected_digest: AssetDigest,
+    pub(crate) expected_directory: Option<AnchoredDirectoryIdentity>,
+    pub(crate) target_rate: u32,
+    pub(crate) recipe: SampleEditRecipe,
+}
+
+pub(crate) fn decode_committed_project_asset<F>(
+    request: CommittedProjectAssetRequest<'_>,
     cancelled: &AtomicBool,
     after_open: F,
 ) -> Result<LoadedSample, ProjectStoreError>
@@ -1283,21 +1285,27 @@ where
         return Err(ProjectStoreError::Cancelled);
     }
     let asset = ProjectStore.read_project_asset_after_open(
-        directory,
-        asset_path,
-        expected_digest,
+        request.directory,
+        request.asset_path,
+        request.expected_digest,
+        request.expected_directory,
         after_open,
     )?;
     if cancelled.load(Ordering::Acquire) {
         return Err(ProjectStoreError::Cancelled);
     }
     let path = asset.path.clone();
-    let sample =
-        decode_and_render_sample(&path, asset.encoded, asset.fingerprint, target_rate, recipe)
-            .map_err(|error| ProjectStoreError::Decode {
-                path,
-                message: error.to_string(),
-            })?;
+    let sample = decode_and_render_sample(
+        &path,
+        asset.encoded,
+        asset.fingerprint,
+        request.target_rate,
+        request.recipe,
+    )
+    .map_err(|error| ProjectStoreError::Decode {
+        path,
+        message: error.to_string(),
+    })?;
     if cancelled.load(Ordering::Acquire) {
         return Err(ProjectStoreError::Cancelled);
     }

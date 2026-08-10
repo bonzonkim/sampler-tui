@@ -822,15 +822,31 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new(sample_rate: u32, ports: EnginePorts) -> Result<Self, EngineError> {
+        Self::new_with_master_mix(sample_rate, ports, MasterMixSettings::default())
+    }
+
+    /// Constructs fresh engine state with persisted master/FX values active at frame zero.
+    ///
+    /// Live updates continue to use [`crate::AudioController::update_master_mix`] and its
+    /// click-suppressing ramps. This setup-only path revalidates the supplied public settings
+    /// before initializing the otherwise-zeroed effect rack directly.
+    pub fn new_with_master_mix(
+        sample_rate: u32,
+        ports: EnginePorts,
+        master_mix: MasterMixSettings,
+    ) -> Result<Self, EngineError> {
         if sample_rate == 0 {
             return Err(EngineError::ZeroSampleRate);
         }
+        master_mix
+            .validate()
+            .map_err(|_| EngineError::InvalidSettings)?;
 
         let telemetry_interval = telemetry_interval(sample_rate);
         Ok(Self {
             sample_rate,
             ports,
-            fx: FxRack::new(sample_rate, MasterMixSettings::default())?,
+            fx: FxRack::new(sample_rate, master_mix)?,
             samples: array::from_fn(|_| SampleEntry {
                 buffer: None,
                 pad_references: 0,

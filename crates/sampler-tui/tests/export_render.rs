@@ -164,6 +164,45 @@ fn fixture(wet: bool) -> (OfflineExportSnapshot, Vec<StagedExportPad>) {
     (snapshot, staged)
 }
 
+fn frame_zero_fx_fixture() -> (OfflineExportSnapshot, Vec<StagedExportPad>) {
+    let settings = PadSettings::new(PlaybackMode::OneShot, 0.0, -1.0, 0.0, None).unwrap();
+    let mix = PadMixSettings::new(false, 1.0, 1.0).unwrap();
+    let staged = vec![staged_pad(
+        0,
+        Arc::new(SampleBuffer::new(EXPORT_SAMPLE_RATE, vec![1.0, 0.0]).unwrap()),
+        settings,
+        mix,
+    )];
+    let transport = Transport::new(
+        EXPORT_SAMPLE_RATE,
+        Tempo::new(240.0).unwrap(),
+        Meter::new(1, 4).unwrap(),
+        1,
+        Resolution::Sixteenth,
+    )
+    .unwrap();
+    let mut editable =
+        EditablePattern::new(PatternSlotId::new(0).unwrap(), "frame-zero fx", transport).unwrap();
+    editable.insert_new(pad(0), 0, 1.0, None).unwrap();
+    let master = MasterMixSettings::new(
+        -6.0,
+        DelaySettings::new(true, 10, 0.0, 0.0).unwrap(),
+        ReverbSettings::new(true, 0.0, 0.0, 0.0).unwrap(),
+    )
+    .unwrap();
+    let snapshot = OfflineExportSnapshot::new(
+        ProjectId::from_bytes([0x31; 16]),
+        3,
+        editable.slot(),
+        ProjectPattern::from_editable(&editable).unwrap(),
+        staged.iter().map(descriptor).collect(),
+        master,
+        EXPORT_SAMPLE_RATE,
+    )
+    .unwrap();
+    (snapshot, staged)
+}
+
 fn snapshot_for_staged(
     source: &OfflineExportSnapshot,
     staged: &[StagedExportPad],
@@ -265,6 +304,34 @@ fn renderer_matches_independent_production_engine_for_dry_and_wet_mix() {
         assert_eq!(bits(&sink.frames), bits(&reference), "wet={wet}");
         assert!(sink.frames.iter().any(|frame| *frame != [0.0, 0.0]));
     }
+}
+
+#[test]
+fn renderer_applies_persisted_master_and_fx_from_frame_zero_without_setup_ramps() {
+    let (snapshot, staged) = frame_zero_fx_fixture();
+    let mut sink = CollectingSink::default();
+
+    render_offline(&snapshot, &staged, &mut sink, &AtomicBool::new(false)).unwrap();
+
+    let master_gain = 10.0_f32.powf(-6.0 / 20.0);
+    let soft_limit = |sample: f32| sample / (1.0 + sample.abs());
+    let dry_impulse = 1.0 / 32.0;
+    assert_eq!(sink.frames[0], [soft_limit(dry_impulse * master_gain), 0.0]);
+
+    // The 10 ms delay reads the exact frame-zero send at frame 480. A live enable ramp would
+    // incorrectly store only 1/64 of this impulse, even though that ramp has ended by frame 480.
+    assert_eq!(
+        sink.frames[480],
+        [soft_limit(dry_impulse * master_gain), 0.0]
+    );
+
+    // At 48 kHz the first left Freeverb comb is 1,215 frames. Its frame-zero mono input is
+    // dry_impulse * 0.5 * 0.125 and the comb sum is scaled by 0.125 before four all-passes.
+    let first_reverb_sample = dry_impulse * 0.5 * 0.125 * 0.125;
+    assert_eq!(
+        sink.frames[1_215],
+        [soft_limit(first_reverb_sample * master_gain), 0.0]
+    );
 }
 
 #[test]

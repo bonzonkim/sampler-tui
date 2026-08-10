@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sampler_audio::SampleBuffer;
 use sampler_core::{
-    MasterMixSettings, PadId, PatternSlotId, ProjectDocument, ProjectId, ProjectPattern,
+    AssetDigest, MasterMixSettings, PadId, PatternSlotId, ProjectDocument, ProjectId,
+    ProjectPattern,
 };
 
-use crate::{ProjectSavePad, ProjectSaveSnapshot, ProjectStoreError, SourceFingerprint};
+use crate::project_store::AnchoredDirectoryIdentity;
+use crate::{ProjectSavePad, ProjectSaveSnapshot, ProjectStore, ProjectStoreError};
 
 pub const EXPORT_SAMPLE_RATE: u32 = 48_000;
 pub const EXPORT_CHUNK_FRAMES: usize = 4_096;
@@ -187,7 +189,26 @@ pub struct OfflineExportSnapshot {
     pads: Vec<ProjectSavePad>,
     master_mix: MasterMixSettings,
     sample_rate: u32,
-    project_sources: Vec<ProjectSavePad>,
+    project_sources: Vec<ExportPadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExportPadSource {
+    descriptor: ProjectSavePad,
+    authority: ExportSourceAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExportSourceAuthority {
+    Project {
+        directory: PathBuf,
+        directory_identity: AnchoredDirectoryIdentity,
+        relative: String,
+        expected_digest: AssetDigest,
+    },
+    Loose {
+        parent_identity: AnchoredDirectoryIdentity,
+    },
 }
 
 impl OfflineExportSnapshot {
@@ -243,6 +264,9 @@ impl OfflineExportSnapshot {
             referenced.push(event.event.pad);
         }
 
+        let directory_identity = ProjectStore
+            .project_directory_identity(directory)
+            .map_err(OfflineExportError::ProjectStore)?;
         let mut project_sources = Vec::with_capacity(referenced.len());
         let mut pads = Vec::with_capacity(referenced.len());
         for pad in referenced {
@@ -252,9 +276,17 @@ impl OfflineExportSnapshot {
                 .find(|candidate| candidate.pad == pad)
                 .ok_or(OfflineExportError::MissingPadSource { pad })?
                 .clone();
-            let source_path = directory.join(&project_pad.audio_path);
-            let fingerprint = SourceFingerprint::from_path(&source_path)
+            let asset = ProjectStore
+                .read_project_asset_after_open(
+                    directory,
+                    &project_pad.audio_path,
+                    project_pad.asset_digest,
+                    Some(directory_identity),
+                    || {},
+                )
                 .map_err(OfflineExportError::ProjectStore)?;
+            let source_path = asset.path;
+            let fingerprint = asset.fingerprint;
             if fingerprint.digest != project_pad.asset_digest {
                 return Err(OfflineExportError::ProjectStore(
                     ProjectStoreError::AssetIntegrity { path: source_path },
@@ -269,7 +301,15 @@ impl OfflineExportSnapshot {
                 mix: project_pad.mix,
                 recipe: project_pad.recipe,
             };
-            project_sources.push(source.clone());
+            project_sources.push(ExportPadSource {
+                descriptor: source.clone(),
+                authority: ExportSourceAuthority::Project {
+                    directory: directory.to_path_buf(),
+                    directory_identity,
+                    relative: project_pad.audio_path,
+                    expected_digest: project_pad.asset_digest,
+                },
+            });
             pads.push(source);
         }
 
@@ -289,6 +329,15 @@ impl OfflineExportSnapshot {
     /// Builds an immutable export snapshot from the App's committed save model.
     pub fn from_save_snapshot(
         directory: &Path,
+        project: &ProjectSaveSnapshot,
+        slot: ExportPatternSlot,
+    ) -> Result<Self, OfflineExportError> {
+        Self::from_save_snapshot_with_project_directory(directory, Some(directory), project, slot)
+    }
+
+    pub(crate) fn from_save_snapshot_with_project_directory(
+        loose_directory: &Path,
+        project_directory: Option<&Path>,
         project: &ProjectSaveSnapshot,
         slot: ExportPatternSlot,
     ) -> Result<Self, OfflineExportError> {
@@ -316,6 +365,21 @@ impl OfflineExportSnapshot {
 
         let mut pads = Vec::with_capacity(referenced.len());
         let mut project_sources = Vec::with_capacity(referenced.len());
+        let project_authority = project_directory
+            .map(|directory| {
+                let identity = ProjectStore
+                    .project_directory_identity(directory)
+                    .map_err(OfflineExportError::ProjectStore)?;
+                let absolute = std::path::absolute(directory).map_err(|error| {
+                    OfflineExportError::ProjectStore(ProjectStoreError::Filesystem {
+                        operation: "resolve project directory",
+                        path: directory.to_path_buf(),
+                        kind: error.kind(),
+                    })
+                })?;
+                Ok::<_, OfflineExportError>((directory.to_path_buf(), absolute, identity))
+            })
+            .transpose()?;
         for pad_id in referenced {
             let source = project
                 .pads
@@ -329,7 +393,7 @@ impl OfflineExportSnapshot {
             let resolved = if source.source_path.is_absolute() {
                 source.source_path.clone()
             } else {
-                directory.join(&source.source_path)
+                loose_directory.join(&source.source_path)
             };
             let metadata = std::fs::symlink_metadata(&resolved)
                 .map_err(|_| OfflineExportError::MissingPadSource { pad: pad_id })?;
@@ -338,7 +402,47 @@ impl OfflineExportSnapshot {
             }
             let mut source = source;
             source.source_path = resolved;
-            project_sources.push(source.clone());
+            let source_project_authority =
+                project_authority
+                    .as_ref()
+                    .and_then(|(directory, absolute, directory_identity)| {
+                        lexical_project_asset(absolute, &source.source_path)
+                            .map(|relative| (directory, *directory_identity, relative))
+                    });
+            let authority =
+                if let Some((directory, directory_identity, relative)) = source_project_authority {
+                    let asset = ProjectStore
+                        .read_project_asset_after_open(
+                            directory,
+                            &relative,
+                            source.fingerprint.digest,
+                            Some(directory_identity),
+                            || {},
+                        )
+                        .map_err(OfflineExportError::ProjectStore)?;
+                    if asset.fingerprint != source.fingerprint {
+                        return Err(OfflineExportError::ProjectStore(
+                            ProjectStoreError::AssetIntegrity {
+                                path: source.source_path.clone(),
+                            },
+                        ));
+                    }
+                    ExportSourceAuthority::Project {
+                        directory: directory.to_path_buf(),
+                        directory_identity,
+                        relative,
+                        expected_digest: source.fingerprint.digest,
+                    }
+                } else {
+                    let parent_identity = ProjectStore
+                        .committed_source_parent_identity(&source.source_path)
+                        .map_err(OfflineExportError::ProjectStore)?;
+                    ExportSourceAuthority::Loose { parent_identity }
+                };
+            project_sources.push(ExportPadSource {
+                descriptor: source.clone(),
+                authority,
+            });
             pads.push(source);
         }
 
@@ -381,6 +485,10 @@ impl OfflineExportSnapshot {
 
     pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    pub(crate) fn has_source_authority(&self) -> bool {
+        !self.project_sources.is_empty() && self.project_sources.len() == self.pads.len()
     }
 
     /// Returns the exact canonical transport loop length represented by this snapshot.
@@ -459,6 +567,25 @@ impl OfflineExportSnapshot {
     }
 }
 
+fn lexical_project_asset(directory: &Path, source: &Path) -> Option<String> {
+    use std::path::Component;
+
+    if !directory.is_absolute() || !source.is_absolute() {
+        return None;
+    }
+    let relative = source.strip_prefix(directory).ok()?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() < 2
+        || !matches!(components[0], Component::Normal(first) if first == "audio")
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    relative.to_str().map(str::to_owned)
+}
+
 /// A fully decoded, edited, and canonical-rate pad ready for an offline engine.
 #[derive(Debug, Clone)]
 pub struct StagedExportPad {
@@ -473,14 +600,7 @@ pub fn stage_export_samples(
     snapshot: &OfflineExportSnapshot,
     cancelled: &AtomicBool,
 ) -> Result<Vec<StagedExportPad>, OfflineExportError> {
-    stage_export_samples_with_decoder(
-        snapshot,
-        cancelled,
-        |pad, cancelled| {
-            crate::loader::decode_committed_source_pad(pad, EXPORT_SAMPLE_RATE, cancelled)
-        },
-        || {},
-    )
+    stage_export_samples_with_observers(snapshot, cancelled, || {}, || {})
 }
 
 #[cfg(test)]
@@ -492,14 +612,7 @@ fn stage_export_samples_with_hook<F>(
 where
     F: FnMut(),
 {
-    stage_export_samples_with_decoder(
-        snapshot,
-        cancelled,
-        |pad, cancelled| {
-            crate::loader::decode_committed_source_pad(pad, EXPORT_SAMPLE_RATE, cancelled)
-        },
-        after_stage,
-    )
+    stage_export_samples_with_observers(snapshot, cancelled, || {}, after_stage)
 }
 
 pub(crate) fn stage_export_samples_with_observers<F, G>(
@@ -512,34 +625,7 @@ where
     F: FnMut(),
     G: FnMut(),
 {
-    stage_export_samples_with_decoder(
-        snapshot,
-        cancelled,
-        |pad, cancelled| {
-            crate::loader::decode_committed_source_pad_after_open(
-                pad,
-                EXPORT_SAMPLE_RATE,
-                cancelled,
-                &mut after_open,
-            )
-        },
-        after_stage,
-    )
-}
-
-fn stage_export_samples_with_decoder<D, F>(
-    snapshot: &OfflineExportSnapshot,
-    cancelled: &AtomicBool,
-    mut decode: D,
-    mut after_stage: F,
-) -> Result<Vec<StagedExportPad>, OfflineExportError>
-where
-    D: FnMut(
-        &ProjectSavePad,
-        &AtomicBool,
-    ) -> Result<crate::loader::LoadedSample, ProjectStoreError>,
-    F: FnMut(),
-{
+    let mut after_stage = after_stage;
     if snapshot.project_sources.is_empty() {
         return Err(OfflineExportError::SnapshotNotProjectBacked);
     }
@@ -548,7 +634,35 @@ where
         if cancelled.load(Ordering::Acquire) {
             return Err(OfflineExportError::Cancelled);
         }
-        let sample = decode(source, cancelled).map_err(|error| match error {
+        let sample = match &source.authority {
+            ExportSourceAuthority::Project {
+                directory,
+                directory_identity,
+                relative,
+                expected_digest,
+            } => crate::loader::decode_committed_project_asset(
+                crate::loader::CommittedProjectAssetRequest {
+                    directory,
+                    asset_path: relative,
+                    expected_digest: *expected_digest,
+                    expected_directory: Some(*directory_identity),
+                    target_rate: EXPORT_SAMPLE_RATE,
+                    recipe: source.descriptor.recipe,
+                },
+                cancelled,
+                &mut after_open,
+            ),
+            ExportSourceAuthority::Loose { parent_identity } => {
+                crate::loader::decode_committed_source_pad_after_open(
+                    &source.descriptor,
+                    *parent_identity,
+                    EXPORT_SAMPLE_RATE,
+                    cancelled,
+                    &mut after_open,
+                )
+            }
+        }
+        .map_err(|error| match error {
             ProjectStoreError::Cancelled => OfflineExportError::Cancelled,
             error => OfflineExportError::ProjectStore(error),
         })?;
@@ -556,10 +670,10 @@ where
             return Err(OfflineExportError::Cancelled);
         }
         staged.push(StagedExportPad {
-            pad: source.pad,
+            pad: source.descriptor.pad,
             sample: sample.rendered,
-            settings: source.settings,
-            mix: source.mix,
+            settings: source.descriptor.settings,
+            mix: source.descriptor.mix,
         });
         after_stage();
     }
@@ -808,7 +922,7 @@ mod tests {
         .unwrap()
     }
 
-    fn committed_source_pad(directory: &Path, index: u8) -> ProjectSavePad {
+    fn committed_source_pad(directory: &Path, index: u8) -> ExportPadSource {
         let source = directory.join(format!("source-{index}.wav"));
         let mut writer = WavWriter::create(
             &source,
@@ -824,7 +938,7 @@ mod tests {
         writer.write_sample(-(index as f32 / 16.0)).unwrap();
         writer.finalize().unwrap();
         let fingerprint = SourceFingerprint::from_path(&source).unwrap();
-        ProjectSavePad {
+        let descriptor = ProjectSavePad {
             pad: pad(index),
             source_path: source,
             source_generation: u64::from(index),
@@ -832,6 +946,13 @@ mod tests {
             settings: PadSettings::default(),
             mix: PadMixSettings::default(),
             recipe: SampleEditRecipe::identity(),
+        };
+        let parent_identity = ProjectStore
+            .committed_source_parent_identity(&descriptor.source_path)
+            .unwrap();
+        ExportPadSource {
+            descriptor,
+            authority: ExportSourceAuthority::Loose { parent_identity },
         }
     }
 

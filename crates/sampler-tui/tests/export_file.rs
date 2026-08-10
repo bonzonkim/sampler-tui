@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use hound::{SampleFormat, WavReader};
+use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use sampler_audio::SampleBuffer;
 use sampler_core::{
     AssetDigest, BankId, EditablePattern, MasterMixSettings, Meter, PadId, PadMixSettings,
@@ -13,9 +13,10 @@ use sampler_core::{
 use sampler_tui::export::StagedExportPad;
 use sampler_tui::export_file::AtomicWavPublisher;
 use sampler_tui::{
-    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportToken, OfflineExportError, OfflineExportReceipt,
-    OfflineExportSnapshot, OfflineFrameSink, OfflineRenderSummary, ProjectSavePad,
-    SourceFingerprint, SupportedAudioExtension, render_offline,
+    EXPORT_CHUNK_FRAMES, EXPORT_SAMPLE_RATE, ExportPatternSlot, ExportToken, OfflineExportError,
+    OfflineExportReceipt, OfflineExportSnapshot, OfflineFrameSink, OfflineRenderSummary,
+    ProjectSavePad, ProjectSaveSnapshot, SourceFingerprint, SupportedAudioExtension,
+    render_offline,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -88,14 +89,60 @@ fn snapshot() -> OfflineExportSnapshot {
     .unwrap()
 }
 
+fn project_backed_snapshot(root: &Path) -> OfflineExportSnapshot {
+    let audio = root.join("audio");
+    fs::create_dir_all(&audio).unwrap();
+    let source = audio.join("source.wav");
+    let mut writer = WavWriter::create(
+        &source,
+        WavSpec {
+            channels: 2,
+            sample_rate: EXPORT_SAMPLE_RATE,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    writer.write_sample(0.5_f32).unwrap();
+    writer.write_sample(-0.5_f32).unwrap();
+    writer.finalize().unwrap();
+    let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+    let model = snapshot();
+    let project = ProjectSaveSnapshot {
+        project_id: model.project_id(),
+        name: "publisher provenance".to_owned(),
+        revision: model.revision(),
+        master_mix: model.master_mix(),
+        midi: sampler_core::MidiSettings::default(),
+        pads: vec![ProjectSavePad {
+            pad: pad(),
+            source_path: source,
+            source_generation: 1,
+            fingerprint,
+            settings: PadSettings::default(),
+            mix: PadMixSettings::default(),
+            recipe: SampleEditRecipe::identity(),
+        }],
+        patterns: vec![model.pattern().clone()],
+    };
+    OfflineExportSnapshot::from_save_snapshot(
+        root,
+        &project,
+        ExportPatternSlot::try_from(1).unwrap(),
+    )
+    .unwrap()
+}
+
 fn export_frames(
     destination: &Path,
     frames: &[[f32; 2]],
 ) -> Result<OfflineExportReceipt, OfflineExportError> {
-    let snapshot = snapshot();
+    let snapshot = project_backed_snapshot(destination.parent().unwrap());
     let cancelled = AtomicBool::new(false);
     let mut publisher = AtomicWavPublisher::prepare(destination)?;
-    publisher.write_frames(frames)?;
+    for chunk in frames.chunks(EXPORT_CHUNK_FRAMES) {
+        publisher.write_frames(chunk)?;
+    }
     publisher.publish(
         ExportToken::new(7),
         &snapshot,
@@ -111,7 +158,16 @@ fn export_frames(
 fn publisher_writes_float_stereo_48k_and_never_overwrites() {
     let fixture = Fixture::new("format-collision");
     let destination = fixture.path("mix.wav");
-    let frames = [[0.25, -0.5], [0.5, -0.75]];
+    let loop_frames = usize::try_from(snapshot().loop_frames().unwrap()).unwrap();
+    let frames = (0..loop_frames)
+        .map(|index| {
+            if index.is_multiple_of(2) {
+                [0.25, -0.5]
+            } else {
+                [0.5, -0.75]
+            }
+        })
+        .collect::<Vec<_>>();
 
     let receipt = export_frames(&destination, &frames).unwrap();
 
@@ -124,7 +180,7 @@ fn publisher_writes_float_stereo_48k_and_never_overwrites() {
             revision: 9,
             slot: PatternSlotId::new(0).unwrap(),
             sample_rate: 48_000,
-            rendered_frames: 2,
+            rendered_frames: loop_frames as u64,
             file_bytes: fs::metadata(&destination).unwrap().len(),
         }
     );
@@ -158,6 +214,93 @@ fn publisher_writes_float_stereo_48k_and_never_overwrites() {
 }
 
 #[test]
+fn publisher_rejects_a_non_loop_written_frame_count_and_cleans_the_owned_temp() {
+    let fixture = Fixture::new("written-loop-frame-contract");
+    let destination = fixture.path("mix.wav");
+    let snapshot = snapshot();
+    let loop_frames = snapshot.loop_frames().unwrap();
+    let mut publisher = AtomicWavPublisher::prepare(&destination).unwrap();
+    publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+
+    assert_eq!(
+        publisher.publish(
+            ExportToken::new(7),
+            &snapshot,
+            OfflineRenderSummary {
+                frame_count: loop_frames,
+                peak: [0.25, 0.5],
+            },
+            &AtomicBool::new(false),
+        ),
+        Err(OfflineExportError::Arithmetic)
+    );
+    assert!(!destination.exists());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
+}
+
+#[test]
+fn publisher_rejects_a_non_loop_summary_frame_count_and_cleans_the_owned_temp() {
+    let fixture = Fixture::new("summary-loop-frame-contract");
+    let destination = fixture.path("mix.wav");
+    let snapshot = snapshot();
+    let loop_frames = usize::try_from(snapshot.loop_frames().unwrap()).unwrap();
+    let chunk = [[0.25, -0.5]; EXPORT_CHUNK_FRAMES];
+    let mut publisher = AtomicWavPublisher::prepare(&destination).unwrap();
+    let mut remaining = loop_frames;
+    while remaining != 0 {
+        let count = remaining.min(chunk.len());
+        publisher.write_frames(&chunk[..count]).unwrap();
+        remaining -= count;
+    }
+
+    assert_eq!(
+        publisher.publish(
+            ExportToken::new(7),
+            &snapshot,
+            OfflineRenderSummary {
+                frame_count: 1,
+                peak: [0.25, 0.5],
+            },
+            &AtomicBool::new(false),
+        ),
+        Err(OfflineExportError::Arithmetic)
+    );
+    assert!(!destination.exists());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
+}
+
+#[test]
+fn publisher_rejects_exact_loop_frames_without_admitted_source_provenance() {
+    let fixture = Fixture::new("source-provenance-contract");
+    let destination = fixture.path("mix.wav");
+    let snapshot = snapshot();
+    let loop_frames = usize::try_from(snapshot.loop_frames().unwrap()).unwrap();
+    let chunk = [[0.25, -0.5]; EXPORT_CHUNK_FRAMES];
+    let mut publisher = AtomicWavPublisher::prepare(&destination).unwrap();
+    let mut remaining = loop_frames;
+    while remaining != 0 {
+        let count = remaining.min(chunk.len());
+        publisher.write_frames(&chunk[..count]).unwrap();
+        remaining -= count;
+    }
+
+    assert_eq!(
+        publisher.publish(
+            ExportToken::new(7),
+            &snapshot,
+            OfflineRenderSummary {
+                frame_count: loop_frames as u64,
+                peak: [0.25, 0.5],
+            },
+            &AtomicBool::new(false),
+        ),
+        Err(OfflineExportError::SnapshotNotProjectBacked)
+    );
+    assert!(!destination.exists());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
+}
+
+#[test]
 fn publisher_rejects_empty_or_oversized_frame_writes() {
     let fixture = Fixture::new("write-bounds");
     let destination = fixture.path("mix.wav");
@@ -180,7 +323,8 @@ fn identical_frame_streams_produce_byte_identical_wavs() {
     let fixture = Fixture::new("deterministic");
     let first = fixture.path("first.wav");
     let second = fixture.path("second.wav");
-    let frames = (0..8_193)
+    let frame_count = usize::try_from(snapshot().loop_frames().unwrap()).unwrap();
+    let frames = (0..frame_count)
         .map(|index| {
             let left = (index as f32 * 0.03125).sin() * 0.5;
             [left, -left]
@@ -188,7 +332,7 @@ fn identical_frame_streams_produce_byte_identical_wavs() {
         .collect::<Vec<_>>();
 
     for destination in [&first, &second] {
-        let snapshot = snapshot();
+        let snapshot = project_backed_snapshot(&fixture.root);
         let cancelled = AtomicBool::new(false);
         let mut publisher = AtomicWavPublisher::prepare(destination).unwrap();
         for chunk in frames.chunks(EXPORT_CHUNK_FRAMES) {
@@ -230,7 +374,7 @@ impl OfflineFrameSink for ObservingPublisher {
 fn renderer_to_publisher_stream_uses_only_bounded_nonempty_chunks() {
     let fixture = Fixture::new("stream-bounds");
     let destination = fixture.path("mix.wav");
-    let snapshot = snapshot();
+    let snapshot = project_backed_snapshot(&fixture.root);
     let staged = vec![StagedExportPad {
         pad: pad(),
         sample: Arc::new(SampleBuffer::new(EXPORT_SAMPLE_RATE, vec![0.5, -0.5]).unwrap()),

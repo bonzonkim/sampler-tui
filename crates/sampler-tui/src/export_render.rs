@@ -112,8 +112,9 @@ fn prepare_engine(
     cancelled: &AtomicBool,
 ) -> Result<(AudioController, AudioEngine), OfflineExportError> {
     let (mut controller, ports) = audio_channels();
-    let mut engine = AudioEngine::new(EXPORT_SAMPLE_RATE, ports)
-        .map_err(|_| OfflineExportError::RendererUnavailable)?;
+    let mut engine =
+        AudioEngine::new_with_master_mix(EXPORT_SAMPLE_RATE, ports, snapshot.master_mix())
+            .map_err(|_| OfflineExportError::RendererUnavailable)?;
 
     // Consume each install at frame zero so the ordinary bounded controller queue also supports
     // a snapshot referencing every pad without adding a second bootstrap or DSP path.
@@ -135,11 +136,6 @@ fn prepare_engine(
             .map_err(|_| OfflineExportError::RendererUnavailable)?;
         engine.render_frames(0, |_| {});
     }
-
-    controller
-        .update_master_mix(snapshot.master_mix())
-        .map_err(|_| OfflineExportError::RendererUnavailable)?;
-    engine.render_frames(0, |_| {});
 
     let editable = snapshot
         .pattern()

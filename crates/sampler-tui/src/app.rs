@@ -4970,8 +4970,12 @@ impl App {
             .map_err(|error| crate::OfflineExportError::UnresolvedAppState(error.to_string()))?;
         let selected = self.patterns.selected_slot();
         let slot = crate::ExportPatternSlot::try_from(selected.get().saturating_add(1))?;
-        let snapshot =
-            OfflineExportSnapshot::from_save_snapshot(&self.current_dir, &project, slot)?;
+        let snapshot = OfflineExportSnapshot::from_save_snapshot_with_project_directory(
+            &self.current_dir,
+            self.project_session.directory(),
+            &project,
+            slot,
+        )?;
         let next = self
             .next_export_token
             .checked_add(1)

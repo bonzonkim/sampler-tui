@@ -90,6 +90,8 @@ pub enum ControlError {
 pub enum EngineError {
     #[error("engine sample rate must be non-zero")]
     ZeroSampleRate,
+    #[error("audio settings are invalid")]
+    InvalidSettings,
     #[error("effect buffer size exceeds the platform limit")]
     EffectBufferSizeOverflow,
     #[error("could not allocate effect buffer storage")]

@@ -328,8 +328,12 @@ impl AtomicWavPublisher {
         if cancelled.load(Ordering::Acquire) {
             return Err(OfflineExportError::Cancelled);
         }
-        if summary.frame_count != self.written_frames {
+        let loop_frames = snapshot.loop_frames()?;
+        if summary.frame_count != loop_frames || self.written_frames != loop_frames {
             return Err(OfflineExportError::Arithmetic);
+        }
+        if !snapshot.has_source_authority() {
+            return Err(OfflineExportError::SnapshotNotProjectBacked);
         }
 
         self.io.set_writer_phase(WriterPhase::Finalize);
@@ -535,16 +539,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use hound::{SampleFormat, WavSpec, WavWriter};
     use sampler_core::{
-        AssetDigest, BankId, EventId, MasterMixSettings, Meter, PadId, PadMixSettings, PadSettings,
-        PatternEvent, PatternSlotId, ProjectId, ProjectPattern, ProjectPatternEvent, Resolution,
-        SampleEditRecipe, Tempo,
+        BankId, EditablePattern, MasterMixSettings, Meter, PadId, PadMixSettings, PadSettings,
+        PatternSlotId, ProjectId, ProjectPattern, Resolution, SampleEditRecipe, Tempo, Transport,
     };
 
     use crate::{
-        EXPORT_SAMPLE_RATE, ExportToken, OfflineExportError, OfflineExportSnapshot,
-        OfflineFrameSink, OfflineRenderSummary, ProjectSavePad, SourceFingerprint,
-        SupportedAudioExtension,
+        EXPORT_SAMPLE_RATE, ExportPatternSlot, ExportToken, OfflineExportError,
+        OfflineExportSnapshot, OfflineFrameSink, OfflineRenderSummary, ProjectSavePad,
+        ProjectSaveSnapshot, SourceFingerprint,
     };
 
     use super::{AtomicWavPublisher, PublisherCheckpoint, PublisherFault};
@@ -602,61 +606,89 @@ mod tests {
         PadId::new(BankId::new(0).unwrap(), 0).unwrap()
     }
 
-    fn snapshot() -> OfflineExportSnapshot {
+    fn snapshot(provenance: &Fixture) -> OfflineExportSnapshot {
         let slot = PatternSlotId::new(0).unwrap();
-        OfflineExportSnapshot::new(
-            ProjectId::from_bytes([0x66; 16]),
-            12,
-            slot,
-            ProjectPattern {
-                slot,
-                name: "failure fences".to_owned(),
+        let transport = Transport::new(
+            EXPORT_SAMPLE_RATE,
+            Tempo::new(120.0).unwrap(),
+            Meter::new(4, 4).unwrap(),
+            1,
+            Resolution::Sixteenth,
+        )
+        .unwrap();
+        let mut editable = EditablePattern::new(slot, "failure fences", transport).unwrap();
+        editable.insert_new(pad(), 0, 1.0, None).unwrap();
+        let source = provenance.root.join("source.wav");
+        let mut writer = WavWriter::create(
+            &source,
+            WavSpec {
+                channels: 2,
                 sample_rate: EXPORT_SAMPLE_RATE,
-                tempo: Tempo::new(120.0).unwrap(),
-                meter: Meter::new(4, 4).unwrap(),
-                bars: 1,
-                resolution: Resolution::Sixteenth,
-                swing: 0.5,
-                quantize_strength: 0.0,
-                events: vec![ProjectPatternEvent {
-                    event: PatternEvent::new(EventId(1), pad(), 0, 1.0, None).unwrap(),
-                    raw_frame: 0,
-                }],
+                bits_per_sample: 32,
+                sample_format: SampleFormat::Float,
             },
-            vec![ProjectSavePad {
+        )
+        .unwrap();
+        writer.write_sample(0.25_f32).unwrap();
+        writer.write_sample(-0.5_f32).unwrap();
+        writer.finalize().unwrap();
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let project = ProjectSaveSnapshot {
+            project_id: ProjectId::from_bytes([0x66; 16]),
+            name: "failure fences".to_owned(),
+            revision: 12,
+            master_mix: MasterMixSettings::default(),
+            midi: sampler_core::MidiSettings::default(),
+            pads: vec![ProjectSavePad {
                 pad: pad(),
-                source_path: PathBuf::from("audio/source.wav"),
+                source_path: source,
                 source_generation: 1,
-                fingerprint: SourceFingerprint {
-                    digest: AssetDigest::from_bytes([0x77; 32]),
-                    encoded_bytes: 8,
-                    extension: SupportedAudioExtension::Wav,
-                },
+                fingerprint,
                 settings: PadSettings::default(),
                 mix: PadMixSettings::default(),
                 recipe: SampleEditRecipe::identity(),
             }],
-            MasterMixSettings::default(),
-            EXPORT_SAMPLE_RATE,
+            patterns: vec![ProjectPattern::from_editable(&editable).unwrap()],
+        };
+        OfflineExportSnapshot::from_save_snapshot(
+            &provenance.root,
+            &project,
+            ExportPatternSlot::try_from(1).unwrap(),
         )
         .unwrap()
     }
 
     fn publish(
         publisher: AtomicWavPublisher,
+        snapshot: &OfflineExportSnapshot,
         cancelled: &AtomicBool,
     ) -> Result<(), OfflineExportError> {
         publisher
             .publish(
                 ExportToken::new(21),
-                &snapshot(),
+                snapshot,
                 OfflineRenderSummary {
-                    frame_count: 1,
+                    frame_count: snapshot.loop_frames().unwrap(),
                     peak: [0.25, 0.5],
                 },
                 cancelled,
             )
             .map(|_| ())
+    }
+
+    fn write_complete_loop(publisher: &mut AtomicWavPublisher, snapshot: &OfflineExportSnapshot) {
+        let frames = usize::try_from(snapshot.loop_frames().unwrap()).unwrap();
+        write_frame_count(publisher, frames);
+    }
+
+    fn write_frame_count(publisher: &mut AtomicWavPublisher, frames: usize) {
+        let chunk = [[0.25, -0.5]; crate::EXPORT_CHUNK_FRAMES];
+        let mut remaining = frames;
+        while remaining != 0 {
+            let count = remaining.min(chunk.len());
+            publisher.write_frames(&chunk[..count]).unwrap();
+            remaining -= count;
+        }
     }
 
     #[test]
@@ -667,6 +699,8 @@ mod tests {
             PublisherFault::FinalizeWrite,
         ] {
             let fixture = Fixture::new("writer-io-fault");
+            let provenance = Fixture::new("writer-io-fault-provenance");
+            let snapshot = snapshot(&provenance);
             fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
             let destination = fixture.destination();
             let before = fixture.entry_names();
@@ -675,7 +709,11 @@ mod tests {
                 Err(error) => Err(error),
                 Ok(mut publisher) => match publisher.write_frames(&[[0.25, -0.5]]) {
                     Err(error) => Err(error),
-                    Ok(()) => publish(publisher, &AtomicBool::new(false)),
+                    Ok(()) => {
+                        let loop_frames = usize::try_from(snapshot.loop_frames().unwrap()).unwrap();
+                        write_frame_count(&mut publisher, loop_frames - 1);
+                        publish(publisher, &snapshot, &AtomicBool::new(false))
+                    }
                 },
             };
 
@@ -691,16 +729,18 @@ mod tests {
     #[test]
     fn finalize_seek_fault_executes_seek_and_cleans_only_the_owned_temp() {
         let fixture = Fixture::new("finalize-seek-fault");
+        let provenance = Fixture::new("finalize-seek-fault-provenance");
+        let snapshot = snapshot(&provenance);
         fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
         let destination = fixture.destination();
         let before = fixture.entry_names();
         let mut publisher =
             AtomicWavPublisher::prepare_with_fault(&destination, PublisherFault::FinalizeSeek)
                 .unwrap();
-        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+        write_complete_loop(&mut publisher, &snapshot);
 
         assert_eq!(
-            publish(publisher, &AtomicBool::new(false)),
+            publish(publisher, &snapshot, &AtomicBool::new(false)),
             Err(OfflineExportError::Encode(destination))
         );
         assert_eq!(fixture.entry_names(), before);
@@ -743,12 +783,14 @@ mod tests {
             ),
         ] {
             let fixture = Fixture::new("publication-io-fault");
+            let provenance = Fixture::new("publication-io-fault-provenance");
+            let snapshot = snapshot(&provenance);
             fs::write(fixture.root.join("foreign-entry"), b"foreign").unwrap();
             let destination = fixture.destination();
             let before = fixture.entry_names();
             let mut publisher =
                 AtomicWavPublisher::prepare_with_fault(&destination, fault).unwrap();
-            publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+            write_complete_loop(&mut publisher, &snapshot);
 
             let mut expected = expected;
             match &mut expected {
@@ -757,7 +799,10 @@ mod tests {
                 | OfflineExportError::Cleanup { path, .. } => *path = destination.clone(),
                 _ => unreachable!(),
             }
-            assert_eq!(publish(publisher, &AtomicBool::new(false)), Err(expected));
+            assert_eq!(
+                publish(publisher, &snapshot, &AtomicBool::new(false)),
+                Err(expected)
+            );
             assert_eq!(fixture.entry_names(), before, "{fault:?}");
             assert_eq!(
                 fs::read(fixture.root.join("foreign-entry")).unwrap(),
@@ -769,6 +814,8 @@ mod tests {
     #[test]
     fn destination_substitution_is_preserved_and_only_owned_temp_is_removed() {
         let fixture = Fixture::new("destination-substitution");
+        let provenance = Fixture::new("destination-substitution-provenance");
+        let snapshot = snapshot(&provenance);
         let destination = fixture.destination();
         let hook_destination = destination.clone();
         let substituted = Arc::new(AtomicBool::new(false));
@@ -782,10 +829,10 @@ mod tests {
         };
         let mut publisher =
             AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
-        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+        write_complete_loop(&mut publisher, &snapshot);
 
         assert_eq!(
-            publish(publisher, &AtomicBool::new(false)),
+            publish(publisher, &snapshot, &AtomicBool::new(false)),
             Err(OfflineExportError::DestinationExists(destination.clone()))
         );
         assert_eq!(fs::read(&destination).unwrap(), b"foreign destination");
@@ -795,6 +842,8 @@ mod tests {
     #[test]
     fn post_link_destination_substitution_never_returns_a_receipt_or_deletes_foreign_bytes() {
         let fixture = Fixture::new("post-link-destination-substitution");
+        let provenance = Fixture::new("post-link-destination-substitution-provenance");
+        let snapshot = snapshot(&provenance);
         let destination = fixture.destination();
         let hook_destination = destination.clone();
         let substituted = Arc::new(AtomicBool::new(false));
@@ -809,14 +858,14 @@ mod tests {
         };
         let mut publisher =
             AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
-        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+        write_complete_loop(&mut publisher, &snapshot);
 
         assert_eq!(
             publisher.publish(
                 ExportToken::new(21),
-                &snapshot(),
+                &snapshot,
                 OfflineRenderSummary {
-                    frame_count: 1,
+                    frame_count: snapshot.loop_frames().unwrap(),
                     peak: [0.25, 0.5],
                 },
                 &AtomicBool::new(false),
@@ -837,6 +886,8 @@ mod tests {
     fn cancellation_before_and_at_publish_leaves_no_destination_or_owned_temp() {
         for cancel_at_fence in [false, true] {
             let fixture = Fixture::new("cancel-publish");
+            let provenance = Fixture::new("cancel-publish-provenance");
+            let snapshot = snapshot(&provenance);
             let destination = fixture.destination();
             let cancelled = Arc::new(AtomicBool::new(!cancel_at_fence));
             let hook_cancelled = Arc::clone(&cancelled);
@@ -847,10 +898,10 @@ mod tests {
             };
             let mut publisher =
                 AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
-            publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+            write_complete_loop(&mut publisher, &snapshot);
 
             assert_eq!(
-                publish(publisher, &cancelled),
+                publish(publisher, &snapshot, &cancelled),
                 Err(OfflineExportError::Cancelled)
             );
             assert!(!destination.exists());
@@ -861,6 +912,8 @@ mod tests {
     #[test]
     fn parent_substitution_before_publish_fails_closed_and_cleans_the_anchored_temp() {
         let fixture = Fixture::new("parent-substitution");
+        let provenance = Fixture::new("parent-substitution-provenance");
+        let snapshot = snapshot(&provenance);
         let destination = fixture.destination();
         let held = fixture.root.with_extension("held");
         let hook_root = fixture.root.clone();
@@ -877,10 +930,10 @@ mod tests {
         };
         let mut publisher =
             AtomicWavPublisher::prepare_with_mutation_hook(&destination, hook).unwrap();
-        publisher.write_frames(&[[0.25, -0.5]]).unwrap();
+        write_complete_loop(&mut publisher, &snapshot);
 
         assert_eq!(
-            publish(publisher, &AtomicBool::new(false)),
+            publish(publisher, &snapshot, &AtomicBool::new(false)),
             Err(OfflineExportError::Publish {
                 path: destination.clone(),
                 kind: io::ErrorKind::Other,

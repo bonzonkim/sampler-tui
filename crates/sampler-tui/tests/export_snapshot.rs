@@ -10,8 +10,8 @@ use sampler_core::{
 };
 use sampler_tui::export::stage_export_samples;
 use sampler_tui::{
-    EXPORT_SAMPLE_RATE, ExportPatternSlot, OfflineExportError, OfflineExportSnapshot, ProjectStore,
-    SourceFingerprint,
+    EXPORT_SAMPLE_RATE, ExportPatternSlot, OfflineExportError, OfflineExportSnapshot,
+    ProjectSavePad, ProjectSaveSnapshot, ProjectStore, SourceFingerprint,
 };
 
 fn pad(index: u8) -> PadId {
@@ -130,6 +130,27 @@ fn project_pad(pad: PadId, asset: (String, sampler_core::AssetDigest)) -> Projec
         SampleEditRecipe::identity(),
     )
     .unwrap()
+}
+
+fn save_snapshot(source: PathBuf, fingerprint: SourceFingerprint) -> ProjectSaveSnapshot {
+    let slot = PatternSlotId::new(0).unwrap();
+    ProjectSaveSnapshot {
+        project_id: ProjectId::from_bytes([0x42; 16]),
+        name: "loose export snapshot".to_owned(),
+        revision: 7,
+        master_mix: MasterMixSettings::default(),
+        midi: sampler_core::MidiSettings::default(),
+        pads: vec![ProjectSavePad {
+            pad: pad(1),
+            source_path: source,
+            source_generation: 3,
+            fingerprint,
+            settings: PadSettings::default(),
+            mix: PadMixSettings::default(),
+            recipe: SampleEditRecipe::identity(),
+        }],
+        patterns: vec![pattern(slot, &[pad(1)])],
+    }
 }
 
 #[test]
@@ -272,6 +293,153 @@ fn staging_rejects_a_symlink_substituted_after_snapshot() {
             sampler_tui::ProjectStoreError::SymlinkRejected { .. }
         ))
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn document_snapshot_rejects_same_and_different_byte_project_ancestor_symlink_substitution() {
+    use std::os::unix::fs::symlink;
+
+    for same_bytes in [true, false] {
+        let fixture = Fixture::new(if same_bytes {
+            "document-ancestor-same"
+        } else {
+            "document-ancestor-different"
+        });
+        let committed = project_pad(pad(1), fixture.add_wav(0.25));
+        let relative = committed.audio_path.clone();
+        let document = document(
+            vec![committed],
+            pattern(PatternSlotId::new(0).unwrap(), &[pad(1)]),
+        );
+        let snapshot = OfflineExportSnapshot::from_document(
+            &fixture.directory,
+            &document,
+            ExportPatternSlot::try_from(1).unwrap(),
+        )
+        .unwrap();
+        let original = fixture.directory.with_extension("original");
+        let attacker = fixture.directory.with_extension("attacker");
+        fs::rename(&fixture.directory, &original).unwrap();
+        fs::create_dir_all(attacker.join("audio")).unwrap();
+        if same_bytes {
+            fs::copy(original.join(&relative), attacker.join(&relative)).unwrap();
+        } else {
+            write_wav(&attacker.join(&relative), 0.9);
+        }
+        symlink(&attacker, &fixture.directory).unwrap();
+
+        let result = stage_export_samples(&snapshot, &AtomicBool::new(false));
+
+        fs::remove_file(&fixture.directory).unwrap();
+        fs::rename(&original, &fixture.directory).unwrap();
+        fs::remove_dir_all(&attacker).unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(OfflineExportError::ProjectStore(
+                    sampler_tui::ProjectStoreError::Filesystem { .. }
+                        | sampler_tui::ProjectStoreError::SymlinkRejected { .. }
+                ))
+            ),
+            "same_bytes={same_bytes}: {result:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn save_snapshot_rejects_same_and_different_byte_loose_ancestor_symlink_substitution() {
+    use std::os::unix::fs::symlink;
+
+    for same_bytes in [true, false] {
+        let fixture = Fixture::new(if same_bytes {
+            "save-ancestor-same"
+        } else {
+            "save-ancestor-different"
+        });
+        let source_parent = fixture.directory.join("loose");
+        fs::create_dir(&source_parent).unwrap();
+        let source = source_parent.join("source.wav");
+        write_wav(&source, 0.5);
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let project = save_snapshot(source.clone(), fingerprint);
+        let snapshot = OfflineExportSnapshot::from_save_snapshot(
+            &fixture.directory,
+            &project,
+            ExportPatternSlot::try_from(1).unwrap(),
+        )
+        .unwrap();
+        let original = fixture.directory.join("loose-original");
+        let attacker = fixture.directory.join("loose-attacker");
+        fs::rename(&source_parent, &original).unwrap();
+        fs::create_dir(&attacker).unwrap();
+        if same_bytes {
+            fs::copy(original.join("source.wav"), attacker.join("source.wav")).unwrap();
+        } else {
+            write_wav(&attacker.join("source.wav"), 0.9);
+        }
+        symlink(&attacker, &source_parent).unwrap();
+
+        let result = stage_export_samples(&snapshot, &AtomicBool::new(false));
+
+        fs::remove_file(&source_parent).unwrap();
+        fs::rename(&original, &source_parent).unwrap();
+        fs::remove_dir_all(&attacker).unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(OfflineExportError::ProjectStore(
+                    sampler_tui::ProjectStoreError::Filesystem { .. }
+                ))
+            ),
+            "same_bytes={same_bytes}: {result:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn save_snapshot_with_relative_project_directory_rejects_project_audio_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let name = format!(
+        ".sampler-tui-export-relative-project-{}",
+        std::process::id()
+    );
+    let relative_directory = PathBuf::from(&name);
+    let directory = std::env::current_dir().unwrap().join(&relative_directory);
+    let attacker = std::env::temp_dir().join(format!("{name}-attacker"));
+    let _ = fs::remove_dir_all(&directory);
+    let _ = fs::remove_dir_all(&attacker);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(&attacker).unwrap();
+    let source = attacker.join("source.wav");
+    write_wav(&source, 0.5);
+    symlink(&attacker, directory.join("audio")).unwrap();
+    let project_source = directory.join("audio/source.wav");
+    let fingerprint = SourceFingerprint::from_path(&project_source).unwrap();
+    let project = save_snapshot(project_source, fingerprint);
+
+    let result = OfflineExportSnapshot::from_save_snapshot(
+        &relative_directory,
+        &project,
+        ExportPatternSlot::try_from(1).unwrap(),
+    );
+
+    fs::remove_file(directory.join("audio")).unwrap();
+    fs::remove_dir(&directory).unwrap();
+    fs::remove_dir_all(&attacker).unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(OfflineExportError::ProjectStore(
+                sampler_tui::ProjectStoreError::SymlinkRejected { .. }
+                    | sampler_tui::ProjectStoreError::Filesystem { .. }
+            ))
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]

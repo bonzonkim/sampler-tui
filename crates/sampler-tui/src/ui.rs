@@ -18,7 +18,7 @@ use crate::{
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const WAVE_CHARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const HELP_LINES: [&str; 21] = [
+const HELP_LINES: [&str; 22] = [
     "Tab / Shift+Tab: cycle Perform / Pattern / Sample / Mixer",
     "PATTERN: Space play/stop · Ctrl+R overdub · ,/. previous/next",
     "Arrows/PgUp/PgDn cursor/bar · Enter/Delete toggle/remove",
@@ -35,6 +35,7 @@ const HELP_LINES: [&str; 21] = [
     "notes 36..51 map to pads 1..16 in every bank",
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
+    "EXPORT: export <path> · 48kHz stereo f32 WAV · one loop · Esc cancel",
     "CAPTURE: resample · record-input · capture-stop · capture-cancel",
     "Recording: Enter stop · Esc review discard · pads/pattern stay live",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
@@ -377,7 +378,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::new().borders(Borders::TOP).title(" STATUS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let primary = app.display_status_text();
+    let primary = compact_status_text(app);
     let rows = [
         primary.as_str(),
         "Enter trigger · Shift+pad stop · Shift+Esc stop all",
@@ -402,7 +403,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
     match overlay {
-        Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 23, HELP_LINES),
+        Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 24, HELP_LINES),
         Overlay::Palette => render_palette(frame, area, app),
         Overlay::FilePicker => render_picker(frame, area, app),
         Overlay::DeviceError(error) => render_list_overlay(
@@ -675,6 +676,83 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
             lines.push("Stop all and held-pad releases remain available.".to_owned());
             render_list_overlay(frame, area, " CAPTURE FAILED ", 72, 10, lines);
         }
+    }
+}
+
+fn compact_status_text(app: &App) -> String {
+    let fallback = app.display_status_text();
+    let Some(view) = app.export_status_view() else {
+        return fallback;
+    };
+    let visible = match &view {
+        crate::ExportStatusView::Active { operation, focused } => match operation.phase() {
+            crate::ExportPhase::Queued | crate::ExportPhase::Running { .. } => *focused,
+            crate::ExportPhase::Cancelling => fallback.starts_with("Cancelling export ·"),
+        },
+        crate::ExportStatusView::Completed { .. } => fallback.starts_with("Exported pattern "),
+        crate::ExportStatusView::Cancelled { .. } => fallback.starts_with("Export cancelled ·"),
+        crate::ExportStatusView::Failed { .. } => fallback.starts_with("Export failed ·"),
+    };
+    if !visible {
+        return fallback;
+    }
+
+    match view {
+        crate::ExportStatusView::Active { operation, .. } => {
+            let slot = operation.slot().get() + 1;
+            let revision = operation.revision();
+            match operation.phase() {
+                crate::ExportPhase::Queued => {
+                    format!("EXPORT P{slot:02} · QUEUED · REV {revision} · Esc cancel")
+                }
+                crate::ExportPhase::Running {
+                    completed_units,
+                    total_units,
+                } => {
+                    let percent = completed_units
+                        .min(total_units)
+                        .saturating_mul(100)
+                        .checked_div(total_units)
+                        .unwrap_or(0);
+                    format!("EXPORT P{slot:02} · {percent}% · REV {revision} · Esc cancel")
+                }
+                crate::ExportPhase::Cancelling => {
+                    format!("EXPORT P{slot:02} · CANCELLING · REV {revision}")
+                }
+            }
+        }
+        crate::ExportStatusView::Completed { receipt } => format!(
+            "EXPORT P{:02} · DONE · REV {} · {} frames",
+            receipt.slot.get() + 1,
+            receipt.revision,
+            receipt.rendered_frames
+        ),
+        crate::ExportStatusView::Cancelled { fence } => format!(
+            "EXPORT P{:02} · CANCELLED · REV {}",
+            fence.slot.get() + 1,
+            fence.revision
+        ),
+        crate::ExportStatusView::Failed { fence, error } => format!(
+            "EXPORT P{:02} · FAILED: {} · REV {}",
+            fence.slot.get() + 1,
+            compact_export_error(&error),
+            fence.revision
+        ),
+    }
+}
+
+fn compact_export_error(error: &crate::OfflineExportError) -> &'static str {
+    match error {
+        crate::OfflineExportError::DestinationExists(_) => "DESTINATION EXISTS",
+        crate::OfflineExportError::ProjectStore(crate::ProjectStoreError::SourceChanged {
+            ..
+        }) => "SOURCE CHANGED",
+        crate::OfflineExportError::ProjectStore(crate::ProjectStoreError::AssetIntegrity {
+            ..
+        }) => "SOURCE INTEGRITY",
+        crate::OfflineExportError::Encode(_) => "ENCODE",
+        crate::OfflineExportError::Cancelled => "CANCELLED",
+        _ => "EXPORT ERROR",
     }
 }
 
@@ -1039,8 +1117,10 @@ fn display_width(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::fs;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -1057,9 +1137,10 @@ mod tests {
     use crate::input::InputAction;
     use crate::loader::{LoadPurpose, LoadSampleError, LoadedSample, WorkerResult};
     use crate::{
-        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, MidiBackend,
-        MidiBackendPort, MidiConnection, MidiIngressProducer, MidiService, MidiServiceError,
-        Overlay, PatternWorkspace, PreviewColumn,
+        App, DirectoryEntry, DirectoryEntryKind, EDIT_PREVIEW_COLUMNS, ExportOperation,
+        ExportStatusView, MidiBackend, MidiBackendPort, MidiConnection, MidiIngressProducer,
+        MidiService, MidiServiceError, OfflineExportError, OfflineExportReceipt, Overlay,
+        PatternWorkspace, PreviewColumn, ProjectStoreError,
     };
 
     use super::{render, transport_bar_index};
@@ -1271,6 +1352,119 @@ mod tests {
 
     fn ready_app() -> App {
         App::with_audio(Box::new(FakeAudio::ready()))
+    }
+
+    static NEXT_EXPORT_UI_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct ExportUiFixture {
+        root: std::path::PathBuf,
+    }
+
+    impl ExportUiFixture {
+        fn new(label: &str) -> Self {
+            let serial = NEXT_EXPORT_UI_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "sampler-tui-export-ui-{label}-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.root.join(name)
+        }
+    }
+
+    impl Drop for ExportUiFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn export_ready_app(label: &str) -> (ExportUiFixture, App, ExportOperation) {
+        let fixture = ExportUiFixture::new(label);
+        let source = fixture.path("åñ¥рл-source.wav");
+        let encoded = b"stable committed source";
+        fs::write(&source, encoded).unwrap();
+        let mut app = ready_app();
+        let request = app.begin_load(pad(0), source.clone()).unwrap();
+        let crate::WorkerRequest::LoadSample { generation, .. } = request else {
+            panic!("expected sample load")
+        };
+        let sample = Arc::new(SampleBuffer::new(48_000, vec![0.25; 64]).unwrap());
+        assert!(app.apply_worker_result(WorkerResult::Loaded {
+            pad: pad(0),
+            generation,
+            purpose: LoadPurpose::User,
+            path: source.clone(),
+            result: Ok(LoadedSample {
+                fingerprint:
+                    crate::SourceFingerprint::from_encoded_bytes(&source, encoded).unwrap(),
+                base: Arc::clone(&sample),
+                base_preview: Arc::new([PreviewColumn::default(); EDIT_PREVIEW_COLUMNS]),
+                rendered: sample,
+                rendered_preview: Arc::new([PreviewColumn::default(); EDIT_PREVIEW_COLUMNS]),
+                recipe: sampler_core::SampleEditRecipe::identity(),
+                source_rate: 48_000,
+                source_frames: 32,
+                duration: Duration::from_secs_f64(32.0 / 48_000.0),
+            }),
+        }));
+        app.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.project_revision(), 2);
+        app.start_export(fixture.path("出力.wav")).unwrap();
+        let operation = app.export_operation().unwrap().clone();
+        app.take_worker_requests();
+        (fixture, app, operation)
+    }
+
+    fn export_progress(app: &mut App, operation: &ExportOperation, completed: u64, total: u64) {
+        assert!(app.maintain_export(Some(WorkerResult::ExportProgress {
+            token: operation.token(),
+            fence: Arc::new(operation.result_fence()),
+            completed_units: completed,
+            total_units: total,
+        })));
+    }
+
+    fn finish_export(
+        app: &mut App,
+        operation: &ExportOperation,
+        result: Result<OfflineExportReceipt, OfflineExportError>,
+    ) {
+        assert!(app.apply_worker_result(WorkerResult::ExportFinished {
+            token: operation.token(),
+            project_id: operation.project_id(),
+            revision: operation.revision(),
+            slot: operation.slot(),
+            destination: operation.destination().to_path_buf(),
+            result,
+        }));
+    }
+
+    fn status_row(width: u16, app: &App) -> String {
+        render_lines(width, 24, app)[20]
+            .clone()
+            .strip_prefix('│')
+            .unwrap_or("")
+            .strip_suffix('│')
+            .unwrap_or("")
+            .trim_end()
+            .to_owned()
+    }
+
+    fn assert_unicode_safe_snapshot(width: u16, app: &App) {
+        let lines = render_lines(width, 24, app);
+        assert!(lines.iter().all(|line| !line.contains('\u{fffd}')));
+        assert!(
+            lines
+                .iter()
+                .all(|line| super::display_width(line) <= usize::from(width))
+        );
     }
 
     struct StaticMidi(Vec<MidiBackendPort>);
@@ -2042,6 +2236,146 @@ mod tests {
     }
 
     #[test]
+    fn idle_help_lists_export_without_changing_midi_capture_or_mixer_contracts() {
+        let mut app = ready_app();
+        app.open_help();
+
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &app).join("\n");
+            assert!(
+                screen.contains(
+                    "EXPORT: export <path> · 48kHz stereo f32 WAV · one loop · Esc cancel"
+                ),
+                "missing export help at {width} columns:\n{screen}"
+            );
+            for unchanged in [
+                "Enter toggle · Backspace reset · Esc Perform",
+                "midi-ports · midi-connect <index> · midi-disconnect",
+                "midi-channel <omni|1..16> · midi-learn/midi-unmap/midi-reset-bank",
+                "CAPTURE: resample · record-input · capture-stop · capture-cancel",
+                "Recording: Enter stop · Esc review discard · pads/pattern stay live",
+            ] {
+                assert!(screen.contains(unchanged), "missing {unchanged:?}");
+            }
+            assert_unicode_safe_snapshot(width, &app);
+        }
+    }
+
+    #[test]
+    fn export_status_snapshots_cover_queued_staging_rendering_cancelling_and_success() {
+        let (_fixture, mut active, operation) = export_ready_app("active");
+        assert_eq!(
+            status_row(80, &active),
+            " EXPORT P01 · QUEUED · REV 2 · Esc cancel"
+        );
+        assert_eq!(
+            status_row(120, &active),
+            " EXPORT P01 · QUEUED · REV 2 · Esc cancel"
+        );
+
+        export_progress(&mut active, &operation, 0, 8);
+        assert_eq!(
+            status_row(80, &active),
+            " EXPORT P01 · 0% · REV 2 · Esc cancel"
+        );
+        export_progress(&mut active, &operation, 4, 8);
+        assert_eq!(
+            status_row(80, &active),
+            " EXPORT P01 · 50% · REV 2 · Esc cancel"
+        );
+        export_progress(&mut active, &operation, 8, 8);
+        assert_eq!(
+            status_row(120, &active),
+            " EXPORT P01 · 100% · REV 2 · Esc cancel"
+        );
+        assert_unicode_safe_snapshot(80, &active);
+        assert_unicode_safe_snapshot(120, &active);
+
+        assert!(active.cancel_export());
+        assert_eq!(status_row(80, &active), " EXPORT P01 · CANCELLING · REV 2");
+        assert_eq!(status_row(120, &active), " EXPORT P01 · CANCELLING · REV 2");
+
+        let (_fixture, mut completed, operation) = export_ready_app("completed");
+        let receipt = OfflineExportReceipt {
+            token: operation.token(),
+            destination: operation.destination().to_path_buf(),
+            project_id: operation.project_id(),
+            revision: operation.revision(),
+            slot: operation.slot(),
+            sample_rate: 48_000,
+            rendered_frames: 96_000,
+            file_bytes: 768_080,
+        };
+        finish_export(&mut completed, &operation, Ok(receipt));
+        assert_eq!(
+            status_row(80, &completed),
+            " EXPORT P01 · DONE · REV 2 · 96000 frames"
+        );
+        assert_eq!(
+            status_row(120, &completed),
+            " EXPORT P01 · DONE · REV 2 · 96000 frames"
+        );
+        assert!(matches!(
+            completed.export_status_view(),
+            Some(ExportStatusView::Completed { receipt })
+                if receipt.revision == 2 && receipt.rendered_frames == 96_000
+        ));
+    }
+
+    #[test]
+    fn export_failure_snapshots_are_compact_typed_and_unicode_safe() {
+        let cases = [
+            (
+                "collision",
+                OfflineExportError::DestinationExists(std::path::PathBuf::from("出力.wav")),
+                " EXPORT P01 · FAILED: DESTINATION EXISTS · REV 2",
+            ),
+            (
+                "source-changed",
+                OfflineExportError::ProjectStore(ProjectStoreError::SourceChanged {
+                    path: std::path::PathBuf::from("資料/変更.wav"),
+                }),
+                " EXPORT P01 · FAILED: SOURCE CHANGED · REV 2",
+            ),
+            (
+                "source-integrity",
+                OfflineExportError::ProjectStore(ProjectStoreError::AssetIntegrity {
+                    path: std::path::PathBuf::from("資料/破損.wav"),
+                }),
+                " EXPORT P01 · FAILED: SOURCE INTEGRITY · REV 2",
+            ),
+            (
+                "encode",
+                OfflineExportError::Encode(std::path::PathBuf::from("出力.wav")),
+                " EXPORT P01 · FAILED: ENCODE · REV 2",
+            ),
+        ];
+
+        for (label, error, expected) in cases {
+            let (_fixture, mut app, operation) = export_ready_app(label);
+            finish_export(&mut app, &operation, Err(error));
+            for width in [80, 120] {
+                assert_eq!(status_row(width, &app), expected, "{label} at {width}");
+                assert_unicode_safe_snapshot(width, &app);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_project_lifecycle_prompt_outranks_compact_export_status() {
+        let (_fixture, mut app, _operation) = export_ready_app("project-priority");
+        app.apply(crate::InputAction::Quit);
+
+        for width in [80, 120] {
+            let screen = render_lines(width, 24, &app).join("\n");
+            assert!(screen.contains("PROJECT OPERATION"));
+            assert!(screen.contains("Waiting for offline export cleanup"));
+            assert!(!screen.contains("EXPORT P01"));
+            assert_unicode_safe_snapshot(width, &app);
+        }
+    }
+
+    #[test]
     fn project_unsaved_and_progress_overlays_show_safe_choices_at_eighty_columns() {
         let mut app = loaded_states_app(FakeAudio::ready());
         app.apply(InputAction::Quit);
@@ -2210,7 +2544,7 @@ mod tests {
         let failed = App::without_audio("device disconnected");
 
         for (app, rect) in [
-            (help, (14, 3, 72, 23)),
+            (help, (14, 3, 72, 24)),
             (palette, (19, 12, 62, 5)),
             (picker, (14, 5, 72, 19)),
             (failed, (19, 11, 62, 7)),

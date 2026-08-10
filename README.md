@@ -44,6 +44,16 @@ Delivery slice 8 Mixer/FX and choke control is implemented with automated cross-
 
 Delivery slice 9 MIDI input and mapping has automated cross-layer evidence through virtual ingress, the real App/controller/engine, worker, project store, and filesystem. The suite covers discovery and explicit connection, velocity-sensitive triggering, exact engine-acknowledged Gate recording, trigger-time ownership across bank changes, distinct per-bank Learn maps, bounded overflow quarantine and held-note release, disappearance/reconnect, portable Save As/open, recovery Restore, schema v3 default migration, bitwise-stable dry rendering, and callback allocation bounds. These are automated claims only: physical USB/virtual-port behavior, perceived latency and feel, audibility, long-session hardware behavior, and terminal restoration remain unchecked on macOS and Linux in [`docs/manual-midi-checklist.md`](docs/manual-midi-checklist.md).
 
+Offline pattern export has automated evidence for exactly these guarantees:
+
+- a canonical stereo IEEE 32-bit float WAV at 48 kHz containing exactly one pattern loop;
+- bitwise decoded-frame parity with an independently bootstrapped production audio engine;
+- bounded worker progress and continued App, pad, and MIDI responsiveness while export runs;
+- create-new, no-replace publication that never overwrites an existing destination;
+- headless export without terminal, keyboard, MIDI, audio-input, or audio-output device initialization.
+
+Use `export <path>` in the command palette for the selected pattern, or `sampler-tui export <project-directory> <pattern-1..16> <output.wav>` for headless operation. Physical DAW import, hearing, long cancellation, real slow/removable filesystems, OS error behavior, and interactive terminal restoration are not automated claims; every macOS and Linux row remains unchecked in [`docs/manual-offline-export-checklist.md`](docs/manual-offline-export-checklist.md).
+
 ## Build and test
 
 Rust 1.95.0 is selected by `rust-toolchain.toml`.
@@ -55,6 +65,7 @@ cargo build --workspace --release
 cargo run -p sampler-tui
 cargo run -p sampler-tui -- open path/to/project-directory
 cargo run -p sampler-tui -- play path/to/sample.wav
+cargo run -p sampler-tui -- export path/to/project-directory 1 path/to/output.wav
 ```
 
 The no-argument command opens an untitled project in the 80x24-minimum performance TUI. `open <project-directory>` queues that project before interactive input begins. The diagnostic `play` command prints the active device rate/channel count and decoded duration, schedules one one-shot, and exits after rendered-frame completion. A successful exit is programmatic path evidence, not proof that the output was heard or free of audible artifacts. Run `cargo run -p sampler-tui -- --help` for its usage.
@@ -66,6 +77,6 @@ The interactive loader is deliberately bounded: a directory view keeps the first
 1. Add offline mixing, sample decoding/resampling, real device output, and responsive pad triggering.
 2. Harden the implemented 80×24 performance TUI with recorded macOS/Linux interactive and hardware acceptance.
 3. Record manual cross-platform acceptance for project save/open, recovery, and dirty-quit workflows.
-4. Add export, device selection, optional input monitoring, and cross-platform release hardening.
+4. Record cross-platform export acceptance, add device selection and optional input monitoring, and continue release hardening.
 
 The approved product design is in [`docs/superpowers/specs/2026-08-07-sampler-tui-design.md`](docs/superpowers/specs/2026-08-07-sampler-tui-design.md), and the slice 1 execution plan is in [`docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md`](docs/superpowers/plans/2026-08-07-deterministic-sampler-core.md).

@@ -388,7 +388,7 @@ fn dedicated_public_mixer_fx_workflow_survives_capture_persistence_recovery_and_
     source.engine.render_frames(65, |_| {});
     assert_eq!(source.engine.active_voices(), 1);
     source.app.apply(InputAction::PadPress(1));
-    source.engine.render_frames(65, |_| {});
+    source.engine.render_frames(1, |_| {});
     assert_eq!(source.engine.active_voices(), 2);
     source.engine.render_frames(63, |_| {});
     assert_eq!(source.engine.active_voices(), 1);

@@ -493,7 +493,7 @@ fn real_worker_apply_preserves_source_and_auditions_the_replaced_buffer() {
     harness.enter_sample();
 
     harness.app.apply(InputAction::PadPress(0));
-    harness.engine.render_frames(65, |_| {});
+    harness.engine.render_frames(1, |_| {});
     assert_eq!(harness.engine.active_voices(), 1);
     harness.app.apply(InputAction::PadRelease(0));
 
@@ -539,7 +539,7 @@ fn real_worker_apply_preserves_source_and_auditions_the_replaced_buffer() {
     let mut audition = Vec::new();
     harness
         .engine
-        .render_frames(65, |frame| audition.push(frame));
+        .render_frames(1, |frame| audition.push(frame));
     let edited_first = audition.last().copied().expect("audition frame");
     assert!(edited_first[0] < 0.0 && edited_first[1] > 0.0);
     assert_eq!(harness.engine.executed_triggers(), 2);
@@ -906,7 +906,7 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     let mut identity_audition = Vec::new();
     harness
         .engine
-        .render_frames(65, |frame| identity_audition.push(frame));
+        .render_frames(1, |frame| identity_audition.push(frame));
     assert!(identity_audition.last().unwrap()[0] > 0.0);
     assert!(identity_audition.last().unwrap()[1] > 0.0);
     harness.app.apply(InputAction::PadRelease(1));
@@ -917,7 +917,7 @@ fn device_rate_recovery_redecodes_one_pad_at_a_time_without_applying_the_draft()
     let mut committed_audition = Vec::new();
     harness
         .engine
-        .render_frames(65, |frame| committed_audition.push(frame));
+        .render_frames(1, |frame| committed_audition.push(frame));
     let committed_first = *committed_audition.last().unwrap();
     let expected_callback = first_callback_frame(correct_first);
     assert!((committed_first[0] - expected_callback[0]).abs() < 1e-6);

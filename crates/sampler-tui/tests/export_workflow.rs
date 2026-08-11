@@ -92,7 +92,12 @@ fn independent_engine(
     staged: &[StagedExportPad],
 ) -> (sampler_audio::AudioController, AudioEngine) {
     let (mut controller, ports) = audio_channels();
-    let mut engine = AudioEngine::new(sampler_tui::EXPORT_SAMPLE_RATE, ports).unwrap();
+    let mut engine = AudioEngine::new_with_master_mix(
+        sampler_tui::EXPORT_SAMPLE_RATE,
+        ports,
+        snapshot.master_mix(),
+    )
+    .unwrap();
     for staged_pad in staged {
         controller
             .install(
@@ -104,8 +109,6 @@ fn independent_engine(
             .unwrap();
         engine.render_frames(0, |_| {});
     }
-    controller.update_master_mix(snapshot.master_mix()).unwrap();
-    engine.render_frames(0, |_| {});
     controller
         .install_pattern(Arc::new(
             snapshot.pattern().to_editable().unwrap().compile().unwrap(),
@@ -133,6 +136,20 @@ fn decoded_wav_bits(path: &Path) -> Vec<[u32; 2]> {
         .chunks_exact(2)
         .map(|frame| [frame[0].to_bits(), frame[1].to_bits()])
         .collect()
+}
+
+fn assert_frame_bits_eq(actual: &[[u32; 2]], expected: &[[u32; 2]]) {
+    assert_eq!(actual.len(), expected.len(), "rendered frame count");
+    if let Some((frame, (actual, expected))) = actual
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find(|(_, (actual, expected))| actual != expected)
+    {
+        panic!(
+            "rendered audio first differs at frame {frame}: actual={actual:?}, expected={expected:?}"
+        );
+    }
 }
 
 fn temporary_entries(root: &Path) -> Vec<PathBuf> {
@@ -443,7 +460,7 @@ fn continuous_real_app_worker_store_engine_and_headless_export_workflow() {
     assert_eq!(receipt.revision, revision_n);
     assert_eq!(harness.app.project_revision(), revision_n + 1);
     let expected_bits = independent_engine_bits(&revision_n_snapshot);
-    assert_eq!(decoded_wav_bits(&first_destination), expected_bits);
+    assert_frame_bits_eq(&decoded_wav_bits(&first_destination), &expected_bits);
 
     let now = Instant::now();
     harness.save_as(&project, now);

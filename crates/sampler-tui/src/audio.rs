@@ -104,12 +104,12 @@ pub trait AudioPort {
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), String>;
     fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), String> {
-        let at = self.render_horizon().saturating_add(64);
+        let at = self.render_horizon();
         self.trigger(pad, at, velocity)
     }
     fn release(&mut self, pad: PadId, at: Frame) -> Result<(), String>;
     fn release_live(&mut self, pad: PadId) -> Result<(), String> {
-        let at = self.render_horizon().saturating_add(64);
+        let at = self.render_horizon();
         self.release(pad, at)
     }
     fn trigger_live_tracked(
@@ -278,12 +278,12 @@ trait SessionLike {
     }
     fn trigger(&mut self, pad: PadId, at: Frame, velocity: f32) -> Result<(), Self::CommandError>;
     fn trigger_live(&mut self, pad: PadId, velocity: f32) -> Result<(), Self::CommandError> {
-        let at = self.render_horizon().saturating_add(64);
+        let at = self.render_horizon();
         self.trigger(pad, at, velocity)
     }
     fn release(&mut self, pad: PadId, at: Frame) -> Result<(), Self::CommandError>;
     fn release_live(&mut self, pad: PadId) -> Result<(), Self::CommandError> {
-        let at = self.render_horizon().saturating_add(64);
+        let at = self.render_horizon();
         self.release(pad, at)
     }
     fn trigger_live_tracked(

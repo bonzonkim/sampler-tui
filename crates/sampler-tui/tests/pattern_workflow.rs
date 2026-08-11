@@ -338,9 +338,9 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
     harness.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
     harness.callback(1); // transport/capture admission
     harness.key(KeyCode::Char('1'), KeyModifiers::NONE);
-    harness.callback(65); // tracked trigger executes at the callback's +64 frame
+    harness.callback(65); // tracked trigger executes on the callback's first frame
     harness.release(KeyCode::Char('1'));
-    harness.callback(65); // tracked release executes at the callback's +64 frame
+    harness.callback(65); // tracked release executes on the callback's first frame
     harness.ui_iteration(); // real bounded ack drain, never workspace.apply_ack directly
 
     let events = harness
@@ -349,7 +349,7 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
         .pattern(PatternSlotId::new(0).unwrap())
         .events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].frame, 65, "ack frame 66 minus callback origin 1");
+    assert_eq!(events[0].frame, 1);
     assert_eq!(events[0].duration, Some(65));
     assert!(
         events[0].frame
@@ -362,9 +362,9 @@ fn records_overdubs_edits_and_switches_at_the_loop_boundary() {
     );
     let observed = harness.observed_acks.borrow();
     assert_eq!(observed.len(), 2);
-    assert_eq!(observed[0].frame, 66);
+    assert_eq!(observed[0].frame, 2);
     assert_eq!(observed[0].transport.unwrap().origin, 1);
-    assert_eq!(observed[1].frame, 131);
+    assert_eq!(observed[1].frame, 67);
     assert_eq!(observed[1].transport.unwrap().origin, 1);
     drop(observed);
     harness.callback(64);

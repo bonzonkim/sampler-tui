@@ -2,12 +2,17 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::{
+    BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
+    SupportedBufferSize, SupportedStreamConfig,
+};
 
 use crate::{
     AudioController, AudioEngine, DeviceBufferError, DeviceError, audio_channels,
     command::SharedControlState,
 };
+
+const LOW_LATENCY_BUFFER_FRAMES: u32 = 64;
 
 pub struct AudioSession {
     _stream: Option<Stream>,
@@ -43,7 +48,7 @@ impl AudioSession {
                 channels,
             }
         })?;
-        let config = supported_config.config();
+        let config = low_latency_stream_config(&supported_config);
         let sample_format = supported_config.sample_format();
         let (error_sender, errors) = mpsc::channel();
         let stream = match sample_format {
@@ -115,6 +120,14 @@ impl AudioSession {
     pub fn poll_error(&self) -> Option<DeviceError> {
         self.errors.try_recv().ok().map(DeviceError::Runtime)
     }
+}
+
+pub(crate) fn low_latency_stream_config(supported: &SupportedStreamConfig) -> StreamConfig {
+    let mut config = supported.config();
+    if let SupportedBufferSize::Range { min, max } = *supported.buffer_size() {
+        config.buffer_size = BufferSize::Fixed(LOW_LATENCY_BUFFER_FRAMES.clamp(min, max));
+    }
+    config
 }
 
 impl Drop for AudioSession {
@@ -292,6 +305,23 @@ mod tests {
         assert!(write_frames(&frames, 0, &mut [0.0_f32; 1]).is_err());
         assert!(write_frames(&frames, 2, &mut [0.0_f32; 3]).is_err());
         assert!(write_frames(&frames, 2, &mut [0.0_f32; 4]).is_err());
+    }
+
+    #[test]
+    fn low_latency_stream_config_requests_sixty_four_frames_when_supported() {
+        let supported = cpal::SupportedStreamConfig::new(
+            2,
+            48_000,
+            cpal::SupportedBufferSize::Range {
+                min: 32,
+                max: 4_096,
+            },
+            cpal::SampleFormat::F32,
+        );
+
+        let config = low_latency_stream_config(&supported);
+
+        assert_eq!(config.buffer_size, cpal::BufferSize::Fixed(64));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::{
+    FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
+};
 
 use crate::capture::CaptureFailureHandle;
 use crate::device::drop_stream_before_controller;
@@ -47,7 +49,7 @@ impl InputCaptureSession {
         }
 
         let sample_kind = input_sample_kind(supported_config.sample_format())?;
-        let config = supported_config.config();
+        let config = input_stream_config(&supported_config);
         let (controller, core) = capture_channels(
             INPUT_CAPTURE_COMMAND_CAPACITY,
             INPUT_CAPTURE_COMPLETION_CAPACITY,
@@ -121,6 +123,10 @@ impl InputCaptureSession {
     pub fn poll_error(&self) -> Option<InputDeviceError> {
         self.errors.try_recv().ok().map(InputDeviceError::Runtime)
     }
+}
+
+fn input_stream_config(supported: &SupportedStreamConfig) -> StreamConfig {
+    supported.config()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +250,23 @@ mod tests {
         CaptureBuffer, CaptureError, CaptureOutcome, CaptureSource, CaptureState, PadId,
         capture_channels,
     };
+
+    #[test]
+    fn input_stream_config_leaves_coreaudio_buffer_negotiation_at_default() {
+        let supported = cpal::SupportedStreamConfig::new(
+            1,
+            48_000,
+            cpal::SupportedBufferSize::Range {
+                min: 15,
+                max: 4_096,
+            },
+            cpal::SampleFormat::F32,
+        );
+
+        let config = input_stream_config(&supported);
+
+        assert_eq!(config.buffer_size, cpal::BufferSize::Default);
+    }
 
     fn input_buffer(token: u64, max_frames: usize) -> CaptureBuffer {
         CaptureBuffer::try_new(

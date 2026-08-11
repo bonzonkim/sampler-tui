@@ -36,7 +36,7 @@ const HELP_LINES: [&str; 22] = [
     "PROJECT: save · save-as <directory> · open-project <directory>",
     "Recovery: R restore · D discard · C cancel",
     "EXPORT: export <path> · 48kHz stereo f32 WAV · one loop · Esc cancel",
-    "CAPTURE: resample · record-input · capture-stop · capture-cancel",
+    "CAPTURE: Ctrl+S then I input · R resample · S stop · C cancel",
     "Recording: Enter stop · Esc review discard · pads/pattern stay live",
     "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
     "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
@@ -429,6 +429,21 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App, overlay: &Overlay) {
     match overlay {
         Overlay::Help => render_list_overlay(frame, area, " HELP ", 72, 24, HELP_LINES),
         Overlay::Palette => render_palette(frame, area, app),
+        Overlay::CaptureCommands => render_list_overlay(
+            frame,
+            area,
+            " CAPTURE COMMANDS ",
+            66,
+            8,
+            [
+                "I  Record system default input",
+                "R  Resample final stereo master",
+                "S  Stop and finalize active capture",
+                "C  Cancel and discard active capture",
+                "Esc close · pads are blocked while this menu is open",
+                app.status(),
+            ],
+        ),
         Overlay::FilePicker => render_picker(frame, area, app),
         Overlay::DeviceError(error) => render_list_overlay(
             frame,
@@ -2290,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_help_lists_export_without_changing_midi_capture_or_mixer_contracts() {
+    fn idle_help_lists_export_and_capture_leader_without_changing_midi_or_mixer_contracts() {
         let mut app = ready_app();
         app.open_help();
 
@@ -2306,7 +2321,7 @@ mod tests {
                 "Enter toggle · Backspace reset · Esc Perform",
                 "midi-ports · midi-connect <index> · midi-disconnect",
                 "midi-channel <omni|1..16> · midi-learn/midi-unmap/midi-reset-bank",
-                "CAPTURE: resample · record-input · capture-stop · capture-cancel",
+                "CAPTURE: Ctrl+S then I input · R resample · S stop · C cancel",
                 "Recording: Enter stop · Esc review discard · pads/pattern stay live",
             ] {
                 assert!(screen.contains(unchanged), "missing {unchanged:?}");
@@ -2768,6 +2783,23 @@ mod tests {
             assert!(snapshot.iter().any(|line| line.contains(title)));
             assert!(snapshot.iter().any(|line| line.contains("BANK A")));
         }
+    }
+
+    #[test]
+    fn capture_command_leader_is_discoverable_at_minimum_terminal_size() {
+        let mut commands = ready_app();
+        commands.apply_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let commands = render_lines(80, 24, &commands).join("\n");
+        assert!(commands.contains("CAPTURE COMMANDS"));
+        assert!(commands.contains("I  Record system default input"));
+        assert!(commands.contains("R  Resample final stereo master"));
+        assert!(commands.contains("S  Stop and finalize active capture"));
+        assert!(commands.contains("C  Cancel and discard active capture"));
+
+        let mut help = ready_app();
+        help.open_help();
+        let help = render_lines(80, 24, &help).join("\n");
+        assert!(help.contains("Ctrl+S then I input · R resample · S stop · C cancel"));
     }
 
     #[test]

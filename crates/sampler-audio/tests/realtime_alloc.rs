@@ -445,7 +445,9 @@ fn measure_pattern_playback_acknowledgement_and_retirement() {
     );
 
     let mut acks = [LiveAck::EMPTY; 2];
-    assert_eq!(controller.drain_live_acks(&mut acks), 2);
+    // The release now executes immediately while replacement invalidates the old recording
+    // capture; only the earlier trigger belongs to a valid capture generation.
+    assert_eq!(controller.drain_live_acks(&mut acks), 1);
     assert_eq!(controller.reclaim_retired_pattern(), Some(initial_owner));
 }
 

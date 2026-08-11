@@ -4214,6 +4214,52 @@ mod capture_task7_tests {
             Some(CaptureSource::Resample)
         );
     }
+
+    #[test]
+    fn control_s_capture_commands_route_to_the_typed_api_without_triggering_pads() {
+        let (audio, probe) = CaptureAudio::new(48_000, 44_100);
+        let mut app = App::with_audio(Box::new(audio));
+        let leader = KeyEvent::new_with_kind(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+
+        app.apply_key(leader);
+        app.apply_key(press(KeyCode::Char('i')));
+        assert_eq!(app.capture_session().source(), Some(CaptureSource::Input));
+
+        app.apply_key(leader);
+        app.apply_key(press(KeyCode::Char('s')));
+        assert!(matches!(
+            probe.calls().last(),
+            Some(CaptureCall::Stop(_, _))
+        ));
+        assert!(!app.is_pad_held(9), "leader S must not trigger pad 10");
+
+        let (cancel_audio, cancel_probe) = CaptureAudio::new(48_000, 44_100);
+        let mut cancel = App::with_audio(Box::new(cancel_audio));
+        start_capture(&mut cancel, CaptureSource::Input, 16);
+        cancel.apply_key(leader);
+        cancel.apply_key(press(KeyCode::Char('c')));
+        assert!(matches!(
+            cancel_probe.calls().last(),
+            Some(CaptureCall::Cancel(_, _))
+        ));
+        assert!(!cancel.is_pad_held(14), "leader C must not trigger pad 15");
+        assert!(cancel.maintain_capture());
+        assert_eq!(cancel.capture_session().phase(), None);
+
+        let (resample_audio, _) = CaptureAudio::new(48_000, 44_100);
+        let mut resample = App::with_audio(Box::new(resample_audio));
+        resample.apply_key(leader);
+        resample.apply_key(press(KeyCode::Char('r')));
+        assert_eq!(
+            resample.capture_session().source(),
+            Some(CaptureSource::Resample)
+        );
+        assert!(!resample.is_pad_held(7), "leader R must not trigger pad 8");
+    }
 }
 
 impl fmt::Display for ProjectSaveError {
@@ -4487,6 +4533,7 @@ struct SampleEditorState {
 pub enum Overlay {
     Help,
     Palette,
+    CaptureCommands,
     FilePicker,
     DeviceError(String),
     ProjectOpenProgress,
@@ -6115,6 +6162,7 @@ impl App {
             self.overlay,
             Some(
                 Overlay::Palette
+                    | Overlay::CaptureCommands
                     | Overlay::ProjectOpenProgress
                     | Overlay::ResolveSampleDraft { .. }
                     | Overlay::UnsavedProject { .. }
@@ -6608,6 +6656,10 @@ impl App {
             }
             return;
         }
+        if self.overlay.is_none() && is_capture_commands_leader(key) {
+            self.open_capture_commands();
+            return;
+        }
         if matches!(self.overlay, Some(Overlay::DeviceError(_)))
             && key.kind == KeyEventKind::Press
             && key.modifiers == KeyModifiers::NONE
@@ -6667,6 +6719,7 @@ impl App {
             Some(Overlay::ProjectSaveProgress) => {}
             Some(Overlay::ProjectError { .. }) => self.apply_project_error_key(key),
             Some(Overlay::Palette) => self.apply_palette_key(key),
+            Some(Overlay::CaptureCommands) => self.apply_capture_commands_key(key),
             Some(Overlay::FilePicker) => self.apply_picker_key(key),
             Some(Overlay::Help) => self.apply_help_key(key),
             Some(Overlay::ClearPattern { .. }) => self.apply_clear_pattern_key(key),
@@ -8825,6 +8878,11 @@ impl App {
         self.overlay = Some(Overlay::Palette);
     }
 
+    fn open_capture_commands(&mut self) {
+        self.export_status_focused = false;
+        self.overlay = Some(Overlay::CaptureCommands);
+    }
+
     pub fn open_picker(&mut self) {
         let source_parent = self
             .selected_pad_id()
@@ -10201,6 +10259,22 @@ impl App {
         };
         if text_changed {
             self.palette_error = None;
+        }
+    }
+
+    fn apply_capture_commands_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press || key.modifiers != KeyModifiers::NONE {
+            return;
+        }
+        let result = match key.code {
+            KeyCode::Char('i' | 'I') => self.request_input_recording(),
+            KeyCode::Char('r' | 'R') => self.request_resample(),
+            KeyCode::Char('s' | 'S') => self.stop_capture(),
+            KeyCode::Char('c' | 'C') => self.cancel_capture(),
+            _ => return,
+        };
+        if let Err(error) = result {
+            self.status = error.to_string();
         }
     }
 
@@ -12133,6 +12207,14 @@ fn is_explicit_device_retry(key: KeyEvent) -> bool {
     let allowed = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
     key.kind == KeyEventKind::Press
         && matches!(key.code, KeyCode::Char('r' | 'R'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.difference(allowed).is_empty()
+}
+
+fn is_capture_commands_leader(key: KeyEvent) -> bool {
+    let allowed = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    key.kind == KeyEventKind::Press
+        && matches!(key.code, KeyCode::Char('s' | 'S'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && key.modifiers.difference(allowed).is_empty()
 }
@@ -20999,11 +21081,11 @@ mod tests {
         assert!(app.patterns.is_recording());
 
         let origin = app.telemetry.pattern_origin.unwrap();
-        let trigger_absolute = engine.rendered_frame() + 64;
+        let trigger_absolute = engine.rendered_frame();
         app.apply_midi_event(midi_on(1, 36, 50));
         engine.render_frames(65, |_| {});
         engine.render_frames(9, |_| {});
-        let release_absolute = engine.rendered_frame() + 64;
+        let release_absolute = engine.rendered_frame();
         app.apply_midi_event(midi_off(1, 36));
         engine.render_frames(65, |_| {});
         app.maintain_audio();

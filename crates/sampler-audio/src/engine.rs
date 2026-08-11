@@ -1057,9 +1057,7 @@ impl AudioEngine {
 
     fn drain_one_immediate_command(&mut self, _horizon: Frame) -> bool {
         self.apply_stop_fence();
-        let resolved_live_frame = self
-            .rendered_frame
-            .saturating_add(Frame::from(RELEASE_FRAMES));
+        let resolved_live_frame = self.rendered_frame;
         // The controller's SPSC producer and this consumer are FIFO. Equal-frame insertion below
         // is stable, so a tracked trigger is executed and acknowledged before its later release.
         // Recording correlation intentionally relies on that engine order.
@@ -3330,21 +3328,7 @@ mod tests {
                             && id.generation == outgoing_generation
                     }))
             );
-            assert!(
-                engine
-                    .pending
-                    .iter()
-                    .take(engine.pending_len)
-                    .flatten()
-                    .any(|action| matches!(
-                        action,
-                        ScheduledAction::Trigger {
-                            pad,
-                            source: ActionSource::Live(_),
-                            ..
-                        } if *pad == preserved_pad
-                    ))
-            );
+            assert!(engine.voices_for_pad(preserved_pad) >= 2);
         }
     }
 
@@ -3720,7 +3704,7 @@ mod tests {
     }
 
     #[test]
-    fn tracked_live_ack_and_sound_share_observed_callback_plus_sixty_four() {
+    fn tracked_live_ack_and_sound_share_the_first_frame_of_the_next_callback() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
         let pad = PadId::first();
@@ -3747,12 +3731,12 @@ mod tests {
 
         let mut acks = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
-        assert_eq!(onset, Some(observed_at + 64));
-        assert_eq!((acks[0].id, acks[0].frame), (id, observed_at + 64));
+        assert_eq!(onset, Some(observed_at));
+        assert_eq!((acks[0].id, acks[0].frame), (id, observed_at));
     }
 
     #[test]
-    fn live_ack_transport_uses_the_pattern_entered_at_its_execution_boundary() {
+    fn live_ack_transport_uses_the_pattern_active_at_immediate_execution() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(1_000, ports).unwrap();
         let pad = PadId::first();
@@ -3766,7 +3750,6 @@ mod tests {
         );
         let first = pattern_snapshot_with_triggers(0, 1_000, &[]);
         let second = pattern_snapshot_with_triggers(1, 1_000, &[(50, pad)]);
-        let second_generation = second.generation();
         let slot_zero = PatternSlotId::new(0).unwrap();
         let slot_one = PatternSlotId::new(1).unwrap();
         controller.install_pattern(first).unwrap();
@@ -3781,12 +3764,7 @@ mod tests {
             .unwrap();
         controller.set_record_capture(Some((slot_zero, 0))).unwrap();
         let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
-        engine.render_frames(0, |_| {});
-        engine.render_frames(64, |_| {});
-        controller
-            .set_record_capture(Some((slot_one, second_generation)))
-            .unwrap();
-        let mut callback_frame = 100;
+        let mut callback_frame = 36;
         let mut onset = None;
 
         engine.render_frames(1, |frame| {
@@ -3798,13 +3776,13 @@ mod tests {
 
         let mut acks = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
-        assert_eq!((onset, acks[0].id, acks[0].frame), (Some(100), id, 100));
+        assert_eq!((onset, acks[0].id, acks[0].frame), (Some(36), id, 36));
         assert_eq!(
             acks[0].transport,
             Some(TransportStamp {
-                slot: slot_one,
-                generation: second_generation,
-                origin: 100,
+                slot: slot_zero,
+                generation: 0,
+                origin: 0,
                 loop_frames: 100,
             })
         );
@@ -3831,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn live_frame_is_fixed_across_repeated_short_callbacks() {
+    fn live_frame_is_the_first_frame_of_a_short_callback() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
         let pad = PadId::first();
@@ -3846,21 +3824,65 @@ mod tests {
         arm_recording_capture(&mut controller, &mut engine, 100);
         let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
 
-        engine.render_frames(32, |frame| assert_eq!(frame, [0.0, 0.0]));
-        assert_eq!(engine.queued_commands(), 0);
-        assert_eq!(engine.pending_actions(), 1);
-        engine.render_frames(32, |frame| assert_eq!(frame, [0.0, 0.0]));
         let mut onset = None;
-        engine.render_frames(1, |frame| {
-            if frame != [0.0, 0.0] {
-                onset = Some(64);
+        let mut callback_frame = 0;
+        engine.render_frames(32, |frame| {
+            if onset.is_none() && frame != [0.0, 0.0] {
+                onset = Some(callback_frame);
             }
+            callback_frame += 1;
         });
+        assert_eq!(engine.queued_commands(), 0);
+        assert_eq!(engine.pending_actions(), 0);
 
         let mut acks = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
-        assert_eq!(onset, Some(64));
-        assert_eq!((acks[0].id, acks[0].frame), (id, 64));
+        assert_eq!(onset, Some(0));
+        assert_eq!((acks[0].id, acks[0].frame), (id, 0));
+    }
+
+    #[test]
+    fn live_trigger_starts_on_the_first_frame_of_the_next_audio_callback() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let pad = PadId::first();
+        install_ready_sample(
+            &mut controller,
+            &mut engine,
+            48_000,
+            pad,
+            PadSettings::default(),
+            128,
+        );
+        controller.trigger_live(pad, 1.0).unwrap();
+        let mut first_frame = [0.0, 0.0];
+
+        engine.render_frames(1, |frame| first_frame = frame);
+
+        assert_ne!(first_frame, [0.0, 0.0]);
+        assert_eq!(engine.executed_triggers(), 1);
+    }
+
+    #[test]
+    fn stop_pad_starts_release_on_the_next_callback_and_is_silent_within_sixty_four_frames() {
+        let (mut controller, ports) = audio_channels();
+        let mut engine = AudioEngine::new(48_000, ports).unwrap();
+        let pad = PadId::first();
+        let looping = PadSettings::new(PlaybackMode::Loop, 0.0, 0.0, 0.0, None).unwrap();
+        install_ready_sample(&mut controller, &mut engine, 48_000, pad, looping, 128);
+        controller.trigger_live(pad, 1.0).unwrap();
+        let mut before_stop = [0.0, 0.0];
+        engine.render_frames(32, |frame| before_stop = frame);
+        controller.stop_pad(pad).unwrap();
+        let mut first_release_frame = [0.0, 0.0];
+
+        engine.render_frames(1, |frame| first_release_frame = frame);
+
+        assert!(first_release_frame[0].abs() < before_stop[0].abs());
+        let mut final_release_frame = [1.0, 1.0];
+        engine.render_frames(63, |frame| final_release_frame = frame);
+        assert_eq!(final_release_frame, [0.0, 0.0]);
+        assert_eq!(engine.active_voices(), 0);
     }
 
     #[test]
@@ -3967,13 +3989,13 @@ mod tests {
 
         let mut acks = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut acks), 1);
-        assert_eq!(onset, Some(observed_at + 64));
-        assert_eq!(acks[0].frame, observed_at + 64);
+        assert_eq!(onset, Some(observed_at));
+        assert_eq!(acks[0].frame, observed_at);
         assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
     }
 
     #[test]
-    fn short_callbacks_preserve_the_initial_resolved_live_frame() {
+    fn command_between_short_callbacks_starts_on_the_next_callback_first_frame() {
         let (mut controller, ports) = audio_channels();
         let mut engine = AudioEngine::new(100, ports).unwrap();
         let pad = PadId::first();
@@ -3986,9 +4008,8 @@ mod tests {
             1,
         );
         arm_recording_capture(&mut controller, &mut engine, 100);
-        let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
-
         engine.render_frames(64, |frame| assert_eq!(frame, [0.0, 0.0]));
+        let id = controller.trigger_live_tracked(pad, 1.0).unwrap();
         let mut onset = None;
         let mut callback_frame = 64;
         engine.render_frames(32, |frame| {
@@ -4014,13 +4035,13 @@ mod tests {
         install_ready_sample(&mut controller, &mut engine, 100, pad, gate, 256);
         arm_recording_capture(&mut controller, &mut engine, 100);
         controller.trigger_live_tracked(pad, 1.0).unwrap();
-        engine.render_frames(65, |_| {});
+        engine.render_frames(1, |_| {});
         let mut trigger_ack = [crate::LiveAck::EMPTY; 1];
         assert_eq!(controller.drain_live_acks(&mut trigger_ack), 1);
         let observed_at = engine.rendered_frame();
         let release_id = controller.release_live_tracked(pad).unwrap();
 
-        engine.render_frames(65, |_| {});
+        engine.render_frames(1, |_| {});
 
         let voice = engine
             .voices
@@ -4033,7 +4054,7 @@ mod tests {
         assert_eq!(voice.envelope.release_frame, Some(1));
         assert_eq!(release_ack[0].id, release_id);
         assert_eq!(release_ack[0].kind, LiveAckKind::Release);
-        assert_eq!(release_ack[0].frame, observed_at + 64);
+        assert_eq!(release_ack[0].frame, observed_at);
     }
 
     #[test]
@@ -4061,7 +4082,7 @@ mod tests {
 
         assert_eq!(engine.voices_for_pad(pad_a), 0);
         assert_eq!(engine.voices_for_pad(pad_b), 1);
-        assert_eq!(engine.last_triggered_frame, Some(64));
+        assert_eq!(engine.last_triggered_frame, Some(0));
     }
 
     #[test]
@@ -4485,7 +4506,7 @@ mod tests {
         engine.render_frames(65, |_| {});
 
         assert_eq!(engine.executed_triggers(), 1);
-        assert_eq!(engine.last_triggered_frame, Some(577));
+        assert_eq!(engine.last_triggered_frame, Some(513));
         assert_eq!(engine.late_commands(), 0);
     }
 
@@ -4511,7 +4532,7 @@ mod tests {
         engine.render_frames(65, |_| {});
 
         assert_eq!(engine.executed_triggers(), 1);
-        assert_eq!(engine.last_triggered_frame, Some(65));
+        assert_eq!(engine.last_triggered_frame, Some(1));
         assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
     }
 
@@ -4555,7 +4576,7 @@ mod tests {
         engine.render_frames(129, |_| {});
 
         assert_eq!(engine.executed_triggers(), 1);
-        assert_eq!(engine.last_triggered_frame, Some(128));
+        assert_eq!(engine.last_triggered_frame, Some(64));
         assert_eq!(engine.voices_for_pad(second), 0);
         assert_eq!(engine.pending_actions(), NON_LIVE_PENDING_COUNT);
         assert_eq!(engine.queued_commands(), 2);
@@ -4611,7 +4632,7 @@ mod tests {
         engine.render_frames(65, |_| {});
 
         assert_eq!(engine.executed_triggers(), 1);
-        assert_eq!(engine.last_triggered_frame, Some(65));
+        assert_eq!(engine.last_triggered_frame, Some(1));
         assert_eq!(engine.queued_commands(), 1);
         assert_eq!(engine.late_commands(), 0);
     }
@@ -4645,7 +4666,7 @@ mod tests {
         engine.render_frames(65, |_| {});
 
         assert_eq!(engine.executed_triggers(), 2);
-        assert_eq!(engine.last_triggered_frame, Some(193));
+        assert_eq!(engine.last_triggered_frame, Some(129));
         assert_eq!(engine.pending_actions(), 0);
         assert_eq!(engine.queued_commands(), 0);
     }

@@ -697,12 +697,12 @@ fn continuous_midi_workflow_survives_overflow_move_recovery_and_reconnect() {
     source.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
     source.engine.render_frames(4, |_| {});
     source.app.maintain_audio();
-    let trigger_expected = source.engine.rendered_frame() + 64;
+    let trigger_expected = source.engine.rendered_frame();
     source.send(&[0x90, 60, 50]);
     source.midi_slice(now);
     source.engine.render_frames(65, |_| {});
     source.engine.render_frames(9, |_| {});
-    let release_expected = source.engine.rendered_frame() + 64;
+    let release_expected = source.engine.rendered_frame();
     source.send(&[0x80, 60, 0]);
     source.midi_slice(now);
     source.engine.render_frames(65, |_| {});

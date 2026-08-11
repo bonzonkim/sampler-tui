@@ -996,9 +996,9 @@ fn loads_plays_releases_switches_banks_and_renders_status() {
                 },
                 settings: PadSettings::default(),
             },
-            AudioCall::Trigger(pad(0, 0), 64, 1.0),
-            AudioCall::Release(pad(0, 0), 64),
-            AudioCall::Trigger(pad(1, 4), 64, 1.0),
+            AudioCall::Trigger(pad(0, 0), 0, 1.0),
+            AudioCall::Release(pad(0, 0), 0),
+            AudioCall::Trigger(pad(1, 4), 0, 1.0),
         ]
     );
     assert_eq!(harness.worker_delivery(), (2, 2));

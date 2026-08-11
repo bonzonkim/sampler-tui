@@ -29,7 +29,7 @@ const HELP_LINES: [&str; 22] = [
     "MIXER: Ctrl+Left/Right section · Up/Down field · Left/Right edit",
     "Enter toggle · Backspace reset · Esc Perform",
     "unsupported edits: use : command palette",
-    "MIDI active bank · linear velocity · Note On 0=Off",
+    "MIDI active bank · linear velocity · Shift+1 fixed 127 · Note On 0=Off",
     "midi-ports · midi-connect <index> · midi-disconnect",
     "midi-channel <omni|1..16> · midi-learn/midi-unmap/midi-reset-bank",
     "notes 36..51 map to pads 1..16 in every bank",
@@ -38,8 +38,8 @@ const HELP_LINES: [&str; 22] = [
     "EXPORT: export <path> · 48kHz stereo f32 WAV · one loop · Esc cancel",
     "CAPTURE: Ctrl+S then I input · R resample · S stop · C cancel",
     "Recording: Enter stop · Esc review discard · pads/pattern stay live",
-    "PADS: 1-4/Q-R/A-F/Z-V global · Shift+pad stop · [/] bank",
-    "Arrow select · Enter trigger · l load · : command · Shift+Esc stop all",
+    "PADS: 1-4/Q-R/A-F/Z-V · H hold Gate · [/] bank",
+    "Shift+1 fixed velocity · Shift+X import · Shift+Esc stop all",
     "Ctrl+Q / Ctrl+C quit · Esc or ? close help · Ctrl+R retries audio",
 ];
 
@@ -202,7 +202,7 @@ fn render_pads(frame: &mut Frame, area: Rect, app: &App) {
             }
             let pad = &app.pads()[bank_offset + index];
             let selected = app.selected_pad() == index;
-            let held = app.is_pad_held(index);
+            let held = app.is_pad_held(index) || app.is_active_pad_hold_latched(index);
             spans.push(Span::styled(
                 pad_cell(
                     PAD_KEYS[index],
@@ -321,7 +321,10 @@ fn render_performance(frame: &mut Frame, area: Rect, app: &App) {
         format!("Overflow {}", telemetry.command_overflows),
         format!("Frame {}", telemetry.rendered_frame),
         format!("Release keys: {release}"),
-        format!("Device {rate}Hz/{channels}ch"),
+        format!(
+            "Device {rate}Hz/{channels}ch · FV {}",
+            if app.fixed_velocity() { "ON" } else { "OFF" }
+        ),
         perform_pattern_summary(app),
     ];
     if let Some((source, target, elapsed, maximum, peak, hard_limit)) = capture_summary(app) {
@@ -384,8 +387,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let primary = compact_status_text(app);
     let rows = [
         primary.as_str(),
-        "Enter trigger · Shift+pad stop · Shift+Esc stop all",
-        "l load · [/] bank · ? help · : cmd · Ctrl+Q quit",
+        "Enter trigger · H hold Gate · Shift+Esc stop all",
+        "Shift+1 fixed · Shift+X import · [/] bank · ? help · Ctrl+Q quit",
     ];
     for (index, row) in rows.iter().enumerate() {
         let y = inner
@@ -2424,8 +2427,8 @@ mod tests {
                 (
                     "Perform",
                     &[
-                        "Enter trigger · Shift+pad stop · Shift+Esc stop all",
-                        "l load · [/] bank · ? help · : cmd · Ctrl+Q quit",
+                        "Enter trigger · H hold Gate · Shift+Esc stop all",
+                        "Shift+1 fixed · Shift+X import · [/] bank · ? help · Ctrl+Q quit",
                     ],
                 ),
                 (

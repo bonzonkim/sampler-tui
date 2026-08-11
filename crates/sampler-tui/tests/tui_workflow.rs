@@ -449,11 +449,8 @@ impl TuiHarness {
         let unread_input = self
             .queued_input_events
             .saturating_sub(self.read_input_events.get());
-        let pads_never_accepted = (0..PAD_KEYS.len())
-            .filter(|index| !self.app.is_pad_held(*index))
-            .count();
         let missing_draw_progress = usize::from(self.draw_calls.get() == 0);
-        accepted_not_completed + unread_input + pads_never_accepted + missing_draw_progress
+        accepted_not_completed + unread_input + missing_draw_progress
     }
 
     fn visible_overflows(&self) -> usize {

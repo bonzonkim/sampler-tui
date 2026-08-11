@@ -14,6 +14,10 @@ pub enum InputAction {
     PadPress(usize),
     PadRelease(usize),
     PadStop(usize),
+    ToggleFixedVelocity,
+    ImportSample,
+    HoldPress,
+    HoldRelease,
     BankDelta(i8),
     StopAll,
     Quit,
@@ -47,8 +51,17 @@ pub fn map_key(event: KeyEvent, capabilities: KeyboardCapabilities) -> Option<In
         match normalized {
             '[' => return Some(InputAction::BankDelta(-1)),
             ']' => return Some(InputAction::BankDelta(1)),
+            'h' => return Some(InputAction::HoldPress),
             _ => {}
         }
+    }
+
+    if event.kind == KeyEventKind::Release
+        && capabilities.release_events
+        && event.modifiers == KeyModifiers::NONE
+        && normalized == 'h'
+    {
+        return Some(InputAction::HoldRelease);
     }
 
     let pad_index = PAD_KEYS
@@ -58,9 +71,11 @@ pub fn map_key(event: KeyEvent, capabilities: KeyboardCapabilities) -> Option<In
         KeyEventKind::Press if event.modifiers == KeyModifiers::NONE => {
             Some(InputAction::PadPress(pad_index))
         }
-        KeyEventKind::Press if event.modifiers == KeyModifiers::SHIFT => {
-            Some(InputAction::PadStop(pad_index))
-        }
+        KeyEventKind::Press if event.modifiers == KeyModifiers::SHIFT => match pad_index {
+            0 => Some(InputAction::ToggleFixedVelocity),
+            13 => Some(InputAction::ImportSample),
+            _ => Some(InputAction::PadStop(pad_index)),
+        },
         KeyEventKind::Release
             if capabilities.release_events
                 && matches!(event.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
@@ -120,14 +135,46 @@ mod tests {
     }
 
     #[test]
-    fn repeats_are_ignored_and_shifted_pads_stop() {
+    fn repeats_are_ignored_and_unassigned_shifted_pads_stop() {
         let caps = KeyboardCapabilities {
             release_events: false,
         };
         assert_eq!(map_key(key('1', NONE, REPEAT), caps), None);
         assert_eq!(
-            map_key(key('1', SHIFT, PRESS), caps),
-            Some(InputAction::PadStop(0))
+            map_key(key('q', SHIFT, PRESS), caps),
+            Some(InputAction::PadStop(4))
+        );
+    }
+
+    #[test]
+    fn sp404_shift_pad_shortcuts_map_fixed_velocity_and_import() {
+        let caps = KeyboardCapabilities {
+            release_events: true,
+        };
+
+        assert_eq!(
+            map_key(key('!', SHIFT, PRESS), caps),
+            Some(InputAction::ToggleFixedVelocity)
+        );
+        assert_eq!(
+            map_key(key('X', SHIFT, PRESS), caps),
+            Some(InputAction::ImportSample)
+        );
+    }
+
+    #[test]
+    fn hold_button_has_press_and_release_actions_when_supported() {
+        let caps = KeyboardCapabilities {
+            release_events: true,
+        };
+
+        assert_eq!(
+            map_key(key('h', NONE, PRESS), caps),
+            Some(InputAction::HoldPress)
+        );
+        assert_eq!(
+            map_key(key('h', NONE, RELEASE), caps),
+            Some(InputAction::HoldRelease)
         );
     }
 
@@ -147,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_character_forms_map_to_the_same_explicit_stop() {
+    fn shifted_character_forms_map_to_the_same_shortcut_or_explicit_stop() {
         let caps = KeyboardCapabilities {
             release_events: false,
         };
@@ -157,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             map_key(key('!', SHIFT, PRESS), caps),
-            Some(InputAction::PadStop(0))
+            Some(InputAction::ToggleFixedVelocity)
         );
     }
 

@@ -38,6 +38,15 @@ Delivery slice 7 capture is implemented with automated cross-layer acceptance ev
 
 Press `Ctrl+S` to open the capture command menu, then press `I` for input recording, `R` for resampling, `S` to stop, or `C` to cancel. `Esc` closes the menu without running a command.
 
+SP-404-style performance shortcuts are available from the Perform view:
+
+- `1`–`4`, `Q`–`R`, `A`–`F`, and `Z`–`V` play pads 1–16; `[` and `]` select banks A–J.
+- Press an active one-shot pad again to stop it. Gate pads stop on key release.
+- Press `H` while holding one or more Gate pads, or hold `H` before pressing them, to keep them playing after release. Press a held pad again to stop it.
+- `Shift+1` toggles Fixed Velocity. When enabled, MIDI pad triggers use velocity 127.
+- `Shift+X` (pad 14) opens sample import for the selected pad. `L` remains an alias.
+- `Shift+Esc` stops every sample and the active pattern. `Space` starts or stops pattern playback.
+
 Record Input does not monitor the input, so captured input is never routed to the output during recording. Recording remains nonblocking for pads, pattern transport, and pattern edits; Enter stops, Escape reviews discard, and Stop All plus held-pad releases remain available through every capture dialog. One take is bounded to 8,388,608 stereo frames, so the displayed maximum duration is derived from the source rate: about 174.76 seconds at 48 kHz or 190.22 seconds at 44.1 kHz. A replacement enters rendered output only after exact worker finalization and audio admission. Save and recovery refuse an unresolved take. After commit, Save As or recovery autosave copies the deterministic WAV into the project's content-addressed `audio/` directory; a moved explicit project and a restarted recovery Restore use that project asset without requiring the runtime-managed temporary source. Quit and Open require an explicit Finalize, Discard, or Cancel choice.
 
 The automated suite uses the real audio engine/controller, input callback adapter, bounded worker, project store, and App workflow, but it does not open capture hardware or establish audibility. System input/output device selection and input monitoring remain deferred; offline pattern export is covered separately below. All macOS and Linux hardware/hearing rows remain unchecked in [`docs/manual-capture-checklist.md`](docs/manual-capture-checklist.md).

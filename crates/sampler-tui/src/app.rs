@@ -4704,6 +4704,10 @@ pub struct App {
     audio: Option<Box<dyn AudioPort>>,
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
+    one_shot_playing: [bool; PAD_VIEW_COUNT],
+    hold_latched: Box<[bool; PAD_VIEW_COUNT]>,
+    hold_button_down: bool,
+    fixed_velocity: bool,
     midi_settings: MidiSettings,
     midi_learn_target: Option<PadId>,
     midi_owned_pads: Box<[Option<MidiOwnedVoice>; MIDI_OWNERSHIP_COUNT]>,
@@ -4881,6 +4885,10 @@ impl App {
             audio,
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
+            one_shot_playing: [false; PAD_VIEW_COUNT],
+            hold_latched: Box::new([false; PAD_VIEW_COUNT]),
+            hold_button_down: false,
+            fixed_velocity: false,
             midi_settings: MidiSettings::default(),
             midi_learn_target: None,
             midi_owned_pads: Box::new([None; MIDI_OWNERSHIP_COUNT]),
@@ -5965,6 +5973,8 @@ impl App {
             self.status = error;
             return true;
         }
+        self.one_shot_playing[offset] = false;
+        self.hold_latched[offset] = false;
 
         let generation = self.capture_session.generation().expect("ready generation");
         self.retire_managed_capture_at(offset);
@@ -6109,6 +6119,8 @@ impl App {
             .as_mut()
             .ok_or_else(|| "audio device is unavailable".to_owned())?
             .remove_sample(pad)?;
+        self.one_shot_playing[offset] = false;
+        self.hold_latched[offset] = false;
         self.retire_managed_capture_at(offset);
         let settings = self.pads[offset].settings;
         self.pads[offset] = PadView {
@@ -6127,12 +6139,19 @@ impl App {
     }
 
     pub fn apply(&mut self, action: InputAction) {
-        if self.should_quit && !matches!(action, InputAction::StopAll | InputAction::PadRelease(_))
+        if self.should_quit
+            && !matches!(
+                action,
+                InputAction::StopAll | InputAction::PadRelease(_) | InputAction::HoldRelease
+            )
         {
             return;
         }
         if self.project_open_is_admitting()
-            && !matches!(action, InputAction::StopAll | InputAction::PadRelease(_))
+            && !matches!(
+                action,
+                InputAction::StopAll | InputAction::PadRelease(_) | InputAction::HoldRelease
+            )
         {
             return;
         }
@@ -6140,6 +6159,10 @@ impl App {
             InputAction::PadPress(index) => self.press_pad(index),
             InputAction::PadRelease(index) => self.release_pad(index),
             InputAction::PadStop(index) => self.stop_pad(index),
+            InputAction::ToggleFixedVelocity => self.toggle_fixed_velocity(),
+            InputAction::ImportSample => self.open_picker(),
+            InputAction::HoldPress => self.engage_hold(),
+            InputAction::HoldRelease => self.hold_button_down = false,
             InputAction::BankDelta(delta) => self.change_bank(delta),
             InputAction::StopAll => self.stop_all(),
             InputAction::Quit => self.begin_project_action(PendingProjectAction::Quit),
@@ -6612,7 +6635,11 @@ impl App {
                     self.report_audio_unavailable();
                     return;
                 };
-                let velocity = f32::from(velocity) / 127.0;
+                let velocity = if self.fixed_velocity {
+                    1.0
+                } else {
+                    f32::from(velocity) / 127.0
+                };
                 let result = audio.trigger_live_tracked(pad, velocity);
                 match result {
                     Ok(command) => {
@@ -6649,8 +6676,11 @@ impl App {
             self.cancel_midi_learn();
         }
         if self.should_quit {
-            if let Some(action @ (InputAction::StopAll | InputAction::PadRelease(_))) =
-                map_key(key, self.keyboard_capabilities)
+            if let Some(
+                action @ (InputAction::StopAll
+                | InputAction::PadRelease(_)
+                | InputAction::HoldRelease),
+            ) = map_key(key, self.keyboard_capabilities)
             {
                 self.apply(action);
             }
@@ -6671,12 +6701,27 @@ impl App {
         if let Some(action) = map_key(key, self.keyboard_capabilities) {
             let captures_pad_keys = self.blocking_pad_overlay();
             match action {
-                InputAction::Quit | InputAction::StopAll | InputAction::PadRelease(_) => {
+                InputAction::Quit
+                | InputAction::StopAll
+                | InputAction::PadRelease(_)
+                | InputAction::HoldRelease => {
                     self.apply(action);
                     return;
                 }
-                InputAction::PadPress(_) | InputAction::PadStop(_) if captures_pad_keys => {}
-                InputAction::PadPress(_) | InputAction::PadStop(_) => {
+                InputAction::PadPress(_)
+                | InputAction::PadStop(_)
+                | InputAction::ToggleFixedVelocity
+                | InputAction::ImportSample
+                | InputAction::HoldPress
+                    if captures_pad_keys => {}
+                InputAction::PadPress(index) => {
+                    self.press_pad_from_key(index);
+                    return;
+                }
+                InputAction::PadStop(_)
+                | InputAction::ToggleFixedVelocity
+                | InputAction::ImportSample
+                | InputAction::HoldPress => {
                     self.apply(action);
                     return;
                 }
@@ -6757,6 +6802,22 @@ impl App {
             return false;
         };
         held.bank() == self.active_bank && usize::from(held.index()) == index
+    }
+
+    pub fn is_pad_hold_latched(&self, pad: PadId) -> bool {
+        self.hold_latched[pad_offset(pad)]
+    }
+
+    pub fn is_active_pad_hold_latched(&self, index: usize) -> bool {
+        if index >= usize::from(PADS_PER_BANK) {
+            return false;
+        }
+        let offset = usize::from(u8::from(self.active_bank)) * usize::from(PADS_PER_BANK) + index;
+        self.hold_latched[offset]
+    }
+
+    pub fn fixed_velocity(&self) -> bool {
+        self.fixed_velocity
     }
 
     pub fn release_events_available(&self) -> bool {
@@ -7679,6 +7740,9 @@ impl App {
                                 candidate.progress.admitted_actions += 1;
                                 candidate.admission = ProjectAdmission::Master;
                                 self.held_pad_by_key.fill(None);
+                                self.one_shot_playing.fill(false);
+                                self.hold_latched.fill(false);
+                                self.hold_button_down = false;
                                 changed = true;
                             }
                             Err(error) => self.status = error,
@@ -7929,6 +7993,9 @@ impl App {
         self.selected_pad = 0;
         self.apply_sample_context = None;
         self.held_pad_by_key.fill(None);
+        self.one_shot_playing.fill(false);
+        self.hold_latched.fill(false);
+        self.hold_button_down = false;
         self.pending_pattern_transport = None;
         self.editor = SampleEditor::open_empty(PadId::first(), self.pads[0].settings);
         self.sync_editor_to_selected_pad();
@@ -8835,6 +8902,12 @@ impl App {
         }
         if self.pads[offset].sample.is_none() {
             self.pads[offset].settings = settings;
+            if settings.mode != PlaybackMode::OneShot {
+                self.one_shot_playing[offset] = false;
+            }
+            if settings.mode != PlaybackMode::Gate {
+                self.hold_latched[offset] = false;
+            }
             return Ok(());
         }
         if !self.current_session_bound[offset] || self.audio.is_none() {
@@ -8846,6 +8919,12 @@ impl App {
             .expect("current session binding requires an audio controller")
             .update_pad(pad, settings)?;
         self.pads[offset].settings = settings;
+        if settings.mode != PlaybackMode::OneShot {
+            self.one_shot_playing[offset] = false;
+        }
+        if settings.mode != PlaybackMode::Gate {
+            self.hold_latched[offset] = false;
+        }
         self.commit_project_mutation();
         Ok(())
     }
@@ -9348,6 +9427,9 @@ impl App {
         self.reinstall_pending.fill(false);
         self.current_session_bound.fill(false);
         self.held_pad_by_key.fill(None);
+        self.one_shot_playing.fill(false);
+        self.hold_latched.fill(false);
+        self.hold_button_down = false;
         self.midi_owned_pads.fill(None);
         for pad in &mut self.pads {
             pad.active = false;
@@ -10123,6 +10205,48 @@ impl App {
         self.trigger_pad(index, true);
     }
 
+    fn press_pad_from_key(&mut self, index: usize) {
+        let Some(pad) = self.pad_in_active_bank(index) else {
+            return;
+        };
+        let offset = pad_offset(pad);
+        if self.hold_latched[offset] {
+            self.stop_pad(index);
+            return;
+        }
+        if self.pads[offset].settings.mode == PlaybackMode::OneShot && self.one_shot_playing[offset]
+        {
+            self.stop_pad(index);
+            return;
+        }
+        self.press_pad(index);
+    }
+
+    fn toggle_fixed_velocity(&mut self) {
+        self.fixed_velocity = !self.fixed_velocity;
+        self.status = format!(
+            "FIXED VELOCITY {}",
+            if self.fixed_velocity { "ON" } else { "OFF" }
+        );
+    }
+
+    fn engage_hold(&mut self) {
+        self.hold_button_down = self.keyboard_capabilities.release_events;
+        let mut latched = 0usize;
+        for pad in self.held_pad_by_key.iter().flatten().copied() {
+            let offset = pad_offset(pad);
+            if self.pads[offset].settings.mode == PlaybackMode::Gate {
+                self.hold_latched[offset] = true;
+                latched = latched.saturating_add(1);
+            }
+        }
+        self.status = if latched == 0 {
+            "HOLD: press a Gate pad".to_owned()
+        } else {
+            format!("HOLD: {latched} Gate pad(s) latched")
+        };
+    }
+
     fn trigger_pad(&mut self, index: usize, track_physical_hold: bool) {
         if self.held_pad_by_key.get(index).is_some_and(Option::is_some) {
             return;
@@ -10140,7 +10264,9 @@ impl App {
             return;
         };
         let recording = self.patterns.is_recording();
-        let records_duration = self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot;
+        let offset = pad_offset(pad);
+        let mode = self.pads[offset].settings.mode;
+        let records_duration = mode != PlaybackMode::OneShot;
         let result = if recording {
             audio.trigger_live_tracked(pad, 1.0).map(Some)
         } else {
@@ -10150,8 +10276,14 @@ impl App {
             Ok(command)
                 if track_physical_hold
                     && (self.keyboard_capabilities.release_events
-                        || self.pads[pad_offset(pad)].settings.mode != PlaybackMode::OneShot) =>
+                        || mode != PlaybackMode::OneShot) =>
             {
+                if mode == PlaybackMode::OneShot {
+                    self.one_shot_playing[offset] = true;
+                }
+                if self.hold_button_down && mode == PlaybackMode::Gate {
+                    self.hold_latched[offset] = true;
+                }
                 self.held_pad_by_key[index] = Some(pad);
                 if let Some(command) = command {
                     self.patterns.note_live_trigger_with_duration(
@@ -10164,6 +10296,12 @@ impl App {
                 }
             }
             Ok(command) => {
+                if track_physical_hold && mode == PlaybackMode::OneShot {
+                    self.one_shot_playing[offset] = true;
+                }
+                if track_physical_hold && self.hold_button_down && mode == PlaybackMode::Gate {
+                    self.hold_latched[offset] = true;
+                }
                 if let Some(command) = command {
                     self.patterns.note_live_trigger_with_duration(
                         index,
@@ -10730,7 +10868,9 @@ impl App {
                 KeyCode::Right => self.move_selection(1, 0),
                 KeyCode::Up => self.move_selection(0, -1),
                 KeyCode::Down => self.move_selection(0, 1),
-                KeyCode::Enter => self.trigger_pad(self.selected_pad, false),
+                KeyCode::Enter => {
+                    self.trigger_pad(self.selected_pad, false);
+                }
                 _ => {
                     if let Some(action) = map_key(key, self.keyboard_capabilities) {
                         self.apply(action);
@@ -11447,6 +11587,12 @@ impl App {
         let Some(pad) = self.held_pad_by_key[index] else {
             return;
         };
+        if self.hold_latched[pad_offset(pad)]
+            && self.pads[pad_offset(pad)].settings.mode == PlaybackMode::Gate
+        {
+            self.held_pad_by_key[index] = None;
+            return;
+        }
         if self.pads[pad_offset(pad)].settings.mode == PlaybackMode::OneShot
             && self.patterns.is_recording()
         {
@@ -11509,10 +11655,13 @@ impl App {
             return;
         };
         match audio.stop_pad(pad) {
-            Ok(()) if self.held_pad_by_key[index] == Some(pad) => {
-                self.held_pad_by_key[index] = None;
+            Ok(()) => {
+                self.one_shot_playing[pad_offset(pad)] = false;
+                self.hold_latched[pad_offset(pad)] = false;
+                if self.held_pad_by_key[index] == Some(pad) {
+                    self.held_pad_by_key[index] = None;
+                }
             }
-            Ok(()) => {}
             Err(error) => self.status = error,
         }
     }
@@ -11525,6 +11674,9 @@ impl App {
         match audio.stop_all() {
             Ok(()) => {
                 self.held_pad_by_key.fill(None);
+                self.one_shot_playing.fill(false);
+                self.hold_latched.fill(false);
+                self.hold_button_down = false;
                 self.midi_owned_pads.fill(None);
                 self.patterns.stop_recording();
                 self.note_pattern_transport_intent(false);
@@ -11601,7 +11753,16 @@ impl App {
             let bank = BankId::new(bank).expect("bounded bank is valid");
             for index in 0..PADS_PER_BANK {
                 let pad = PadId::new(bank, index).expect("bounded pad is valid");
-                self.pads[pad_offset(pad)].active = telemetry.is_pad_active(pad);
+                let offset = pad_offset(pad);
+                let was_active = self.pads[offset].active;
+                let is_active = telemetry.is_pad_active(pad);
+                if self.one_shot_playing[offset] && was_active && !is_active {
+                    self.one_shot_playing[offset] = false;
+                }
+                if self.hold_latched[offset] && was_active && !is_active {
+                    self.hold_latched[offset] = false;
+                }
+                self.pads[offset].active = is_active;
             }
         }
         changed
@@ -11634,6 +11795,9 @@ impl App {
         self.audio_unavailable_message = Some(error.clone());
         self.export_status_focused = false;
         self.held_pad_by_key.fill(None);
+        self.one_shot_playing.fill(false);
+        self.hold_latched.fill(false);
+        self.hold_button_down = false;
         self.cancel_midi_learn();
         self.midi_owned_pads.fill(None);
         self.patterns.stop_recording();
@@ -11694,6 +11858,9 @@ impl App {
         self.audio_format = Some((sample_rate, channels));
         self.audio_unavailable_message = None;
         self.held_pad_by_key.fill(None);
+        self.one_shot_playing.fill(false);
+        self.hold_latched.fill(false);
+        self.hold_button_down = false;
         self.dismiss_overlay(ExportPresentationDismissal::Defer);
         self.committed_recovery_loads.fill_with(|| None);
         self.reinstall_pending.fill(false);
@@ -12016,6 +12183,8 @@ impl App {
             self.refresh_editor_for_offset(offset);
             return;
         }
+        self.one_shot_playing[offset] = false;
+        self.hold_latched[offset] = false;
 
         if kind == PendingLoadKind::User {
             self.retire_managed_capture_at(offset);
@@ -14612,24 +14781,223 @@ mod tests {
     }
 
     #[test]
-    fn fallback_one_shot_press_rearms_without_a_release_event() {
+    fn one_shot_key_press_toggles_without_release_event_support() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
         let mut app = App::with_audio(Box::new(fake));
         app.pads[0].settings =
             PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        let press =
+            || KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, KeyEventKind::Press);
 
-        app.apply(InputAction::PadPress(0));
-        app.apply(InputAction::PadPress(0));
+        app.apply_key(press());
+        app.apply_key(press());
+        app.apply_key(press());
 
         assert_eq!(
             calls.snapshot(),
             [
                 AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopPad(pad(0, 0)),
                 AudioCall::Trigger(pad(0, 0), 64, 1.0),
             ]
         );
         assert!(!app.is_pad_held(0));
+    }
+
+    #[test]
+    fn one_shot_key_press_toggles_play_stop_play() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.pads[0].settings =
+            PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        let press =
+            || KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, KeyEventKind::Press);
+        let release = || {
+            KeyEvent::new_with_kind(
+                KeyCode::Char('1'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        };
+
+        app.apply_key(press());
+        app.apply_key(release());
+        app.apply_key(press());
+        app.apply_key(release());
+        app.apply_key(press());
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+                AudioCall::StopPad(pad(0, 0)),
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn naturally_finished_one_shot_plays_on_the_next_press() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.pads[0].settings =
+            PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        let press =
+            || KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, KeyEventKind::Press);
+        let release = || {
+            KeyEvent::new_with_kind(
+                KeyCode::Char('1'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        };
+
+        app.apply_key(press());
+        app.apply_key(release());
+        let mut active = transport_telemetry(1, false);
+        active.active_pads[0] = 1;
+        app.apply_telemetry(active);
+        app.apply_telemetry(transport_telemetry(2, false));
+        calls.clear();
+
+        app.apply_key(press());
+
+        assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 0), 64, 1.0)]);
+    }
+
+    #[test]
+    fn sp404_fixed_velocity_shortcut_forces_midi_velocity_to_127() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        let shortcut =
+            KeyEvent::new_with_kind(KeyCode::Char('!'), KeyModifiers::SHIFT, KeyEventKind::Press);
+
+        app.apply_key(shortcut);
+        app.apply_midi_event(midi_on(1, 36, 32));
+
+        assert!(app.fixed_velocity());
+        assert_eq!(
+            calls.snapshot(),
+            [AudioCall::TrackedTrigger(pad(0, 0), 1.0)]
+        );
+
+        app.apply_key(shortcut);
+        assert!(!app.fixed_velocity());
+    }
+
+    #[test]
+    fn sp404_hold_latches_a_gate_pad_after_the_key_is_released() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.pads[0].settings = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Char('1'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Char('1'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+
+        assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 0), 64, 1.0)]);
+        assert!(app.is_pad_hold_latched(pad(0, 0)));
+        assert!(!app.is_pad_held(0));
+
+        app.apply(InputAction::PadStop(0));
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopPad(pad(0, 0)),
+            ]
+        );
+        assert!(!app.is_pad_hold_latched(pad(0, 0)));
+    }
+
+    #[test]
+    fn sp404_hold_then_gate_pad_latches_and_same_pad_stops() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.set_keyboard_capabilities(crate::KeyboardCapabilities {
+            release_events: true,
+        });
+        app.pads[0].settings = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+        let key = |character, kind| {
+            KeyEvent::new_with_kind(KeyCode::Char(character), KeyModifiers::NONE, kind)
+        };
+
+        app.apply_key(key('h', KeyEventKind::Press));
+        app.apply_key(key('1', KeyEventKind::Press));
+        app.apply_key(key('1', KeyEventKind::Release));
+        app.apply_key(key('h', KeyEventKind::Release));
+        app.apply_key(key('1', KeyEventKind::Press));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::StopPad(pad(0, 0)),
+            ]
+        );
+        assert!(!app.is_pad_hold_latched(pad(0, 0)));
+    }
+
+    #[test]
+    fn hold_is_not_sticky_when_terminal_has_no_release_events() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.pads[0].settings = PadSettings::new(PlaybackMode::Gate, 0.0, 0.0, 0.0, None).unwrap();
+
+        app.apply_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.apply_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        app.apply(InputAction::PadRelease(0));
+
+        assert_eq!(
+            calls.snapshot(),
+            [
+                AudioCall::Trigger(pad(0, 0), 64, 1.0),
+                AudioCall::Release(pad(0, 0), 64),
+            ]
+        );
+        assert!(!app.is_pad_hold_latched(pad(0, 0)));
+    }
+
+    #[test]
+    fn sp404_shift_pad_14_opens_sample_import() {
+        let mut app = App::with_audio(Box::new(FakeAudio::ready(48_000, 2)));
+
+        app.apply_key(KeyEvent::new_with_kind(
+            KeyCode::Char('X'),
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(app.overlay(), Some(&super::Overlay::FilePicker));
     }
 
     #[test]
@@ -15370,7 +15738,7 @@ mod tests {
             calls.snapshot(),
             [
                 AudioCall::Trigger(pad(0, 4), 64, 1.0),
-                AudioCall::Trigger(pad(0, 4), 64, 1.0),
+                AudioCall::StopPad(pad(0, 4)),
             ]
         );
     }

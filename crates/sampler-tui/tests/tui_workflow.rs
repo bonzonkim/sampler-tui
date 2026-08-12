@@ -718,6 +718,7 @@ fn telemetry_with_peaks(
 ) -> Telemetry {
     Telemetry {
         active_pads: [0; 3],
+        pad_trigger_counts: [0; 160],
         rendered_frame,
         last_triggered_frame: None,
         peak_left,

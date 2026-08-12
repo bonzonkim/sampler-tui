@@ -1898,6 +1898,7 @@ mod tests {
     fn pattern_playhead_and_cursor_are_distinct_fixed_width_cells() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 0,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -1936,6 +1937,7 @@ mod tests {
     fn perform_view_summarizes_the_playing_pattern_bar() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 96_000,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -1971,6 +1973,7 @@ mod tests {
     fn pending_slot_switch_keeps_the_perform_summary_on_the_live_generation() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 0,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -2041,6 +2044,7 @@ mod tests {
     fn pattern_view_labels_a_pending_slot_switch_without_borrowing_the_live_playhead() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 0,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -2078,6 +2082,7 @@ mod tests {
     fn stale_edit_generation_keeps_the_live_play_state_but_omits_a_fabricated_bar() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 0,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -2116,6 +2121,7 @@ mod tests {
     fn logical_transport_bar_boundary_keeps_pgdn_cursor_toggle_and_summary_together() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 573_134,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -2904,6 +2910,7 @@ mod tests {
     fn tick_clamps_non_finite_meters_and_render_uses_cached_counters() {
         let telemetry = Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 512,
             last_triggered_frame: Some(500),
             peak_left: f32::NAN,
@@ -2959,6 +2966,7 @@ mod tests {
     fn active_and_held_are_independent_pad_states() {
         let telemetry = Telemetry {
             active_pads: [1, 0, 0],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 64,
             last_triggered_frame: Some(0),
             peak_left: 0.0,

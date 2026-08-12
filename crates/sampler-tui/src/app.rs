@@ -4705,6 +4705,7 @@ pub struct App {
     audio_format: Option<(u32, u16)>,
     held_pad_by_key: [Option<PadId>; PADS_PER_BANK as usize],
     one_shot_playing: [bool; PAD_VIEW_COUNT],
+    one_shot_trigger_counts: Box<[u8; PAD_VIEW_COUNT]>,
     hold_latched: Box<[bool; PAD_VIEW_COUNT]>,
     hold_button_down: bool,
     fixed_velocity: bool,
@@ -4735,7 +4736,7 @@ pub struct App {
     keyboard_capabilities: KeyboardCapabilities,
     status: String,
     audio_unavailable_message: Option<String>,
-    telemetry: Telemetry,
+    telemetry: Box<Telemetry>,
     meter_left: f32,
     meter_right: f32,
     recorded_ack_count: usize,
@@ -4886,6 +4887,7 @@ impl App {
             audio_format,
             held_pad_by_key: [None; PADS_PER_BANK as usize],
             one_shot_playing: [false; PAD_VIEW_COUNT],
+            one_shot_trigger_counts: Box::new([0; PAD_VIEW_COUNT]),
             hold_latched: Box::new([false; PAD_VIEW_COUNT]),
             hold_button_down: false,
             fixed_velocity: false,
@@ -4924,8 +4926,9 @@ impl App {
             keyboard_capabilities: KeyboardCapabilities::default(),
             status: audio_error.clone().unwrap_or_default(),
             audio_unavailable_message: audio_error,
-            telemetry: Telemetry {
+            telemetry: Box::new(Telemetry {
                 active_pads: [0; 3],
+                pad_trigger_counts: [0; PAD_VIEW_COUNT],
                 rendered_frame: 0,
                 last_triggered_frame: None,
                 peak_left: 0.0,
@@ -4943,7 +4946,7 @@ impl App {
                 pattern_loop_count: 0,
                 pattern_overflows: 0,
                 live_ack_overflows: 0,
-            },
+            }),
             meter_left: 0.0,
             meter_right: 0.0,
             recorded_ack_count: 0,
@@ -6825,7 +6828,7 @@ impl App {
     }
 
     pub fn telemetry(&self) -> Telemetry {
-        self.telemetry
+        *self.telemetry
     }
 
     pub fn patterns(&self) -> &PatternWorkspace {
@@ -7866,7 +7869,7 @@ impl App {
                         }
                         ProjectAdmission::Patterns(submitted) => {
                             let maintenance =
-                                candidate.patterns.maintain(audio.as_mut(), self.telemetry);
+                                candidate.patterns.maintain(audio.as_mut(), *self.telemetry);
                             if maintenance.submitted_slot.is_some() {
                                 let next = submitted + 1;
                                 candidate.progress.admitted_actions += 1;
@@ -8631,7 +8634,7 @@ impl App {
                     .expect("audio remains present after a successful poll");
                 self.patterns.maintain_with_recording_budget(
                     audio.as_mut(),
-                    self.telemetry,
+                    *self.telemetry,
                     recording_mutation_budget,
                 )
             };
@@ -10280,6 +10283,7 @@ impl App {
             {
                 if mode == PlaybackMode::OneShot {
                     self.one_shot_playing[offset] = true;
+                    self.one_shot_trigger_counts[offset] = self.telemetry.pad_trigger_count(pad);
                 }
                 if self.hold_button_down && mode == PlaybackMode::Gate {
                     self.hold_latched[offset] = true;
@@ -10298,6 +10302,7 @@ impl App {
             Ok(command) => {
                 if track_physical_hold && mode == PlaybackMode::OneShot {
                     self.one_shot_playing[offset] = true;
+                    self.one_shot_trigger_counts[offset] = self.telemetry.pad_trigger_count(pad);
                 }
                 if track_physical_hold && self.hold_button_down && mode == PlaybackMode::Gate {
                     self.hold_latched[offset] = true;
@@ -11739,7 +11744,7 @@ impl App {
     }
 
     fn apply_telemetry(&mut self, telemetry: Telemetry) -> bool {
-        let changed = self.telemetry != telemetry;
+        let changed = *self.telemetry != telemetry;
         if self
             .pending_pattern_transport
             .is_some_and(|intent| telemetry.pattern_playing == intent.playing)
@@ -11748,7 +11753,7 @@ impl App {
         }
         self.meter_left = self.meter_left.max(sanitize_peak(telemetry.peak_left));
         self.meter_right = self.meter_right.max(sanitize_peak(telemetry.peak_right));
-        self.telemetry = telemetry;
+        *self.telemetry = telemetry;
         for bank in 0..BANK_COUNT {
             let bank = BankId::new(bank).expect("bounded bank is valid");
             for index in 0..PADS_PER_BANK {
@@ -11756,7 +11761,12 @@ impl App {
                 let offset = pad_offset(pad);
                 let was_active = self.pads[offset].active;
                 let is_active = telemetry.is_pad_active(pad);
-                if self.one_shot_playing[offset] && was_active && !is_active {
+                let trigger_was_admitted =
+                    telemetry.pad_trigger_count(pad) != self.one_shot_trigger_counts[offset];
+                if self.one_shot_playing[offset]
+                    && !is_active
+                    && (was_active || trigger_was_admitted)
+                {
                     self.one_shot_playing[offset] = false;
                 }
                 if self.hold_latched[offset] && was_active && !is_active {
@@ -14876,6 +14886,47 @@ mod tests {
     }
 
     #[test]
+    fn short_one_shot_that_finishes_between_telemetry_updates_plays_again() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.pads[0].settings =
+            PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        let press =
+            || KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, KeyEventKind::Press);
+
+        app.apply_key(press());
+        let mut completed = transport_telemetry(2, false);
+        completed.last_triggered_frame = Some(1);
+        completed.pad_trigger_counts[0] = 1;
+        app.apply_telemetry(completed);
+        calls.clear();
+
+        app.apply_key(press());
+
+        assert_eq!(calls.snapshot(), [AudioCall::Trigger(pad(0, 0), 64, 1.0)]);
+    }
+
+    #[test]
+    fn stale_inactive_telemetry_before_trigger_admission_keeps_toggle_stop() {
+        let fake = FakeAudio::ready(48_000, 2);
+        let calls = fake.call_log();
+        let mut app = App::with_audio(Box::new(fake));
+        app.pads[0].settings =
+            PadSettings::new(PlaybackMode::OneShot, 0.0, 0.0, 0.0, None).unwrap();
+        let press =
+            || KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, KeyEventKind::Press);
+
+        app.apply_key(press());
+        app.apply_telemetry(transport_telemetry(1, false));
+        calls.clear();
+
+        app.apply_key(press());
+
+        assert_eq!(calls.snapshot(), [AudioCall::StopPad(pad(0, 0))]);
+    }
+
+    #[test]
     fn sp404_fixed_velocity_shortcut_forces_midi_velocity_to_127() {
         let fake = FakeAudio::ready(48_000, 2);
         let calls = fake.call_log();
@@ -15255,6 +15306,7 @@ mod tests {
     fn transport_telemetry(rendered_frame: Frame, playing: bool) -> Telemetry {
         Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; super::PAD_VIEW_COUNT],
             rendered_frame,
             last_triggered_frame: None,
             peak_left: 0.0,

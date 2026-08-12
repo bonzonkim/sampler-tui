@@ -658,6 +658,7 @@ mod tests {
     fn telemetry(peak_left: f32, peak_right: f32) -> Telemetry {
         Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 64,
             last_triggered_frame: None,
             peak_left,

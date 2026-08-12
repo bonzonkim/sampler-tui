@@ -798,6 +798,7 @@ mod tests {
         let other = PadId::new(sampler_core::BankId::new(1).unwrap(), 0).unwrap();
         let telemetry = Telemetry {
             active_pads: [1, 0, 1 << 31],
+            pad_trigger_counts: [0; 160],
             rendered_frame: 0,
             last_triggered_frame: None,
             peak_left: 0.0,
@@ -1140,6 +1141,7 @@ pub enum CriticalEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Telemetry {
     pub active_pads: [u64; 3],
+    pub pad_trigger_counts: [u8; 160],
     pub rendered_frame: Frame,
     pub last_triggered_frame: Option<Frame>,
     pub peak_left: f32,
@@ -1167,6 +1169,11 @@ impl Telemetry {
         self.active_pads
             .get(word)
             .is_some_and(|value| value & (1u64 << bit) != 0)
+    }
+
+    pub fn pad_trigger_count(self, pad: PadId) -> u8 {
+        let index = usize::from(u8::from(pad.bank())) * 16 + usize::from(pad.index());
+        self.pad_trigger_counts[index]
     }
 }
 

@@ -1864,6 +1864,7 @@ mod tests {
     fn telemetry(rendered_frame: u64) -> Telemetry {
         Telemetry {
             active_pads: [0; 3],
+            pad_trigger_counts: [0; 160],
             rendered_frame,
             last_triggered_frame: None,
             peak_left: 0.0,

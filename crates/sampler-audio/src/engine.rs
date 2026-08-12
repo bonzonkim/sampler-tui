@@ -808,6 +808,7 @@ pub struct AudioEngine {
     pattern_player: PatternPlayer,
     rendered_frame: Frame,
     last_triggered_frame: Option<Frame>,
+    pad_trigger_counts: [u8; PAD_COUNT],
     late_commands: u64,
     invalid_commands: u64,
     executed_triggers: u64,
@@ -869,6 +870,7 @@ impl AudioEngine {
             pattern_player: PatternPlayer::new(),
             rendered_frame: 0,
             last_triggered_frame: None,
+            pad_trigger_counts: [0; PAD_COUNT],
             late_commands: 0,
             invalid_commands: 0,
             executed_triggers: 0,
@@ -1835,6 +1837,8 @@ impl AudioEngine {
             pattern_voice,
             live_trigger,
         });
+        let index = pad_index(pad);
+        self.pad_trigger_counts[index] = self.pad_trigger_counts[index].wrapping_add(1);
         true
     }
 
@@ -2033,6 +2037,7 @@ impl AudioEngine {
         };
         let telemetry = Telemetry {
             active_pads: self.active_pad_bits(),
+            pad_trigger_counts: self.pad_trigger_counts,
             rendered_frame: self.rendered_frame,
             last_triggered_frame: self.last_triggered_frame,
             peak_left: self.telemetry_peak_left,
@@ -5186,6 +5191,7 @@ mod tests {
         let telemetry = controller.latest_telemetry().unwrap();
         assert_eq!(telemetry.rendered_frame, 3_200);
         assert_eq!(telemetry.last_triggered_frame, Some(1_600));
+        assert_eq!(telemetry.pad_trigger_count(PadId::first()), 1);
         assert_eq!(telemetry.active_voices, 0);
     }
 

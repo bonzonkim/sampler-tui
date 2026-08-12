@@ -5663,6 +5663,19 @@ impl App {
                         }
                         Err(_) => false,
                     }
+                } else if completion.source == CaptureSource::Input && completion.peak == 0.0 {
+                    match self.capture_session.accept_completion(completion) {
+                        Ok(()) => {
+                            let message = CaptureError::NoInputSignal.to_string();
+                            let _ = self.capture_session.mark_failed(message.clone());
+                            self.status = message;
+                            self.overlay = Some(Overlay::CaptureFailed {
+                                action: self.pending_capture_project_action(),
+                            });
+                            true
+                        }
+                        Err(_) => false,
+                    }
                 } else if self.capture_session.accept_completion(completion).is_ok() {
                     let completion = self
                         .capture_session

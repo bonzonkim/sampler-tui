@@ -984,6 +984,93 @@ fn input_44100_autosave_restart_restore_preserves_duration_and_exact_wav_digest(
 }
 
 #[test]
+fn input_capture_plays_immediately_from_pad_key_after_install() {
+    let mut harness = Harness::new();
+    let input = (0..4_410)
+        .flat_map(|frame| {
+            let sample = (frame as f32 * 0.01).sin() * 0.5;
+            [sample, sample]
+        })
+        .collect::<Vec<_>>();
+
+    harness
+        .app
+        .request_capture_with_frame_limit(CaptureSource::Input, 8_000)
+        .unwrap();
+    harness.poll_input_capture_commands();
+    assert_eq!(
+        write_input_device(&mut harness.input_core.borrow_mut(), 2, &input).unwrap(),
+        input.len() / 2
+    );
+    harness.app.stop_capture().unwrap();
+    write_input_device::<f32>(&mut harness.input_core.borrow_mut(), 2, &[]).unwrap();
+    assert!(harness.app.maintain_capture());
+    harness.finish_capture();
+    harness.app.maintain_audio();
+
+    let triggers = harness.engine.executed_triggers();
+    harness.app.apply_key(press(KeyCode::Char('1')));
+    let mut peak = 0.0_f32;
+    harness.engine.render_frames(4_800, |frame| {
+        peak = peak.max(frame[0].abs()).max(frame[1].abs());
+    });
+
+    assert!(harness.engine.executed_triggers() > triggers);
+    assert!(
+        peak > 1.0e-4,
+        "captured pad must render nonzero audio: {peak}"
+    );
+}
+
+#[test]
+fn silent_input_capture_is_rejected_before_install() {
+    let fixture = FixtureTree::new();
+    let original_wav = fixture.write_constant_wav("original.wav", 0.25);
+    let mut harness = Harness::new();
+    harness.load(pad(0), &original_wav);
+    let original_pcm = harness
+        .app
+        .pad(pad(0))
+        .sample
+        .as_ref()
+        .unwrap()
+        .data()
+        .to_vec();
+    let original_revision = harness.app.project_revision();
+    let original_installs = harness.probe.install_counts();
+    let silent_input = vec![0.0_f32; 64];
+
+    harness
+        .app
+        .request_capture_with_frame_limit(CaptureSource::Input, 64)
+        .unwrap();
+    harness.app.confirm_capture().unwrap();
+    harness.poll_input_capture_commands();
+    assert_eq!(
+        write_input_device(&mut harness.input_core.borrow_mut(), 2, &silent_input).unwrap(),
+        silent_input.len() / 2
+    );
+    harness.app.stop_capture().unwrap();
+    write_input_device::<f32>(&mut harness.input_core.borrow_mut(), 2, &[]).unwrap();
+    assert!(harness.app.maintain_capture());
+
+    assert_eq!(
+        harness.app.capture_session().phase(),
+        Some(CapturePhase::Failed)
+    );
+    assert_eq!(
+        harness.app.status(),
+        "input capture contains no signal; check the microphone or input device"
+    );
+    assert_eq!(
+        harness.app.pad(pad(0)).sample.as_ref().unwrap().data(),
+        original_pcm
+    );
+    assert_eq!(harness.probe.install_counts(), original_installs);
+    assert_eq!(harness.app.project_revision(), original_revision);
+}
+
+#[test]
 fn cancellation_empty_limit_worker_staleness_and_save_refusal_preserve_transaction_truth() {
     let target = pad(0);
 

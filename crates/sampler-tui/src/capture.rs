@@ -74,6 +74,7 @@ pub enum CaptureError {
     ProjectOperationPending,
     AudioUnavailable,
     EmptyCapture,
+    NoInputSignal,
     ProjectRevisionExhausted,
 }
 
@@ -146,6 +147,9 @@ impl fmt::Display for CaptureError {
             Self::ProjectOperationPending => formatter.write_str("a project operation is pending"),
             Self::AudioUnavailable => formatter.write_str("audio device is unavailable"),
             Self::EmptyCapture => formatter.write_str("capture contains no frames"),
+            Self::NoInputSignal => formatter.write_str(
+                "input capture contains no signal; check the microphone or input device",
+            ),
             Self::ProjectRevisionExhausted => formatter.write_str("project revision is exhausted"),
         }
     }

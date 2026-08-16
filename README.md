@@ -8,25 +8,48 @@ Both guides cover installation, pad performance, recording, patterns, sample edi
 
 The application currently targets macOS and Linux and requires a terminal of at least 80×24 cells.
 
-## Quick start
+## Install
 
-Rust 1.95.0 is selected by `rust-toolchain.toml`.
+Install a prebuilt release with Homebrew:
 
 ```sh
-cargo run -p sampler-tui
+brew install bonzonkim/tap/sampler-tui
+```
+
+Or use the platform-detecting installer on macOS or x86-64 Linux. This does not require Rust:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-installer.sh | sh
+```
+
+Manual archives for Apple Silicon macOS, Intel macOS, and x86-64 Linux are available from the [latest release](https://github.com/bonzonkim/sampler-tui/releases/latest).
+
+Run the installed application:
+
+```sh
+sampler-tui
 ```
 
 Other launch modes:
 
 ```sh
 # Open a saved project in the TUI
-cargo run -p sampler-tui -- open path/to/project
+sampler-tui open path/to/project
 
 # Decode and play one sample as a diagnostic
-cargo run -p sampler-tui -- play path/to/sample.wav
+sampler-tui play path/to/sample.wav
 
 # Render one pattern loop without opening audio or terminal devices
-cargo run -p sampler-tui -- export path/to/project 1 path/to/output.wav
+sampler-tui export path/to/project 1 path/to/output.wav
+```
+
+### Build from source
+
+Rust 1.95.0 is selected by `rust-toolchain.toml`.
+
+```sh
+cargo run -p sampler-tui
 ```
 
 Press `?` in the application for contextual help. Press `:` to enter a command.
@@ -156,6 +179,18 @@ cargo build --workspace --release
 ```
 
 The automated suite covers the real application, worker, controller, engine, persistence, MIDI, and export paths with hermetic audio callbacks. Physical hardware behavior, human-perceived latency, and audibility still require testing on each target machine.
+
+## Releases
+
+[`cargo-dist`](https://axodotdev.github.io/cargo-dist/) defines the release pipeline in `dist-workspace.toml`. A version tag such as `v0.1.0` builds Apple Silicon macOS, Intel macOS, and x86-64 Linux archives, generates SHA-256 checksums and a shell installer, publishes a GitHub Release, and updates `bonzonkim/homebrew-tap`.
+
+The repository must have a `HOMEBREW_TAP_TOKEN` Actions secret with write access to the tap repository. After updating the package version and confirming the generated plan, publish a release with:
+
+```sh
+dist plan --tag=v0.1.0
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Documentation site
 

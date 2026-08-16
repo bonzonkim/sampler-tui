@@ -129,20 +129,46 @@
             <span class="section-number">01</span>
             <div><p class="eyebrow">Quick start</p><h2>설치와 실행</h2></div>
           </div>
-          <p class="section-intro">Rust 1.95.0이 필요합니다. 저장소를 받은 뒤 워크스페이스 루트에서 실행하세요.</p>
+          <p class="section-intro">Rust나 개발 도구 없이 미리 빌드된 릴리스를 설치할 수 있습니다. 자동 설치기, Homebrew 또는 운영체제별 압축 파일을 사용하세요.</p>
+          <div class="download-grid" id="install-downloads" aria-label="운영체제별 직접 다운로드">
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-aarch64-apple-darwin.tar.xz" data-release-target="aarch64-apple-darwin">
+              <span>macOS</span><strong>Apple Silicon</strong><small>.tar.xz 다운로드</small>
+            </a>
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-x86_64-apple-darwin.tar.xz" data-release-target="x86_64-apple-darwin">
+              <span>macOS</span><strong>Intel</strong><small>.tar.xz 다운로드</small>
+            </a>
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-x86_64-unknown-linux-gnu.tar.xz" data-release-target="x86_64-unknown-linux-gnu">
+              <span>Linux</span><strong>x86-64</strong><small>.tar.xz 다운로드</small>
+            </a>
+          </div>
+          <h3>자동 설치기</h3>
           <div class="code-block">
-            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">복사</button></div>
-            <pre><code><span class="prompt">$</span> cargo run -p sampler-tui</code></pre>
+            <div class="code-head"><span>macOS · Linux</span><button class="copy-button" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-installer.sh | sh">복사</button></div>
+            <pre><code><span class="prompt">$</span> curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-installer.sh | sh</code></pre>
           </div>
           <div class="callout info">
             <span class="callout-icon">i</span>
-            <div><strong>먼저 이것만 기억하세요</strong><p><kbd>?</kbd>는 현재 화면 도움말, <kbd>:</kbd>는 명령어 입력, <kbd>Tab</kbd>은 작업 화면 전환입니다.</p></div>
+            <div><strong>Rust 설치가 필요 없습니다</strong><p>설치기가 Apple Silicon, Intel macOS 또는 x86-64 Linux를 감지해 알맞은 바이너리를 내려받고 실행 경로를 셸에 추가합니다.</p></div>
+          </div>
+          <h3>Homebrew</h3>
+          <div class="code-block">
+            <div class="code-head"><span>macOS · Linux</span><button class="copy-button" type="button" data-copy="brew install bonzonkim/tap/sampler-tui">복사</button></div>
+            <pre><code><span class="prompt">$</span> brew install bonzonkim/tap/sampler-tui</code></pre>
+          </div>
+          <h3>sampler-tui 실행</h3>
+          <div class="code-block">
+            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="sampler-tui">복사</button></div>
+            <pre><code><span class="prompt">$</span> sampler-tui</code></pre>
           </div>
           <h3>다른 실행 모드</h3>
           <div class="command-list">
-            <div><code>cargo run -p sampler-tui -- open path/to/project</code><span>저장한 프로젝트를 바로 열기</span></div>
-            <div><code>cargo run -p sampler-tui -- play path/to/sample.wav</code><span>샘플 디코딩과 출력을 진단</span></div>
-            <div><code>cargo run -p sampler-tui -- export path/to/project 1 output.wav</code><span>화면 없이 패턴 1을 WAV로 렌더링</span></div>
+            <div><code>sampler-tui open path/to/project</code><span>저장한 프로젝트를 바로 열기</span></div>
+            <div><code>sampler-tui play path/to/sample.wav</code><span>샘플 디코딩과 출력을 진단</span></div>
+            <div><code>sampler-tui export path/to/project 1 output.wav</code><span>화면 없이 패턴 1을 WAV로 렌더링</span></div>
+          </div>
+          <div class="callout">
+            <span class="callout-icon">&lt;/&gt;</span>
+            <div><strong>소스에서 빌드하기</strong><p>개발자는 저장소를 복제한 뒤 Rust 1.95.0으로 <code>cargo run -p sampler-tui</code>을 실행할 수 있습니다.</p></div>
           </div>
         </section>
 
@@ -341,7 +367,7 @@
         <section class="closing-panel">
           <p class="eyebrow">Ready when you are</p>
           <h2>첫 소리를<br>패드에 담아보세요.</h2>
-          <div class="closing-command"><code>cargo run -p sampler-tui</code><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">복사</button></div>
+          <div class="closing-command"><code>sampler-tui</code><button class="copy-button" type="button" data-copy="sampler-tui">복사</button></div>
           <a href="#record">녹음 가이드로 이동 <span aria-hidden="true">→</span></a>
         </section>
 

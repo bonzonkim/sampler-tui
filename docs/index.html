@@ -129,20 +129,46 @@
             <span class="section-number">01</span>
             <div><p class="eyebrow">Quick start</p><h2>Install and run</h2></div>
           </div>
-          <p class="section-intro">sampler-tui uses Rust 1.95.0. From the root of a checked-out repository, run:</p>
+          <p class="section-intro">Install a prebuilt release without Rust or other developer tools. Use the automatic installer, Homebrew, or download the archive for your system.</p>
+          <div class="download-grid" id="install-downloads" aria-label="Manual downloads">
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-aarch64-apple-darwin.tar.xz" data-release-target="aarch64-apple-darwin">
+              <span>macOS</span><strong>Apple Silicon</strong><small>Download .tar.xz</small>
+            </a>
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-x86_64-apple-darwin.tar.xz" data-release-target="x86_64-apple-darwin">
+              <span>macOS</span><strong>Intel</strong><small>Download .tar.xz</small>
+            </a>
+            <a class="download-card" href="https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-x86_64-unknown-linux-gnu.tar.xz" data-release-target="x86_64-unknown-linux-gnu">
+              <span>Linux</span><strong>x86-64</strong><small>Download .tar.xz</small>
+            </a>
+          </div>
+          <h3>Automatic installer</h3>
           <div class="code-block">
-            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">Copy</button></div>
-            <pre><code><span class="prompt">$</span> cargo run -p sampler-tui</code></pre>
+            <div class="code-head"><span>macOS · Linux</span><button class="copy-button" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-installer.sh | sh">Copy</button></div>
+            <pre><code><span class="prompt">$</span> curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bonzonkim/sampler-tui/releases/latest/download/sampler-tui-installer.sh | sh</code></pre>
           </div>
           <div class="callout info">
             <span class="callout-icon">i</span>
-            <div><strong>Remember these three controls</strong><p><kbd>?</kbd> opens contextual help, <kbd>:</kbd> opens the command palette, and <kbd>Tab</kbd> changes workspaces.</p></div>
+            <div><strong>No Rust toolchain required</strong><p>The installer detects Apple Silicon, Intel macOS, or x86-64 Linux, downloads the matching binary, and adds its install directory to your shell path.</p></div>
+          </div>
+          <h3>Homebrew</h3>
+          <div class="code-block">
+            <div class="code-head"><span>macOS · Linux</span><button class="copy-button" type="button" data-copy="brew install bonzonkim/tap/sampler-tui">Copy</button></div>
+            <pre><code><span class="prompt">$</span> brew install bonzonkim/tap/sampler-tui</code></pre>
+          </div>
+          <h3>Run sampler-tui</h3>
+          <div class="code-block">
+            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="sampler-tui">Copy</button></div>
+            <pre><code><span class="prompt">$</span> sampler-tui</code></pre>
           </div>
           <h3>Other launch modes</h3>
           <div class="command-list">
-            <div><code>cargo run -p sampler-tui -- open path/to/project</code><span>Open a saved project directly</span></div>
-            <div><code>cargo run -p sampler-tui -- play path/to/sample.wav</code><span>Diagnose sample decoding and output</span></div>
-            <div><code>cargo run -p sampler-tui -- export path/to/project 1 output.wav</code><span>Render pattern 1 to WAV without the TUI</span></div>
+            <div><code>sampler-tui open path/to/project</code><span>Open a saved project directly</span></div>
+            <div><code>sampler-tui play path/to/sample.wav</code><span>Diagnose sample decoding and output</span></div>
+            <div><code>sampler-tui export path/to/project 1 output.wav</code><span>Render pattern 1 to WAV without the TUI</span></div>
+          </div>
+          <div class="callout">
+            <span class="callout-icon">&lt;/&gt;</span>
+            <div><strong>Building from source</strong><p>Developers can clone the repository and run <code>cargo run -p sampler-tui</code> with Rust 1.95.0.</p></div>
           </div>
         </section>
 
@@ -335,7 +361,7 @@
         <section class="closing-panel">
           <p class="eyebrow">Ready when you are</p>
           <h2>Put your first sound<br>on a pad.</h2>
-          <div class="closing-command"><code>cargo run -p sampler-tui</code><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">Copy</button></div>
+          <div class="closing-command"><code>sampler-tui</code><button class="copy-button" type="button" data-copy="sampler-tui">Copy</button></div>
           <a href="#record">Open the recording guide <span aria-hidden="true">→</span></a>
         </section>
 

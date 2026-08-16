@@ -63,7 +63,7 @@
           <a href="#troubleshooting">문제 해결</a>
         </nav>
         <div class="sidebar-footer">
-          <span class="status-dot"></span>
+          <span class="system-label">SYS / READY</span>
           macOS · Linux<br>
           최소 80 × 24 터미널
         </div>
@@ -83,7 +83,7 @@
 
           <div class="terminal-card" aria-label="sampler-tui 터미널 화면 예시">
             <div class="terminal-bar">
-              <div class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              <span class="terminal-origin" aria-hidden="true">TTY://LOCAL</span>
               <span>BANK A · sampler-tui</span>
               <span>48kHz/2ch · RUN</span>
             </div>
@@ -91,7 +91,7 @@
               <div class="wave" aria-hidden="true">
                 <i style="--h:22%"></i><i style="--h:42%"></i><i style="--h:72%"></i><i style="--h:35%"></i><i style="--h:88%"></i><i style="--h:55%"></i><i style="--h:30%"></i><i style="--h:66%"></i><i style="--h:96%"></i><i style="--h:48%"></i><i style="--h:76%"></i><i style="--h:28%"></i><i style="--h:60%"></i><i style="--h:84%"></i><i style="--h:40%"></i><i style="--h:68%"></i><i style="--h:25%"></i><i style="--h:52%"></i><i style="--h:90%"></i><i style="--h:38%"></i><i style="--h:74%"></i><i style="--h:46%"></i><i style="--h:82%"></i><i style="--h:32%"></i>
               </div>
-              <p class="terminal-label">PADS <span>state: ●ready ▶active</span></p>
+              <p class="terminal-label">PADS <span>state: [READY] [ACTIVE]</span></p>
               <div class="mini-pad-grid">
                 <span class="hot"><b>1</b> kick</span><span><b>2</b> snare</span><span><b>3</b> hat</span><span><b>4</b> chop</span>
                 <span><b>Q</b> bass</span><span><b>W</b> vox</span><span><b>E</b> perc</span><span><b>R</b> fx</span>
@@ -171,9 +171,9 @@
             </div>
           </div>
           <div class="mode-grid">
-            <article><span class="mode-dot blue"></span><h3>OneShot</h3><p>한 번 누르면 끝까지 재생됩니다. 재생 중 같은 패드를 누르면 멈추고, 다시 누르면 처음부터 재생됩니다.</p></article>
-            <article><span class="mode-dot pink"></span><h3>Gate</h3><p>패드를 누르는 동안만 재생됩니다. <kbd>H</kbd>를 함께 눌러 소리를 계속 유지할 수 있습니다.</p></article>
-            <article><span class="mode-dot amber"></span><h3>Loop</h3><p>패드가 활성화된 동안 지정한 구간을 반복합니다.</p></article>
+            <article><span class="mode-tag blue">[O]</span><h3>OneShot</h3><p>한 번 누르면 끝까지 재생됩니다. 재생 중 같은 패드를 누르면 멈추고, 다시 누르면 처음부터 재생됩니다.</p></article>
+            <article><span class="mode-tag pink">[G]</span><h3>Gate</h3><p>패드를 누르는 동안만 재생됩니다. <kbd>H</kbd>를 함께 눌러 소리를 계속 유지할 수 있습니다.</p></article>
+            <article><span class="mode-tag amber">[L]</span><h3>Loop</h3><p>패드가 활성화된 동안 지정한 구간을 반복합니다.</p></article>
           </div>
           <div class="callout warning"><span class="callout-icon">!</span><div><strong><kbd>Space</kbd>는 패드 재생 키가 아닙니다</strong><p>현재 패턴의 재생·정지를 전환합니다. 선택한 패드는 <kbd>Enter</kbd> 또는 해당 패드 키로 재생하세요.</p></div></div>
         </section>
@@ -184,7 +184,7 @@
             <li><span>1</span><div><strong>목적지 패드 선택</strong><p>패드 키 또는 방향키로 샘플을 넣을 자리를 선택합니다.</p></div></li>
             <li><span>2</span><div><strong>파일 선택기 열기</strong><p><kbd>Shift</kbd>+<kbd>X</kbd> 또는 <kbd>L</kbd>을 누릅니다. <code>:load path/to/sample.wav</code>도 사용할 수 있습니다.</p></div></li>
             <li><span>3</span><div><strong>파일 선택</strong><p>WAV, AIFF, FLAC, MP3를 지원합니다. 원본 파일은 수정하지 않습니다.</p></div></li>
-            <li><span>4</span><div><strong>패드로 확인</strong><p>상태가 <code>●ready</code>가 되면 해당 패드 키를 눌러 들어봅니다.</p></div></li>
+            <li><span>4</span><div><strong>패드로 확인</strong><p>상태가 <code>READY</code>가 되면 해당 패드 키를 눌러 들어봅니다.</p></div></li>
           </ol>
         </section>
 

@@ -6,6 +6,9 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+repository = "https://github.com/bonzonkim/sampler-tui"
+homepage = "https://bonzonkim.github.io/sampler-tui/"
+description = "A keyboard-driven terminal sampler for live performance, recording, sequencing, and sound design"
 
 [workspace.dependencies]
 crossbeam-channel = "0.5.15"
@@ -22,3 +25,8 @@ sha2 = "0.10.9"
 symphonia = { version = "0.6.0", default-features = false, features = ["wav", "aiff", "flac", "mp3", "pcm"] }
 thiserror = "2.0.19"
 toml = "1.1.4"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -104,6 +104,11 @@ button { color: inherit; }
 .version { padding: 4px 7px; color: var(--muted); background: var(--surface-soft); border: 1px solid var(--border); border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
 
 .top-actions { display: flex; align-items: center; gap: 8px; }
+.language-switch { display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 2px; overflow: hidden; }
+.language-switch a { display: grid; place-items: center; min-width: 31px; height: 30px; color: var(--faint); background: transparent; font: 700 9px/1 var(--mono); letter-spacing: .06em; }
+.language-switch a + a { border-left: 1px solid var(--border); }
+.language-switch a:hover { color: var(--text); background: var(--surface); }
+.language-switch a[aria-current="page"] { color: var(--bg-deep); background: var(--text); }
 .icon-button, .github-link {
   min-height: 36px;
   display: inline-flex;

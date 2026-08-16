@@ -1,87 +1,95 @@
 <!doctype html>
-<html lang="ko" data-theme="dark">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="sampler-tui 공식 사용 가이드 — 키보드로 샘플을 녹음하고, 연주하고, 편집하고, 패턴으로 만드는 터미널 샘플러">
+    <meta name="description" content="The official sampler-tui guide — record, play, edit, and sequence samples from the keyboard in your terminal">
     <meta name="theme-color" content="#111318">
     <meta property="og:title" content="sampler-tui — User Guide">
-    <meta property="og:description" content="터미널 안에서 샘플을 녹음하고, 연주하고, 패턴으로 만드세요.">
+    <meta property="og:description" content="Record, play, and sequence samples without leaving the terminal.">
     <meta property="og:type" content="website">
     <title>sampler-tui — User Guide</title>
+    <link rel="canonical" href="https://bonzonkim.github.io/sampler-tui/">
+    <link rel="alternate" hreflang="en" href="https://bonzonkim.github.io/sampler-tui/">
+    <link rel="alternate" hreflang="ko" href="https://bonzonkim.github.io/sampler-tui/ko/">
+    <link rel="alternate" hreflang="x-default" href="https://bonzonkim.github.io/sampler-tui/">
     <link rel="stylesheet" href="./styles.css">
     <script src="./app.js" defer></script>
   </head>
   <body id="top">
-    <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
+    <a class="skip-link" href="#main-content">Skip to content</a>
 
     <header class="topbar">
-      <a class="brand" href="#top" aria-label="sampler-tui 문서 홈">
+      <a class="brand" href="#top" aria-label="sampler-tui documentation home">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
         <span>sampler-tui</span>
         <span class="version">guide</span>
       </a>
-      <nav class="top-actions" aria-label="문서 도구">
-        <button class="icon-button search-trigger" type="button" aria-label="문서 검색 열기" aria-keyshortcuts="/">
-          <span aria-hidden="true">⌕</span><span class="button-label">검색</span><kbd>/</kbd>
+      <div class="top-actions">
+        <nav class="language-switch" aria-label="Choose language">
+          <a href="./" lang="en" hreflang="en" aria-current="page">EN</a>
+          <a href="./ko/" lang="ko" hreflang="ko">KO</a>
+        </nav>
+        <button class="icon-button search-trigger" type="button" aria-label="Open documentation search" aria-keyshortcuts="/">
+          <span aria-hidden="true">⌕</span><span class="button-label">Search</span><kbd>/</kbd>
         </button>
-        <button class="icon-button theme-toggle" type="button" aria-label="밝은 테마로 전환">
+        <button class="icon-button theme-toggle" type="button" aria-label="Switch to light theme">
           <span class="theme-icon" aria-hidden="true">☼</span>
         </button>
         <a class="github-link" href="https://github.com/bonzonkim/sampler-tui" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a>
-      </nav>
+      </div>
     </header>
 
     <div class="mobile-bar">
-      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar">목차 <span aria-hidden="true">＋</span></button>
-      <span class="mobile-current">시작하기</span>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar">Contents <span aria-hidden="true">＋</span></button>
+      <span class="mobile-current">Overview</span>
     </div>
 
     <div class="page-shell">
       <aside class="sidebar" id="sidebar">
-        <nav aria-label="문서 목차">
-          <p class="nav-label">시작</p>
-          <a href="#overview" class="active">한눈에 보기</a>
-          <a href="#install">설치와 실행</a>
-          <a href="#interface">화면 이해하기</a>
+        <nav aria-label="Documentation sections">
+          <p class="nav-label">Start</p>
+          <a href="#overview" class="active">Overview</a>
+          <a href="#install">Install and run</a>
+          <a href="#interface">Understand the UI</a>
 
-          <p class="nav-label">연주와 녹음</p>
-          <a href="#pads">패드 연주</a>
-          <a href="#import">샘플 불러오기</a>
-          <a href="#record">마이크 녹음</a>
-          <a href="#resample">리샘플링</a>
+          <p class="nav-label">Play and record</p>
+          <a href="#pads">Play pads</a>
+          <a href="#import">Import samples</a>
+          <a href="#record">Record a microphone</a>
+          <a href="#resample">Resample</a>
 
-          <p class="nav-label">만들기</p>
-          <a href="#pattern">패턴</a>
-          <a href="#sample-edit">샘플 편집</a>
-          <a href="#mixer">믹서와 이펙트</a>
+          <p class="nav-label">Create</p>
+          <a href="#pattern">Patterns</a>
+          <a href="#sample-edit">Edit samples</a>
+          <a href="#mixer">Mixer and effects</a>
 
-          <p class="nav-label">관리</p>
-          <a href="#projects">프로젝트</a>
+          <p class="nav-label">Manage</p>
+          <a href="#projects">Projects</a>
           <a href="#midi">MIDI</a>
-          <a href="#commands">명령어</a>
-          <a href="#troubleshooting">문제 해결</a>
+          <a href="#commands">Commands</a>
+          <a href="#troubleshooting">Troubleshooting</a>
         </nav>
         <div class="sidebar-footer">
           <span class="system-label">SYS / READY</span>
           macOS · Linux<br>
-          최소 80 × 24 터미널
+          Minimum terminal: 80 × 24
         </div>
       </aside>
 
       <main id="main-content">
-        <section class="hero doc-section" id="overview" data-title="한눈에 보기">
+        <section class="hero doc-section" id="overview" data-title="Overview">
           <div class="hero-copy">
             <p class="eyebrow">Keyboard-driven sampler</p>
-            <h1>터미널을<br><span>악기로.</span></h1>
-            <p class="hero-lead">키보드로 샘플을 녹음하고, 즉시 연주하고, 패턴으로 조립하세요. 마우스 없이 흐름을 끊지 않는 16패드 샘플러입니다.</p>
+            <h1>Turn your<br><span>terminal into an instrument.</span></h1>
+            <p class="hero-lead">Record a sound, play it immediately, and shape it into a pattern. sampler-tui is a sixteen-pad sampler that keeps your hands on the keyboard and your flow intact.</p>
             <div class="hero-actions">
-              <a class="primary-button" href="#install">시작하기 <span aria-hidden="true">↓</span></a>
-              <a class="text-link" href="https://github.com/bonzonkim/sampler-tui" target="_blank" rel="noreferrer">소스 보기 <span aria-hidden="true">↗</span></a>
+              <a class="primary-button" href="#install">Get started <span aria-hidden="true">↓</span></a>
+              <a class="text-link" href="https://github.com/bonzonkim/sampler-tui" target="_blank" rel="noreferrer">View source <span aria-hidden="true">↗</span></a>
             </div>
           </div>
 
-          <div class="terminal-card" aria-label="sampler-tui 터미널 화면 예시">
+          <div class="terminal-card" aria-label="Example sampler-tui terminal screen">
             <div class="terminal-bar">
               <span class="terminal-origin" aria-hidden="true">TTY://LOCAL</span>
               <span>BANK A · sampler-tui</span>
@@ -103,66 +111,60 @@
           </div>
         </section>
 
-        <section class="feature-strip" aria-label="주요 기능">
+        <section class="feature-strip" aria-label="Key features">
           <article><span>01</span><strong>16 × 10</strong><small>pads &amp; banks</small></article>
           <article><span>02</span><strong>48 kHz</strong><small>stereo engine</small></article>
           <article><span>03</span><strong>3 modes</strong><small>OneShot · Gate · Loop</small></article>
           <article><span>04</span><strong>0 mouse</strong><small>keyboard first</small></article>
         </section>
 
-        <section class="doc-section" id="install" data-title="설치와 실행">
+        <section class="doc-section" id="install" data-title="Install and run">
           <div class="section-heading">
             <span class="section-number">01</span>
-            <div><p class="eyebrow">Quick start</p><h2>설치와 실행</h2></div>
+            <div><p class="eyebrow">Quick start</p><h2>Install and run</h2></div>
           </div>
-          <p class="section-intro">Rust 1.95.0이 필요합니다. 저장소를 받은 뒤 워크스페이스 루트에서 실행하세요.</p>
+          <p class="section-intro">sampler-tui uses Rust 1.95.0. From the root of a checked-out repository, run:</p>
           <div class="code-block">
-            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">복사</button></div>
+            <div class="code-head"><span>Terminal</span><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">Copy</button></div>
             <pre><code><span class="prompt">$</span> cargo run -p sampler-tui</code></pre>
           </div>
           <div class="callout info">
             <span class="callout-icon">i</span>
-            <div><strong>먼저 이것만 기억하세요</strong><p><kbd>?</kbd>는 현재 화면 도움말, <kbd>:</kbd>는 명령어 입력, <kbd>Tab</kbd>은 작업 화면 전환입니다.</p></div>
+            <div><strong>Remember these three controls</strong><p><kbd>?</kbd> opens contextual help, <kbd>:</kbd> opens the command palette, and <kbd>Tab</kbd> changes workspaces.</p></div>
           </div>
-          <h3>다른 실행 모드</h3>
+          <h3>Other launch modes</h3>
           <div class="command-list">
-            <div><code>cargo run -p sampler-tui -- open path/to/project</code><span>저장한 프로젝트를 바로 열기</span></div>
-            <div><code>cargo run -p sampler-tui -- play path/to/sample.wav</code><span>샘플 디코딩과 출력을 진단</span></div>
-            <div><code>cargo run -p sampler-tui -- export path/to/project 1 output.wav</code><span>화면 없이 패턴 1을 WAV로 렌더링</span></div>
+            <div><code>cargo run -p sampler-tui -- open path/to/project</code><span>Open a saved project directly</span></div>
+            <div><code>cargo run -p sampler-tui -- play path/to/sample.wav</code><span>Diagnose sample decoding and output</span></div>
+            <div><code>cargo run -p sampler-tui -- export path/to/project 1 output.wav</code><span>Render pattern 1 to WAV without the TUI</span></div>
           </div>
         </section>
 
-        <section class="doc-section" id="interface" data-title="화면 이해하기">
-          <div class="section-heading">
-            <span class="section-number">02</span>
-            <div><p class="eyebrow">Workspace</p><h2>네 개의 작업 화면</h2></div>
-          </div>
-          <p class="section-intro"><kbd>Tab</kbd>과 <kbd>Shift</kbd>+<kbd>Tab</kbd>으로 Perform → Pattern → Sample → Mixer 화면을 순환합니다.</p>
+        <section class="doc-section" id="interface" data-title="Understand the UI">
+          <div class="section-heading"><span class="section-number">02</span><div><p class="eyebrow">Workspace</p><h2>Four workspaces</h2></div></div>
+          <p class="section-intro">Use <kbd>Tab</kbd> and <kbd>Shift</kbd>+<kbd>Tab</kbd> to cycle through Perform → Pattern → Sample → Mixer.</p>
           <div class="workspace-grid">
-            <article class="workspace-card accent-blue"><span>01</span><h3>Perform</h3><p>패드 선택, 연주, 뱅크 이동, 샘플 로드와 녹음.</p><kbd>기본 화면</kbd></article>
-            <article class="workspace-card accent-pink"><span>02</span><h3>Pattern</h3><p>실시간 오버더빙과 스텝 단위 시퀀싱.</p><kbd>Tab × 1</kbd></article>
-            <article class="workspace-card accent-amber"><span>03</span><h3>Sample</h3><p>트림, 피치, 정규화, 역재생과 재생 모드.</p><kbd>Tab × 2</kbd></article>
-            <article class="workspace-card accent-green"><span>04</span><h3>Mixer</h3><p>패드별 레벨·팬·센드와 마스터 이펙트.</p><kbd>Tab × 3</kbd></article>
+            <article class="workspace-card accent-blue"><span>01</span><h3>Perform</h3><p>Select and play pads, change banks, load samples, and record.</p><kbd>Default</kbd></article>
+            <article class="workspace-card accent-pink"><span>02</span><h3>Pattern</h3><p>Overdub in real time or sequence one step at a time.</p><kbd>Tab × 1</kbd></article>
+            <article class="workspace-card accent-amber"><span>03</span><h3>Sample</h3><p>Trim, pitch, normalize, reverse, and set playback modes.</p><kbd>Tab × 2</kbd></article>
+            <article class="workspace-card accent-green"><span>04</span><h3>Mixer</h3><p>Set pad levels, pan, sends, and master effects.</p><kbd>Tab × 3</kbd></article>
           </div>
         </section>
 
-        <section class="doc-section" id="pads" data-title="패드 연주">
-          <div class="section-heading">
-            <span class="section-number">03</span>
-            <div><p class="eyebrow">Perform</p><h2>패드 연주</h2></div>
-          </div>
+        <section class="doc-section" id="pads" data-title="Play pads">
+          <div class="section-heading"><span class="section-number">03</span><div><p class="eyebrow">Perform</p><h2>Play pads</h2></div></div>
           <div class="split-layout">
             <div>
-              <p class="section-intro">키보드 왼쪽 4 × 4 영역이 현재 뱅크의 16개 패드입니다. 방향키로 선택하고 <kbd>Enter</kbd>로 선택 패드를 연주할 수도 있습니다.</p>
+              <p class="section-intro">The left-hand 4 × 4 keyboard area controls the sixteen pads in the current bank. You can also select a pad with the arrow keys and play it with <kbd>Enter</kbd>.</p>
               <dl class="key-actions">
-                <div><dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>뱅크 A–J 이동</dd></div>
-                <div><dt><kbd>Shift</kbd> + <kbd>패드</kbd></dt><dd>해당 패드 즉시 정지</dd></div>
-                <div><dt><kbd>Shift</kbd> + <kbd>Esc</kbd></dt><dd>모든 패드와 패턴 정지</dd></div>
-                <div><dt><kbd>H</kbd></dt><dd>누르고 있는 Gate 패드 래치</dd></div>
-                <div><dt><kbd>Shift</kbd> + <kbd>1</kbd></dt><dd>MIDI Fixed Velocity 전환</dd></div>
+                <div><dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Move through banks A–J</dd></div>
+                <div><dt><kbd>Shift</kbd> + <kbd>pad</kbd></dt><dd>Stop that pad immediately</dd></div>
+                <div><dt><kbd>Shift</kbd> + <kbd>Esc</kbd></dt><dd>Stop every pad and the pattern</dd></div>
+                <div><dt><kbd>H</kbd></dt><dd>Latch held Gate pads</dd></div>
+                <div><dt><kbd>Shift</kbd> + <kbd>1</kbd></dt><dd>Toggle MIDI Fixed Velocity</dd></div>
               </dl>
             </div>
-            <div class="pad-controller" aria-label="컴퓨터 키보드 패드 배치">
+            <div class="pad-controller" aria-label="Computer keyboard pad layout">
               <div><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd></div>
               <div><kbd>Q</kbd><kbd>W</kbd><kbd>E</kbd><kbd>R</kbd></div>
               <div><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd></div>
@@ -171,164 +173,164 @@
             </div>
           </div>
           <div class="mode-grid">
-            <article><span class="mode-tag blue">[O]</span><h3>OneShot</h3><p>한 번 누르면 끝까지 재생됩니다. 재생 중 같은 패드를 누르면 멈추고, 다시 누르면 처음부터 재생됩니다.</p></article>
-            <article><span class="mode-tag pink">[G]</span><h3>Gate</h3><p>패드를 누르는 동안만 재생됩니다. <kbd>H</kbd>를 함께 눌러 소리를 계속 유지할 수 있습니다.</p></article>
-            <article><span class="mode-tag amber">[L]</span><h3>Loop</h3><p>패드가 활성화된 동안 지정한 구간을 반복합니다.</p></article>
+            <article><span class="mode-tag blue">[O]</span><h3>OneShot</h3><p>One press plays the sample to its end. Press the same active pad to stop it; press again to start from the beginning.</p></article>
+            <article><span class="mode-tag pink">[G]</span><h3>Gate</h3><p>The sample plays only while the pad is held. Hold <kbd>H</kbd> with a Gate pad to keep it active.</p></article>
+            <article><span class="mode-tag amber">[L]</span><h3>Loop</h3><p>The selected sample region repeats while the pad remains active.</p></article>
           </div>
-          <div class="callout warning"><span class="callout-icon">!</span><div><strong><kbd>Space</kbd>는 패드 재생 키가 아닙니다</strong><p>현재 패턴의 재생·정지를 전환합니다. 선택한 패드는 <kbd>Enter</kbd> 또는 해당 패드 키로 재생하세요.</p></div></div>
+          <div class="callout warning"><span class="callout-icon">!</span><div><strong><kbd>Space</kbd> does not play the selected pad</strong><p>It starts or stops the current pattern. Use <kbd>Enter</kbd> or the pad's own key to play the selected pad.</p></div></div>
         </section>
 
-        <section class="doc-section" id="import" data-title="샘플 불러오기">
-          <div class="section-heading"><span class="section-number">04</span><div><p class="eyebrow">Import</p><h2>샘플 불러오기</h2></div></div>
+        <section class="doc-section" id="import" data-title="Import samples">
+          <div class="section-heading"><span class="section-number">04</span><div><p class="eyebrow">Import</p><h2>Import a sample</h2></div></div>
           <ol class="steps">
-            <li><span>1</span><div><strong>목적지 패드 선택</strong><p>패드 키 또는 방향키로 샘플을 넣을 자리를 선택합니다.</p></div></li>
-            <li><span>2</span><div><strong>파일 선택기 열기</strong><p><kbd>Shift</kbd>+<kbd>X</kbd> 또는 <kbd>L</kbd>을 누릅니다. <code>:load path/to/sample.wav</code>도 사용할 수 있습니다.</p></div></li>
-            <li><span>3</span><div><strong>파일 선택</strong><p>WAV, AIFF, FLAC, MP3를 지원합니다. 원본 파일은 수정하지 않습니다.</p></div></li>
-            <li><span>4</span><div><strong>패드로 확인</strong><p>상태가 <code>READY</code>가 되면 해당 패드 키를 눌러 들어봅니다.</p></div></li>
+            <li><span>1</span><div><strong>Select a destination pad</strong><p>Use a pad key or the arrow keys to choose where the sample will go.</p></div></li>
+            <li><span>2</span><div><strong>Open the file picker</strong><p>Press <kbd>Shift</kbd>+<kbd>X</kbd> or <kbd>L</kbd>. You can also enter <code>:load path/to/sample.wav</code>.</p></div></li>
+            <li><span>3</span><div><strong>Choose a file</strong><p>WAV, AIFF, FLAC, and MP3 are supported. The source file is never modified.</p></div></li>
+            <li><span>4</span><div><strong>Check the pad</strong><p>When its state is <code>READY</code>, press the pad key to hear it.</p></div></li>
           </ol>
         </section>
 
-        <section class="doc-section" id="record" data-title="마이크 녹음">
-          <div class="section-heading"><span class="section-number">05</span><div><p class="eyebrow">Capture</p><h2>마이크로 샘플 녹음</h2></div></div>
-          <p class="section-intro">운영체제의 현재 기본 입력 장치에서 녹음합니다. 녹음 중 입력 소리를 출력으로 모니터링하지는 않지만, 패드와 패턴은 계속 연주할 수 있습니다.</p>
-          <div class="record-flow" aria-label="녹음 순서">
-            <div><span>01</span><kbd>Ctrl+S</kbd><small>캡처 메뉴</small></div><i>→</i>
-            <div><span>02</span><kbd>I</kbd><small>입력 녹음</small></div><i>→</i>
-            <div><span>03</span><b>PEAK ↗</b><small>신호 확인</small></div><i>→</i>
-            <div><span>04</span><kbd>Enter</kbd><small>정지·설치</small></div><i>→</i>
-            <div><span>05</span><kbd>패드</kbd><small>재생</small></div>
+        <section class="doc-section" id="record" data-title="Record a microphone">
+          <div class="section-heading"><span class="section-number">05</span><div><p class="eyebrow">Capture</p><h2>Record a microphone</h2></div></div>
+          <p class="section-intro">sampler-tui records from the operating system's current default input. Input is not monitored through the output, but pads and patterns remain playable during a take.</p>
+          <div class="record-flow" aria-label="Recording sequence">
+            <div><span>01</span><kbd>Ctrl+S</kbd><small>Capture menu</small></div><i>→</i>
+            <div><span>02</span><kbd>I</kbd><small>Record input</small></div><i>→</i>
+            <div><span>03</span><b>PEAK ↗</b><small>Check signal</small></div><i>→</i>
+            <div><span>04</span><kbd>Enter</kbd><small>Stop and install</small></div><i>→</i>
+            <div><span>05</span><kbd>Pad</kbd><small>Play</small></div>
           </div>
-          <h3>캡처 단축키</h3>
-          <div class="shortcut-table" role="table" aria-label="캡처 단축키">
-            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>I</kbd></span><span role="cell">기본 입력 장치 녹음 시작</span></div>
-            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>R</kbd></span><span role="cell">마스터 출력 리샘플링 시작</span></div>
-            <div role="row"><span role="cell"><kbd>Enter</kbd></span><span role="cell">현재 녹음 정지 후 패드에 설치</span></div>
-            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>S</kbd></span><span role="cell">현재 녹음 정지 후 마무리</span></div>
-            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>C</kbd></span><span role="cell">현재 녹음 취소</span></div>
-            <div role="row"><span role="cell"><kbd>Esc</kbd></span><span role="cell">녹음 폐기 여부 검토</span></div>
+          <h3>Capture shortcuts</h3>
+          <div class="shortcut-table" role="table" aria-label="Capture shortcuts">
+            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>I</kbd></span><span role="cell">Start recording the default input</span></div>
+            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>R</kbd></span><span role="cell">Start resampling the master output</span></div>
+            <div role="row"><span role="cell"><kbd>Enter</kbd></span><span role="cell">Stop the take and install it on the pad</span></div>
+            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>S</kbd></span><span role="cell">Stop and finalize the active take</span></div>
+            <div role="row"><span role="cell"><kbd>Ctrl+S</kbd> → <kbd>C</kbd></span><span role="cell">Cancel the active take</span></div>
+            <div role="row"><span role="cell"><kbd>Esc</kbd></span><span role="cell">Review whether to discard the take</span></div>
           </div>
-          <div class="callout success"><span class="callout-icon">✓</span><div><strong>녹음 전에 PEAK를 확인하세요</strong><p>말하거나 손뼉을 칠 때 PEAK가 올라가야 합니다. 완전한 무음 입력은 기존 패드를 보호하기 위해 설치되지 않습니다.</p></div></div>
-          <div class="callout mac"><span class="callout-icon">⌘</span><div><strong>macOS 클램셸 모드</strong><p>MacBook 덮개를 닫으면 내장 마이크가 무음이 될 수 있습니다. 외장 또는 iPhone 연속성 마이크를 기본 입력으로 선택하고 앱을 다시 시작하세요. 실행 터미널에도 <em>시스템 설정 → 개인정보 보호 및 보안 → 마이크</em> 권한이 필요합니다.</p></div></div>
+          <div class="callout success"><span class="callout-icon">✓</span><div><strong>Check PEAK before recording</strong><p>PEAK should move when you speak or clap. A completely silent input is rejected so it cannot replace the existing pad.</p></div></div>
+          <div class="callout mac"><span class="callout-icon">⌘</span><div><strong>macOS clamshell mode</strong><p>The built-in microphone may return silence while a MacBook lid is closed. Select an external or iPhone Continuity microphone as the default input, then restart sampler-tui. The launching terminal also needs permission under <em>System Settings → Privacy &amp; Security → Microphone</em>.</p></div></div>
         </section>
 
-        <section class="doc-section" id="resample" data-title="리샘플링">
-          <div class="section-heading"><span class="section-number">06</span><div><p class="eyebrow">Resample</p><h2>연주를 다시 샘플로</h2></div></div>
-          <p class="section-intro">리샘플링은 패드, 패턴, 레벨, 팬, 딜레이와 리버브를 모두 거친 최종 스테레오 출력을 선택한 패드에 녹음합니다.</p>
+        <section class="doc-section" id="resample" data-title="Resample">
+          <div class="section-heading"><span class="section-number">06</span><div><p class="eyebrow">Resample</p><h2>Turn a performance into a sample</h2></div></div>
+          <p class="section-intro">Resampling records the final stereo master after pads, patterns, levels, pan, delay, and reverb, then installs the result on the selected pad.</p>
           <ol class="steps compact">
-            <li><span>1</span><div><strong>빈 패드 또는 교체할 패드를 선택</strong></div></li>
-            <li><span>2</span><div><strong><kbd>Ctrl+S</kbd> 다음 <kbd>R</kbd></strong><p>리샘플 캡처가 시작됩니다.</p></div></li>
-            <li><span>3</span><div><strong>패드나 패턴을 연주</strong><p>마스터에서 들리는 결과가 그대로 들어갑니다.</p></div></li>
-            <li><span>4</span><div><strong><kbd>Enter</kbd>로 완료</strong><p>새 샘플이 선택한 패드에 설치됩니다.</p></div></li>
+            <li><span>1</span><div><strong>Select an empty pad or one to replace</strong></div></li>
+            <li><span>2</span><div><strong>Press <kbd>Ctrl+S</kbd>, then <kbd>R</kbd></strong><p>Master-output capture begins.</p></div></li>
+            <li><span>3</span><div><strong>Play pads or a pattern</strong><p>Everything audible at the master is recorded.</p></div></li>
+            <li><span>4</span><div><strong>Press <kbd>Enter</kbd> to finish</strong><p>The new sample is installed on the selected pad.</p></div></li>
           </ol>
         </section>
 
-        <section class="doc-section" id="pattern" data-title="패턴">
-          <div class="section-heading"><span class="section-number">07</span><div><p class="eyebrow">Pattern</p><h2>비트를 패턴으로</h2></div></div>
-          <p class="section-intro">16개 패턴 슬롯에 실시간으로 연주를 녹음하거나 스텝을 직접 편집할 수 있습니다. 재생 중 다음 패턴을 예약하면 루프 경계에서 전환됩니다.</p>
+        <section class="doc-section" id="pattern" data-title="Patterns">
+          <div class="section-heading"><span class="section-number">07</span><div><p class="eyebrow">Pattern</p><h2>Build a beat</h2></div></div>
+          <p class="section-intro">Record live into sixteen pattern slots or edit individual steps. Queue another pattern during playback to switch at the next loop boundary.</p>
           <div class="two-column-table">
-            <div><h3>재생과 녹음</h3><dl class="key-actions"><div><dt><kbd>Space</kbd></dt><dd>재생 / 정지</dd></div><div><dt><kbd>Ctrl+R</kbd></dt><dd>오버더빙 시작 / 정지</dd></div><div><dt><kbd>,</kbd> <kbd>.</kbd></dt><dd>이전 / 다음 패턴</dd></div><div><dt><code>:tempo 120</code></dt><dd>템포 설정</dd></div></dl></div>
-            <div><h3>스텝 편집</h3><dl class="key-actions"><div><dt><kbd>←↑↓→</kbd></dt><dd>스텝 / 패드 커서</dd></div><div><dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>마디 이동</dd></div><div><dt><kbd>Enter</kbd> / <kbd>Del</kbd></dt><dd>스텝 추가 / 제거</dd></div><div><dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>벨로시티 조정</dd></div><div><dt><kbd>U</kbd></dt><dd>패턴 지우기 실행 취소</dd></div><div><dt><kbd>Ctrl+Del</kbd></dt><dd>패턴 전체 지우기</dd></div></dl></div>
+            <div><h3>Playback and recording</h3><dl class="key-actions"><div><dt><kbd>Space</kbd></dt><dd>Play / stop</dd></div><div><dt><kbd>Ctrl+R</kbd></dt><dd>Start / stop overdubbing</dd></div><div><dt><kbd>,</kbd> <kbd>.</kbd></dt><dd>Previous / next pattern</dd></div><div><dt><code>:tempo 120</code></dt><dd>Set tempo</dd></div></dl></div>
+            <div><h3>Step editing</h3><dl class="key-actions"><div><dt><kbd>←↑↓→</kbd></dt><dd>Move step / pad cursor</dd></div><div><dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>Move between bars</dd></div><div><dt><kbd>Enter</kbd> / <kbd>Del</kbd></dt><dd>Add / remove a step</dd></div><div><dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Adjust velocity</dd></div><div><dt><kbd>U</kbd></dt><dd>Undo pattern clear</dd></div><div><dt><kbd>Ctrl+Del</kbd></dt><dd>Clear the whole pattern</dd></div></dl></div>
           </div>
-          <div class="callout info"><span class="callout-icon">i</span><div><strong>패턴 설정은 명령어로 정밀하게</strong><p><code>:bars 4</code> · <code>:resolution 1/16</code> · <code>:swing 58</code> · <code>:quantize 100</code></p></div></div>
+          <div class="callout info"><span class="callout-icon">i</span><div><strong>Use commands for precise pattern settings</strong><p><code>:bars 4</code> · <code>:resolution 1/16</code> · <code>:swing 58</code> · <code>:quantize 100</code></p></div></div>
         </section>
 
-        <section class="doc-section" id="sample-edit" data-title="샘플 편집">
-          <div class="section-heading"><span class="section-number">08</span><div><p class="eyebrow">Sample</p><h2>샘플 다듬기</h2></div></div>
-          <p class="section-intro">편집 내용은 메모리의 샘플에 적용되며 가져온 원본 파일을 덮어쓰지 않습니다.</p>
-          <div class="shortcut-table" role="table" aria-label="샘플 편집 단축키">
-            <div role="row"><span role="cell"><kbd>M</kbd></span><span role="cell">시작 / 끝 마커 선택</span></div>
-            <div role="row"><span role="cell"><kbd>←</kbd> <kbd>→</kbd></span><span role="cell">선택한 트림 마커 이동</span></div>
-            <div role="row"><span role="cell"><kbd>Shift</kbd> + <kbd>←</kbd>/<kbd>→</kbd></span><span role="cell">마커를 큰 단위로 이동</span></div>
-            <div role="row"><span role="cell"><kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span role="cell">파형 확대 / 축소</span></div>
-            <div role="row"><span role="cell"><kbd>N</kbd> / <kbd>U</kbd></span><span role="cell">정규화 / 역재생 전환</span></div>
-            <div role="row"><span role="cell"><kbd>↑</kbd> <kbd>↓</kbd></span><span role="cell">피치 ±1 반음</span></div>
-            <div role="row"><span role="cell"><kbd>O</kbd> <kbd>G</kbd> <kbd>L</kbd></span><span role="cell">OneShot / Gate / Loop 모드</span></div>
-            <div role="row"><span role="cell"><kbd>Enter</kbd></span><span role="cell">편집 적용 확인</span></div>
-            <div role="row"><span role="cell"><kbd>Ctrl+Z</kbd></span><span role="cell">적용한 편집 실행 취소</span></div>
-            <div role="row"><span role="cell"><kbd>Esc</kbd></span><span role="cell">Perform로 돌아가기 또는 초안 폐기</span></div>
+        <section class="doc-section" id="sample-edit" data-title="Edit samples">
+          <div class="section-heading"><span class="section-number">08</span><div><p class="eyebrow">Sample</p><h2>Shape a sample</h2></div></div>
+          <p class="section-intro">Edits apply to the in-memory sample and never overwrite the imported source file.</p>
+          <div class="shortcut-table" role="table" aria-label="Sample editor shortcuts">
+            <div role="row"><span role="cell"><kbd>M</kbd></span><span role="cell">Select the start / end marker</span></div>
+            <div role="row"><span role="cell"><kbd>←</kbd> <kbd>→</kbd></span><span role="cell">Move the selected trim marker</span></div>
+            <div role="row"><span role="cell"><kbd>Shift</kbd> + <kbd>←</kbd>/<kbd>→</kbd></span><span role="cell">Move the marker in larger steps</span></div>
+            <div role="row"><span role="cell"><kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span role="cell">Zoom the waveform in / out</span></div>
+            <div role="row"><span role="cell"><kbd>N</kbd> / <kbd>U</kbd></span><span role="cell">Toggle normalization / reverse</span></div>
+            <div role="row"><span role="cell"><kbd>↑</kbd> <kbd>↓</kbd></span><span role="cell">Pitch ±1 semitone</span></div>
+            <div role="row"><span role="cell"><kbd>O</kbd> <kbd>G</kbd> <kbd>L</kbd></span><span role="cell">OneShot / Gate / Loop mode</span></div>
+            <div role="row"><span role="cell"><kbd>Enter</kbd></span><span role="cell">Confirm and apply the edit</span></div>
+            <div role="row"><span role="cell"><kbd>Ctrl+Z</kbd></span><span role="cell">Undo an applied edit</span></div>
+            <div role="row"><span role="cell"><kbd>Esc</kbd></span><span role="cell">Return to Perform or discard the draft</span></div>
           </div>
         </section>
 
-        <section class="doc-section" id="mixer" data-title="믹서와 이펙트">
-          <div class="section-heading"><span class="section-number">09</span><div><p class="eyebrow">Mixer</p><h2>믹서와 이펙트</h2></div></div>
-          <p class="section-intro">선택 패드의 레벨·팬·뮤트·초크·센드와 마스터 딜레이·리버브를 조절합니다.</p>
-          <div class="mixer-demo" aria-label="믹서 기능 요약">
+        <section class="doc-section" id="mixer" data-title="Mixer and effects">
+          <div class="section-heading"><span class="section-number">09</span><div><p class="eyebrow">Mixer</p><h2>Mixer and effects</h2></div></div>
+          <p class="section-intro">Control the selected pad's level, pan, mute, choke group, and sends alongside master delay and reverb.</p>
+          <div class="mixer-demo" aria-label="Mixer feature summary">
             <div class="channel"><span>PAD</span><i style="--level:74%"></i><b>LEVEL</b><small>−6.0 dB</small></div>
             <div class="channel"><span>PAN</span><i style="--level:50%"></i><b>POSITION</b><small>CENTER</small></div>
             <div class="channel"><span>DLY</span><i style="--level:38%"></i><b>SEND</b><small>0.38</small></div>
             <div class="channel"><span>RVB</span><i style="--level:62%"></i><b>SEND</b><small>0.62</small></div>
           </div>
           <dl class="key-actions horizontal">
-            <div><dt><kbd>Ctrl+←</kbd> <kbd>Ctrl+→</kbd></dt><dd>Pad / Master / Delay / Reverb 섹션 이동</dd></div>
-            <div><dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>필드 이동</dd></div>
-            <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>값 조정</dd></div>
-            <div><dt><kbd>Enter</kbd></dt><dd>켜기 / 끄기</dd></div>
-            <div><dt><kbd>Backspace</kbd></dt><dd>기본값으로 초기화</dd></div>
-            <div><dt><kbd>Esc</kbd></dt><dd>Perform로 돌아가기</dd></div>
+            <div><dt><kbd>Ctrl+←</kbd> <kbd>Ctrl+→</kbd></dt><dd>Move through Pad / Master / Delay / Reverb</dd></div>
+            <div><dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Move between fields</dd></div>
+            <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Adjust a value</dd></div>
+            <div><dt><kbd>Enter</kbd></dt><dd>Toggle on / off</dd></div>
+            <div><dt><kbd>Backspace</kbd></dt><dd>Reset to the default value</dd></div>
+            <div><dt><kbd>Esc</kbd></dt><dd>Return to Perform</dd></div>
           </dl>
         </section>
 
-        <section class="doc-section" id="projects" data-title="프로젝트">
-          <div class="section-heading"><span class="section-number">10</span><div><p class="eyebrow">Projects</p><h2>저장하고 다시 열기</h2></div></div>
-          <p class="section-intro">프로젝트는 설정을 TOML에 저장하고 사용 중인 오디오를 프로젝트의 <code>audio/</code> 디렉터리로 복사합니다. 전체 폴더를 옮겨도 오디오 참조가 유지됩니다.</p>
+        <section class="doc-section" id="projects" data-title="Projects">
+          <div class="section-heading"><span class="section-number">10</span><div><p class="eyebrow">Projects</p><h2>Save and reopen</h2></div></div>
+          <p class="section-intro">A project stores its configuration in TOML and copies used audio into its own <code>audio/</code> directory. Move the complete folder and its audio references remain valid.</p>
           <div class="code-block">
-            <div class="code-head"><span>Command palette</span><button class="copy-button" type="button" data-copy=":save-as path/to/my-project">복사</button></div>
-            <pre><code><span class="comment"># 처음 저장</span>
+            <div class="code-head"><span>Command palette</span><button class="copy-button" type="button" data-copy=":save-as path/to/my-project">Copy</button></div>
+            <pre><code><span class="comment"># First save</span>
 :save-as path/to/my-project
 
-<span class="comment"># 이후 저장 / 다른 프로젝트 열기</span>
+<span class="comment"># Save again / open another project</span>
 :save
 :open-project path/to/another-project
 
-<span class="comment"># 현재 패턴 한 루프 내보내기</span>
+<span class="comment"># Export one loop of the current pattern</span>
 :export path/to/output.wav</code></pre>
           </div>
-          <div class="callout warning"><span class="callout-icon">!</span><div><strong>진행 중인 작업 보호</strong><p>미완성 녹음, 샘플 편집 초안, 저장하지 않은 변경이 있으면 프로젝트 열기나 종료 전에 처리 방법을 묻습니다. 복구 화면에서는 <kbd>R</kbd> 복원 · <kbd>D</kbd> 폐기 · <kbd>C</kbd> 취소를 사용합니다.</p></div></div>
+          <div class="callout warning"><span class="callout-icon">!</span><div><strong>Your work is protected</strong><p>If a capture, sample-edit draft, or unsaved project change is active, opening another project or quitting asks how to resolve it. On recovery screens use <kbd>R</kbd> to restore, <kbd>D</kbd> to discard, or <kbd>C</kbd> to cancel.</p></div></div>
         </section>
 
         <section class="doc-section" id="midi" data-title="MIDI">
-          <div class="section-heading"><span class="section-number">11</span><div><p class="eyebrow">MIDI</p><h2>MIDI 컨트롤러 연결</h2></div></div>
-          <p class="section-intro">MIDI Note 36–51은 현재 뱅크의 패드 1–16에 연결됩니다. 벨로시티, 채널 필터, 뱅크별 Learn 매핑을 지원합니다.</p>
+          <div class="section-heading"><span class="section-number">11</span><div><p class="eyebrow">MIDI</p><h2>Connect a MIDI controller</h2></div></div>
+          <p class="section-intro">MIDI Notes 36–51 map to pads 1–16 in the current bank. Velocity, channel filtering, and per-bank Learn mappings are supported.</p>
           <div class="command-list numbered">
-            <div><code>:midi-ports</code><span>사용 가능한 입력 포트와 번호 확인</span></div>
-            <div><code>:midi-connect 0</code><span>0번 포트에 연결</span></div>
-            <div><code>:midi-channel omni</code><span>모든 채널 수신, 또는 1–16 지정</span></div>
-            <div><code>:midi-learn</code><span>선택한 패드의 Learn 대기</span></div>
-            <div><code>:midi-unmap</code><span>선택 패드의 매핑 제거</span></div>
-            <div><code>:midi-reset-bank</code><span>현재 뱅크 매핑 초기화</span></div>
-            <div><code>:midi-disconnect</code><span>현재 포트 연결 해제</span></div>
+            <div><code>:midi-ports</code><span>List available input ports and indexes</span></div>
+            <div><code>:midi-connect 0</code><span>Connect to port 0</span></div>
+            <div><code>:midi-channel omni</code><span>Receive every channel, or specify 1–16</span></div>
+            <div><code>:midi-learn</code><span>Arm Learn for the selected pad</span></div>
+            <div><code>:midi-unmap</code><span>Remove the selected pad mapping</span></div>
+            <div><code>:midi-reset-bank</code><span>Reset mappings for the current bank</span></div>
+            <div><code>:midi-disconnect</code><span>Disconnect the current port</span></div>
           </div>
         </section>
 
-        <section class="doc-section" id="commands" data-title="명령어">
-          <div class="section-heading"><span class="section-number">12</span><div><p class="eyebrow">Reference</p><h2>명령어 빠른 참조</h2></div></div>
-          <p class="section-intro"><kbd>:</kbd>를 눌러 명령 팔레트를 열고 아래 명령을 입력합니다. 경로에 공백이 있으면 전체 나머지를 경로로 사용하거나 따옴표로 감쌀 수 있습니다.</p>
+        <section class="doc-section" id="commands" data-title="Commands">
+          <div class="section-heading"><span class="section-number">12</span><div><p class="eyebrow">Reference</p><h2>Command quick reference</h2></div></div>
+          <p class="section-intro">Press <kbd>:</kbd> to open the command palette. A path containing spaces can use the complete command remainder or matching quotes.</p>
           <div class="command-groups">
-            <article><h3>파일과 프로젝트</h3><code>:load [path]</code><code>:save</code><code>:save-as &lt;directory&gt;</code><code>:open-project &lt;directory&gt;</code><code>:export &lt;file.wav&gt;</code></article>
-            <article><h3>선택과 재생</h3><code>:bank &lt;A..J&gt;</code><code>:select &lt;1..16&gt;</code><code>:play</code><code>:stop</code><code>:stop-all</code></article>
-            <article><h3>패턴</h3><code>:pattern &lt;1..16&gt;</code><code>:tempo &lt;20..300&gt;</code><code>:bars &lt;n&gt;</code><code>:resolution &lt;value&gt;</code><code>:swing &lt;50..75&gt;</code><code>:quantize &lt;0..100&gt;</code><code>:record</code><code>:clear-pattern</code></article>
-            <article><h3>샘플과 캡처</h3><code>:trim-start &lt;frame&gt;</code><code>:trim-end &lt;frame&gt;</code><code>:normalize &lt;on|off&gt;</code><code>:reverse &lt;on|off&gt;</code><code>:pitch &lt;-24..24&gt;</code><code>:mode &lt;oneshot|gate|loop&gt;</code><code>:apply-sample</code><code>:undo-sample</code><code>:record-input</code><code>:resample</code><code>:capture-stop</code><code>:capture-cancel</code></article>
-            <article><h3>패드 믹스</h3><code>:pad-level &lt;-60..6&gt;</code><code>:pad-pan &lt;-1..1&gt;</code><code>:pad-mute &lt;on|off&gt;</code><code>:pad-choke &lt;off|1..16&gt;</code><code>:delay-send &lt;0..1&gt;</code><code>:reverb-send &lt;0..1&gt;</code></article>
-            <article><h3>마스터 이펙트</h3><code>:master-level &lt;-60..6&gt;</code><code>:delay-enable &lt;on|off&gt;</code><code>:delay-time &lt;ms&gt;</code><code>:delay-feedback &lt;0..0.95&gt;</code><code>:delay-return &lt;-60..6&gt;</code><code>:reverb-enable &lt;on|off&gt;</code><code>:reverb-room &lt;0..1&gt;</code><code>:reverb-damping &lt;0..1&gt;</code><code>:reverb-return &lt;-60..6&gt;</code></article>
+            <article><h3>Files and projects</h3><code>:load [path]</code><code>:save</code><code>:save-as &lt;directory&gt;</code><code>:open-project &lt;directory&gt;</code><code>:export &lt;file.wav&gt;</code></article>
+            <article><h3>Selection and playback</h3><code>:bank &lt;A..J&gt;</code><code>:select &lt;1..16&gt;</code><code>:play</code><code>:stop</code><code>:stop-all</code></article>
+            <article><h3>Patterns</h3><code>:pattern &lt;1..16&gt;</code><code>:tempo &lt;20..300&gt;</code><code>:bars &lt;n&gt;</code><code>:resolution &lt;value&gt;</code><code>:swing &lt;50..75&gt;</code><code>:quantize &lt;0..100&gt;</code><code>:record</code><code>:clear-pattern</code></article>
+            <article><h3>Samples and capture</h3><code>:trim-start &lt;frame&gt;</code><code>:trim-end &lt;frame&gt;</code><code>:normalize &lt;on|off&gt;</code><code>:reverse &lt;on|off&gt;</code><code>:pitch &lt;-24..24&gt;</code><code>:mode &lt;oneshot|gate|loop&gt;</code><code>:apply-sample</code><code>:undo-sample</code><code>:record-input</code><code>:resample</code><code>:capture-stop</code><code>:capture-cancel</code></article>
+            <article><h3>Pad mix</h3><code>:pad-level &lt;-60..6&gt;</code><code>:pad-pan &lt;-1..1&gt;</code><code>:pad-mute &lt;on|off&gt;</code><code>:pad-choke &lt;off|1..16&gt;</code><code>:delay-send &lt;0..1&gt;</code><code>:reverb-send &lt;0..1&gt;</code></article>
+            <article><h3>Master effects</h3><code>:master-level &lt;-60..6&gt;</code><code>:delay-enable &lt;on|off&gt;</code><code>:delay-time &lt;ms&gt;</code><code>:delay-feedback &lt;0..0.95&gt;</code><code>:delay-return &lt;-60..6&gt;</code><code>:reverb-enable &lt;on|off&gt;</code><code>:reverb-room &lt;0..1&gt;</code><code>:reverb-damping &lt;0..1&gt;</code><code>:reverb-return &lt;-60..6&gt;</code></article>
           </div>
         </section>
 
-        <section class="doc-section" id="troubleshooting" data-title="문제 해결">
-          <div class="section-heading"><span class="section-number">13</span><div><p class="eyebrow">Troubleshooting</p><h2>막혔을 때</h2></div></div>
+        <section class="doc-section" id="troubleshooting" data-title="Troubleshooting">
+          <div class="section-heading"><span class="section-number">13</span><div><p class="eyebrow">Troubleshooting</p><h2>When something goes wrong</h2></div></div>
           <div class="faq-list">
-            <details open><summary>녹음 PEAK가 계속 0입니다</summary><div><p>운영체제의 기본 입력 장치와 터미널 마이크 권한을 확인한 뒤 앱을 다시 시작하세요. MacBook 덮개가 닫혀 있으면 내장 마이크 대신 외장 또는 iPhone 마이크를 사용해야 합니다.</p></div></details>
-            <details><summary>PEAK는 움직이는데 녹음한 소리가 들리지 않습니다</summary><div><p><kbd>Enter</kbd>로 녹음을 마무리한 후 목적지 패드 키를 누르세요. <kbd>Space</kbd>는 선택 패드가 아니라 패턴을 재생합니다. 출력 장치와 시스템 볼륨도 확인하세요.</p></div></details>
-            <details><summary>패드를 다시 눌렀는데 동작이 헷갈립니다</summary><div><p>OneShot 패드는 재생 중 다시 누르면 정지합니다. 그 다음 누름부터 새로 재생됩니다. 확실하게 정지하려면 <kbd>Shift</kbd>+해당 패드, 전체 정지는 <kbd>Shift</kbd>+<kbd>Esc</kbd>를 사용하세요.</p></div></details>
-            <details><summary>Audio device connected에서 멈춘 것처럼 보입니다</summary><div><p>터미널 크기가 최소 80 × 24인지 확인하세요. 오디오 장치 변경 뒤에는 앱을 다시 시작하고, 장치 오류 화면에서는 <kbd>Ctrl+R</kbd>로 오디오 연결을 재시도할 수 있습니다.</p></div></details>
-            <details><summary>패드에 있던 소리를 지우고 싶습니다</summary><div><p>현재 버전은 빈 파일을 덮어쓰는 방식 대신 새 샘플로 교체하는 흐름을 중심으로 합니다. 재생만 멈추려면 <kbd>Shift</kbd>+패드를 사용하세요.</p></div></details>
+            <details open><summary>Recording PEAK stays at 0</summary><div><p>Check the operating system's default input and your terminal's microphone permission, then restart sampler-tui. With a closed MacBook lid, use an external or iPhone microphone instead of the built-in input.</p></div></details>
+            <details><summary>PEAK moves, but the recording is silent on playback</summary><div><p>Press <kbd>Enter</kbd> to finalize the take, then press its destination pad. <kbd>Space</kbd> plays the pattern, not the selected pad. Also check the output device and system volume.</p></div></details>
+            <details><summary>Pressing the same pad again is confusing</summary><div><p>Pressing an active OneShot pad stops it. The following press starts it again from the beginning. Use <kbd>Shift</kbd>+pad for an explicit stop or <kbd>Shift</kbd>+<kbd>Esc</kbd> to stop everything.</p></div></details>
+            <details><summary>The screen appears stuck at “Audio device connected”</summary><div><p>Ensure the terminal is at least 80 × 24. Restart after changing audio devices, or press <kbd>Ctrl+R</kbd> on a device error screen to retry the audio connection.</p></div></details>
+            <details><summary>I want to clear a pad</summary><div><p>The current workflow replaces pads with new samples rather than writing an empty file. To stop playback without replacing the sample, press <kbd>Shift</kbd>+pad.</p></div></details>
           </div>
         </section>
 
         <section class="closing-panel">
           <p class="eyebrow">Ready when you are</p>
-          <h2>첫 소리를<br>패드에 담아보세요.</h2>
-          <div class="closing-command"><code>cargo run -p sampler-tui</code><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">복사</button></div>
-          <a href="#record">녹음 가이드로 이동 <span aria-hidden="true">→</span></a>
+          <h2>Put your first sound<br>on a pad.</h2>
+          <div class="closing-command"><code>cargo run -p sampler-tui</code><button class="copy-button" type="button" data-copy="cargo run -p sampler-tui">Copy</button></div>
+          <a href="#record">Open the recording guide <span aria-hidden="true">→</span></a>
         </section>
 
         <footer>
@@ -342,15 +344,15 @@
     <dialog class="search-dialog" aria-labelledby="search-title">
       <form method="dialog" class="search-shell">
         <div class="search-head">
-          <label id="search-title" for="doc-search">문서 검색</label>
-          <button type="submit" aria-label="검색 닫기">ESC</button>
+          <label id="search-title" for="doc-search">Search documentation</label>
+          <button type="submit" aria-label="Close search">ESC</button>
         </div>
-        <input id="doc-search" type="search" placeholder="예: 녹음, 패턴, MIDI" autocomplete="off">
+        <input id="doc-search" type="search" placeholder="Try recording, pattern, or MIDI" autocomplete="off">
         <div class="search-results" aria-live="polite"></div>
       </form>
     </dialog>
 
-    <button class="back-to-top" type="button" aria-label="페이지 맨 위로">↑</button>
-    <div class="toast" role="status" aria-live="polite">클립보드에 복사했습니다</div>
+    <button class="back-to-top" type="button" aria-label="Back to top">↑</button>
+    <div class="toast" role="status" aria-live="polite">Copied to clipboard</div>
   </body>
 </html>

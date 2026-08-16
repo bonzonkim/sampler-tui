@@ -2,7 +2,9 @@
 
 `sampler-tui` is an original, keyboard-driven sampler for the terminal, inspired by the immediacy of hardware performance samplers. It supports pad performance, microphone recording, resampling, pattern sequencing, sample editing, effects, MIDI mapping, project persistence, and offline export.
 
-**[Open the user guide](https://bonzonkim.github.io/sampler-tui/)** for a visual walkthrough of installation, pad performance, recording, patterns, sample editing, mixing, projects, MIDI, and troubleshooting.
+**User guides:** [English](https://bonzonkim.github.io/sampler-tui/) · [한국어](https://bonzonkim.github.io/sampler-tui/ko/)
+
+Both guides cover installation, pad performance, recording, patterns, sample editing, mixing, projects, MIDI, and troubleshooting.
 
 The application currently targets macOS and Linux and requires a terminal of at least 80×24 cells.
 
@@ -157,7 +159,7 @@ The automated suite covers the real application, worker, controller, engine, per
 
 ## Documentation site
 
-The static documentation site lives in `docs/` and uses relative asset paths so it works both locally and under the GitHub Pages project path. To publish it, open the repository's **Settings → Pages**, choose **Deploy from a branch**, then select the `main` branch and `/docs` folder. Future pushes that change `docs/` will update the site automatically.
+The bilingual static documentation site lives in `docs/`: English is served from the project root and Korean from `/ko/`. It uses relative asset paths so both locales work locally and under the GitHub Pages project path. To publish it, open the repository's **Settings → Pages**, choose **Deploy from a branch**, then select the `main` branch and `/docs` folder. Future pushes that change `docs/` will update both guides automatically.
 
 ## License
 

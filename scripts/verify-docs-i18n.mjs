@@ -103,6 +103,8 @@ assertNoRootRelativeAssets(english);
 assertNoRootRelativeAssets(korean);
 assert.doesNotMatch(css, /status-dot|terminal-dots|mode-dot|border-radius:\s*50%/);
 assert.match(javascript, /uiStrings/);
+assert.match(javascript, /const locale = root\.lang \|\| "en";/);
+assert.doesNotMatch(javascript, /toLocaleLowerCase\("ko"\)/);
 assert.ok(fs.existsSync(path.join(docsRoot, ".nojekyll")));
 
 console.log("docs i18n contract: OK");

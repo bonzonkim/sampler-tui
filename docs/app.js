@@ -1,5 +1,12 @@
 const root = document.documentElement;
 const body = document.body;
+const locale = root.lang || "en";
+const uiStrings = Object.freeze({
+  themeLightLabel: body.dataset.themeLightLabel,
+  themeDarkLabel: body.dataset.themeDarkLabel,
+  searchEmptyTemplate: body.dataset.searchEmptyTemplate,
+  copySuccess: body.dataset.copySuccess,
+});
 const sections = [...document.querySelectorAll(".doc-section[id]")];
 const navLinks = [...document.querySelectorAll('.sidebar a[href^="#"]')];
 const menuToggle = document.querySelector(".menu-toggle");
@@ -23,7 +30,10 @@ const searchIndex = sections.map((section) => ({
 function setTheme(theme, persist = true) {
   root.dataset.theme = theme;
   themeIcon.textContent = theme === "dark" ? "☼" : "◐";
-  themeToggle.setAttribute("aria-label", theme === "dark" ? "밝은 테마로 전환" : "어두운 테마로 전환");
+  themeToggle.setAttribute(
+    "aria-label",
+    theme === "dark" ? uiStrings.themeLightLabel : uiStrings.themeDarkLabel,
+  );
   document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#111318" : "#f2f0e8";
   if (persist) localStorage.setItem("sampler-docs-theme", theme);
 }
@@ -81,8 +91,8 @@ const sectionObserver = new IntersectionObserver(
 sections.forEach((section) => sectionObserver.observe(section));
 
 function highlightSnippet(item, query) {
-  const normalizedText = item.text.toLocaleLowerCase("ko");
-  const index = normalizedText.indexOf(query.toLocaleLowerCase("ko"));
+  const normalizedText = item.text.toLocaleLowerCase(locale);
+  const index = normalizedText.indexOf(query.toLocaleLowerCase(locale));
   const start = Math.max(0, index === -1 ? 0 : index - 28);
   const end = Math.min(item.text.length, start + 100);
   return `${start > 0 ? "…" : ""}${item.text.slice(start, end)}${end < item.text.length ? "…" : ""}`;
@@ -91,14 +101,14 @@ function highlightSnippet(item, query) {
 function renderSearch(query = "") {
   const cleanQuery = query.trim();
   const matches = cleanQuery
-    ? searchIndex.filter((item) => item.text.toLocaleLowerCase("ko").includes(cleanQuery.toLocaleLowerCase("ko")))
+    ? searchIndex.filter((item) => item.text.toLocaleLowerCase(locale).includes(cleanQuery.toLocaleLowerCase(locale)))
     : searchIndex.slice(0, 7);
 
   searchResults.replaceChildren();
   if (!matches.length) {
     const empty = document.createElement("p");
     empty.className = "search-empty";
-    empty.textContent = `“${cleanQuery}”에 맞는 문서가 없습니다.`;
+    empty.textContent = uiStrings.searchEmptyTemplate.replace("{query}", cleanQuery);
     searchResults.append(empty);
     return;
   }
@@ -160,7 +170,7 @@ async function copyText(text) {
     document.execCommand("copy");
     input.remove();
   }
-  showToast("클립보드에 복사했습니다");
+  showToast(uiStrings.copySuccess);
 }
 
 document.querySelectorAll("[data-copy]").forEach((button) => {
